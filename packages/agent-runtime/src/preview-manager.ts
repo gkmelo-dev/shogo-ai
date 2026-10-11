@@ -870,21 +870,38 @@ export function resolveApiServerEnv(input: {
   appRuntimeToken?: string | null
 }): Record<string, string> {
   const { parentEnv, portStr, cwd, projectId, appRuntimeToken } = input
-  const out: Record<string, string> = {}
-  for (const [k, v] of Object.entries(parentEnv)) {
-    if (typeof v === 'string') out[k] = v
-  }
-  // Capture the agent runtime's own listening port BEFORE we overwrite
-  // PORT below — the sidecar's @shogo-ai/sdk/tools/server proxy needs
-  // RUNTIME_PORT to forward `/api/tools/*` calls back to the runtime
-  // over `127.0.0.1`. parentEnv.PORT is the runtime's port; portStr is
-  // the sidecar's own bind port.
-  out.RUNTIME_PORT = parentEnv.PORT ?? '8080'
+  const out = resolveProjectProcessEnv({ parentEnv, projectId, appRuntimeToken })
   out.PORT = portStr
   out.API_SERVER_PORT = portStr
   out.SKILL_SERVER_PORT = portStr
   out.DATABASE_URL = resolveSidecarDatabaseUrl(parentEnv, cwd, projectId)
-  // The merged map is a workspace transport detail — the sidecar must not
+  return out
+}
+
+/**
+ * Env for any process that runs project code: the API sidecar, builds,
+ * watchers, Expo and Prisma. The `@shogo-ai/sdk` in that process reads
+ * RUNTIME_AUTH_SECRET, PROJECT_ID and RUNTIME_PORT from it.
+ *
+ * In a workspace runtime the inherited workspace token is replaced by the
+ * project's own token, or removed when there is none, and PROJECT_ID names
+ * the project rather than the workspace.
+ */
+export function resolveProjectProcessEnv(input: {
+  parentEnv: NodeJS.ProcessEnv
+  projectId?: string
+  appRuntimeToken?: string | null
+}): Record<string, string> {
+  const { parentEnv, projectId, appRuntimeToken } = input
+  const out: Record<string, string> = {}
+  for (const [k, v] of Object.entries(parentEnv)) {
+    if (typeof v === 'string') out[k] = v
+  }
+  // parentEnv.PORT is the runtime's own port. The SDK tools client uses it
+  // to reach the runtime over 127.0.0.1; the sidecar overwrites PORT with
+  // its bind port afterwards.
+  out.RUNTIME_PORT = parentEnv.PORT ?? '8080'
+  // The merged map is a workspace transport detail — project code must not
   // see a sibling project's connection string.
   delete out.WORKSPACE_DATABASE_URLS
   if (parentEnv.WORKSPACE_RUNTIME === 'true') {
@@ -1754,6 +1771,12 @@ export class PreviewManager {
     // middleware) across this regeneration. Captured before the overwrite,
     // re-applied after a successful generate. No-op when there are none.
     const preservedRegions = captureServerCustomRegions(cwd)
+    const generateEnv = await this.projectProcessEnv({
+      DATABASE_URL: `file:${join(cwd, 'prisma', 'dev.db')}`,
+      // Hint to non-TTY child processes (Prisma's spinner library,
+      // chalk, etc.) so they don't waste cycles on TTY queries.
+      CI: '1',
+    })
 
     const generateOk = await new Promise<boolean>((resolveResult) => {
       // Use async spawn rather than execSync. The runtime's startup path
@@ -1766,13 +1789,7 @@ export class PreviewManager {
       const proc = spawn(pkg.bunBinary, args, {
         cwd,
         stdio: ['ignore', 'pipe', 'pipe'],
-        env: {
-          ...process.env,
-          DATABASE_URL: `file:${join(cwd, 'prisma', 'dev.db')}`,
-          // Hint to non-TTY child processes (Prisma's spinner library,
-          // chalk, etc.) so they don't waste cycles on TTY queries.
-          CI: '1',
-        },
+        env: generateEnv,
       })
 
       let stdout = ''
@@ -2069,7 +2086,7 @@ export class PreviewManager {
       const result = await runStaticBuild(cwd, plan, {
         stagingDir: PUBLISH_STAGING_DIR,
         basePath: '/',
-        env: { NODE_ENV: 'production' },
+        env: await this.projectProcessEnv({ NODE_ENV: 'production' }),
       })
       return result.ok ? { ok: true } : { ok: false, error: result.error }
     }
@@ -2380,6 +2397,11 @@ export class PreviewManager {
     )
     if (!viteBin || this.resolveDevServer() !== 'vite') return false
     const invocation = resolveBinInvocation(cwd, 'vite') ?? { cmd: viteBin, argsPrefix: [] }
+    const env = await this.projectProcessEnv({
+      NODE_ENV: 'development',
+      VITE_RUNTIME_PORT: String(this.runtimePort),
+      CI: '1',
+    })
     const exitCode = await new Promise<number | null>((resolveBuild) => {
       try {
         const proc = spawn(
@@ -2389,7 +2411,7 @@ export class PreviewManager {
             cwd,
             stdio: 'ignore',
             shell: isWindows,
-            env: { ...process.env, NODE_ENV: 'development', VITE_RUNTIME_PORT: String(this.runtimePort), CI: '1' },
+            env,
           },
         )
         proc.on('error', () => resolveBuild(null))
@@ -2512,7 +2534,7 @@ export class PreviewManager {
     const result = await runStaticBuild(cwd, plan, {
       stagingDir: DEFAULT_STAGING_DIR,
       basePath: this.basePath,
-      env: { NODE_ENV: 'production' },
+      env: await this.projectProcessEnv({ NODE_ENV: 'production' }),
       onLine: (stream, line) => emitBuildLine(buildLogPath, `[${stream}]`, line, stream),
     })
     if (!result.ok) {
@@ -2896,7 +2918,7 @@ export class PreviewManager {
         // can take ~3s on a cold pod. The sync variant blocks the event
         // loop and was the root cause of the ~4.7s /pool/assign freeze
         // observed in staging on 2026-05-11. Always use *Async from here.
-        await pkg.prismaGenerateAsync(cwd)
+        await pkg.prismaGenerateAsync(cwd, { env: await this.projectProcessEnv() })
         timings.prisma = Date.now() - t1
       } catch (err: any) {
         timings.prisma = Date.now() - t1
@@ -2918,7 +2940,7 @@ export class PreviewManager {
     const t2 = Date.now()
     try {
       await pkg.prismaDbPushAsync(cwd, {
-        env: { ...process.env, DATABASE_URL: `file:${devDb}` } as NodeJS.ProcessEnv,
+        env: await this.projectProcessEnv({ DATABASE_URL: `file:${devDb}` }),
       })
       timings.dbPush = Date.now() - t2
       console.log(`[${LOG_PREFIX}] Prisma db push succeeded (${timings.dbPush}ms)`)
@@ -3254,6 +3276,11 @@ export class PreviewManager {
     // unbounded) — used to classify the failure (ENOSPC vs. a normal
     // build error) and to surface a useful excerpt in `errors.setup`.
     let stderrTail = ''
+    const env = await this.projectProcessEnv({
+      NODE_ENV: 'development',
+      VITE_RUNTIME_PORT: String(this.runtimePort),
+      CI: '1',
+    })
     const exitCode = await new Promise<number | null>((resolveBuild) => {
       let proc: ChildProcess
       try {
@@ -3264,12 +3291,7 @@ export class PreviewManager {
             cwd,
             stdio: ['ignore', 'pipe', 'pipe'],
             shell: isWindows,
-            env: {
-              ...process.env,
-              NODE_ENV: 'development',
-              VITE_RUNTIME_PORT: String(this.runtimePort),
-              CI: '1',
-            },
+            env,
           },
         )
       } catch (err: any) {
@@ -3355,6 +3377,10 @@ export class PreviewManager {
     if (!existsSync(join(cwd, 'dist', 'index.html'))) {
       await this.runViteOneShotBuild(viteBin, cwd, buildLogPath, isWindows)
     }
+    const watchEnv = await this.projectProcessEnv({
+      NODE_ENV: 'development',
+      VITE_RUNTIME_PORT: String(this.runtimePort),
+    })
 
     console.log(`[${LOG_PREFIX}] Starting vite build --watch (no empty)...`)
 
@@ -3412,11 +3438,7 @@ export class PreviewManager {
           // `.CMD` shims must go through cmd.exe on Windows.
           shell: isWindows,
           detached: useProcessGroup,
-          env: {
-            ...process.env,
-            NODE_ENV: 'development',
-            VITE_RUNTIME_PORT: String(this.runtimePort),
-          },
+          env: watchEnv,
         },
       )
     } catch (err: any) {
@@ -3543,6 +3565,24 @@ export class PreviewManager {
    * work. Concurrent callers join the same in-flight promise rather than
    * each attempting their own spawn.
    */
+  /** In a workspace runtime, this project's runtime token for the processes it runs. */
+  private async fetchAppRuntimeToken(): Promise<string | null | undefined> {
+    if (process.env.WORKSPACE_RUNTIME !== 'true' || !this.workspaceProjectId) return undefined
+    return fetchAppRuntimeToken(this.workspaceProjectId)
+  }
+
+  /** {@link resolveProjectProcessEnv} for this project, plus `extra`. */
+  private async projectProcessEnv(extra: Record<string, string> = {}): Promise<Record<string, string>> {
+    return {
+      ...resolveProjectProcessEnv({
+        parentEnv: process.env,
+        projectId: this.workspaceProjectId,
+        appRuntimeToken: await this.fetchAppRuntimeToken(),
+      }),
+      ...extra,
+    }
+  }
+
   private async startApiServer(): Promise<void> {
     if (this.apiServerStartInFlight) {
       console.log(`[${LOG_PREFIX}] API server start already in flight — awaiting it instead of spawning a second one`)
@@ -3744,10 +3784,7 @@ export class PreviewManager {
       return
     }
 
-    const appRuntimeToken =
-      process.env.WORKSPACE_RUNTIME === 'true' && this.workspaceProjectId
-        ? await fetchAppRuntimeToken(this.workspaceProjectId)
-        : undefined
+    const appRuntimeToken = await this.fetchAppRuntimeToken()
 
     // Last chance before we actually spawn a process bound to the port —
     // if a stop()/restart() superseded this attempt while we were awaiting
@@ -4370,6 +4407,15 @@ export class PreviewManager {
     // expo export (it expects a clean output dir or none). Drop it
     // before spawning.
     cleanupStagingOutput(cwd, stagingDir)
+    const exportEnv = await this.projectProcessEnv({
+      NODE_ENV: 'development',
+      // Expo Router reads this when a project's dynamic config opts
+      // into an environment-driven base URL. app.json projects are
+      // patched below with the same normalized value.
+      ...(basePath ? { EXPO_BASE_URL: normalizeExpoBasePath(basePath) } : {}),
+      // CI=1 keeps Expo non-interactive (no prompts to install missing deps).
+      CI: '1',
+    })
 
     const t0 = Date.now()
     const restoreExpoConfig = basePath
@@ -4386,16 +4432,7 @@ export class PreviewManager {
             stdio: ['ignore', 'pipe', 'pipe'],
             // `.CMD` shims must go through cmd.exe on Windows.
             shell: isWindows,
-            env: {
-              ...process.env,
-              NODE_ENV: 'development',
-              // Expo Router reads this when a project's dynamic config opts
-              // into an environment-driven base URL. app.json projects are
-              // patched above with the same normalized value.
-              ...(basePath ? { EXPO_BASE_URL: normalizeExpoBasePath(basePath) } : {}),
-              // CI=1 keeps Expo non-interactive (no prompts to install missing deps).
-              CI: '1',
-            },
+            env: exportEnv,
           })
         } catch (err: any) {
           console.error(`[${LOG_PREFIX}] Failed to spawn expo export: ${err?.message ?? err}`)
@@ -4548,6 +4585,7 @@ export class PreviewManager {
     const probedPort = await pickFreePort()
     this.metroPort = probedPort
     const portArgs = probedPort != null ? ['--port', String(probedPort)] : []
+    const tunnelEnv = await this.projectProcessEnv({ CI: '1', EXPO_NO_TELEMETRY: '1' })
     console.log(
       `[${LOG_PREFIX}] Starting Expo tunnel${probedPort != null ? ` on port ${probedPort}` : ''}...`,
     )
@@ -4566,11 +4604,7 @@ export class PreviewManager {
           stdio: ['ignore', 'pipe', 'pipe'],
           // `.CMD` shims must go through cmd.exe on Windows.
           shell: isWindows,
-          env: {
-            ...process.env,
-            CI: '1',
-            EXPO_NO_TELEMETRY: '1',
-          },
+          env: tunnelEnv,
         },
       )
     } catch (err: any) {

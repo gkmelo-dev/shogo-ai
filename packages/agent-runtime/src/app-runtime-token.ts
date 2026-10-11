@@ -61,6 +61,14 @@ export function isAppRuntimeToken(token: string): boolean {
   return false
 }
 
+/** The runtime routes an app's SDK tools client calls. */
+const APP_TOOL_PATHS = new Set(['/agent/tools/execute', '/agent/tools/schemas'])
+
+/** `acceptsScopedToken` for the agent runtime: app tokens may call the tool routes only. */
+export function acceptsAppToolToken(path: string, token: string): boolean {
+  return APP_TOOL_PATHS.has(path) && isAppRuntimeToken(token)
+}
+
 /** @internal */
 export function _resetAppRuntimeTokensForTests(): void {
   tokensByProject.clear()
