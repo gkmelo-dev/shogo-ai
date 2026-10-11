@@ -19,6 +19,7 @@ import { Hono } from "hono"
 import { S3Client, PutObjectCommand, CopyObjectCommand, DeleteObjectsCommand, ListObjectsV2Command, HeadObjectCommand } from "@aws-sdk/client-s3"
 import { prisma } from "../lib/prisma"
 import { deriveProjectRuntimeToken } from "../lib/project-runtime-token"
+import { publishStepTimeouts } from "@shogo/shared-runtime/publish-timeouts"
 import { recordCheckpointForCommit } from "../services/checkpoint.service"
 import {
   getCustomHostnamesConfig,
@@ -79,9 +80,9 @@ const AWS_REGION = process.env.S3_REGION || process.env.AWS_REGION || "us-east-1
 // returned a structured error to Studio. 180s covers an Expo web export
 // (install + `expo export`), which regularly exceeds a 60s bun-rebuild
 // budget. A second attempt is made after `build_timeout` so a cold pod
-// that wakes during the first call can finish.
-const PUBLISH_BUILD_TIMEOUT_MS = Number(process.env.PUBLISH_BUILD_TIMEOUT_MS) || 180_000
-const PUBLISH_DOWNLOAD_TIMEOUT_MS = Number(process.env.PUBLISH_DOWNLOAD_TIMEOUT_MS) || 60_000
+// that wakes during the first call can finish. The retry joins the
+// runtime's in-flight publish build (`PreviewManager.buildForPublish`),
+// so it does not start a second build in dist.publish.staging.
 // The S3 upload and substrate "configure" step (createPublishedService /
 // getMetalPublishedUrl, etc.) previously had NO timeout at all, unlike build
 // and download above — a stalled OCI/S3 call or a wedged Knative/metal
@@ -89,10 +90,16 @@ const PUBLISH_DOWNLOAD_TIMEOUT_MS = Number(process.env.PUBLISH_DOWNLOAD_TIMEOUT_
 // surfaces to the user as a Publish button/subdomain spinner stuck in an
 // infinite loading loop with no error. `withTimeout` below races the step
 // against a timer so we always return a structured error to Studio.
-const PUBLISH_UPLOAD_TIMEOUT_MS = Number(process.env.PUBLISH_UPLOAD_TIMEOUT_MS) || 60_000
-const PUBLISH_CONFIGURE_TIMEOUT_MS = Number(process.env.PUBLISH_CONFIGURE_TIMEOUT_MS) || 60_000
-const PUBLISH_CONFIGURE_TIMEOUT_METAL_MS = Number(process.env.PUBLISH_CONFIGURE_TIMEOUT_METAL_MS) || 150_000
-const PUBLISH_GIT_FLUSH_TIMEOUT_MS = Number(process.env.PUBLISH_GIT_FLUSH_TIMEOUT_MS) || 60_000
+// Defaults live in @shogo/shared-runtime/publish-timeouts so the agent
+// runtime's wait budget is the same sum.
+const {
+  buildMs: PUBLISH_BUILD_TIMEOUT_MS,
+  downloadMs: PUBLISH_DOWNLOAD_TIMEOUT_MS,
+  uploadMs: PUBLISH_UPLOAD_TIMEOUT_MS,
+  configureMs: PUBLISH_CONFIGURE_TIMEOUT_MS,
+  configureMetalMs: PUBLISH_CONFIGURE_TIMEOUT_METAL_MS,
+  gitFlushMs: PUBLISH_GIT_FLUSH_TIMEOUT_MS,
+} = publishStepTimeouts()
 
 /**
  * Race `promise` against a timer so a hung outbound call (S3, substrate
@@ -584,7 +591,7 @@ async function triggerBuild(
       return {
         success: false,
         code: 'build_timeout',
-        error: `Build timed out after ${timeoutMs / 1000}s — the runtime pod is unresponsive`,
+        error: `Build timed out after ${timeoutMs / 1000}s — the publish build did not finish in time`,
       }
     }
     console.error(`[Publish] Build error:`, err)
@@ -592,7 +599,11 @@ async function triggerBuild(
   }
 }
 
-/** One retry after a timeout: the first call often wakes a cold runtime. */
+/**
+ * One retry after a timeout: the first call often wakes a cold runtime.
+ * The runtime publish-build handler joins an in-flight build, so this
+ * second POST does not start a concurrent build.
+ */
 export async function triggerBuildWithRetry(projectId: string): Promise<{ success: boolean; error?: string; code?: string }> {
   const first = await triggerBuild(projectId)
   if (first.success || first.code !== 'build_timeout') return first
@@ -1325,9 +1336,10 @@ export async function publishProject(
         // static nginx), its DomainMapping, and the SERVER_BACKED edge flag.
         await setPublishStatus(projectId, 'configuring')
         try {
+          const configureTimeoutMs = await publishConfigureTimeoutMs(projectId)
           await withTimeout(
             configurePublishedService(projectId, subdomain, { alwaysOn }),
-            await publishConfigureTimeoutMs(projectId),
+            configureTimeoutMs,
             'Publish configure',
           )
         } catch (err: any) {
@@ -1774,9 +1786,10 @@ export function publishRoutes() {
           // republish never clobbers accumulated end-user writes.
           await setPublishStatus(projectId, 'configuring')
           try {
+            const configureTimeoutMs = await publishConfigureTimeoutMs(projectId)
             await withTimeout(
               configurePublishedService(projectId, subdomain, { alwaysOn }),
-              await publishConfigureTimeoutMs(projectId),
+              configureTimeoutMs,
               'Publish configure',
             )
           } catch (err: any) {

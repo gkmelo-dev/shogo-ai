@@ -26,6 +26,8 @@ export interface CredentialScope {
   approvalId?: string
   /** Live chat stream, so a tool can ask the UI to show a reconnect card. */
   uiWriter?: { write(chunk: Record<string, any>): void }
+  /** Toolkits that already raised a reconnect card during this turn. */
+  reconnectCardsShown?: Set<string>
 }
 
 const scopeStorage = new AsyncLocalStorage<CredentialScope>()

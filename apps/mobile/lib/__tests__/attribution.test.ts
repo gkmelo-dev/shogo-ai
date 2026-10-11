@@ -163,16 +163,40 @@ describe('queueSignupAttribution', () => {
 
   test('records email signups for a week, and oauth only for a fresh account', () => {
     const now = Date.parse('2026-10-10T00:00:00Z')
-    queueSignupAttribution('email')
-    const email = getPendingSignupAttribution()!
-    expect(shouldRecordSignupAttribution(email, new Date(now - 6 * 24 * 60 * 60 * 1000), now)).toBe(true)
+    const email = { method: 'email' as const, queuedAt: now - 6 * 24 * 60 * 60 * 1000 }
+    expect(shouldRecordSignupAttribution(email, new Date(email.queuedAt), now)).toBe(true)
     expect(shouldRecordSignupAttribution(email, new Date(now - 8 * 24 * 60 * 60 * 1000), now)).toBe(false)
 
-    discardPendingSignupAttribution()
-    queueSignupAttribution('google')
-    const google = getPendingSignupAttribution()!
-    expect(shouldRecordSignupAttribution(google, new Date(now - 5 * 60 * 1000), now)).toBe(true)
+    const google = { method: 'google' as const, queuedAt: now - 60 * 1000 }
+    expect(shouldRecordSignupAttribution(google, new Date(now - 30 * 1000), now)).toBe(true)
     expect(shouldRecordSignupAttribution(google, new Date(now - 30 * 60 * 1000), now)).toBe(false)
     expect(shouldRecordSignupAttribution(google, null, now)).toBe(false)
+  })
+
+  test('does not attribute a queued signup to a different account', () => {
+    const now = Date.parse('2026-10-10T00:00:00Z')
+    const pending = { method: 'email' as const, queuedAt: now - 60 * 1000 }
+    expect(shouldRecordSignupAttribution(pending, new Date(now - 2 * 24 * 60 * 60 * 1000), now)).toBe(false)
+    expect(shouldRecordSignupAttribution(pending, new Date(now - 2 * 60 * 60 * 1000), now)).toBe(false)
+    expect(shouldRecordSignupAttribution(pending, new Date(now - 30 * 1000), now)).toBe(true)
+  })
+
+  test('posts once when two flushes overlap', async () => {
+    queueSignupAttribution('email')
+    let posts = 0
+    let release: () => void = () => {}
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    const first = flushSignupAttribution(async () => {
+      posts += 1
+      await gate
+    })
+    const second = flushSignupAttribution(async () => {
+      posts += 1
+      await gate
+    })
+    release()
+    await Promise.all([first, second])
+    expect(posts).toBe(1)
+    expect(getPendingSignupAttribution()).toBeNull()
   })
 })

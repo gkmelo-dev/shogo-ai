@@ -86,6 +86,16 @@ describe('createWriteFileTool', () => {
     expect(readFileSync(join(TEST_DIR, '.tmp/report.pdf'))).toEqual(payload)
   })
 
+  test('does not rewrite an absolute /tmp path that is already inside the workspace', async () => {
+    const ctx = makeCtx()
+    const absolute = join(TEST_DIR, 'inside.txt')
+    const r = await run(ctx, 'write_file', { path: absolute, content: 'stay' })
+    expect(r.details.ok).toBe(true)
+    expect(r.details.remappedFrom).toBeUndefined()
+    expect(readFileSync(absolute, 'utf8')).toBe('stay')
+    expect(existsSync(join(TEST_DIR, '.tmp'))).toBe(false)
+  })
+
   test('creates parent directories on the fly', async () => {
     const ctx = makeCtx()
     const r = await run(ctx, 'write_file', { path: 'a/b/c/deep.txt', content: 'deep' })

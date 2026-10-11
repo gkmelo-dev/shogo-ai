@@ -7,7 +7,7 @@
  * cache, git, the project archive, subagent merge, runtime auth, and the
  * Composio reconnect card all run as themselves.
  */
-import { describe, test, expect, beforeAll, afterAll, beforeEach, mock } from 'bun:test'
+import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach, mock } from 'bun:test'
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from 'node:http'
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -27,23 +27,24 @@ class FakeComposio {
   create = (...a: any[]) => handlers.create(...a)
   constructor(_opts: any) {}
 }
-mock.module('@composio/core', () => ({ Composio: FakeComposio }))
-mock.module('../../composio-auto-bind', () => ({
+mock.module('../packages/agent-runtime/node_modules/@composio/core', () => ({ Composio: FakeComposio }))
+mock.module('../packages/agent-runtime/src/composio-auto-bind', () => ({
   fetchComposioToolSchemas: async () => mockedSchemas,
 }))
 
-import { createTools, type ToolContext } from '../../gateway-tools'
-import { FileStateCache } from '../../file-state-cache'
-import { runSubagent } from '../../subagent'
-import { createMockStreamFn, buildTextResponse, buildToolUseResponse } from '../helpers/mock-anthropic'
-import { trustWorkspaceForTests, clearTrustForTests } from '../helpers/test-trust'
-import { MCPClientManager } from '../../mcp-client'
-import { S3Sync } from '../../../../../packages/shared-runtime/src/s3-sync'
-import { createRuntimeApp } from '../../../../../packages/shared-runtime/src/server-framework'
-import { initRepo, commit } from '../../../../../apps/api/src/services/git.service'
-import { deriveWorkspaceRuntimeToken, verifyWorkspaceRuntimeToken } from '../../../../../apps/api/src/lib/workspace-runtime-token'
-import { withIntegrationCredentials } from '../../integration-credentials'
-import { initComposioSession, registerToolkitProxyTools, resetComposioSession } from '../../composio'
+import { createTools, type ToolContext } from '../packages/agent-runtime/src/gateway-tools'
+import { FileStateCache } from '../packages/agent-runtime/src/file-state-cache'
+import { runSubagent } from '../packages/agent-runtime/src/subagent'
+import { createMockStreamFn, buildTextResponse, buildToolUseResponse } from '../packages/agent-runtime/src/__tests__/helpers/mock-anthropic'
+import { trustWorkspaceForTests, clearTrustForTests } from '../packages/agent-runtime/src/__tests__/helpers/test-trust'
+import { MCPClientManager } from '../packages/agent-runtime/src/mcp-client'
+import { S3Sync } from '../packages/shared-runtime/src/s3-sync'
+import { createRuntimeApp } from '../packages/shared-runtime/src/server-framework'
+import { publishRequestTimeoutMs } from '../packages/shared-runtime/src/publish-timeouts'
+import { initRepo, commit } from '../apps/api/src/services/git.service'
+import { deriveWorkspaceRuntimeToken, verifyWorkspaceRuntimeToken } from '../apps/api/src/lib/workspace-runtime-token'
+import { withIntegrationCredentials } from '../packages/agent-runtime/src/integration-credentials'
+import { initComposioSession, registerToolkitProxyTools, resetComposioSession } from '../packages/agent-runtime/src/composio'
 
 let mockedSchemas: any[] = []
 
@@ -71,6 +72,13 @@ const hits: Hit[] = []
 let mode: Mode = 'share'
 let mountAttempts = 0
 let previewStarts = 0
+const tempDirs: string[] = []
+
+function tempDir(prefix: string): string {
+  const dir = mkdtempSync(join(tmpdir(), prefix))
+  tempDirs.push(dir)
+  return dir
+}
 
 function readBody(req: IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -152,6 +160,12 @@ beforeEach(() => {
   mode = 'share'
 })
 
+afterEach(() => {
+  for (const dir of tempDirs.splice(0)) {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 function workspace(dir: string, projectId = 'ws:ws-int'): ToolContext {
   trustWorkspaceForTests(dir)
   const cache = new FileStateCache(dir)
@@ -186,7 +200,7 @@ function armWorkspaceEnv(extra: Record<string, string | undefined> = {}) {
 describe('workspace tools talk to a real API with a real project id', () => {
   test('share_file and publish send the anchor id, never ws:', async () => {
     armWorkspaceEnv({ WORKSPACE_ANCHOR_PROJECT_ID: 'proj-anchor', WORKSPACE_PROJECT_IDS: 'proj-anchor,proj-other' })
-    const dir = mkdtempSync(join(tmpdir(), 'ws-tools-'))
+    const dir = tempDir('ws-tools-')
     writeFileSync(join(dir, 'report.pdf'), 'pdf')
     const ctx = workspace(dir)
     mode = 'share'
@@ -214,17 +228,16 @@ describe('workspace tools talk to a real API with a real project id', () => {
       expect(published.details.published).toBe(true)
       expect(published.details.url).toBe('https://demo.shogo.one')
       expect(hits.some((h) => h.method === 'POST' && h.url === '/api/internal/projects/proj-anchor/publish' && h.body.subdomain === 'demo')).toBe(true)
-      expect(timeouts).toContain(180_000 * 2 + 60_000 + 60_000 + 150_000 + 30_000)
+      expect(timeouts).toContain(publishRequestTimeoutMs())
     } finally {
       AbortSignal.timeout = realTimeout
       globalThis.fetch = realFetch
-      rmSync(dir, { recursive: true, force: true })
     }
   })
 
   test('notify_user omits projectId when the runtime id is ws:', async () => {
     armWorkspaceEnv({ WORKSPACE_ANCHOR_PROJECT_ID: undefined, WORKSPACE_PROJECT_IDS: undefined })
-    const dir = mkdtempSync(join(tmpdir(), 'ws-notify-'))
+    const dir = tempDir('ws-notify-')
     mode = 'notify'
     const result = await tool(workspace(dir), 'notify_user').execute('t', { title: 'Due', body: 'Stand up' })
     expect(result.details.delivered).toBe(true)
@@ -232,7 +245,6 @@ describe('workspace tools talk to a real API with a real project id', () => {
     expect(notify?.body.workspaceId).toBe('ws-int')
     expect(notify?.body.projectId).toBeUndefined()
     expect(notify?.body.title).toBe('Due')
-    rmSync(dir, { recursive: true, force: true })
   })
 
   test('share_file asks for project_id when several projects are attached', async () => {
@@ -240,44 +252,41 @@ describe('workspace tools talk to a real API with a real project id', () => {
       WORKSPACE_ANCHOR_PROJECT_ID: undefined,
       WORKSPACE_PROJECT_IDS: 'proj-a,proj-b',
     })
-    const dir = mkdtempSync(join(tmpdir(), 'ws-ask-'))
+    const dir = tempDir('ws-ask-')
     writeFileSync(join(dir, 'a.txt'), 'a')
     const result = await tool(workspace(dir), 'share_file').execute('t', { path: 'a.txt' })
     expect(result.details.error).toMatch(/project_id/)
     expect(hits.filter((h) => h.url.includes('/shared-files'))).toHaveLength(0)
-    rmSync(dir, { recursive: true, force: true })
   })
 })
 
 describe('mount and preview against the workspace API', () => {
   test('mount_project retries an HTML 502 and hides the proxy page', async () => {
     armWorkspaceEnv()
-    const dir = mkdtempSync(join(tmpdir(), 'ws-mount-'))
+    const dir = tempDir('ws-mount-')
     mode = 'mount'
     const result = await tool(workspace(dir), 'mount_project').execute('t', { projectId: 'proj-anchor' })
     expect(result.details.mounted).toBe(true)
     expect(mountAttempts).toBe(2)
     expect(JSON.stringify(result.details)).not.toMatch(/cloudflare|<html/i)
-    rmSync(dir, { recursive: true, force: true })
   })
 
   test('preview_project mounts once after project_not_attached, then starts', async () => {
     armWorkspaceEnv()
     setEnv('PORT', String(port))
-    const dir = mkdtempSync(join(tmpdir(), 'ws-preview-'))
+    const dir = tempDir('ws-preview-')
     mode = 'preview'
     const result = await tool(workspace(dir), 'preview_project').execute('t', { projectId: 'proj-anchor' })
     expect(previewStarts).toBe(2)
     expect(mountAttempts).toBe(1)
     expect(result.details.ready).toBe(true)
     expect(result.details.url).toBe(`http://localhost:${port}/p/proj-anchor/`)
-    rmSync(dir, { recursive: true, force: true })
   })
 })
 
 describe('edit and write on a real workspace', () => {
   test('a stale unique edit applies, and a non-unique one refreshes the cache', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'ws-edit-'))
+    const dir = tempDir('ws-edit-')
     const ctx = workspace(dir, 'proj-anchor')
     writeFileSync(join(dir, 'note.txt'), 'alpha\nbeta\n')
     await tool(ctx, 'read_file').execute('t', { path: 'note.txt' })
@@ -306,12 +315,11 @@ describe('edit and write on a real workspace', () => {
     expect(stale.details.error).toMatch(/modified since last read/)
     expect(stale.details.hint).toBeTruthy()
     expect(ctx.fileStateCache!.getRecord('note.txt')?.content).toContain('completely different')
-    rmSync(dir, { recursive: true, force: true })
   })
 
   test('exec re-stats tracked files so the next edit sees the command output', async () => {
     armWorkspaceEnv()
-    const dir = mkdtempSync(join(tmpdir(), 'ws-exec-'))
+    const dir = tempDir('ws-exec-')
     const ctx = workspace(dir)
     writeFileSync(join(dir, 'note.txt'), 'before')
     await tool(ctx, 'read_file').execute('t', { path: 'note.txt' })
@@ -332,11 +340,10 @@ describe('edit and write on a real workspace', () => {
     })
     expect(edited.details.error).toBeUndefined()
     expect(readFileSync(join(dir, 'note.txt'), 'utf8')).toBe('final')
-    rmSync(dir, { recursive: true, force: true })
   })
 
   test('a subagent edit stays on the parent cache after the clone is merged', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'ws-sub-'))
+    const dir = tempDir('ws-sub-')
     const ctx = workspace(dir, 'proj-anchor')
     writeFileSync(join(dir, 'note.txt'), 'hello world')
     await tool(ctx, 'read_file').execute('t', { path: 'note.txt' })
@@ -366,11 +373,10 @@ describe('edit and write on a real workspace', () => {
     const after = ctx.fileStateCache!.getRecord('note.txt')
     expect(after?.content).toContain('goodbye')
     expect(after!.readAt).toBeGreaterThanOrEqual(before.readAt)
-    rmSync(dir, { recursive: true, force: true })
   })
 
   test('write_file base64 of /tmp lands in .tmp and is left out of git and the project archive', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'ws-write-'))
+    const dir = tempDir('ws-write-')
     const ctx = workspace(dir, 'proj-anchor')
     const pdf = Buffer.from('%PDF-1.1 fake')
     const wrote = await tool(ctx, 'write_file').execute('t', {
@@ -400,21 +406,18 @@ describe('edit and write on a real workspace', () => {
     })
     const archive = await sync.packProjectArchive(packed)
     expect(archive?.bytes).toBeGreaterThan(0)
-    const extracted = mkdtempSync(join(tmpdir(), 'ws-extract-'))
+    const extracted = tempDir('ws-extract-')
     execFileSync('tar', ['-xzf', packed, '-C', extracted])
     expect(readFileSync(join(extracted, 'keep.txt'), 'utf8')).toBe('keep')
     expect(() => statSync(join(extracted, '.tmp', 'report.pdf'))).toThrow()
-    rmSync(dir, { recursive: true, force: true })
-    rmSync(extracted, { recursive: true, force: true })
   })
 
   test('a one-character project-folder typo points at the path that exists', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'ws-hint-'))
+    const dir = tempDir('ws-hint-')
     mkdirSync(join(dir, 'proj-111', 'src'), { recursive: true })
     writeFileSync(join(dir, 'proj-111', 'src', 'App.tsx'), 'export {}\n')
     const missing = await tool(workspace(dir, 'proj-anchor'), 'read_file').execute('t', { path: 'proj-112/src/App.tsx' })
     expect(missing.details.error).toMatch(/did you mean "proj-111\/src\/App\.tsx"/)
-    rmSync(dir, { recursive: true, force: true })
   })
 })
 
@@ -429,7 +432,7 @@ describe('runtime auth accepts the workspace token the API verifies', () => {
     mode = 'token'
     const { app, state } = await createRuntimeApp({
       name: 'workspace-tool-failures',
-      workDir: mkdtempSync(join(tmpdir(), 'ws-runtime-')),
+      workDir: tempDir('ws-runtime-'),
       runtimeType: 'unified',
       authPrefixes: ['/agent'],
       async onAssign() {},
@@ -458,14 +461,13 @@ describe('runtime auth accepts the workspace token the API verifies', () => {
 describe('connect and composio reconnect', () => {
   test('connect filesystem and computer-use point at the built-in tools', async () => {
     setEnv('SHOGO_LOCAL_MODE', undefined)
-    const dir = mkdtempSync(join(tmpdir(), 'ws-connect-'))
+    const dir = tempDir('ws-connect-')
     const ctx = workspace(dir, 'proj-anchor')
     ctx.mcpClientManager = new MCPClientManager()
     const files = await tool(ctx, 'connect').execute('t', { name: 'filesystem', source: 'mcp' })
     expect(files.details.error).toMatch(/read_file/)
     const computer = await tool(ctx, 'connect').execute('t', { name: 'computer-use', source: 'mcp' })
     expect(computer.details.error).toMatch(/Use exec/)
-    rmSync(dir, { recursive: true, force: true })
   })
 
   test('an expired Shopify token raises the reconnect card through the credential wrapper', async () => {

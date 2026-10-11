@@ -559,8 +559,8 @@ export async function createRuntimeApp(config: RuntimeAppConfig): Promise<Runtim
     // garbage would amplify into one API HMAC-verify roundtrip per unique
     // string (negative cache is keyed by token, so each new garbage byte
     // sequence is a fresh miss). Project tokens start `rt_v1_<projectId>_`.
-    // Workspace tokens start `wrt_v1_<workspaceId>_` — project_call forwards
-    // those, and a stale RUNTIME_AUTH_SECRET will not byte-match them.
+    // Workspace tokens start `wrt_v1_<workspaceId>_`; the API sends one to
+    // every agent runtime, keyed by the workspace alone.
     const workspaceId = process.env.WORKSPACE_ID
     const isProjectToken = Boolean(
       candidate &&

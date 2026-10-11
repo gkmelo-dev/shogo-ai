@@ -5,6 +5,7 @@
 // the surrounding catalog gating and config persistence without spawning
 // real MCP server subprocesses.
 import { describe, it, expect, beforeEach, afterEach, mock } from 'bun:test'
+import * as realCatalog from '../mcp-catalog'
 import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
@@ -59,6 +60,7 @@ mock.module('@modelcontextprotocol/sdk/client/stdio.js', () => ({ StdioClientTra
 mock.module('@modelcontextprotocol/sdk/client/streamableHttp.js', () => ({ StreamableHTTPClientTransport: FakeHttpTransport }))
 
 mock.module('../mcp-catalog', () => ({
+  ...realCatalog,
   isMcpServerAllowed: (name: string) =>
     name !== 'forbidden' && name !== 'filesystem' && name !== 'computer-use',
   isPreinstalledMcpId: () => false,

@@ -75,8 +75,7 @@ import {
 import { MemorySearchEngine } from '@shogo-ai/sdk/memory'
 import { IndexEngine, createDefaultConfig } from './index-engine'
 import { HistoryIndex, type HistoryKind } from './history-index'
-import { MCP_CATALOG, isPreinstalledMcpId, isMcpServerAllowed, getPreinstalledPackages } from './mcp-catalog'
-import { builtinCapabilityRefusal } from './mcp-client'
+import { MCP_CATALOG, isPreinstalledMcpId, isMcpServerAllowed, getPreinstalledPackages, builtinCapabilityRefusal } from './mcp-catalog'
 import {
   initComposioSession,
   isComposioEnabled,
@@ -88,7 +87,7 @@ import {
 } from './composio'
 import { loadAllSkills, loadBundledSkills, searchSkills } from './skills'
 import { addQuickAction, validateQuickActions } from './quick-actions'
-import { withActionRules, withPermissionGate, assertWithinWorkspace as assertWithinWorkspaceSecure, rewriteScratchPath, type PermissionEngine } from './permission-engine'
+import { withActionRules, withPermissionGate, assertWithinWorkspace as assertWithinWorkspaceSecure, scratchPathForWrite, type PermissionEngine } from './permission-engine'
 import { assertAllowedPath as assertAllowedPathRaw, getRuntimeTrust } from './runtime-trust'
 import { isBinaryFilePath } from '@shogo/shared-runtime'
 import { withShogoPrFooter } from '@shogo/shared-runtime/agent-attribution'
@@ -2150,7 +2149,7 @@ function createWriteFileTool(ctx: ToolContext): AgentTool {
         append?: boolean
         encoding?: 'utf-8' | 'base64'
       }
-      const scratch = rewriteScratchPath(requestedPath)
+      const scratch = scratchPathForWrite(ctx.workspaceDir, requestedPath)
       const filePath = scratch.path
       const resolved = assertWithinWorkspace(ctx.workspaceDir, filePath)
       const scratchFields = scratch.remappedFrom
@@ -2815,7 +2814,7 @@ function createEditFileTool(ctx: ToolContext): AgentTool {
         new_string: string
         replace_all?: boolean
       }
-      const filePath = rewriteScratchPath(requestedPath).path
+      const filePath = scratchPathForWrite(ctx.workspaceDir, requestedPath).path
       if (old_string === new_string) {
         return textResult({ error: 'old_string and new_string must differ' })
       }

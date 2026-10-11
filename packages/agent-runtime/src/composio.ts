@@ -739,9 +739,7 @@ function buildComposioErrorResult(errMsg: string, slug: string) {
  */
 function socialResourceHint(slug: string, propertyKeys?: string[]): string | null {
   const upper = slug.toUpperCase()
-  if (upper.includes('_LIST_') || upper.startsWith('FACEBOOK_LIST') || upper.startsWith('INSTAGRAM_LIST') || upper.startsWith('YOUTUBE_LIST')) {
-    return null
-  }
+  if (upper.includes('_LIST_')) return null
   const keys = propertyKeys?.map(k => k.toLowerCase())
   const takesId = (re: RegExp) => !keys || keys.some(k => re.test(k))
   if ((upper.startsWith('FACEBOOK_') || upper.startsWith('INSTAGRAM_')) && takesId(/page_?id|ig_user|account_?id/)) {
@@ -1012,11 +1010,6 @@ function jsonSchemaPropertyToTypebox(p: Record<string, any>): any {
 }
 
 /**
- * Check auth status for a Composio toolkit via the SDK.
- * Lists connected accounts to determine if the user has an active connection,
- * then falls back to initiating a new auth flow if needed.
- */
-/**
  * Start a fresh OAuth flow even when an account still looks connected.
  * Expired tokens and missing scopes stay "active" in Composio's list, so a
  * reconnect has to authorize again rather than trust that status.
@@ -1033,15 +1026,20 @@ async function emitReconnectCard(
   result: { needs_reconnect?: boolean; hint?: string; error?: string },
 ): Promise<void> {
   if (!result.needs_reconnect) return
-  const writer = currentCredentialScope()?.uiWriter
+  const scope = currentCredentialScope()
+  const writer = scope?.uiWriter
   if (!writer) return
+  const shown = scope?.reconnectCardsShown
+  const key = toolkitSlug.toLowerCase()
+  if (shown?.has(key)) return
   try {
     const auth = await requestComposioReconnect(toolkitSlug)
     if (!auth.authUrl) return
+    shown?.add(key)
     writer.write({
       type: 'data-integration-auth-required',
       data: {
-        provider: `composio:${toolkitSlug.toLowerCase()}`,
+        provider: `composio:${key}`,
         connectUrl: auth.authUrl,
         message: result.hint ?? result.error,
       },
@@ -1051,6 +1049,11 @@ async function emitReconnectCard(
   }
 }
 
+/**
+ * Check auth status for a Composio toolkit via the SDK.
+ * Lists connected accounts to determine if the user has an active connection,
+ * then falls back to initiating a new auth flow if needed.
+ */
 export async function checkComposioAuth(
   toolkitSlug: string,
 ): Promise<{ status: 'active' | 'needs_auth'; authUrl?: string }> {

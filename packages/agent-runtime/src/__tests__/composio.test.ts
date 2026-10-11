@@ -569,6 +569,28 @@ describe('registerToolkitProxyTools', () => {
     expect(await requestComposioReconnect('shopify')).toMatchObject({ authUrl: 'https://oauth.example/x' })
   })
 
+  it('raises one reconnect card per toolkit in a turn', async () => {
+    mockedSchemas = [{ slug: 'SHOPIFY_GET_ORDERS', description: '', is_deprecated: false }]
+    let auths = 0
+    handlers.toolsExecute = async () => ({ successful: false, error: 'Invalid API key or access token' })
+    handlers.create = async () => {
+      auths += 1
+      return { authorize: async () => ({ redirectUrl: 'https://oauth.example/x' }) }
+    }
+    const writes: any[] = []
+    const mgr = fakeMcpMgr()
+    await registerToolkitProxyTools(mgr, 'shopify')
+    const tool = mgr.calls[0].tools[0]
+    const scope = {
+      uiWriter: { write: (chunk: Record<string, any>) => writes.push(chunk) },
+      reconnectCardsShown: new Set<string>(),
+    }
+    await runInCredentialScope(scope, () => tool.execute('tc-1', {}))
+    await runInCredentialScope(scope, () => tool.execute('tc-2', {}))
+    expect(writes).toHaveLength(1)
+    expect(auths).toBe(1)
+  })
+
   it('proxy tool execute() marks needs_reconnect on a Drive 403 scope error', async () => {
     mockedSchemas = [{ slug: 'GOOGLEDRIVE_LIST_FILES', description: '', is_deprecated: false }]
     handlers.toolsExecute = async () => ({ successful: false, error: '403 insufficient authentication scopes' })

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Shogo Technologies, Inc.
 import { existsSync, readFileSync } from 'fs'
+import { publishRequestTimeoutMs } from '@shogo/shared-runtime/publish-timeouts'
 import { requesterTicketHeaders } from './credential-scope'
 
 const SA_TOKEN_PATH = '/var/run/secrets/kubernetes.io/serviceaccount/token'
@@ -594,12 +595,6 @@ export async function getPublishState(projectId: string): Promise<CheckpointCall
   })
 }
 
-/**
- * Must outlast the API's publish steps: two 180s build attempts, a 60s
- * download, a 60s upload, and a 150s metal configure, plus a little slack.
- */
-const PUBLISH_REQUEST_TIMEOUT_MS = 180_000 * 2 + 60_000 + 60_000 + 150_000 + 30_000
-
 export async function publishProject(
   projectId: string,
   opts: PublishOptions,
@@ -608,7 +603,7 @@ export async function publishProject(
     method: 'POST',
     body: JSON.stringify(opts),
     parse: (j) => j as PublishResult,
-  }, PUBLISH_REQUEST_TIMEOUT_MS)
+  }, publishRequestTimeoutMs())
 }
 
 export interface SharedFileResult {

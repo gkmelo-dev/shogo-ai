@@ -1014,9 +1014,37 @@ export function rewriteScratchPath(filePath: string): { path: string; remappedFr
   return { path: filePath }
 }
 
+function linkedFolderRoots(): string[] {
+  const raw = process.env.LINKED_FOLDERS
+  if (!raw) return []
+  try {
+    const parsed = JSON.parse(raw)
+    if (!Array.isArray(parsed)) return []
+    return parsed.filter((p): p is string => typeof p === 'string' && p.length > 0)
+  } catch {
+    return []
+  }
+}
+
+/**
+ * Rewrite a `/tmp` scratch path into workspace `.tmp/` unless that path
+ * already resolves inside the workspace or a linked folder. On Linux the
+ * workspace itself often lives under `/tmp` (mkdtemp, CI), and those
+ * absolute paths are real project files, not scratch writes.
+ */
+export function scratchPathForWrite(
+  workspaceDir: string,
+  filePath: string,
+): { path: string; remappedFrom?: string } {
+  const rewritten = rewriteScratchPath(filePath)
+  if (!rewritten.remappedFrom) return rewritten
+  const roots = dedupeRoots([workspaceDir, ...linkedFolderRoots()].map((r) => resolve(r)))
+  if (isWithinAnyRoot(roots, resolve(filePath))) return { path: filePath }
+  return rewritten
+}
+
 export function assertWithinWorkspace(workspaceDir: string, filePath: string): string {
-  const rewritten = rewriteScratchPath(filePath).path
-  const resolved = resolve(workspaceDir, rewritten)
+  const resolved = resolve(workspaceDir, filePath)
 
   // External (VS Code-style) projects: validate against the union of
   // [WORKSPACE_DIR, ...linkedFolders]. We import lazily so tests that

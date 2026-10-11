@@ -231,9 +231,9 @@ app.post('/validate-runtime-token', async (c) => {
     if (verified.ok) {
       return c.json({ valid: true, projectId: verified.projectId, format: verified.format })
     }
-    // project_call forwards a workspace token (`wrt_v1_*`). The callee's
-    // slow path asks us to HMAC-verify it; the recovered workspace must
-    // match the runtime's WORKSPACE_ID.
+    // Every agent runtime is a workspace runtime, so the API calls it with a
+    // workspace token (`wrt_v1_*`). The runtime compares the recovered
+    // workspace with its own WORKSPACE_ID.
     if (token.startsWith('wrt_v1_')) {
       const { verifyWorkspaceRuntimeToken } = await import('../lib/workspace-runtime-token')
       const workspace = verifyWorkspaceRuntimeToken(token)
