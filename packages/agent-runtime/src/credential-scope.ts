@@ -24,6 +24,8 @@ export interface CredentialScope {
   actingAs?: string
   /** An approval to spend on internal API calls made while repeating a call someone approved. */
   approvalId?: string
+  /** Live chat stream, so a tool can ask the UI to show a reconnect card. */
+  uiWriter?: { write(chunk: Record<string, any>): void }
 }
 
 const scopeStorage = new AsyncLocalStorage<CredentialScope>()

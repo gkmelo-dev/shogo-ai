@@ -71,6 +71,21 @@ describe('createWriteFileTool', () => {
     expect(existsSync(join(TEST_DIR, 'upload.xlsx'))).toBe(false)
   })
 
+  test('writes a binary file from base64 and rewrites /tmp into .tmp', async () => {
+    const ctx = makeCtx()
+    const payload = Buffer.from('pdf-bytes')
+    const r = await run(ctx, 'write_file', {
+      path: '/tmp/report.pdf',
+      content: payload.toString('base64'),
+      encoding: 'base64',
+    })
+    expect(r.details.ok).toBe(true)
+    expect(r.details.path).toBe('.tmp/report.pdf')
+    expect(r.details.remappedFrom).toBe('/tmp/report.pdf')
+    expect(r.details.bytes).toBe(payload.length)
+    expect(readFileSync(join(TEST_DIR, '.tmp/report.pdf'))).toEqual(payload)
+  })
+
   test('creates parent directories on the fly', async () => {
     const ctx = makeCtx()
     const r = await run(ctx, 'write_file', { path: 'a/b/c/deep.txt', content: 'deep' })

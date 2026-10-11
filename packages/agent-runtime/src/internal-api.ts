@@ -564,6 +564,7 @@ export interface PublishOptions {
 async function publishFetch<T>(
   path: string,
   init: RequestInit & { parse?: (json: any) => T },
+  timeoutMs = 120_000,
 ): Promise<CheckpointCallResult<T>> {
   const apiUrl = deriveApiUrl()
   if (!apiUrl) return { ok: false, status: 0, error: 'No API URL configured' }
@@ -571,7 +572,7 @@ async function publishFetch<T>(
     const res = await fetch(`${apiUrl}${path}`, {
       headers: getInternalHeaders(),
       // Publish builds + uploads the app, which can take a while — be generous.
-      signal: AbortSignal.timeout(120_000),
+      signal: AbortSignal.timeout(timeoutMs),
       ...init,
     })
     const json = (await res.json().catch(() => null)) as any
@@ -593,6 +594,12 @@ export async function getPublishState(projectId: string): Promise<CheckpointCall
   })
 }
 
+/**
+ * Must outlast the API's publish steps: two 180s build attempts, a 60s
+ * download, a 60s upload, and a 150s metal configure, plus a little slack.
+ */
+const PUBLISH_REQUEST_TIMEOUT_MS = 180_000 * 2 + 60_000 + 60_000 + 150_000 + 30_000
+
 export async function publishProject(
   projectId: string,
   opts: PublishOptions,
@@ -601,7 +608,7 @@ export async function publishProject(
     method: 'POST',
     body: JSON.stringify(opts),
     parse: (j) => j as PublishResult,
-  })
+  }, PUBLISH_REQUEST_TIMEOUT_MS)
 }
 
 export interface SharedFileResult {

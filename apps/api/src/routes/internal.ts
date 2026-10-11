@@ -228,10 +228,21 @@ app.post('/validate-runtime-token', async (c) => {
     // legacy fallback. We pass it through but verifyRuntimeToken ignores it
     // when the token is v1-formatted.
     const verified = verifyRuntimeToken(token, body.expectedProjectId)
-    if (!verified.ok) {
-      return c.json({ valid: false, reason: verified.reason })
+    if (verified.ok) {
+      return c.json({ valid: true, projectId: verified.projectId, format: verified.format })
     }
-    return c.json({ valid: true, projectId: verified.projectId, format: verified.format })
+    // project_call forwards a workspace token (`wrt_v1_*`). The callee's
+    // slow path asks us to HMAC-verify it; the recovered workspace must
+    // match the runtime's WORKSPACE_ID.
+    if (token.startsWith('wrt_v1_')) {
+      const { verifyWorkspaceRuntimeToken } = await import('../lib/workspace-runtime-token')
+      const workspace = verifyWorkspaceRuntimeToken(token)
+      if (!workspace.ok) {
+        return c.json({ valid: false, reason: workspace.reason })
+      }
+      return c.json({ valid: true, workspaceId: workspace.workspaceId, format: 'wrt_v1' })
+    }
+    return c.json({ valid: false, reason: verified.reason })
   } catch (err: any) {
     console.error('[Internal] Failed to validate runtime token:', err.message)
     return c.json({ valid: false, error: 'Validation failed' }, 500)

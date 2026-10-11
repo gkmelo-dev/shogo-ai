@@ -425,7 +425,7 @@ export async function createRuntimeApp(config: RuntimeAppConfig): Promise<Runtim
   // Auth Middleware
   // ---------------------------------------------------------------------------
   const previewTokenCache = new Map<string, { valid: boolean; projectId?: string; expiresAt: number }>()
-  const runtimeTokenCache = new Map<string, { valid: boolean; projectId?: string; expiresAt: number }>()
+  const runtimeTokenCache = new Map<string, { valid: boolean; projectId?: string; workspaceId?: string; expiresAt: number }>()
   const PREVIEW_CACHE_VALID_MS = 5 * 60 * 1000
   const PREVIEW_CACHE_INVALID_MS = 30 * 1000
   // Runtime tokens are deterministic per (signingSecret, projectId), so a
@@ -496,11 +496,11 @@ export async function createRuntimeApp(config: RuntimeAppConfig): Promise<Runtim
     }
   }
 
-  async function validateRuntimeTokenViaApi(token: string): Promise<{ valid: boolean; projectId?: string }> {
+  async function validateRuntimeTokenViaApi(token: string): Promise<{ valid: boolean; projectId?: string; workspaceId?: string }> {
     const now = Date.now()
     const cached = runtimeTokenCache.get(token)
     if (cached && cached.expiresAt > now) {
-      return { valid: cached.valid, projectId: cached.projectId }
+      return { valid: cached.valid, projectId: cached.projectId, workspaceId: cached.workspaceId }
     }
 
     const apiUrl = deriveApiUrl()
@@ -519,10 +519,10 @@ export async function createRuntimeApp(config: RuntimeAppConfig): Promise<Runtim
         return { valid: false }
       }
 
-      const data = await res.json() as { valid: boolean; projectId?: string }
+      const data = await res.json() as { valid: boolean; projectId?: string; workspaceId?: string }
       const ttl = data.valid ? RUNTIME_CACHE_VALID_MS : RUNTIME_CACHE_INVALID_MS
-      runtimeTokenCache.set(token, { valid: data.valid, projectId: data.projectId, expiresAt: now + ttl })
-      return { valid: data.valid, projectId: data.projectId }
+      runtimeTokenCache.set(token, { valid: data.valid, projectId: data.projectId, workspaceId: data.workspaceId, expiresAt: now + ttl })
+      return { valid: data.valid, projectId: data.projectId, workspaceId: data.workspaceId }
     } catch (err) {
       console.error(`[${config.name}] Runtime token validation failed:`, err)
       return { valid: false }
@@ -554,20 +554,31 @@ export async function createRuntimeApp(config: RuntimeAppConfig): Promise<Runtim
     // so a token valid for project A can't authenticate calls to a pod
     // bound to project B.
     const candidate = runtimeToken || (auth.startsWith('Bearer ') ? auth.slice('Bearer '.length) : '')
-    if (
+    // Local pre-filter: only proxy plausibly-structured v1 tokens to the
+    // API. Without this, an attacker spamming the pod with random bearer
+    // garbage would amplify into one API HMAC-verify roundtrip per unique
+    // string (negative cache is keyed by token, so each new garbage byte
+    // sequence is a fresh miss). Project tokens start `rt_v1_<projectId>_`.
+    // Workspace tokens start `wrt_v1_<workspaceId>_` — project_call forwards
+    // those, and a stale RUNTIME_AUTH_SECRET will not byte-match them.
+    const workspaceId = process.env.WORKSPACE_ID
+    const isProjectToken = Boolean(
       candidate &&
       state.currentProjectId &&
       state.currentProjectId !== '__POOL__' &&
-      // Local pre-filter: only proxy plausibly-structured v1 tokens to the
-      // API. Without this, an attacker spamming the pod with random bearer
-      // garbage would amplify into one API HMAC-verify roundtrip per unique
-      // string (negative cache is keyed by token, so each new garbage byte
-      // sequence is a fresh miss). Real v1 tokens always start `rt_v1_`
-      // and embed our project id — refuse anything else locally.
-      candidate.startsWith(`rt_v1_${state.currentProjectId}_`)
-    ) {
+      candidate.startsWith(`rt_v1_${state.currentProjectId}_`),
+    )
+    const isWorkspaceToken = Boolean(
+      candidate &&
+      workspaceId &&
+      candidate.startsWith(`wrt_v1_${workspaceId}_`),
+    )
+    if (isProjectToken || isWorkspaceToken) {
       const result = await validateRuntimeTokenViaApi(candidate)
-      if (result.valid && result.projectId === state.currentProjectId) {
+      if (isProjectToken && result.valid && result.projectId === state.currentProjectId) {
+        return null
+      }
+      if (isWorkspaceToken && result.valid && result.workspaceId === workspaceId) {
         return null
       }
     }

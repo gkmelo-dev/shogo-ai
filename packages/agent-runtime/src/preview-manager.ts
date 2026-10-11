@@ -2095,7 +2095,7 @@ export class PreviewManager {
         })
         return existsSync(join(cwd, PUBLISH_STAGING_DIR, 'index.html'))
           ? { ok: true }
-          : { ok: false, error: 'Expo publish build did not produce dist/index.html' }
+          : { ok: false, error: `Expo publish build did not produce ${PUBLISH_STAGING_DIR}/index.html` }
       }
 
       return {

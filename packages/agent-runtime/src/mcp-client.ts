@@ -20,6 +20,22 @@ import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/
 import { Type } from '@sinclair/typebox'
 import type { AgentTool, AgentToolResult } from '@mariozechner/pi-agent-core'
 import { isPreinstalledMcpId, isMcpServerAllowed, isCatalogEntry, getPreinstalledPackages } from './mcp-catalog'
+
+/**
+ * Names agents pass to `connect` that are already built into the runtime.
+ * Connecting them as MCP servers always fails the catalog check; point at the
+ * real tools instead of a bare "not in the catalog" error.
+ */
+export function builtinCapabilityRefusal(name: string): string | undefined {
+  const key = name.trim().toLowerCase()
+  if (key === 'filesystem' || key === 'file-system' || key === 'files') {
+    return `"${name}" is built in. Use read_file, write_file, and edit_file for files in the workspace. Do not connect a filesystem server.`
+  }
+  if (key === 'computer-use' || key === 'computer_use' || key === 'computeruse') {
+    return `"${name}" is built in. Use exec for shell commands. Do not connect a computer-use server.`
+  }
+  return undefined
+}
 import { getSanitizedEnv } from './sandbox-exec'
 import { shouldRouteThroughCloud, getCloudDispatcher, type McpTransportPin } from './lib/cloud-fetcher'
 import { enforceImageSizeLimit } from './image-size-guard'
@@ -312,7 +328,7 @@ export class MCPClientManager {
 
   async startServer(name: string, config: MCPServerConfig): Promise<AgentTool[]> {
     if (!isMcpServerAllowed(name)) {
-      throw new Error(`MCP server "${name}" is not in the catalog. Use a catalog server ID or a remote MCP URL.`)
+      throw new Error(builtinCapabilityRefusal(name) ?? `MCP server "${name}" is not in the catalog. Use a catalog server ID or a remote MCP URL.`)
     }
 
     if (this.servers.has(name)) {

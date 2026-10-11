@@ -76,9 +76,11 @@ const AWS_REGION = process.env.S3_REGION || process.env.AWS_REGION || "us-east-1
 // hangs the publish HTTP request indefinitely — which is exactly what
 // happened to project b11c65dd on 2026-05-20: the runtime went silent for
 // 4 minutes, Knative reaped the ksvc mid-flight, and the publish API never
-// returned a structured error to Studio. 60s covers a healthy bun-rebuild
-// of a typical app; anything longer is almost certainly a stuck pod.
-const PUBLISH_BUILD_TIMEOUT_MS = Number(process.env.PUBLISH_BUILD_TIMEOUT_MS) || 60_000
+// returned a structured error to Studio. 180s covers an Expo web export
+// (install + `expo export`), which regularly exceeds a 60s bun-rebuild
+// budget. A second attempt is made after `build_timeout` so a cold pod
+// that wakes during the first call can finish.
+const PUBLISH_BUILD_TIMEOUT_MS = Number(process.env.PUBLISH_BUILD_TIMEOUT_MS) || 180_000
 const PUBLISH_DOWNLOAD_TIMEOUT_MS = Number(process.env.PUBLISH_DOWNLOAD_TIMEOUT_MS) || 60_000
 // The S3 upload and substrate "configure" step (createPublishedService /
 // getMetalPublishedUrl, etc.) previously had NO timeout at all, unlike build
@@ -89,6 +91,8 @@ const PUBLISH_DOWNLOAD_TIMEOUT_MS = Number(process.env.PUBLISH_DOWNLOAD_TIMEOUT_
 // against a timer so we always return a structured error to Studio.
 const PUBLISH_UPLOAD_TIMEOUT_MS = Number(process.env.PUBLISH_UPLOAD_TIMEOUT_MS) || 60_000
 const PUBLISH_CONFIGURE_TIMEOUT_MS = Number(process.env.PUBLISH_CONFIGURE_TIMEOUT_MS) || 60_000
+const PUBLISH_CONFIGURE_TIMEOUT_METAL_MS = Number(process.env.PUBLISH_CONFIGURE_TIMEOUT_METAL_MS) || 150_000
+const PUBLISH_GIT_FLUSH_TIMEOUT_MS = Number(process.env.PUBLISH_GIT_FLUSH_TIMEOUT_MS) || 60_000
 
 /**
  * Race `promise` against a timer so a hung outbound call (S3, substrate
@@ -544,7 +548,10 @@ async function releasePublishLock(projectId: string): Promise<void> {
 /**
  * Trigger a build in the runtime pod
  */
-async function triggerBuild(projectId: string): Promise<{ success: boolean; error?: string; code?: string }> {
+async function triggerBuild(
+  projectId: string,
+  timeoutMs = PUBLISH_BUILD_TIMEOUT_MS,
+): Promise<{ success: boolean; error?: string; code?: string }> {
   try {
     const { getProjectPodUrl } = await import("../lib/knative-project-manager")
     const podUrl = await getProjectPodUrl(projectId)
@@ -556,7 +563,7 @@ async function triggerBuild(projectId: string): Promise<{ success: boolean; erro
         'Content-Type': 'application/json',
         'x-runtime-token': await deriveProjectRuntimeToken(projectId),
       },
-      signal: AbortSignal.timeout(PUBLISH_BUILD_TIMEOUT_MS),
+      signal: AbortSignal.timeout(timeoutMs),
     })
 
     if (!response.ok) {
@@ -573,16 +580,35 @@ async function triggerBuild(projectId: string): Promise<{ success: boolean; erro
   } catch (err: any) {
     const isTimeout = err?.name === 'TimeoutError' || err?.name === 'AbortError'
     if (isTimeout) {
-      console.error(`[Publish] Build timed out after ${PUBLISH_BUILD_TIMEOUT_MS}ms for ${projectId}`)
+      console.error(`[Publish] Build timed out after ${timeoutMs}ms for ${projectId}`)
       return {
         success: false,
         code: 'build_timeout',
-        error: `Build timed out after ${PUBLISH_BUILD_TIMEOUT_MS / 1000}s — the runtime pod is unresponsive`,
+        error: `Build timed out after ${timeoutMs / 1000}s — the runtime pod is unresponsive`,
       }
     }
     console.error(`[Publish] Build error:`, err)
     return { success: false, code: 'build_failed', error: err.message || 'Build failed' }
   }
+}
+
+/** One retry after a timeout: the first call often wakes a cold runtime. */
+export async function triggerBuildWithRetry(projectId: string): Promise<{ success: boolean; error?: string; code?: string }> {
+  const first = await triggerBuild(projectId)
+  if (first.success || first.code !== 'build_timeout') return first
+  console.warn(`[Publish] Build timed out for ${projectId}; retrying once now that the runtime has been warmed`)
+  return triggerBuild(projectId)
+}
+
+export async function publishConfigureTimeoutMs(projectId: string): Promise<number> {
+  try {
+    const { getPublishSubstrate } = await import("../lib/substrate/router")
+    const substrate = await getPublishSubstrate(projectId)
+    if (substrate.kind === 'metal') return PUBLISH_CONFIGURE_TIMEOUT_METAL_MS
+  } catch (err: any) {
+    console.warn(`[Publish] Could not resolve publish substrate for ${projectId}: ${err?.message ?? err}`)
+  }
+  return PUBLISH_CONFIGURE_TIMEOUT_MS
 }
 
 /**
@@ -960,7 +986,7 @@ async function flushGitSync(
         'content-type': 'application/json',
       },
       body: JSON.stringify({ tags: opts.tags, deleteTags: opts.deleteTags }),
-      signal: AbortSignal.timeout(PUBLISH_BUILD_TIMEOUT_MS),
+      signal: AbortSignal.timeout(PUBLISH_GIT_FLUSH_TIMEOUT_MS),
     })
     if (!response.ok) {
       console.warn(`[Publish] git-flush returned ${response.status} for ${projectId} (continuing)`)
@@ -1259,7 +1285,7 @@ export async function publishProject(
       try {
         // Step 1: Trigger build
         await setPublishStatus(projectId, 'building')
-        const buildResult = await triggerBuild(projectId)
+        const buildResult = await triggerBuildWithRetry(projectId)
         if (!buildResult.success) {
           await setPublishStatus(projectId, 'failed', buildResult.code || 'build_failed')
           return { ok: false, status: 500, code: buildResult.code || "build_failed", message: buildResult.error || "Build failed" }
@@ -1301,7 +1327,7 @@ export async function publishProject(
         try {
           await withTimeout(
             configurePublishedService(projectId, subdomain, { alwaysOn }),
-            PUBLISH_CONFIGURE_TIMEOUT_MS,
+            await publishConfigureTimeoutMs(projectId),
             'Publish configure',
           )
         } catch (err: any) {
@@ -1704,7 +1730,7 @@ export function publishRoutes() {
         await acquirePublishLock(projectId)
         try {
           await setPublishStatus(projectId, 'building')
-          const buildResult = await triggerBuild(projectId)
+          const buildResult = await triggerBuildWithRetry(projectId)
           if (!buildResult.success) {
             await setPublishStatus(projectId, 'failed', buildResult.code || 'build_failed')
             return c.json({
@@ -1750,7 +1776,7 @@ export function publishRoutes() {
           try {
             await withTimeout(
               configurePublishedService(projectId, subdomain, { alwaysOn }),
-              PUBLISH_CONFIGURE_TIMEOUT_MS,
+              await publishConfigureTimeoutMs(projectId),
               'Publish configure',
             )
           } catch (err: any) {

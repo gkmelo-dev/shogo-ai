@@ -300,7 +300,7 @@ export function createIntegrationCredentialWrapper(ctx: CredentialWrapperContext
 
 export function withIntegrationCredentials(tool: AgentTool, ctx: CredentialWrapperContext): AgentTool {
   const execute: AgentTool['execute'] = async (toolCallId, params, signal, onUpdate) => {
-    const scope: CredentialScope = { requesterTicket: ctx.requesterTicket }
+    const scope: CredentialScope = { requesterTicket: ctx.requesterTicket, uiWriter: ctx.uiWriter }
     const meta = toolCredentialMeta(tool, params)
     const projectId = projectScopedId(ctx.projectId)
     let used: Extract<ResolvedCredential, { ok: true }> | null = null

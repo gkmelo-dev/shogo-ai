@@ -1000,8 +1000,23 @@ function gate(
 // Path validation (replaces old assertWithinWorkspace)
 // ---------------------------------------------------------------------------
 
+/**
+ * `/tmp` is outside the workspace, so scratch writes there are rejected.
+ * Rewrite them into `<workspace>/.tmp`, which is gitignored and left out of
+ * sync and publish. Callers should tell the agent about `remappedFrom`.
+ */
+export function rewriteScratchPath(filePath: string): { path: string; remappedFrom?: string } {
+  const normalized = filePath.replace(/\\/g, '/')
+  if (normalized === '/tmp' || normalized.startsWith('/tmp/')) {
+    const rest = normalized.slice('/tmp'.length).replace(/^\/+/, '')
+    return { path: rest ? `.tmp/${rest}` : '.tmp', remappedFrom: filePath }
+  }
+  return { path: filePath }
+}
+
 export function assertWithinWorkspace(workspaceDir: string, filePath: string): string {
-  const resolved = resolve(workspaceDir, filePath)
+  const rewritten = rewriteScratchPath(filePath).path
+  const resolved = resolve(workspaceDir, rewritten)
 
   // External (VS Code-style) projects: validate against the union of
   // [WORKSPACE_DIR, ...linkedFolders]. We import lazily so tests that
