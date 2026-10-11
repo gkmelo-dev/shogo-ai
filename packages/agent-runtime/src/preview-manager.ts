@@ -145,6 +145,7 @@ export function emitBuildLine(
 }
 import { createServer } from 'net'
 import { pkg, resolveBinInvocation } from '@shogo/shared-runtime'
+import { fetchAppRuntimeToken } from './app-runtime-token'
 import {
   previewBuildLogPath,
   previewConsoleLogPath,
@@ -861,8 +862,14 @@ export function resolveApiServerEnv(input: {
    * the single-project behaviour (projectId unset).
    */
   projectId?: string
+  /**
+   * In a workspace runtime, this project's own runtime token. It replaces the
+   * inherited workspace token, which must never reach user code; without one
+   * the sidecar gets no RUNTIME_AUTH_SECRET at all.
+   */
+  appRuntimeToken?: string | null
 }): Record<string, string> {
-  const { parentEnv, portStr, cwd, projectId } = input
+  const { parentEnv, portStr, cwd, projectId, appRuntimeToken } = input
   const out: Record<string, string> = {}
   for (const [k, v] of Object.entries(parentEnv)) {
     if (typeof v === 'string') out[k] = v
@@ -880,6 +887,11 @@ export function resolveApiServerEnv(input: {
   // The merged map is a workspace transport detail — the sidecar must not
   // see a sibling project's connection string.
   delete out.WORKSPACE_DATABASE_URLS
+  if (parentEnv.WORKSPACE_RUNTIME === 'true') {
+    if (projectId) out.PROJECT_ID = projectId
+    if (projectId && appRuntimeToken) out.RUNTIME_AUTH_SECRET = appRuntimeToken
+    else delete out.RUNTIME_AUTH_SECRET
+  }
   if (parentEnv.SHOGO_LOCAL_MODE === 'true' && !parentEnv.SHOGO_API_URL) {
     out.SHOGO_API_URL = 'http://localhost:8002'
   }
@@ -3732,6 +3744,11 @@ export class PreviewManager {
       return
     }
 
+    const appRuntimeToken =
+      process.env.WORKSPACE_RUNTIME === 'true' && this.workspaceProjectId
+        ? await fetchAppRuntimeToken(this.workspaceProjectId)
+        : undefined
+
     // Last chance before we actually spawn a process bound to the port —
     // if a stop()/restart() superseded this attempt while we were awaiting
     // the port-free checks above, bail rather than spawning a sidecar the
@@ -3765,6 +3782,7 @@ export class PreviewManager {
         portStr,
         cwd,
         projectId: this.workspaceProjectId,
+        appRuntimeToken,
       }),
     })
 

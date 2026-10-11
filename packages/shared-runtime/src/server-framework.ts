@@ -41,6 +41,12 @@ export interface RuntimeAppConfig {
   /** Auth-protected path prefixes (e.g. ['/agent', '/pool']) */
   authPrefixes?: string[]
   /**
+   * Accepts a token other than RUNTIME_AUTH_SECRET for one request. Workspace
+   * runtimes use it to let each app server reach `/agent/tools/*` with its
+   * own project token.
+   */
+  acceptsScopedToken?: (path: string, token: string) => boolean
+  /**
    * Called when a warm pool pod is assigned to a project.
    * The framework handles env injection, project identity update, and AI proxy
    * reconfiguration. This callback runs the runtime-specific init (e.g. S3 sync,
@@ -543,6 +549,7 @@ export async function createRuntimeApp(config: RuntimeAppConfig): Promise<Runtim
     // This is the common case after a successful /pool/assign and signing-
     // secret stability — no API round-trip needed.
     if (auth === `Bearer ${runtimeSecret}` || runtimeToken === runtimeSecret) return null
+    if (runtimeToken && config.acceptsScopedToken?.(c.req.path, runtimeToken)) return null
 
     // Slow path: byte-compare missed. That happens during warm-pool reassign
     // races, signing-secret rotation, or stale-image pods inherited across

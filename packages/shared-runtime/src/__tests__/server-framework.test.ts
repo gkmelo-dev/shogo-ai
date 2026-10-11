@@ -308,6 +308,24 @@ describe('auth middleware', () => {
     expect(res.status).toBe(200)
   })
 
+  test('accepts a token the acceptsScopedToken hook allows for that path', async () => {
+    const { app } = await buildApp({
+      config: { acceptsScopedToken: (path, token) => path === '/agent/tools/execute' && token === 'rt_v1_p1_app' },
+    })
+    app.post('/agent/tools/execute', (c) => c.json({ ok: true }))
+    app.post('/agent/tools/install', (c) => c.json({ ok: true }))
+    const allowed = await app.request('/agent/tools/execute', {
+      method: 'POST',
+      headers: { 'x-runtime-token': 'rt_v1_p1_app' },
+    })
+    expect(allowed.status).toBe(200)
+    const otherPath = await app.request('/agent/tools/install', {
+      method: 'POST',
+      headers: { 'x-runtime-token': 'rt_v1_p1_app' },
+    })
+    expect(otherPath.status).toBe(401)
+  })
+
   test('accepts a workspace token the API verifies for this WORKSPACE_ID', async () => {
     fetchResponses = [
       { ok: true, body: { valid: true, workspaceId: 'ws-9' } },

@@ -151,6 +151,7 @@ import {
   type PortHttpWsData,
 } from './port-bridge'
 import { deriveApiUrl, getInternalHeaders, postCheckpointRecord, postWorktreeStatus, postPlanMirror } from './internal-api'
+import { isAppRuntimeToken } from './app-runtime-token'
 import {
   detachMemberFromRootRepo,
   runGitHubWorkspaceOp,
@@ -636,12 +637,16 @@ const workspaceStatus: {
   depsInstalled: false,
 }
 
+/** The runtime routes an app server's SDK tools client calls. */
+const APP_TOOL_PATHS = new Set(['/agent/tools/execute', '/agent/tools/schemas'])
+
 const { app, state, logTiming } = await createRuntimeApp({
   name: 'agent-runtime',
   workDir: WORKSPACE_DIR,
   runtimeType: 'unified',
   internalPaths: ['/agent/heartbeat/trigger'],
   authPrefixes: ['/agent', '/pool', '/diagnostics', '/terminal'],
+  acceptsScopedToken: (path, token) => APP_TOOL_PATHS.has(path) && isAppRuntimeToken(token),
   async onAssign(projectId, envVars) {
     const hostWorkspacesRoot = envVars.SHOGO_HOST_WORKSPACES_ROOT || '/host-workspaces'
     const assignedWorkspaceDir = envVars.WORKSPACE_DIR || envVars.PROJECT_DIR
