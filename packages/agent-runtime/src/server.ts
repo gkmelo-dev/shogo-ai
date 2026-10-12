@@ -127,6 +127,7 @@ import {
 } from './writable-state'
 import { spoolDir, spoolPath, spooledFileResponse, sweepSpool } from './spool'
 import { extractTarFromUrl, extractTarStream, redactUrls } from './tar-stream'
+import { handleExportHome, handleHydrateHome } from './home-state-routes'
 import { runtimeDiagnosticsRoutes } from './runtime-diagnostics-routes'
 import { runtimeLspRoutes } from './runtime-lsp-routes'
 import { computePublishedReadiness } from './published-readiness'
@@ -150,6 +151,7 @@ import {
   type PortHttpWsData,
 } from './port-bridge'
 import { deriveApiUrl, getInternalHeaders, postCheckpointRecord, postWorktreeStatus, postPlanMirror } from './internal-api'
+import { acceptsAppToolToken } from './app-runtime-token'
 import {
   detachMemberFromRootRepo,
   runGitHubWorkspaceOp,
@@ -641,6 +643,7 @@ const { app, state, logTiming } = await createRuntimeApp({
   runtimeType: 'unified',
   internalPaths: ['/agent/heartbeat/trigger'],
   authPrefixes: ['/agent', '/pool', '/diagnostics', '/terminal'],
+  acceptsScopedToken: acceptsAppToolToken,
   async onAssign(projectId, envVars) {
     const hostWorkspacesRoot = envVars.SHOGO_HOST_WORKSPACES_ROOT || '/host-workspaces'
     const assignedWorkspaceDir = envVars.WORKSPACE_DIR || envVars.PROJECT_DIR
@@ -1457,6 +1460,10 @@ app.patch('/agent/config', async (c) => {
     Object.assign(fileConfig, body)
     writeFileSync(configPath, JSON.stringify(fileConfig, null, 2), 'utf-8')
     agentGateway?.reloadConfig()
+
+    // The PATCH is the immediate update. Capability toggles are then
+    // confirmed against Project.settings, which wins when the pull succeeds.
+    await agentGateway?.syncCapabilitiesFromApi()
 
     return c.json({ ok: true })
   } catch (error: any) {
@@ -3205,6 +3212,7 @@ function repoRootCommitAt(dir: string): number | null {
     const out = Bun.spawnSync(['git', '-C', dir, 'log', '--max-parents=0', '--format=%ct', 'HEAD'], {
       stdout: 'pipe',
       stderr: 'ignore',
+      windowsHide: true,
     })
     if (out.exitCode !== 0) return null
     const times = out.stdout
@@ -3415,6 +3423,11 @@ app.post('/pool/export-data', async (c) => {
   }
 })
 
+// Encrypted HOME credentials/config (~/.ssh, ~/.oci, ~/.kube, ~/.config). Same
+// host-pulls/host-pushes model as writable state; see home-state.ts.
+app.post('/pool/export-home', (c) => handleExportHome(c.req.raw, { stageDir: () => spoolDir() }))
+app.post('/pool/hydrate-home', (c) => handleHydrateHome(c.req.raw))
+
 /**
  * Every PreviewManager this runtime has built, keyed by project id. The root
  * manager is included when it serves something: always outside workspace
@@ -3558,7 +3571,7 @@ app.get('/preview/metro', (c) => {
 // Template Copy (app mode — extract pre-built archive into project/)
 // ---------------------------------------------------------------------------
 
-import { execSync } from 'child_process'
+import { execSync } from '@shogo/shared-runtime/child-process'
 
 const TEMPLATES_DIR = resolve(MONOREPO_ROOT, 'packages/sdk/templates')
 const EXAMPLES_DIR = resolve(MONOREPO_ROOT, 'packages/sdk/examples')
@@ -6897,7 +6910,7 @@ async function initialize(): Promise<void> {
  */
 async function checkoutPublishedTag(subdomain: string): Promise<void> {
   if (!subdomain) return
-  const { execFile } = await import('child_process')
+  const { execFile } = await import('@shogo/shared-runtime/child-process')
   await new Promise<void>((resolve) => {
     execFile(
       'git',

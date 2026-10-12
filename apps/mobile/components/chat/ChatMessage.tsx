@@ -13,6 +13,8 @@ import { cn } from "@shogo/shared-ui/primitives"
 import { MarkdownText } from "./MarkdownText"
 import { analyzeContent } from "./long-text-utils"
 import { LongTextPreviewCard } from "./LongTextPreviewCard"
+import { channelDispatchOf } from "@shogo/shared-app/chat"
+import { ChannelDispatchCard } from "./turns/ChannelDispatchCard"
 import { stripAskUserAnswerMarker } from "./turns/askUserAnswers"
 import { preserveUserLineBreaks } from "./user-markdown"
 
@@ -21,6 +23,7 @@ export interface ChatMessageProps {
     id: string
     role: "user" | "assistant"
     content: string
+    parts?: unknown
   }
   isStreaming?: boolean
 }
@@ -34,6 +37,14 @@ export function ChatMessage({
     ? stripAskUserAnswerMarker(message.content)
     : message.content
   const isLongText = isUser && content ? analyzeContent(content).isLong : false
+  const dispatch = isUser ? channelDispatchOf(message) : null
+  if (dispatch) {
+    return (
+      <View className="flex-row w-full justify-start">
+        <ChannelDispatchCard dispatch={dispatch} />
+      </View>
+    )
+  }
 
   return (
     <View

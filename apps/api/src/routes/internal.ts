@@ -228,10 +228,21 @@ app.post('/validate-runtime-token', async (c) => {
     // legacy fallback. We pass it through but verifyRuntimeToken ignores it
     // when the token is v1-formatted.
     const verified = verifyRuntimeToken(token, body.expectedProjectId)
-    if (!verified.ok) {
-      return c.json({ valid: false, reason: verified.reason })
+    if (verified.ok) {
+      return c.json({ valid: true, projectId: verified.projectId, format: verified.format })
     }
-    return c.json({ valid: true, projectId: verified.projectId, format: verified.format })
+    // Every agent runtime is a workspace runtime, so the API calls it with a
+    // workspace token (`wrt_v1_*`). The runtime compares the recovered
+    // workspace with its own WORKSPACE_ID.
+    if (token.startsWith('wrt_v1_')) {
+      const { verifyWorkspaceRuntimeToken } = await import('../lib/workspace-runtime-token')
+      const workspace = verifyWorkspaceRuntimeToken(token)
+      if (!workspace.ok) {
+        return c.json({ valid: false, reason: workspace.reason })
+      }
+      return c.json({ valid: true, workspaceId: workspace.workspaceId, format: 'wrt_v1' })
+    }
+    return c.json({ valid: false, reason: verified.reason })
   } catch (err: any) {
     console.error('[Internal] Failed to validate runtime token:', err.message)
     return c.json({ valid: false, error: 'Validation failed' }, 500)
@@ -551,6 +562,20 @@ app.post('/billing/provision', async (c) => {
           overageEnabled: body.overageEnabled,
           overageHardLimitUsd: body.overageHardLimitUsd ?? null,
         })
+        break
+      case 'markOverageInvoicePaid':
+        if (typeof body.invoiceId !== 'string') return c.json({ error: 'invoiceId required' }, 400)
+        wallet = {
+          settled: await svc.markOverageInvoicePaidLocal(
+            body.workspaceId,
+            body.invoiceId,
+            typeof body.invoiceUrl === 'string' ? body.invoiceUrl : undefined,
+          ),
+        }
+        break
+      case 'releaseOverageInvoice':
+        if (typeof body.invoiceId !== 'string') return c.json({ error: 'invoiceId required' }, 400)
+        wallet = { released: await svc.releaseOverageInvoiceLocal(body.workspaceId, body.invoiceId) }
         break
       default:
         return c.json({ error: `Unknown provision op: ${body.op}` }, 400)

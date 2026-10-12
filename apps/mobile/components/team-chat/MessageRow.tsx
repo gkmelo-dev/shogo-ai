@@ -10,7 +10,7 @@ import { ActionSheetIOS, Alert, Image, Linking, Modal, Platform, Pressable, Text
 import * as Clipboard from 'expo-clipboard'
 import { AlarmClock, AlertCircle, Bookmark, Check, CircleDot, CornerDownRight, FileText, Link2, Loader2, MessageSquare, MoreHorizontal, Pencil, Pin, SmilePlus, Square, Trash2 } from 'lucide-react-native'
 import { cn } from '@shogo/shared-ui/primitives'
-import { MarkdownText } from '../chat/MarkdownText'
+import { ChatMarkdown } from '../chat/ChatMarkdown'
 import { SidebarContextMenu, type SidebarMenuEntry } from '../layout/SidebarContextMenu'
 import { absoluteApiUrl, teamChatApi, type ChatMessage, type LinkUnfurl } from '../../lib/team-chat-api'
 import { messageLink, parseMessageLink } from '../../lib/team-chat-links'
@@ -72,6 +72,18 @@ export interface MessageRowProps {
   onMarkUnread?: (message: ChatMessage) => void
   /** Briefly emphasized after opening a link to it. */
   highlighted?: boolean
+}
+
+/** The original channel message an `agent.message` activity line points at. */
+function agentMessageHref(message: ChatMessage): string | null {
+  const blocks = message.blocks
+  if (!blocks || blocks.kind !== 'agent.message') return null
+  if (typeof blocks.conversationId !== 'string' || typeof blocks.messageId !== 'string') return null
+  return messageLink({
+    conversationId: blocks.conversationId,
+    messageId: blocks.messageId,
+    threadRootId: typeof blocks.threadRootId === 'string' ? blocks.threadRootId : null,
+  })
 }
 
 /** Message links open in place; everything else goes to the browser. */
@@ -387,6 +399,7 @@ function MessageRowImpl(props: MessageRowProps) {
 
   if (message.authorType === 'system' && message.blocks?.type === 'activity') {
     const canDiscuss = !!props.onReply && !inThread
+    const viewHref = agentMessageHref(message)
     return (
       <Pressable
         onPress={canDiscuss && !isWeb ? () => props.onReply!(message) : undefined}
@@ -395,7 +408,17 @@ function MessageRowImpl(props: MessageRowProps) {
       >
         <View className="mt-1.5 h-1.5 w-1.5 rounded-full bg-primary/60" />
         <View className="min-w-0 flex-1">
-          <MarkdownText>{renderMentions(message.text, names)}</MarkdownText>
+          <ChatMarkdown isStreaming={false}>{renderMentions(message.text, names)}</ChatMarkdown>
+          {viewHref ? (
+            <Pressable
+              onPress={() => openMessageLinkInApp(viewHref)}
+              accessibilityRole="link"
+              accessibilityLabel="View message"
+              className="mt-0.5 self-start"
+            >
+              <Text className="text-xs font-medium text-primary">View message</Text>
+            </Pressable>
+          ) : null}
           {message.replyCount > 0 && canDiscuss && (
             <Pressable onPress={() => props.onReply!(message)} className="mt-0.5 flex-row items-center gap-1 self-start">
               <MessageSquare size={11} className="text-primary" />
@@ -544,7 +567,7 @@ function MessageRowImpl(props: MessageRowProps) {
                       {jumbo.map((code, i) => <ReactionGlyph key={`${code}-${i}`} emoji={code} size={32} />)}
                     </View>
                   ) : (
-                    <MarkdownText isStreaming={running} onLinkPress={openMessageLinkInApp}>{renderMentions(body, names)}</MarkdownText>
+                    <ChatMarkdown isStreaming={running} onLinkPress={openMessageLinkInApp}>{renderMentions(body, names)}</ChatMarkdown>
                   )}
                 </View>
               )
