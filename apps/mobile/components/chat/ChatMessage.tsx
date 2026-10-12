@@ -14,6 +14,7 @@ import { MarkdownText } from "./MarkdownText"
 import { analyzeContent } from "./long-text-utils"
 import { LongTextPreviewCard } from "./LongTextPreviewCard"
 import { stripAskUserAnswerMarker } from "./turns/askUserAnswers"
+import { preserveUserLineBreaks } from "./user-markdown"
 
 export interface ChatMessageProps {
   message: {
@@ -53,7 +54,12 @@ export function ChatMessage({
           isLongText && !isStreaming ? (
             <LongTextPreviewCard text={content} title="Your Message" />
           ) : (
-            <Text className={cn("text-sm text-foreground")}>{content}</Text>
+            <MarkdownText
+              className="text-sm text-foreground"
+              isStreaming={false}
+            >
+              {preserveUserLineBreaks(content)}
+            </MarkdownText>
           )
         ) : (
           <MarkdownText
