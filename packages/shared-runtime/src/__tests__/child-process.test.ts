@@ -108,6 +108,27 @@ describe('child_process windowsHide default', () => {
     expect(last('execFileSync')).toEqual(['git', null, { cwd: '/x', windowsHide: true }])
   })
 
+  test('execFile fills an undefined or null options slot ahead of the callback', () => {
+    const cb = () => {}
+    const execFile = cp.execFile as (...args: unknown[]) => unknown
+    execFile('git', ['status'], undefined, cb)
+    expect(last('execFile')).toEqual(['git', ['status'], { windowsHide: true }, cb])
+    execFile('git', ['status'], null, cb)
+    expect(last('execFile')).toEqual(['git', ['status'], { windowsHide: true }, cb])
+  })
+
+  test('spawn fills an undefined options slot instead of appending past it', () => {
+    const spawn = cp.spawn as (...args: unknown[]) => unknown
+    spawn('git', ['status'], undefined)
+    expect(last('spawn')).toEqual(['git', ['status'], { windowsHide: true }])
+  })
+
+  test('execFile with no argv or options inserts options before the callback', () => {
+    const cb = () => {}
+    cp.execFile('git', cb)
+    expect(last('execFile')).toEqual(['git', { windowsHide: true }, cb])
+  })
+
   test('execSync merges windowsHide without dropping encoding', () => {
     cp.execSync('echo hi', { encoding: 'utf8' })
     expect(last('execSync')[1]).toEqual({ encoding: 'utf8', windowsHide: true })

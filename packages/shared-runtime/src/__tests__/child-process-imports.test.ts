@@ -64,7 +64,7 @@ describe('production code imports child_process through the windowsHide wrapper'
     for (const root of roots) walk(join(repoRoot, root), files)
     const offenders: string[] = []
     for (const file of files) {
-      const rel = relative(repoRoot, file)
+      const rel = relative(repoRoot, file).replaceAll('\\', '/')
       if (allow.has(rel)) continue
       const text = readFileSync(file, 'utf8')
       const lines = text.split('\n')

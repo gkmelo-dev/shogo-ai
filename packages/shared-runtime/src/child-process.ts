@@ -68,7 +68,12 @@ function hideSpawnArgs(args: unknown[]): unknown[] {
       return out
     }
   }
-  out.splice(end, 0, { windowsHide: true })
+  // Options follow argv when argv (array or null) was passed. Fill an empty
+  // `undefined` / `null` slot in place: inserting after it would push a
+  // trailing callback out of position, or land where Node ignores it.
+  const slot = end > 1 && (Array.isArray(out[1]) || out[1] == null) ? 2 : 1
+  if (slot >= end) out.splice(end, 0, { windowsHide: true })
+  else if (out[slot] == null) out[slot] = { windowsHide: true }
   return out
 }
 
