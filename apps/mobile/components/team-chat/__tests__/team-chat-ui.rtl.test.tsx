@@ -159,6 +159,7 @@ mock.module('../../../hooks/useTeamChat', () => ({
     trimOld: () => {},
   }),
   useMarkReadWhileVisible: () => {},
+  useMentionables: () => null,
   useTypingUsers: () => [],
 }))
 const routed: any[] = []

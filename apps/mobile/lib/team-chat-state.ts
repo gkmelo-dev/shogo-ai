@@ -6,6 +6,7 @@
  * composer / display.
  */
 import type { ChatMessage, ConversationSummary, Mentionables, TeamChatEvent } from './team-chat-api'
+import { docTokenFor, fullDateLabel, parseDocToken, relativeDateLabel, shortDateLabel } from './doc-tokens'
 
 // ─── Timeline ────────────────────────────────────────────────────────────────
 
@@ -271,13 +272,27 @@ export function stepConversation(
 // ─── Mentions ────────────────────────────────────────────────────────────────
 
 export interface MentionCandidate {
-  kind: 'user' | 'agent' | 'group' | 'special'
+  kind: 'user' | 'agent' | 'group' | 'special' | 'channel' | 'project' | 'date'
   display: string
   token: string
+  /** What the composer shows for it; defaults to `@display`. Channels use `#name`. */
+  insert?: string
   subtitle?: string | null
   userId?: string
-  /** For an agent: its project (null for the workspace agent). */
+  /** For an agent: its project (null for the workspace agent). For a project: its id. */
   projectId?: string | null
+  image?: string | null
+}
+
+/** The text a candidate stands for in the composer. */
+export function candidateText(c: MentionCandidate): string {
+  return c.insert ?? `@${c.display}`
+}
+
+/** A date token as something the composer can show and turn back into the token. */
+export function dateCandidate(value: string, now = new Date(), tz?: string | null): MentionCandidate {
+  const display = shortDateLabel(value, now, tz)
+  return { kind: 'date', display, token: docTokenFor({ kind: 'date', value }), subtitle: fullDateLabel(value, now, tz) }
 }
 
 export function mentionCandidates(mentionables: Mentionables | null, meId: string | null): MentionCandidate[] {
@@ -329,20 +344,20 @@ export function filterCandidates(candidates: MentionCandidate[], query: string, 
 
 /** Replace `@query` at the cursor with `@Display ` and return the new text/cursor. */
 export function insertMention(text: string, at: { start: number; query: string }, candidate: MentionCandidate) {
-  const insert = `@${candidate.display} `
+  const insert = `${candidateText(candidate)} `
   const next = text.slice(0, at.start) + insert + text.slice(at.start + 1 + at.query.length)
   return { text: next, cursor: at.start + insert.length }
 }
 
-/** Turn the `@Display` names the user picked back into wire tokens. */
+/** Turn the `@Display` (or `#channel`) names the user picked back into wire tokens. */
 export function encodeMentions(text: string, picked: MentionCandidate[]): string {
-  const unique = Array.from(new Map(picked.map((p) => [p.display, p])).values()).sort(
-    (a, b) => b.display.length - a.display.length,
+  const unique = Array.from(new Map(picked.map((p) => [candidateText(p), p])).values()).sort(
+    (a, b) => candidateText(b).length - candidateText(a).length,
   )
   let out = text
   for (const p of unique) {
-    const escaped = p.display.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-    out = out.replace(new RegExp(`(^|[\\s(])@${escaped}(?=$|[\\s.,!?:;)])`, 'g'), `$1${p.token}`)
+    const escaped = candidateText(p).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    out = out.replace(new RegExp(`(^|[\\s(])${escaped}(?=$|[\\s.,!?:;)])`, 'g'), `$1${p.token}`)
   }
   return out
 }
@@ -352,6 +367,7 @@ export interface MentionNames {
   agents: Map<string, string>
   conversations?: Map<string, string>
   groups?: Map<string, string>
+  projects?: Map<string, string>
 }
 
 export function mentionNames(mentionables: Mentionables | null): MentionNames {
@@ -359,7 +375,14 @@ export function mentionNames(mentionables: Mentionables | null): MentionNames {
     users: new Map((mentionables?.people ?? []).map((p) => [p.id, p.name])),
     agents: new Map((mentionables?.agents ?? []).map((a) => [a.key, a.name])),
     groups: new Map((mentionables?.groups ?? []).map((g) => [g.id, g.handle])),
+    conversations: new Map((mentionables?.channels ?? []).flatMap((c) => (c.name ? [[c.id, c.name] as [string, string]] : []))),
+    projects: new Map((mentionables?.projects ?? []).map((p) => [p.id, p.name])),
   }
+}
+
+/** A date token as the reader sees it, e.g. "Friday" or "Oct 19, 3:00 PM". */
+function dateTokenLabel(value: string): string {
+  return parseDocToken(`<!date:${value}>`) ? relativeDateLabel(value) : value
 }
 
 /** Render wire tokens as bold names for Markdown display. */
@@ -370,6 +393,8 @@ export function renderMentions(text: string, names: MentionNames): string {
     .replace(/<!(here|channel)>/g, (_m, which) => `**@${which}**`)
     .replace(/<#c:([^>]+)>/g, (_m, id) => `**#${names.conversations?.get(id) ?? 'channel'}**`)
     .replace(/<@g:([^>]+)>/g, (_m, id) => `**@${names.groups?.get(id) ?? 'group'}**`)
+    .replace(/<#p:([^>]+)>/g, (_m, id) => `**${names.projects?.get(id) ?? 'project'}**`)
+    .replace(/<!date:([^>]+)>/g, (_m, value) => `**${dateTokenLabel(value)}**`)
 }
 
 /** Mention tokens as plain `@name` labels, leaving the message's own markdown alone. */
@@ -380,6 +405,8 @@ function renderMentionLabels(text: string, names: MentionNames): string {
     .replace(/<!(here|channel)>/g, (_m, which) => `@${which}`)
     .replace(/<#c:([^>]+)>/g, (_m, id) => `#${names.conversations?.get(id) ?? 'channel'}`)
     .replace(/<@g:([^>]+)>/g, (_m, id) => `@${names.groups?.get(id) ?? 'group'}`)
+    .replace(/<#p:([^>]+)>/g, (_m, id) => names.projects?.get(id) ?? 'project')
+    .replace(/<!date:([^>]+)>/g, (_m, value) => dateTokenLabel(value))
 }
 
 export interface InlineSegment {
@@ -682,11 +709,12 @@ export function expiryFrom(choice: ClearAfter, now = new Date()): string | null 
 export function decodeMentions(wire: string, candidates: MentionCandidate[]): { text: string; picked: MentionCandidate[] } {
   const byToken = new Map(candidates.map((c) => [c.token, c]))
   const picked: MentionCandidate[] = []
-  const text = wire.replace(/<[@!][^>]+>/g, (token) => {
-    const c = byToken.get(token)
+  const text = wire.replace(/<[@!#][^>]+>/g, (token) => {
+    const ref = parseDocToken(token)
+    const c = byToken.get(token) ?? (ref?.kind === 'date' ? dateCandidate(ref.value) : undefined)
     if (!c) return token
     picked.push(c)
-    return `@${c.display}`
+    return candidateText(c)
   })
   return { text, picked }
 }

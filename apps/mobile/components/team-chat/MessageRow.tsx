@@ -20,6 +20,7 @@ import { formatFullTime, formatShortTime, formatTime } from '../../lib/team-chat
 import { EmojiPicker } from './EmojiPicker'
 import { AgentAvatar } from './AgentAvatar'
 import { AgentProfileCard } from './AgentProfileCard'
+import { PersonCardById } from './PersonProfileCard'
 import { ApprovalCardView, StatusCardView } from './AgentStatus'
 import { approvalOf, messageKind, statusCardOf, workOf } from '../../lib/team-chat-kinds'
 import { AgentWorkedFor, AgentWorkingStatus } from './AgentWork'
@@ -156,7 +157,7 @@ function Avatar({ message, onPress }: { message: ChatMessage; onPress?: () => vo
     return <View className="h-8 w-8 items-center justify-center rounded-lg bg-muted" />
   }
   const name = message.author?.name ?? 'Someone'
-  return (
+  const avatar = (
     <View className="relative">
       {message.author?.image ? (
         <Image source={{ uri: message.author.image }} className="h-8 w-8 rounded-lg" accessibilityIgnoresInvertColors />
@@ -167,6 +168,12 @@ function Avatar({ message, onPress }: { message: ChatMessage; onPress?: () => vo
       )}
       <PresenceDot userId={message.authorUserId} size={10} badge />
     </View>
+  )
+  if (!onPress) return avatar
+  return (
+    <Pressable onPress={onPress} accessibilityLabel={`${name} profile`} accessibilityRole="button">
+      {avatar}
+    </Pressable>
   )
 }
 
@@ -466,13 +473,13 @@ function MessageRowImpl(props: MessageRowProps) {
             </TimeTooltip>
           ) : null
         ) : (
-          <Avatar message={message} onPress={message.authorType === 'agent' && !deleted ? () => setProfileOpen(true) : undefined} />
+          <Avatar message={message} onPress={(message.authorType === 'agent' || (message.authorType === 'user' && message.authorUserId)) && !deleted ? () => setProfileOpen(true) : undefined} />
         )}
       </View>
       <View className="min-w-0 flex-1">
         {!grouped && (
           <View className="flex-row items-baseline gap-2">
-            {message.authorType === 'agent' && !deleted ? (
+            {(message.authorType === 'agent' || (message.authorType === 'user' && message.authorUserId)) && !deleted ? (
               <Pressable onPress={() => setProfileOpen(true)} accessibilityLabel={`${authorName(message)} profile`}>
                 <Text className="text-sm font-semibold text-foreground">{authorName(message)}</Text>
               </Pressable>
@@ -717,6 +724,9 @@ function MessageRowImpl(props: MessageRowProps) {
           onOpenProjectPane={props.onOpenProjectPane}
         />
       )}
+      {profileOpen && message.authorType === 'user' && message.authorUserId ? (
+        <PersonCardById workspaceId={message.workspaceId} userId={message.authorUserId} me={me} onClose={() => setProfileOpen(false)} />
+      ) : null}
       {pickerOpen && (
         <Modal visible transparent animationType="fade" onRequestClose={() => setPickerOpen(false)}>
           <Pressable className="flex-1 items-center justify-center bg-black/30 p-6" onPress={() => setPickerOpen(false)} accessibilityLabel="Close emoji picker">

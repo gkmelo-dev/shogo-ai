@@ -11,6 +11,7 @@ import { ChevronLeft, Upload, X } from 'lucide-react-native'
 import { cn } from '@shogo/shared-ui/primitives'
 import { conversationTitle, teamChatApi, type ChatMessage, type ConversationDetail, type Mentionables } from '../../lib/team-chat-api'
 import { mentionNames } from '../../lib/team-chat-state'
+import { privateMemberIds } from '../../lib/mention-menu'
 import { ACTIVITY_CHANNEL_FILTERS, EMPTY_ACTIVITY_FILTER, isActivityFilterActive, matchesActivityFilters, type ActivityFilterState } from '../../lib/activity-channel-filters'
 import { TIMELINE_SOFT_LIMIT, useConversationList, useConversationTimeline, useMarkReadWhileVisible, useTypingUsers } from '../../hooks/useTeamChat'
 import { requestEditMessage } from '../../hooks/useChatShortcuts'
@@ -277,6 +278,7 @@ export function TimelinePane(props: TimelinePaneProps) {
   const canPostHere = threadRootId ? conversation.canReply : conversation.canPost
   const showComposer = !(!conversation.joined && isChannel && !threadRootId)
   const dragging = useFileDrop(rootRef, showComposer && canPostHere, (files) => composerRef.current?.addFiles(files))
+  const memberIds = useMemo(() => privateMemberIds(conversation), [conversation])
 
   const crumbs = threadCrumbs({ kind: conversation.kind, label: conversationTitle(conversation) })
   const typingText = typingLabel(typing)
@@ -363,6 +365,7 @@ export function TimelinePane(props: TimelinePaneProps) {
       disabledReason={disabledReason}
       onSend={timeline.send}
       onEditLast={onEditLast}
+      memberIds={memberIds}
     />
   )
 

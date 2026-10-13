@@ -164,10 +164,13 @@ export interface UserStatus {
 export type PresenceStatus = 'active' | 'away' | 'offline'
 
 export interface Mentionables {
-  people: Array<{ id: string; name: string; email: string; image: string | null; role: string }>
+  people: Array<{ id: string; name: string; email: string; image: string | null; role: string; title?: string | null; timezone?: string | null }>
   agents: Array<{ key: string; projectId: string | null; name: string; description: string | null; image: string | null; buddyLook?: BuddyLook | null }>
   statuses?: Record<string, UserStatus>
   groups?: UserGroup[]
+  /** Public channels and private ones you're in. */
+  channels?: Array<{ id: string; name: string | null; kind: string }>
+  projects?: Array<{ id: string; name: string; description: string | null }>
 }
 
 /** An action an agent is waiting on a person to approve, across all channels. */
@@ -232,6 +235,8 @@ export interface ChatSettings {
   dndUntil: string | null
   quietHours: string | null
   timezone: string | null
+  /** Job title shown on the person card. */
+  title: string | null
   notifyDefault: NotifyLevel
   keywords: string[]
   emailDigest: 'off' | 'daily'
@@ -246,6 +251,8 @@ export interface InboxItem {
   messageId: string | null
   threadRootId: string | null
   actorUserId: string | null
+  /** "doc" when this points at the conversation's doc rather than a message. */
+  target?: 'doc' | null
   title: string
   preview: string
   readAt: string | null
@@ -289,6 +296,7 @@ export interface Reminder {
   status: 'pending' | 'fired' | 'done' | 'cancelled'
   messageId: string | null
   conversationId: string | null
+  target?: 'doc' | null
   firedAt: string | null
   createdAt: string
 }
@@ -338,6 +346,8 @@ export type TeamChatEvent =
       messageId: string | null
       threadRootId: string | null
       reason: 'dm' | 'mention' | 'keyword' | 'broadcast' | 'thread' | 'message' | 'reminder'
+      /** "doc" when it's about the conversation's doc. */
+      target?: 'doc' | null
       title: string
       body: string
     }
@@ -598,7 +608,7 @@ export function teamChatApi() {
     },
     async createReminder(
       workspaceId: string,
-      input: { command?: string; text?: string; remindAt?: string; messageId?: string },
+      input: { command?: string; text?: string; remindAt?: string; messageId?: string; conversationId?: string; target?: 'doc' },
     ): Promise<Reminder> {
       return (await http.post<{ reminder: Reminder }>(`${ws(workspaceId)}/reminders`, input)).data.reminder
     },
