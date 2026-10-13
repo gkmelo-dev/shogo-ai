@@ -7,16 +7,16 @@
  * answer, a teammate, or a masked secret only the asking agent can read. The
  * answer goes into the message's thread, tagging the agent.
  */
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { Platform, Pressable, Text, TextInput, View } from 'react-native'
-import { Check, HelpCircle, KeyRound, Search, X } from 'lucide-react-native'
+import { Check, KeyRound, MessageCircleQuestion, Search, X } from 'lucide-react-native'
 import { cn } from '@shogo/shared-ui/primitives'
 import { ChatMarkdown } from '../chat/ChatMarkdown'
 import { GlassCard } from '../ui/GlassCard'
 import { DrawnCheckmark } from '../ui/DrawnCheckmark'
-import { useMentionables } from '../../hooks/useTeamChat'
 import { answerQuestion, dismissQuestion } from '../../lib/question-answer'
 import { renderMentions, type MentionNames } from '../../lib/team-chat-state'
+import { teamChatApi } from '../../lib/team-chat-api'
 import { isAskedOf, questionOptions, type Question } from '../../lib/team-chat-kinds'
 
 const AMBER = '#f59e0b'
@@ -117,7 +117,7 @@ function QuestionItem({
     <>
       <View className="flex-row items-center gap-2">
         <View className={cn('flex-row items-center gap-1 rounded px-1.5 py-0.5', isOpen ? 'bg-amber-500/20' : 'bg-muted')}>
-          {q.interaction === 'secret' ? <KeyRound size={10} className={isOpen ? 'text-amber-700 dark:text-amber-400' : 'text-muted-foreground'} /> : <HelpCircle size={10} className={isOpen ? 'text-amber-700 dark:text-amber-400' : 'text-muted-foreground'} />}
+          {q.interaction === 'secret' ? <KeyRound size={10} className={isOpen ? 'text-amber-700 dark:text-amber-400' : 'text-muted-foreground'} /> : <MessageCircleQuestion size={10} className={isOpen ? 'text-amber-700 dark:text-amber-400' : 'text-muted-foreground'} />}
           <Text className={cn('text-[10px] font-semibold uppercase', isOpen ? 'text-amber-700 dark:text-amber-400' : 'text-muted-foreground')} numberOfLines={1}>
             {q.header}
           </Text>
@@ -266,13 +266,19 @@ function AnswerInput({
 }
 
 function PersonPicker({ workspaceId, busy, onPick }: { workspaceId?: string; busy: boolean; onPick: (answer: string) => void }) {
-  const mentionables = useMentionables(workspaceId)
+  const [people, setPeople] = useState<Array<{ id: string; name: string; email: string }>>([])
   const [query, setQuery] = useState('')
-  const people = useMemo(() => {
-    const all = mentionables?.people ?? []
+  useEffect(() => {
+    if (!workspaceId) {
+      setPeople([])
+      return
+    }
+    void teamChatApi().mentionables(workspaceId).then((result) => setPeople(result.people)).catch(() => setPeople([]))
+  }, [workspaceId])
+  const visiblePeople = useMemo(() => {
     const q = query.trim().toLowerCase()
-    return (q ? all.filter((p) => p.name.toLowerCase().includes(q) || p.email.toLowerCase().includes(q)) : all).slice(0, 6)
-  }, [mentionables, query])
+    return (q ? people.filter((p) => p.name.toLowerCase().includes(q) || p.email.toLowerCase().includes(q)) : people).slice(0, 6)
+  }, [people, query])
   return (
     <View className="gap-1.5">
       <View className="flex-row items-center gap-2 rounded-lg border border-border bg-background px-2.5 py-1.5">
@@ -280,7 +286,7 @@ function PersonPicker({ workspaceId, busy, onPick }: { workspaceId?: string; bus
         <TextInput value={query} onChangeText={setQuery} placeholder="Pick a teammate" autoCapitalize="none" className="min-w-0 flex-1 text-sm text-foreground" accessibilityLabel="Search teammates" />
       </View>
       <View className="flex-row flex-wrap gap-2">
-        {people.map((p) => (
+        {visiblePeople.map((p) => (
           <Pressable
             key={p.id}
             disabled={busy}

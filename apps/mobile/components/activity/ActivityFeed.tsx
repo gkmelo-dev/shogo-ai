@@ -8,7 +8,7 @@
 import { useCallback, useMemo, useState } from 'react'
 import { ActivityIndicator, Pressable, RefreshControl, ScrollView, Text, View } from 'react-native'
 import { useFocusEffect, useRouter } from 'expo-router'
-import { AlarmClock, AtSign, Bot, ChevronRight, Heart, HelpCircle, Lock, Megaphone, MessageSquare, MessagesSquare, Tag } from 'lucide-react-native'
+import { AlarmClock, AtSign, Bot, ChevronRight, Heart, Lock, Megaphone, MessageCircleQuestion, MessageSquare, MessagesSquare, Tag } from 'lucide-react-native'
 import { cn } from '@shogo/shared-ui/primitives'
 import { useActiveWorkspace } from '../../hooks/useActiveWorkspace'
 import { useAgentActivity } from '../../hooks/useAgentActivity'
@@ -30,7 +30,7 @@ const KIND_ICON: Record<InboxKind, typeof AtSign> = {
   keyword: Tag,
   broadcast: Megaphone,
   message: MessageSquare,
-  question: HelpCircle,
+  question: MessageCircleQuestion,
 }
 
 /** Polls only while the screen showing the feed is focused. */
@@ -131,7 +131,7 @@ export function ActivityFeed({ compact = false }: ActivityFeedProps) {
             className={cn('flex-row items-center gap-2 border-b border-amber-500/30 bg-amber-500/10 active:bg-amber-500/20', compact ? 'px-3 py-2' : 'px-4 py-2.5')}
             testID="questions-waiting"
           >
-            <HelpCircle size={14} className="text-amber-600" />
+            <MessageCircleQuestion size={14} className="text-amber-600" />
             <Text className="flex-1 text-sm font-medium text-amber-800 dark:text-amber-300">
               {`Waiting on you: ${waitingOnYou} ${waitingOnYou === 1 ? 'question' : 'questions'}`}
             </Text>
