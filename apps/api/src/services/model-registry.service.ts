@@ -421,6 +421,21 @@ export async function primeModelRegistry(): Promise<void> {
   await refresh()
 }
 
+/**
+ * Await the first load when nothing has been loaded yet. The local/desktop
+ * entry point never calls `primeModelRegistry`, so the sync accessors return
+ * an empty snapshot until the lazy background refresh lands.
+ */
+export async function ensureModelRegistryLoaded(): Promise<void> {
+  if (snapshot.loadedAt > 0) return
+  if (!inflight) {
+    inflight = refresh().finally(() => {
+      inflight = null
+    })
+  }
+  await inflight
+}
+
 /** Drop the cache and reload. Call from admin write routes. */
 export async function invalidateModelRegistry(): Promise<void> {
   await refresh()

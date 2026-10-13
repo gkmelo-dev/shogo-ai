@@ -204,6 +204,35 @@ describe('logCacheControlIfEnabled (AI_PROXY_LOG_CACHE=1)', () => {
     expect(cacheLog!).toContain('lastUserMsg blocks=1 cache_control=1')
   })
 
+  test('non-streaming Anthropic chat completion reports and bills cache reads and writes', async () => {
+    pushJson({
+      id: 'msg_cache',
+      content: [{ type: 'text', text: 'hi' }],
+      stop_reason: 'end_turn',
+      usage: { input_tokens: 3, cache_read_input_tokens: 6000, cache_creation_input_tokens: 1200, output_tokens: 7 },
+    })
+    const res = await app.fetch(new Request('http://localhost/api/ai/v1/chat/completions', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer shogo_sk_valid_extra', 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'claude-haiku-4-5',
+        max_tokens: 16,
+        messages: [{ role: 'system', content: 'be brief' }, { role: 'user', content: 'hello' }],
+      }),
+    }))
+    expect(res.status).toBe(200)
+    const body = await res.json() as any
+    expect(body.usage).toEqual({
+      prompt_tokens: 6003,
+      completion_tokens: 7,
+      total_tokens: 6010,
+      prompt_tokens_details: { cached_tokens: 6000 },
+      cache_creation_input_tokens: 1200,
+    })
+    const charged = logs.find(l => l.includes('Charged'))
+    expect(charged).toContain('3 in, 1200 cache-write, 6000 cache-read, 7 out')
+  })
+
   test('logs cache:stream on streaming Anthropic chat completion', async () => {
     pushFetch(() => new Response(
       new TextEncoder().encode(

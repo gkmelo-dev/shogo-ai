@@ -18,19 +18,26 @@ mock.module('../services/public-models.service', () => ({
 
 const OPUS_UUID = '8947628a-1415-4b3a-90c3-63f8a85c16b7'
 
+// Like the real registry on the local/desktop entry point: empty until the
+// first load completes.
+let registryLoaded = false
 mock.module('../services/model-registry.service', () => ({
   getMergedModelEntrySync: (id: string) =>
     id === 'local-premium'
       ? { id, provider: 'local', tier: 'premium' }
       : undefined,
-  getDbModelEntriesSync: () => [
+  ensureModelRegistryLoaded: async () => {
+    await Promise.resolve()
+    registryLoaded = true
+  },
+  getDbModelEntriesSync: () => registryLoaded ? [
     { id: OPUS_UUID, provider: 'anthropic', apiModel: 'claude-opus-5-5', contextWindow: 1_000_000, maxOutputTokens: 128_000 },
     { id: 'gpt-live-uuid', provider: 'openai', apiModel: 'gpt-live-1', kind: 'live' },
-  ],
-  getCloudModelEntriesSync: () => [
+  ] : [],
+  getCloudModelEntriesSync: () => registryLoaded ? [
     { id: OPUS_UUID, provider: 'anthropic', apiModel: 'claude-opus-5-5' },
     { id: 'mimo-v2.5', provider: 'custom', apiModel: 'mimo-v2.5' },
-  ],
+  ] : [],
 }))
 
 mock.module('../lib/prisma', () => ({

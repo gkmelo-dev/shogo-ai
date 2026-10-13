@@ -20,7 +20,7 @@ import {
 // local bundle, which must not pull in the Stripe-backed billing service.
 import * as billingService from '../../services/billing-runtime'
 import { resolvePublicModelSync } from '../../services/public-models.service'
-import * as modelRegistry from '../../services/model-registry.service'
+import * as modelRegistryService from '../../services/model-registry.service'
 import { getMergedModelEntrySync } from '../../services/model-registry.service'
 import { prisma } from '../prisma'
 import { fetchCloudAgentModelDefaults } from '../federated-upstream'
@@ -247,8 +247,8 @@ export function serializeModelRegistryEnv(): string | undefined {
   const seen = new Set<string>()
   const out: Array<{ id: string; provider: string; apiModel?: string; contextWindow?: number; maxOutputTokens?: number }> = []
   const entries = [
-    ...(modelRegistry.getDbModelEntriesSync?.() ?? []),
-    ...(modelRegistry.getCloudModelEntriesSync?.() ?? []),
+    ...(modelRegistryService.getDbModelEntriesSync?.() ?? []),
+    ...(modelRegistryService.getCloudModelEntriesSync?.() ?? []),
   ]
   for (const entry of entries) {
     if (!entry?.id || !entry.provider || seen.has(entry.id) || entry.kind === 'live') continue
@@ -292,6 +292,7 @@ export async function resolveAgentModelEnv(workspaceId = 'local-dev'): Promise<A
     }
   }
 
+  await modelRegistryService.ensureModelRegistryLoaded?.()
   const modelRegistry = serializeModelRegistryEnv()
   const registryEnv = modelRegistry ? { AGENT_MODEL_REGISTRY: modelRegistry } : {}
 

@@ -1227,6 +1227,13 @@ function convertAnthropicResponseToOpenAI(anthropicResponse: any, model: string)
     }))
   }
 
+  // Same shape as the streaming path's terminal usage chunk: prompt_tokens
+  // includes cache reads; cache writes are reported separately for billing.
+  const inputTokens = anthropicResponse.usage?.input_tokens || 0
+  const cachedInputTokens = anthropicResponse.usage?.cache_read_input_tokens || 0
+  const cacheWriteTokens = anthropicResponse.usage?.cache_creation_input_tokens || 0
+  const outputTokens = anthropicResponse.usage?.output_tokens || 0
+  const promptTokens = inputTokens + cachedInputTokens
   return {
     id: anthropicResponse.id || `chatcmpl-${Date.now()}`,
     object: 'chat.completion',
@@ -1240,11 +1247,11 @@ function convertAnthropicResponseToOpenAI(anthropicResponse: any, model: string)
       },
     ],
     usage: {
-      prompt_tokens: anthropicResponse.usage?.input_tokens || 0,
-      completion_tokens: anthropicResponse.usage?.output_tokens || 0,
-      total_tokens:
-        (anthropicResponse.usage?.input_tokens || 0) +
-        (anthropicResponse.usage?.output_tokens || 0),
+      prompt_tokens: promptTokens,
+      completion_tokens: outputTokens,
+      total_tokens: promptTokens + outputTokens,
+      prompt_tokens_details: { cached_tokens: cachedInputTokens },
+      ...(cacheWriteTokens > 0 ? { cache_creation_input_tokens: cacheWriteTokens } : {}),
     },
   }
 }
@@ -3558,7 +3565,7 @@ export function aiProxyRoutes() {
             inputPrompt,
             usage.completion_tokens || 0,
             cachedPrompt,
-            0,
+            usage.cache_creation_input_tokens || 0,
             chatSessionId,
             internalUsage,
             usage.completion_tokens_details?.reasoning_tokens || 0,
