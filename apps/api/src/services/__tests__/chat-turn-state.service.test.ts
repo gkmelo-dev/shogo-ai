@@ -6,12 +6,12 @@ import { describe, expect, mock, test } from 'bun:test'
 const update = mock(async () => ({}))
 const updateMany = mock(async () => ({ count: 1 }))
 const findMany = mock(async () => [])
-const findMessages = mock(async () => [])
+const findMessage = mock(async (): Promise<unknown> => null)
 
 mock.module('../../lib/prisma', () => ({
   prisma: {
     chatSession: { update, updateMany, findMany },
-    conversationMessage: { findMany: findMessages },
+    conversationMessage: { findFirst: findMessage },
   },
 }))
 
@@ -147,25 +147,12 @@ describe('chat-turn-state service', () => {
         project: { id: 'project-devops', name: 'Shogo DevOps', hidden: true },
       },
     ] as never)
-    // Prisma returns these already ordered by seq desc; the first row per session wins.
-    findMessages.mockResolvedValueOnce([
-      {
-        id: 'msg-newest',
-        seq: 9,
-        conversationId: 'conv-ops',
-        threadRootId: 'thread-1',
-        agentSessionId: 'session-ops',
-        conversation: { name: 'ops', slug: 'ops', kind: 'public' },
-      },
-      {
-        id: 'msg-older',
-        seq: 4,
-        conversationId: 'conv-ops',
-        threadRootId: 'thread-1',
-        agentSessionId: 'session-ops',
-        conversation: { name: 'ops', slug: 'ops', kind: 'public' },
-      },
-    ] as never)
+    findMessage.mockResolvedValueOnce({
+      id: 'msg-newest',
+      conversationId: 'conv-ops',
+      threadRootId: 'thread-1',
+      conversation: { name: 'ops', slug: 'ops', kind: 'public' },
+    })
 
     await expect(listActiveChatTurns('workspace-1')).resolves.toEqual([
       {
@@ -184,15 +171,13 @@ describe('chat-turn-state service', () => {
         conversationKind: 'public',
       },
     ])
-    expect(findMessages).toHaveBeenCalledWith({
-      where: { agentSessionId: { in: ['session-ops'] }, authorType: 'agent', deletedAt: null },
-      orderBy: { seq: 'desc' },
+    expect(findMessage).toHaveBeenCalledWith({
+      where: { agentSessionId: 'session-ops', authorType: 'agent', deletedAt: null },
+      orderBy: { createdAt: 'desc' },
       select: {
         id: true,
-        seq: true,
         conversationId: true,
         threadRootId: true,
-        agentSessionId: true,
         conversation: { select: { name: true, slug: true, kind: true } },
       },
     })

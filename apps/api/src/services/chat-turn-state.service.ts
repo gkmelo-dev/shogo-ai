@@ -173,35 +173,28 @@ export async function listActiveChatTurns(
   })
 }
 
-/** Newest agent reply per session, so a live turn can point at its channel and thread. */
+/**
+ * Newest agent reply per session, so a live turn can point at its channel and thread.
+ * `seq` is only ordered within one conversation, so recency comes from `createdAt`.
+ */
 async function conversationReplies(sessionIds: string[]) {
-  const bySession = new Map<string, {
-    id: string
-    conversationId: string
-    threadRootId: string | null
-    conversation: { name: string | null; slug: string | null; kind: string }
-  }>()
-  if (sessionIds.length === 0) return bySession
-  const rows = await prisma.conversationMessage.findMany({
-    where: { agentSessionId: { in: sessionIds }, authorType: 'agent', deletedAt: null },
-    orderBy: { seq: 'desc' },
-    select: {
-      id: true,
-      seq: true,
-      conversationId: true,
-      threadRootId: true,
-      agentSessionId: true,
-      conversation: { select: { name: true, slug: true, kind: true } },
-    },
+  const rows = await Promise.all(
+    sessionIds.map((agentSessionId) =>
+      prisma.conversationMessage.findFirst({
+        where: { agentSessionId, authorType: 'agent', deletedAt: null },
+        orderBy: { createdAt: 'desc' },
+        select: {
+          id: true,
+          conversationId: true,
+          threadRootId: true,
+          conversation: { select: { name: true, slug: true, kind: true } },
+        },
+      }),
+    ),
+  )
+  const bySession = new Map<string, NonNullable<(typeof rows)[number]>>()
+  rows.forEach((row, index) => {
+    if (row) bySession.set(sessionIds[index], row)
   })
-  for (const row of rows) {
-    if (!row.agentSessionId || bySession.has(row.agentSessionId)) continue
-    bySession.set(row.agentSessionId, {
-      id: row.id,
-      conversationId: row.conversationId,
-      threadRootId: row.threadRootId,
-      conversation: row.conversation,
-    })
-  }
   return bySession
 }
