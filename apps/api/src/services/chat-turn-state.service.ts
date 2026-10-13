@@ -28,6 +28,12 @@ export type ActiveChatTurn = {
   projectName: string | null
   projectHidden: boolean
   startedAt: Date
+  /** Present when the turn is an agent reply posted into team chat. */
+  conversationId?: string
+  threadRootId?: string | null
+  messageId?: string
+  conversationName?: string | null
+  conversationKind?: string | null
 }
 
 /**
@@ -140,9 +146,12 @@ export async function listActiveChatTurns(
     orderBy: { activeTurnStartedAt: 'desc' },
   })
 
-  return sessions
-    .filter((session) => session.activeTurnId && session.activeTurnStartedAt)
-    .map((session) => ({
+  const live = sessions.filter((session) => session.activeTurnId && session.activeTurnStartedAt)
+  const replies = await conversationReplies(live.map((session) => session.id))
+
+  return live.map((session) => {
+    const reply = replies.get(session.id)
+    return {
       chatSessionId: session.id,
       turnId: session.activeTurnId!,
       sessionName: session.name || session.inferredName || 'Chat',
@@ -151,5 +160,48 @@ export async function listActiveChatTurns(
       projectName: session.project?.name ?? null,
       projectHidden: session.project?.hidden ?? false,
       startedAt: session.activeTurnStartedAt!,
-    }))
+      ...(reply
+        ? {
+            conversationId: reply.conversationId,
+            threadRootId: reply.threadRootId,
+            messageId: reply.id,
+            conversationName: reply.conversation.name || reply.conversation.slug,
+            conversationKind: reply.conversation.kind,
+          }
+        : {}),
+    }
+  })
+}
+
+/** Newest agent reply per session, so a live turn can point at its channel and thread. */
+async function conversationReplies(sessionIds: string[]) {
+  const bySession = new Map<string, {
+    id: string
+    conversationId: string
+    threadRootId: string | null
+    conversation: { name: string | null; slug: string | null; kind: string }
+  }>()
+  if (sessionIds.length === 0) return bySession
+  const rows = await prisma.conversationMessage.findMany({
+    where: { agentSessionId: { in: sessionIds }, authorType: 'agent', deletedAt: null },
+    orderBy: { seq: 'desc' },
+    select: {
+      id: true,
+      seq: true,
+      conversationId: true,
+      threadRootId: true,
+      agentSessionId: true,
+      conversation: { select: { name: true, slug: true, kind: true } },
+    },
+  })
+  for (const row of rows) {
+    if (!row.agentSessionId || bySession.has(row.agentSessionId)) continue
+    bySession.set(row.agentSessionId, {
+      id: row.id,
+      conversationId: row.conversationId,
+      threadRootId: row.threadRootId,
+      conversation: row.conversation,
+    })
+  }
+  return bySession
 }
