@@ -595,6 +595,7 @@ import {
   type SpawnClassificationInput,
 } from './model-router'
 import { inferProviderFromModel } from '@shogo/model-catalog'
+import { createStableLoopTransform } from './stable-compaction'
 
 const MODEL_TIER_MAP: Record<ModelTierName, string> = {
   fast: 'claude-haiku-4-5',
@@ -1068,6 +1069,7 @@ export async function runSubagent(
       loopDetection: config.loopDetection,
       streamFn: options?.streamFn,
       signal: options?.signal,
+      transformContext: createStableLoopTransform(runModel),
       onToolCall: callbacks?.onToolCall,
       onTextDelta: callbacks?.onTextDelta,
       onThinkingStart: callbacks?.onThinkingStart,
