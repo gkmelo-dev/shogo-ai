@@ -596,6 +596,7 @@ import {
 } from './model-router'
 import { inferProviderFromModel } from '@shogo/model-catalog'
 import { createStableLoopTransform } from './stable-compaction'
+import { SUBAGENT_REPORT_INSTRUCTION } from './subagent-prompts'
 
 const MODEL_TIER_MAP: Record<ModelTierName, string> = {
   fast: 'claude-haiku-4-5',
@@ -884,7 +885,7 @@ export async function runSubagent(
     if (forkCtx.thinkingLevel) thinkingLevel = forkCtx.thinkingLevel
   } else {
     // Normal mode: build tool set from config
-    systemPrompt = config.systemPrompt
+    systemPrompt = `${config.systemPrompt}\n\n${SUBAGENT_REPORT_INSTRUCTION}`
     history = options?.history || []
 
     if (config.toolNames && config.toolNames.length > 0) {
