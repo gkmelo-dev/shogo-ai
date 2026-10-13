@@ -162,17 +162,6 @@ export default function ConversationScreen() {
   )
   const closeProjectPane = useCallback(() => router.setParams({ project: undefined } as any), [router])
   const openFiles = useCallback(
-    () => router.setParams({ files: '1', thread: undefined, project: undefined } as any),
-    [router],
-  )
-  const closeFiles = useCallback(() => router.setParams({ files: undefined } as any), [router])
-  const showFileInChat = useCallback(
-    (file: ConversationFile) =>
-      router.setParams({ files: undefined, project: undefined, thread: file.threadRootId ?? undefined, msg: file.messageId } as any),
-    [router],
-  )
-  const closeProjectPane = useCallback(() => router.setParams({ project: undefined } as any), [router])
-  const openFiles = useCallback(
     () => router.setParams({ files: '1', doc: undefined, thread: undefined, project: undefined } as any),
     [router],
   )
