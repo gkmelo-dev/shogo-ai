@@ -30,7 +30,7 @@
 
 import { prisma } from '../lib/prisma'
 import { decryptSecret } from '../lib/secret-crypto'
-import { setDbModelPricingProvider } from '../lib/db-model-pricing'
+import { setDbModelBillingModelProvider, setDbModelPricingProvider } from '../lib/db-model-pricing'
 import * as modelCatalog from '@shogo/model-catalog'
 import type {
   ModelEntry,
@@ -615,10 +615,22 @@ export function getDbModelPricingSync(id: string): DbModelPricing | undefined {
   return snapshot.pricing.get(canonical)
 }
 
+/**
+ * Billing bucket for a merged (DB or cloud) model. Prefers the static catalog
+ * entry for the backing `apiModel` (e.g. a UUID row for `claude-opus-5-5` maps
+ * to the `claude-opus-5-5` bucket rather than the family-derived `opus`).
+ */
+export function getDbModelBillingModelSync(id: string): string | undefined {
+  const entry = getMergedModelEntrySync(id)
+  if (!entry) return undefined
+  return modelCatalog.getModelEntry(entry.apiModel)?.billingModel ?? entry.billingModel
+}
+
 // Register with the billing-side pricing hook so usage-cost / cost-analytics
 // can read DB pricing without importing this module (and the full catalog)
 // directly. See apps/api/src/lib/db-model-pricing.ts.
 setDbModelPricingProvider(getDbModelPricingSync)
+setDbModelBillingModelProvider(getDbModelBillingModelSync)
 
 /** Async merged catalog (awaits a refresh when stale). For non-hot paths. */
 export async function getMergedCatalog(): Promise<ModelEntry[]> {
