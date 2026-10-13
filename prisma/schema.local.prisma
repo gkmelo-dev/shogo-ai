@@ -1357,6 +1357,9 @@ model ChatSession {
   contextId           String?
   // Set only for contextType == workspace (see schema.prisma).
   workspaceId         String?
+  // Owner of a personal workspace-agent chat. Null for project chats,
+  // scheduled/DM/Slack sessions, and chats created before ownership existed.
+  createdByUserId     String?
   phase               String?
   claudeCodeSessionId String?
   cachedMessageCount  Int      @default(0)
@@ -1393,6 +1396,7 @@ model ChatSession {
 
   @@index([contextType, contextId])
   @@index([workspaceId])
+  @@index([workspaceId, createdByUserId, lastActiveAt])
   @@index([activeTurnHeartbeatAt])
   @@map("chat_sessions")
 }
@@ -3099,6 +3103,7 @@ model Conversation {
   drafts            ConversationDraft[]
   scheduledMessages ScheduledMessage[]
   huddles           Huddle[]
+  doc               ConversationDoc?
 
   @@unique([workspaceId, slug])
   @@unique([workspaceId, dmKey])
@@ -3311,12 +3316,37 @@ model ConversationAttachment {
   extractedText  String?
   createdAt      DateTime @default(now())
 
-  conversation Conversation         @relation(fields: [conversationId], references: [id], onDelete: Cascade)
-  message      ConversationMessage? @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  conversation Conversation                  @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  message      ConversationMessage?          @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  chunks       ConversationAttachmentChunk[]
 
   @@index([conversationId])
   @@index([messageId])
   @@map("conversation_attachments")
+}
+
+/// A slice of a chat file's extracted text, read by agents and ranked by search.
+model ConversationAttachmentChunk {
+  id             String   @id @default(uuid())
+  attachmentId   String
+  conversationId String
+  workspaceId    String
+  idx            Int
+  text           String
+  charStart      Int
+  charEnd        Int
+  /// Embedding model, set once the indexer has processed the chunk (even when it produced no vector).
+  model          String?
+  /// JSON array of numbers.
+  embedding      String?
+  createdAt      DateTime @default(now())
+
+  attachment ConversationAttachment @relation(fields: [attachmentId], references: [id], onDelete: Cascade)
+
+  @@index([attachmentId, idx])
+  @@index([conversationId])
+  @@index([workspaceId, createdAt])
+  @@map("conversation_attachment_chunks")
 }
 
 /// Per-workspace chat settings: custom status, Do Not Disturb, and notification defaults.
@@ -3358,6 +3388,46 @@ model ConversationPin {
 
   @@index([conversationId, createdAt])
   @@map("conversation_pins")
+}
+
+/// The channel's single shared markdown document. See schema.prisma.
+model ConversationDoc {
+  id                 String   @id @default(uuid())
+  conversationId     String   @unique
+  workspaceId        String
+  title              String   @default("")
+  content            String   @default("")
+  version            Int      @default(1)
+  locked             Boolean  @default(false)
+  updatedByType      String   @default("user")
+  updatedByUserId    String?
+  updatedByProjectId String?
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  conversation Conversation              @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  revisions    ConversationDocRevision[]
+
+  @@index([workspaceId])
+  @@map("conversation_docs")
+}
+
+model ConversationDocRevision {
+  id                 String   @id @default(uuid())
+  docId              String
+  version            Int
+  title              String   @default("")
+  content            String   @default("")
+  updatedByType      String   @default("user")
+  updatedByUserId    String?
+  updatedByProjectId String?
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  doc ConversationDoc @relation(fields: [docId], references: [id], onDelete: Cascade)
+
+  @@index([docId, createdAt])
+  @@map("conversation_doc_revisions")
 }
 
 model SavedMessage {

@@ -217,7 +217,7 @@ const HOME_REGION_PARTITIONED: HomeRegionPartitioned[] = [
     fn: 'runChannelIndexer',
     file: 'apps/api/src/jobs/run-channel-workers.ts',
     reason:
-      'conversation_message_embeddings replicates. indexPendingMessages only embeds messages in conversations whose workspace is homed here (homeRegionWorkspaceWhere), so a message is embedded by one region and the messageId unique never collides across regions. The per-region lock only de-duplicates pods within a region.',
+      'conversation_message_embeddings and conversation_attachment_chunks replicate. indexPendingMessages, chunkPendingAttachments and embedPendingChunks only touch conversations whose workspace is homed here (homeRegionWorkspaceWhere), so each message or file is indexed by one region and the messageId unique never collides across regions. The per-region lock only de-duplicates pods within a region.',
     partitionKeyColumn: 'Workspace.homeRegion',
   },
   {
@@ -734,6 +734,12 @@ const ACCEPTED_UNIQUE_KEYS: UniqueKeyRule[] = [
     category: 'external_global_id',
     reason:
       'Shadow conversation for an external chat channel (Slack/Teams/Google Chat channel id). The inbound bridge upserts on this key per webhook delivery; a raced duplicate delivery re-reads the existing row. No cron writer.',
+  },
+  {
+    key: 'ConversationDoc.conversationId',
+    category: 'request_scoped',
+    reason:
+      'One shared doc per channel, created by the user or agent channel request after resolving the conversation; optimistic version checks handle concurrent saves, and a cross-region create race is limited to failover.',
   },
   {
     key: 'ChatInstallation.(provider,workspaceId)',

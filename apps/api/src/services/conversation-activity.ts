@@ -280,6 +280,7 @@ export async function recordAgentTaskOutcome(task: {
         taskId: task.id,
         chatSessionId: task.chatSessionId,
         preview: clipActivityText(detail),
+        conversationId: task.notifyConversationId ?? null,
       },
     })
     fillActivitySummary(posted, {
@@ -331,6 +332,7 @@ export async function recordScheduleOutcome(schedule: {
         scheduleId: schedule.id,
         chatSessionId: schedule.chatSessionId ?? null,
         preview: clipActivityText(detail),
+        conversationId: schedule.notifyConversationId ?? null,
       },
     })
     fillActivitySummary(posted, {

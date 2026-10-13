@@ -16,6 +16,7 @@ import {
   MAX_CONVERSATION_FILE_BYTES,
   buildConversationFileKey,
   conversationFileUrl,
+  loadConversationFileBytes,
   putConversationFile,
   readConversationFile,
   verifyAttachmentToken,
@@ -51,6 +52,7 @@ import {
   updateConversation,
   updateMembership,
 } from '../services/conversation.service'
+import { getDocForAgent, updateDocAsAgent } from '../services/conversation-doc.service'
 import { afterMessagePosted } from '../services/conversation-pipeline'
 import { AgentMessageError, postAgentMessage, updateAgentMessage } from '../services/chat-providers/outbound'
 import { blocksForKind, cardToMarkdown, normalizeCard, normalizeKind, normalizeQuestionDrafts, questionsOf, questionsToMarkdown } from '../services/conversation-message-kind'
@@ -73,6 +75,15 @@ import { getChannelMetrics } from '../services/conversation-metrics'
 import { searchMessages } from '../services/conversation-search'
 import { askWorkspace, semanticSearch } from '../services/conversation-semantic'
 import { canExtract, extractAndStoreAttachmentText } from '../services/conversation-file-text'
+import { loadVisibleFile, type FilePrincipal } from '../services/conversation-file-access'
+import { readFileText, searchFiles } from '../services/conversation-file-index'
+import {
+  listFileConversations,
+  listFiles,
+  parseFileKind,
+  serializeFileForAgent,
+  serializeFileForUser,
+} from '../services/conversation-files.service'
 import { registerConversationNotifications } from '../services/conversation-notifications'
 import { registerConversationUnfurls } from '../services/conversation-unfurl'
 import { listStatuses } from '../services/chat-settings'
@@ -92,7 +103,7 @@ export interface ConversationRoutesConfig {
 
 function errorResponse(c: any, err: unknown) {
   if (err instanceof ConversationError) {
-    return c.json({ error: { code: err.code, message: err.message } }, err.status)
+    return c.json({ error: { code: err.code, message: err.message, ...err.details } }, err.status)
   }
   throw err
 }
@@ -653,6 +664,24 @@ export function conversationRoutes(config: ConversationRoutesConfig): Hono {
     }
   })
 
+  router.get('/conversations/:conversationId/files', async (c) => {
+    const userId = await requireUser(c)
+    if (userId instanceof Response) return userId
+    try {
+      const access = await loadAccess(c.req.param('conversationId'), userId)
+      const { files, nextCursor } = await listFiles({ kind: 'user', userId }, access.conversation.workspaceId, {
+        conversationId: access.conversation.id,
+        q: c.req.query('q') || undefined,
+        kind: parseFileKind(c.req.query('kind')),
+        cursor: c.req.query('cursor') || undefined,
+        limit: numberParam(c.req.query('limit')),
+      })
+      return c.json({ files: files.map(serializeFileForUser), nextCursor })
+    } catch (err) {
+      return errorResponse(c, err)
+    }
+  })
+
   // ─── Message-level ───────────────────────────────────────────────────────
 
   router.get('/conversation-messages/:messageId', async (c) => {
@@ -858,7 +887,23 @@ export function textContains(q: string) {
   return isLocalMode() ? { contains: q } : { contains: q, mode: 'insensitive' as const }
 }
 
+/**
+ * The conversation an agent names: a channel name (with or without `#`), a
+ * conversation id, or `@person` (an email or user id) for its DM with them.
+ * Null when it doesn't exist or the agent can't see it.
+ */
 export async function resolveAgentConversation(workspaceId: string, channel: string, projectId: string | null) {
+  if (channel.startsWith('@')) {
+    const who = channel.slice(1).trim()
+    if (!who) return null
+    const member = await db.member.findFirst({
+      where: { workspaceId, projectId: null, OR: [{ userId: who }, { user: { email: who.toLowerCase() } }] },
+      select: { userId: true },
+    })
+    if (!member) return null
+    return db.conversation.findFirst({ where: { workspaceId, dmKey: `a:${member.userId}:${projectId ?? 'ws'}` } })
+  }
+  channel = channel.replace(/^#/, '')
   const byId = await db.conversation.findUnique({ where: { id: channel } }).catch(() => null)
   const conversation = byId && byId.workspaceId === workspaceId
     ? byId
@@ -870,6 +915,11 @@ export async function resolveAgentConversation(workspaceId: string, channel: str
     select: { id: true },
   })
   return member ? conversation : null
+}
+
+const AGENT_MESSAGE_INCLUDE = {
+  authorUser: { select: { name: true, email: true } },
+  attachments: { select: { id: true, name: true, mimeType: true, size: true } },
 }
 
 async function renderForAgent(rows: any[]) {
@@ -893,8 +943,13 @@ async function renderForAgent(rows: any[]) {
     text: [renderMentionsAsText(r.text, names), questionsToMarkdown(questionsOf(r.blocks), names)].filter(Boolean).join('\n\n'),
     threadRootId: r.threadRootId ?? null,
     replyCount: r.replyCount ?? 0,
+    files: (r.attachments ?? []).map((a: any) => ({ id: a.id, name: a.name, mimeType: a.mimeType, size: a.size })),
     createdAt: r.createdAt,
   }))
+}
+
+function docUrl(conversationId: string): string {
+  return `${getFrontendUrl()}/c/${encodeURIComponent(conversationId)}?doc=1`
 }
 
 export function agentChannelRoutes(routeConfig: AgentChannelRoutesConfig): Hono {
@@ -1014,6 +1069,101 @@ export function agentChannelRoutes(routeConfig: AgentChannelRoutesConfig): Hono 
     return c.json({ results: rendered.map((r, i) => ({ ...r, channel: rows[i].conversation?.name ?? null })) })
   })
 
+  // ─── Files ───────────────────────────────────────────────────────────────
+  // Visibility is decided by conversation-file-access, the same rules the Files pane uses.
+
+  const FILE_NOT_VISIBLE = { error: { code: 'not_found', message: 'Conversation not found or not visible to this agent' } }
+
+  /** The agent principal, and the conversation id it named (null when none was named, undefined when it can't see it). */
+  async function fileScope(c: any, auth: AgentChannelAuthContext) {
+    const projectId = await agentIdentity(auth, c.req.query('projectId'))
+    const principal: FilePrincipal = { kind: 'agent', projectId }
+    const ref = c.req.query('conversation')?.trim()
+    if (!ref) return { principal, conversationId: null as string | null }
+    const conversation = await resolveAgentConversation(auth.workspaceId, ref, projectId)
+    return { principal, conversationId: conversation?.id as string | undefined }
+  }
+
+  router.get(`${base}/files`, async (c) => {
+    const auth = await config.authorize(c)
+    if (auth instanceof Response) return auth
+    const { principal, conversationId } = await fileScope(c, auth)
+    if (conversationId === undefined) return c.json(FILE_NOT_VISIBLE, 404)
+    const conversations = await listFileConversations(principal, auth.workspaceId)
+    const folders = new Map<string, string>(conversations.map((conv: any) => [conv.id, conv.folder]))
+    const { files, nextCursor } = await listFiles(principal, auth.workspaceId, {
+      conversationId: conversationId ?? undefined,
+      q: c.req.query('q') || undefined,
+      kind: parseFileKind(c.req.query('kind')),
+      cursor: c.req.query('cursor') || undefined,
+      limit: numberParam(c.req.query('limit')),
+    })
+    return c.json({ conversations, files: files.map((f: any) => serializeFileForAgent(f, folders)), nextCursor })
+  })
+
+  router.get(`${base}/files/search`, async (c) => {
+    const auth = await config.authorize(c)
+    if (auth instanceof Response) return auth
+    const { principal, conversationId } = await fileScope(c, auth)
+    if (conversationId === undefined) return c.json(FILE_NOT_VISIBLE, 404)
+    const q = (c.req.query('q') ?? '').trim()
+    if (!q) return c.json({ results: [], semantic: false })
+    const [{ results, semantic }, conversations] = await Promise.all([
+      searchFiles(principal, auth.workspaceId, q, { conversationId: conversationId ?? undefined, limit: numberParam(c.req.query('limit')) }),
+      listFileConversations(principal, auth.workspaceId),
+    ])
+    const byId = new Map(conversations.map((conv: any) => [conv.id, conv]))
+    return c.json({
+      semantic,
+      results: results.map((r) => {
+        const conv: any = byId.get(r.conversationId)
+        return { ...r, conversation: conv ? { id: conv.id, kind: conv.kind, name: conv.name } : null, folder: conv?.folder ?? r.conversationId }
+      }),
+    })
+  })
+
+  router.get(`${base}/files/:fileId/text`, async (c) => {
+    const auth = await config.authorize(c)
+    if (auth instanceof Response) return auth
+    const { principal } = await fileScope(c, auth)
+    try {
+      const text = await readFileText(principal, auth.workspaceId, c.req.param('fileId'), {
+        offset: numberParam(c.req.query('offset')),
+        limit: numberParam(c.req.query('limit')),
+      })
+      return c.json(text)
+    } catch (err) {
+      return errorResponse(c, err)
+    }
+  })
+
+  router.get(`${base}/files/:fileId/content`, async (c) => {
+    const auth = await config.authorize(c)
+    if (auth instanceof Response) return auth
+    const { principal } = await fileScope(c, auth)
+    try {
+      const { attachment, conversation } = await loadVisibleFile(principal, auth.workspaceId, c.req.param('fileId'))
+      const [bytes, conversations] = await Promise.all([
+        loadConversationFileBytes(attachment.storageKey),
+        listFileConversations(principal, auth.workspaceId),
+      ])
+      const folder = conversations.find((conv: any) => conv.id === conversation.id)?.folder
+      return new Response(bytes as any, {
+        headers: {
+          'Content-Type': attachment.mimeType,
+          'Content-Length': String(bytes.byteLength),
+          'Content-Disposition': `attachment; filename*=UTF-8''${encodeURIComponent(attachment.name)}`,
+          'X-File-Name': encodeURIComponent(attachment.name),
+          'X-File-Folder': encodeURIComponent(folder ?? conversation.id),
+          'Cache-Control': 'private, no-store',
+        },
+      })
+    } catch (err) {
+      if (err instanceof ConversationError) return errorResponse(c, err)
+      return c.json({ error: { code: 'not_found', message: 'File not found' } }, 404)
+    }
+  })
+
   router.get(`${base}/:channel/messages`, async (c) => {
     const auth = await config.authorize(c)
     if (auth instanceof Response) return auth
@@ -1026,13 +1176,13 @@ export function agentChannelRoutes(routeConfig: AgentChannelRoutesConfig): Hono 
     const rows = threadRootId
       ? await db.conversationMessage.findMany({
           where: { conversationId: conversation.id, OR: [{ id: threadRootId }, { threadRootId }], deletedAt: null },
-          include: { authorUser: { select: { name: true, email: true } } },
+          include: AGENT_MESSAGE_INCLUDE,
           orderBy: { seq: 'asc' },
           take: limit,
         })
       : (await db.conversationMessage.findMany({
           where: { conversationId: conversation.id, threadRootId: null, deletedAt: null },
-          include: { authorUser: { select: { name: true, email: true } } },
+          include: AGENT_MESSAGE_INCLUDE,
           orderBy: { seq: 'desc' },
           take: limit,
         })).reverse()
@@ -1040,6 +1190,46 @@ export function agentChannelRoutes(routeConfig: AgentChannelRoutesConfig): Hono 
       channel: { id: conversation.id, kind: conversation.kind, name: conversation.name, topic: conversation.topic, lastMessageAt: conversation.lastMessageAt },
       messages: await renderForAgent(rows),
     })
+  })
+
+  router.get(`${base}/:channel/doc`, async (c) => {
+    const auth = await config.authorize(c)
+    if (auth instanceof Response) return auth
+    const projectId = await agentIdentity(auth, c.req.query('projectId'))
+    const conversation = await resolveAgentConversation(auth.workspaceId, c.req.param('channel'), projectId)
+    if (!conversation) return c.json({ error: { code: 'not_found', message: 'Channel not found or not visible to this agent' } }, 404)
+    if (await isolatedIn(conversation.id, projectId)) return c.json(ISOLATED_ERROR, 403)
+    try {
+      const doc = await getDocForAgent(conversation)
+      return c.json({ channel: { id: conversation.id, name: conversation.name }, doc, url: docUrl(conversation.id) })
+    } catch (err) {
+      return errorResponse(c, err)
+    }
+  })
+
+  router.put(`${base}/:channel/doc`, async (c) => {
+    const auth = await config.authorize(c)
+    if (auth instanceof Response) return auth
+    const body = await readJson(c)
+    const projectId = await agentIdentity(auth, body.projectId)
+    const limited = await rateLimited(c, `agent:${auth.workspaceId}:${projectId ?? 'ws'}`, CHAT_RATE_LIMITS.agentPost)
+    if (limited) return limited
+    const conversation = await resolveAgentConversation(auth.workspaceId, c.req.param('channel'), projectId)
+    if (!conversation) return c.json({ error: { code: 'not_found', message: 'Channel not found or not visible to this agent' } }, 404)
+    if (await isolatedIn(conversation.id, projectId)) return c.json(ISOLATED_ERROR, 403)
+    const mode = body.mode === 'append' || body.mode === 'patch_section' ? body.mode : 'replace'
+    try {
+      const doc = await updateDocAsAgent(conversation, projectId, {
+        mode,
+        content: body.content,
+        title: typeof body.title === 'string' ? body.title : undefined,
+        section: typeof body.section === 'string' ? body.section : undefined,
+        baseVersion: Number.isInteger(body.baseVersion) ? body.baseVersion : undefined,
+      })
+      return c.json({ doc, url: docUrl(conversation.id) })
+    } catch (err) {
+      return errorResponse(c, err)
+    }
   })
 
   router.post(`${base}/:channel/messages`, async (c) => {

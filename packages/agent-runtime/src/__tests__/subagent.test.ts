@@ -5,6 +5,7 @@ import { describe, it, expect, beforeEach, afterEach, mock } from 'bun:test'
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
+import { clearDynamicModels, registerDynamicModels, rememberProviderHint } from '@shogo/model-catalog'
 
 // --- Module mocks (set up BEFORE importing the SUT) ------------------------
 
@@ -77,10 +78,10 @@ describe('getBuiltinSubagentConfig', () => {
     expect(getBuiltinSubagentConfig('mystery', {} as any, [])).toBeNull()
   })
 
-  it('explore is haiku + 5 turns + readonly tool set', () => {
+  it('explore is auto + 100 turns + readonly tool set', () => {
     const cfg = getBuiltinSubagentConfig('explore', {} as any, [])!
-    expect(cfg.model).toBe('claude-haiku-4-5')
-    expect(cfg.maxTurns).toBe(5)
+    expect(cfg.model).toBe('auto')
+    expect(cfg.maxTurns).toBe(100)
     expect(cfg.toolNames).toContain('read_file')
     expect(cfg.disallowedTools).toContain('task')
   })
@@ -381,6 +382,36 @@ describe('resolveSubagentModel', () => {
     expect(r.experimentVariant).toBe('B')
     expect(r.model).toBe('sonnet')
   })
+
+  describe('with DB-defined (UUID) models', () => {
+    const OPUS_UUID = '8947628a-1415-4b3a-90c3-63f8a85c16b7'
+    afterEach(() => clearDynamicModels())
+
+    it('resolves a provider-less override for a registered Anthropic UUID to anthropic', async () => {
+      registerDynamicModels([{ id: OPUS_UUID, provider: 'anthropic', apiModel: 'claude-opus-5-5' }])
+      fetchImpl = async () => new Response(JSON.stringify({
+        override: { model: OPUS_UUID, provider: null, source: 'workspace' },
+        experiment: null,
+      }), { status: 200 })
+      const r = await resolveSubagentModel('explore', 'w1', null, undefined, undefined, 'haiku', 'custom')
+      expect(r.provider).toBe('anthropic')
+    })
+
+    it('resolves an experiment UUID learned from a chat provider hint to anthropic', async () => {
+      rememberProviderHint(OPUS_UUID, 'anthropic')
+      fetchImpl = async () => new Response(JSON.stringify({
+        override: null,
+        experiment: { experimentId: 'e1', model: OPUS_UUID, variant: 'A' },
+      }), { status: 200 })
+      const r = await resolveSubagentModel('explore', 'w1', null, undefined, undefined, 'haiku', 'custom', 'bkt')
+      expect(r.provider).toBe('anthropic')
+    })
+
+    it('still resolves an unregistered UUID to custom', async () => {
+      const r = await resolveSubagentModel('explore', null, null, OPUS_UUID, undefined, 'haiku', 'anthropic')
+      expect(r.provider).toBe('custom')
+    })
+  })
 })
 
 // --- runSubagent — core paths ---------------------------------------------
@@ -431,6 +462,40 @@ describe('runSubagent — success paths', () => {
     expect(result.iterations).toBe(2)
     expect(result.responseEmpty).toBe(false)
     expect(events).toEqual(['start', 'model', 'end'])
+  })
+
+  it('routes explore through auto even when the parent is not in auto mode', async () => {
+    let observed: any = {}
+    runAgentLoopImpl = async (opts: any) => {
+      observed = opts
+      return { text: 'ok', toolCalls: [], iterations: 1, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, newMessages: [], effectiveModelId: opts.model }
+    }
+    const writes: any[] = []
+    const ctx = makeCtx({
+      uiWriter: { write: (e: any) => writes.push(e) },
+      autoTierOverride: {
+        economy: { id: 'tier-economy' },
+        standard: { id: 'tier-standard' },
+        premium: { id: 'tier-premium', provider: 'anthropic' },
+      },
+    })
+    const cfg = getBuiltinSubagentConfig('explore', ctx, [])!
+    await runSubagent(cfg, 'find where auth is handled', ctx, [])
+    expect(['tier-economy', 'tier-standard', 'tier-premium']).toContain(observed.model)
+    expect(observed.maxIterations).toBe(100)
+    expect(writes.some(e => e.type === 'data-routing-decision')).toBe(true)
+  })
+
+  it('an explicit model_tier still wins over explore auto routing', async () => {
+    let observed: any = {}
+    runAgentLoopImpl = async (opts: any) => {
+      observed = opts
+      return { text: 'ok', toolCalls: [], iterations: 1, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, newMessages: [], effectiveModelId: opts.model }
+    }
+    const cfg = { ...getBuiltinSubagentConfig('explore', makeCtx(), [])!, modelTier: 'capable' as const }
+    await runSubagent(cfg, 'p', makeCtx(), [])
+    expect(observed.model).not.toBe('auto')
+    expect(observed.model).toBe(resolveModelTier('capable', 'parent-model'))
   })
 
   it('reuses the parent provider hint when inheriting a DB-defined (UUID) model', async () => {

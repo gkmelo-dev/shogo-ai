@@ -54,6 +54,7 @@ import { resolveFriendlyMentions } from './conversation-directory'
 import { expirePendingApprovals, postApprovalCard, type ApprovalRequest } from './conversation-approvals'
 import type { AgentWork, StatusCard } from './conversation-message-kind'
 import { agentWorkOf } from './agent-work-log'
+import { docContextFor } from './conversation-doc.service'
 import { parseMuteCommand, pickResponder, type RelevanceCandidate } from './conversation-agent-relevance'
 
 const db = prisma as any
@@ -471,8 +472,12 @@ export async function renderTranscript(workspaceId: string, history: any[], mark
     m.authorType === 'user' ? (m.authorUser?.name || m.authorUser?.email || m.blocks?.externalAuthor?.name || 'Someone')
       : m.authorType === 'agent' ? `${m.authorAgentRef?.name ?? 'Agent'} (agent)`
         : m.authorType === 'bot' ? 'Bot' : 'System'
+  const files = (m: any) => {
+    const list = (m.attachments ?? []).map((a: any) => `${a.name} (file id ${a.id})`)
+    return list.length ? ` [attached: ${list.join(', ')}]` : ''
+  }
   return history
-    .map((m) => `${author(m)}${m.id === markMessageId ? ' [mentions you]' : ''}: ${renderMentionsAsText(m.text, names)}`)
+    .map((m) => `${author(m)}${m.id === markMessageId ? ' [mentions you]' : ''}: ${renderMentionsAsText(m.text, names)}${files(m)}`)
     .join('\n')
 }
 
@@ -584,6 +589,11 @@ async function buildIsolatedPrompt(args: {
   return lines.join('\n')
 }
 
+const TRANSCRIPT_INCLUDE = {
+  authorUser: { select: { name: true, email: true } },
+  attachments: { select: { id: true, name: true } },
+}
+
 async function buildPrompt(args: {
   conversation: any
   trigger: any
@@ -604,17 +614,18 @@ async function buildPrompt(args: {
       where: { conversationId: conversation.id, OR: [{ id: threadRootId }, { threadRootId }], deletedAt: null },
       orderBy: { seq: 'desc' },
       take: CONTEXT_MESSAGES,
-      include: { authorUser: { select: { name: true, email: true } } },
+      include: TRANSCRIPT_INCLUDE,
     })
   } else {
     history = await db.conversationMessage.findMany({
       where: { conversationId: conversation.id, threadRootId: null, deletedAt: null, seq: { lte: trigger.seq } },
       orderBy: { seq: 'desc' },
       take: reusedSession ? 6 : CONTEXT_MESSAGES,
-      include: { authorUser: { select: { name: true, email: true } } },
+      include: TRANSCRIPT_INCLUDE,
     })
   }
-  history = history.reverse().filter((m) => m.text?.trim() && !(m.authorType === 'agent' && m.agentStatus === 'running'))
+  history = history.reverse().filter((m) =>
+    (m.text?.trim() || m.attachments?.length) && !(m.authorType === 'agent' && m.agentStatus === 'running'))
 
   if (reusedSession) {
     const lastAgentIdx = history.map((m) => m.authorType).lastIndexOf('agent')
@@ -635,10 +646,35 @@ async function buildPrompt(args: {
     'Reply to the latest message addressed to you. Write concise Markdown suitable for a chat message.',
     'Do real work with your tools when asked. The team sees only your final reply here; your full session is linked from it.',
     ...chainContext(conversation, trigger, threadRootId, chain),
+    ...(history.some((m) => m.attachments?.length)
+      ? ['Files attached below can be read or searched with fetch_chat_files (pass the file id); download one only when you need the raw file.']
+      : []),
+    ...(await channelDocContext(conversation)),
     '',
     transcript,
   ]
   return lines.join('\n')
+}
+
+/** Characters of the channel doc included in an agent's prompt. */
+const DOC_CONTEXT_CHARS = 8000
+
+/** The channel doc as shared context: the channel's plans, decisions and checklists. */
+async function channelDocContext(conversation: any): Promise<string[]> {
+  if (conversation.kind !== 'public' && conversation.kind !== 'private') return []
+  const doc = await docContextFor(conversation.id).catch(() => null)
+  if (!doc) return []
+  const truncated = doc.content.length > DOC_CONTEXT_CHARS
+  const body = truncated ? `${doc.content.slice(0, DOC_CONTEXT_CHARS)}\n…(truncated; read the rest with team_chat_doc_read)` : doc.content
+  return [
+    '',
+    `Channel doc${doc.title ? ` "${doc.title}"` : ''} (version ${doc.version}): the channel's shared document. Treat it as the ` +
+      'source of truth for plans, decisions and checklists. Update it with team_chat_doc_update when you settle ' +
+      'something the team should keep (prefer mode "patch_section" or "append" over rewriting it).',
+    '<channel_doc>',
+    body,
+    '</channel_doc>',
+  ]
 }
 
 function chainContext(conversation: any, trigger: any, threadRootId: string | null, chain: AgentChain): string[] {

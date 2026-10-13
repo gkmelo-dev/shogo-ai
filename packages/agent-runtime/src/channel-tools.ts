@@ -12,18 +12,25 @@ import type { AgentTool } from '@mariozechner/pi-agent-core'
 import type { ToolContext } from './gateway-tools'
 import { textResult } from './gateway-tools'
 import { resolveRuntimeIdentity } from './workspace-runtime-mode'
+import { downloadedPath, pruneChatFiles, saveChatFile } from './chat-files'
 import {
   getMemberActivity,
   getTeamDirectory,
   listAgentChannels,
   postAgentChannelMessage,
   readAgentChannel,
+  readAgentChannelDoc,
+  updateAgentChannelDoc,
   updateAgentChannelMessage,
   searchAgentChannels,
   sendAgentDirectMessage,
   addAgentChannelMembers,
   readAgentQuestionSecret,
+  listAgentChatFiles,
+  readAgentChatFileText,
+  searchAgentChatFiles,
   type AgentChannelIdentity,
+  type AgentDocMode,
   type AgentMessageKind,
   type AgentStatusCard,
 } from './internal-api'
@@ -101,6 +108,9 @@ export const CHANNEL_TOOL_NAMES = [
   'team_chat_search',
   'team_chat_dm',
   'team_chat_add_member',
+  'fetch_chat_files',
+  'team_chat_doc_read',
+  'team_chat_doc_update',
   'team_directory',
   'member_activity',
   'team_chat_question_secret',
@@ -124,6 +134,8 @@ export const TEAM_CHAT_GUIDE = [
   '- Use `team_chat_dm` to escalate something urgent to one person instead of tagging a whole channel.',
   '- If someone asks you to message a teammate for them, use `team_chat_dm` with `for_requester: true`; then reply to the requester with the returned link.',
   '- Use `team_chat_add_member` to put someone in a channel, e.g. when welcoming a new teammate.',
+  '- Files shared in your channels and DMs: use `fetch_chat_files`. Search them by meaning with `query`, read a document\'s text with `file_id`, and pass `download: true` only when you need the raw file on disk (images, spreadsheets to run code on, archives); it is saved under `chat-files/`.',
+  '- Each channel can have a doc: a shared markdown page for its plans, decisions and checklists. Read it with `team_chat_doc_read`; record settled decisions and long content there with `team_chat_doc_update` (prefer `patch_section` or `append` over rewriting it), then mention the change briefly in your reply.',
   '- Asked what a teammate worked on ("what did Sam do today?")? Use `member_activity`. Only owners and admins may ask; if the API refuses, say so plainly and do not guess from channel history. Answer only the person who asked, in the conversation where they asked. Never post someone\'s activity summary into a channel.',
   '- Respect Do Not Disturb: when someone is away, leave the question in the thread rather than pinging them repeatedly.',
   '- Starting a new piece of work? Post a top-level message with `team_chat_post` (pass `run_id` if you track one); you own that thread and unaddressed replies there come to you.',
@@ -369,6 +381,75 @@ export function createAddChannelMemberTool(ctx: ToolContext): AgentTool {
   }
 }
 
+export function createChannelDocReadTool(ctx: ToolContext): AgentTool {
+  return {
+    name: 'team_chat_doc_read',
+    label: 'Read Channel Doc',
+    description:
+      "Read a team chat channel's doc: its shared markdown page of plans, decisions and checklists. Returns the " +
+      'title, content and version (pass version as base_version when you replace the whole doc), or doc: null when ' +
+      'the channel has none yet.',
+    parameters: Type.Object({
+      channel: Type.String({ description: 'Channel name (without #) or conversation id.' }),
+    }),
+    execute: async (_id, params) => {
+      const workspaceId = workspaceIdOf(ctx)
+      if (!workspaceId) return noWorkspace()
+      const input = params as { channel: string }
+      const result = await readAgentChannelDoc(workspaceId, input.channel.replace(/^#/, ''), channelIdentity(ctx))
+      return result.ok ? textResult({ ok: true, ...result.data }) : apiError(result, 'Could not read the channel doc')
+    },
+  }
+}
+
+export function createChannelDocUpdateTool(ctx: ToolContext): AgentTool {
+  return {
+    name: 'team_chat_doc_update',
+    label: 'Update Channel Doc',
+    description:
+      "Change a team chat channel's doc (creating it if needed), attributed to you. Modes: \"patch_section\" " +
+      'replaces the body under one heading (or adds that section), "append" adds to the end, and "replace" rewrites ' +
+      'the whole doc and needs base_version from team_chat_doc_read. Prefer patch_section or append so you do not ' +
+      'overwrite teammates. Everyone in the channel sees the change live and can restore an earlier version. ' +
+      'Fails with code doc_conflict if someone saved since you read it: read again and retry.',
+    parameters: Type.Object({
+      channel: Type.String({ description: 'Channel name (without #) or conversation id.' }),
+      mode: Type.Union([Type.Literal('patch_section'), Type.Literal('append'), Type.Literal('replace')], {
+        description: 'How to apply content.',
+      }),
+      content: Type.String({ description: 'Markdown. For patch_section, the new body of the section (without its heading).' }),
+      section: Type.Optional(Type.String({ description: 'Heading text of the section to replace (patch_section only), e.g. "Decisions".' })),
+      title: Type.Optional(Type.String({ description: 'New doc title. Omit to keep the current one.' })),
+      base_version: Type.Optional(Type.Number({ description: 'Version you read; required for replace.' })),
+    }),
+    execute: async (_id, params) => {
+      const workspaceId = workspaceIdOf(ctx)
+      if (!workspaceId) return noWorkspace()
+      const input = params as { channel: string; mode: AgentDocMode; content: string; section?: string; title?: string; base_version?: number }
+      if (typeof input.content !== 'string') return textResult({ error: 'content is required', code: 'invalid_input' })
+      if (input.mode === 'patch_section' && !input.section?.trim()) {
+        return textResult({ error: 'section is required for patch_section', code: 'invalid_input' })
+      }
+      if (input.mode === 'replace' && typeof input.base_version !== 'number') {
+        return textResult({ error: 'base_version is required for replace; read the doc first', code: 'invalid_input' })
+      }
+      const result = await updateAgentChannelDoc(workspaceId, input.channel.replace(/^#/, ''), {
+        identity: channelIdentity(ctx),
+        mode: input.mode,
+        content: input.content,
+        section: input.section,
+        title: input.title,
+        baseVersion: input.base_version,
+      })
+      if (result.ok && result.data) {
+        const { doc, url } = result.data
+        return textResult({ ok: true, version: doc?.version, title: doc?.title, url })
+      }
+      return apiError(result, 'Could not update the channel doc')
+    },
+  }
+}
+
 export function createTeamDirectoryTool(ctx: ToolContext): AgentTool {
   return {
     name: 'team_directory',
@@ -430,6 +511,101 @@ export function createMemberActivityTool(ctx: ToolContext): AgentTool {
   }
 }
 
+export function createFetchChatFilesTool(ctx: ToolContext): AgentTool {
+  return {
+    name: 'fetch_chat_files',
+    label: 'Chat Files',
+    description:
+      'Find, read and download files shared in team chat: every channel and DM you can read. ' +
+      'With no arguments, lists recent files and the conversations that have them; narrow with conversation or kind. ' +
+      'With query, searches file contents by meaning and returns snippets plus char_start to read from. ' +
+      'With file_id, returns the file\'s extracted text a page at a time (offset, limit; follow next_offset). ' +
+      'With file_id and download: true, saves the raw file under chat-files/ and returns its path, for images, ' +
+      'spreadsheets, archives or anything your other tools need on disk. Read text instead of downloading when you can.',
+    parameters: Type.Object({
+      conversation: Type.Optional(Type.String({ description: 'Limit to one conversation: a channel name, @person (email or user id) for your DM with them, or a conversation id.' })),
+      query: Type.Optional(Type.String({ description: 'What to look for inside files, in plain words.' })),
+      file_id: Type.Optional(Type.String({ description: 'A file id from a listing, a search result, or a transcript ("file id ...").' })),
+      offset: Type.Optional(Type.Number({ description: 'Character offset to read from (file_id only). Use char_start from a search hit or next_offset from the last page.' })),
+      limit: Type.Optional(Type.Number({ description: 'Characters to read (default 20000, max 60000), or how many files to list or search results to return.' })),
+      download: Type.Optional(Type.Boolean({ description: 'With file_id: save the raw file to disk and return its path.' })),
+      kind: Type.Optional(Type.Union([Type.Literal('image'), Type.Literal('document'), Type.Literal('other')], { description: 'Listing only: filter by file type.' })),
+      cursor: Type.Optional(Type.String({ description: 'Listing only: next_cursor from the previous page.' })),
+    }),
+    execute: async (_id, params) => {
+      const workspaceId = workspaceIdOf(ctx)
+      if (!workspaceId) return noWorkspace()
+      const input = params as {
+        conversation?: string; query?: string; file_id?: string; offset?: number; limit?: number
+        download?: boolean; kind?: 'image' | 'document' | 'other'; cursor?: string
+      }
+      const identity = channelIdentity(ctx)
+      const conversation = input.conversation?.trim() || undefined
+      const fileId = input.file_id?.trim()
+
+      if (fileId && input.download) {
+        try {
+          const saved = await saveChatFile(ctx.workspaceDir, workspaceId, identity, fileId)
+          return textResult({ ok: true, file_id: fileId, path: saved.path, size: saved.size, already_downloaded: saved.reused })
+        } catch (err: any) {
+          return textResult({ error: err?.message ?? 'Could not download the file', code: err?.code, status: err?.status })
+        }
+      }
+
+      if (fileId) {
+        const result = await readAgentChatFileText(workspaceId, identity, fileId, { offset: input.offset, limit: input.limit })
+        if (!result.ok || !result.data) return apiError(result, 'Could not read the file')
+        const file = result.data
+        const onDisk = downloadedPath(ctx.workspaceDir, fileId)
+        if (file.text === null) {
+          return textResult({
+            ok: true, file_id: fileId, name: file.name, mime_type: file.mimeType, text: null,
+            ...(onDisk ? { path: onDisk } : {}),
+            hint: onDisk ? 'No extractable text; the raw file is at path.' : 'No extractable text. Call again with download: true to get the raw file.',
+          })
+        }
+        return textResult({
+          ok: true, file_id: fileId, name: file.name, mime_type: file.mimeType,
+          offset: file.offset, total_chars: file.totalChars, next_offset: file.nextOffset,
+          ...(onDisk ? { path: onDisk } : {}),
+          text: file.text,
+        })
+      }
+
+      if (input.query?.trim()) {
+        const result = await searchAgentChatFiles(workspaceId, identity, input.query.trim(), { conversation, limit: input.limit })
+        if (!result.ok || !result.data) return apiError(result, 'Could not search chat files')
+        return textResult({
+          ok: true,
+          semantic: result.data.semantic,
+          results: result.data.results.map((r) => ({
+            file_id: r.fileId, name: r.name, mime_type: r.mimeType, size: r.size,
+            conversation: r.conversation?.name ?? null, conversation_id: r.conversationId, message_id: r.messageId,
+            match: r.match, snippet: r.snippet, char_start: r.charStart,
+            path: downloadedPath(ctx.workspaceDir, r.fileId),
+          })),
+        })
+      }
+
+      const result = await listAgentChatFiles(workspaceId, identity, { conversation, kind: input.kind, cursor: input.cursor, limit: input.limit })
+      if (!result.ok || !result.data) return apiError(result, 'Could not list chat files')
+      const { conversations, files, nextCursor } = result.data
+      // The full list names every conversation this agent can still read.
+      pruneChatFiles(ctx.workspaceDir, conversations.map((c) => c.folder))
+      return textResult({
+        ok: true,
+        conversations: conversation ? undefined : conversations.map((c) => ({ id: c.id, kind: c.kind, name: c.name, file_count: c.fileCount, last_file_at: c.lastFileAt })),
+        files: files.map((f) => ({
+          file_id: f.id, name: f.name, kind: f.kind, mime_type: f.mimeType, size: f.size,
+          conversation_id: f.conversationId, message_id: f.messageId, uploaded_by: f.uploadedBy, created_at: f.createdAt,
+          has_text: f.hasText, path: downloadedPath(ctx.workspaceDir, f.id),
+        })),
+        next_cursor: nextCursor,
+      })
+    },
+  }
+}
+
 export function createQuestionSecretTool(ctx: ToolContext): AgentTool {
   return {
     name: 'team_chat_question_secret',
@@ -461,6 +637,9 @@ export function createChannelTools(ctx: ToolContext): AgentTool[] {
     createChannelSearchTool(ctx),
     createDmUserTool(ctx),
     createAddChannelMemberTool(ctx),
+    createFetchChatFilesTool(ctx),
+    createChannelDocReadTool(ctx),
+    createChannelDocUpdateTool(ctx),
     createTeamDirectoryTool(ctx),
     createMemberActivityTool(ctx),
     createQuestionSecretTool(ctx),
