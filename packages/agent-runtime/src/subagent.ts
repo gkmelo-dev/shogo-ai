@@ -397,8 +397,8 @@ export function getBuiltinSubagentConfig(
           ? ['read_file', 'exec', 'search', 'web', 'impact_radius']
           : ['read_file', 'exec', 'web', 'impact_radius'],
         disallowedTools: ['task', 'skill'],
-        model: 'claude-haiku-4-5',
-        maxTurns: 5,
+        model: AUTO_MODEL_ID,
+        maxTurns: 100,
       }
     case 'general-purpose':
       return {
@@ -594,7 +594,7 @@ import {
   type ModelRouterOptions,
   type SpawnClassificationInput,
 } from './model-router'
-import { inferProviderFromModel } from '@shogo/model-catalog'
+import { AUTO_MODEL_ID, inferProviderFromModel, isAutoModel } from '@shogo/model-catalog'
 import { createStableLoopTransform } from './stable-compaction'
 import { SUBAGENT_REPORT_INSTRUCTION } from './subagent-prompts'
 
@@ -625,7 +625,7 @@ export function resolveModelTier(tier: ModelTierName | undefined, parentModel: s
 //      the runtime sub-process has no direct DB access.
 //
 //   4. Built-in/custom default. Built-ins use `getBuiltinSubagentConfig()`
-//      (e.g. explore→haiku); custom agents fall back to their registered
+//      (e.g. explore→auto); custom agents fall back to their registered
 //      default tier or the parent model.
 //
 // In CLI / desktop mode there's no API server reachable, so the HTTP fetch
@@ -1025,7 +1025,10 @@ export async function runSubagent(
   let routingDecision: RoutingDecision | undefined
   let routerOptions: ModelRouterOptions | undefined
 
-  const useAutoRouting = parentCtx.autoRouting && !config.modelTier && !config.model
+  const overrideWon = !!resolvedOverride && resolvedOverride.source !== 'builtin'
+  const useAutoRouting =
+    (parentCtx.autoRouting && !config.modelTier && !config.model) ||
+    (isAutoModel(parentModel) && !overrideWon && !hasExplicitTier)
   const autoProviderHints = autoTierProviderHints(parentCtx.autoTierOverride)
   if (useAutoRouting) {
     const autoTiers = buildAutoTierMap(autoTierIds(parentCtx.autoTierOverride))
