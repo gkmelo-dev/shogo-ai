@@ -650,6 +650,7 @@ export const AppSidebar = observer(function AppSidebar({
     : null;
   const {
     parent: pooledWorkspaceParent,
+    parentOptions: pooledParentOptions,
     createPooledWorkspace,
   } = usePooledWorkspaceCreation({
     workspaces: allWorkspaces,
@@ -716,8 +717,8 @@ export const AppSidebar = observer(function AppSidebar({
   ]);
 
   const handleCreateWorkspaceSubmit = useCallback(
-    async (name: string) => {
-      if (pooledWorkspaceParent) return createPooledWorkspace(name);
+    async (name: string, parentId?: string) => {
+      if (pooledWorkspaceParent) return createPooledWorkspace(name, parentId);
       if (!user?.id) return;
       try {
         const newWorkspace = await actions.createWorkspace(
@@ -1576,7 +1577,8 @@ export const AppSidebar = observer(function AppSidebar({
         visible={createWorkspaceOpen}
         onClose={() => setCreateWorkspaceOpen(false)}
         onSubmit={handleCreateWorkspaceSubmit}
-        parentName={pooledWorkspaceParent?.name}
+        parent={pooledWorkspaceParent}
+        parentOptions={pooledParentOptions}
       />
       <CommandPalette
         visible={commandPaletteOpen}
