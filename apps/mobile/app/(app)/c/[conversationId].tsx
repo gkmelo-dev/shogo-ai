@@ -6,13 +6,16 @@
  * narrow ones. `?msg=<id>` scrolls to and highlights one message (in the
  * thread when `thread` is set too). `?project=<id>` shows an agent's project
  * (canvas, files, plans, chat) beside the timeline on wide screens, where it
- * replaces the thread pane.
+ * replaces the thread pane. `?files=1` lists the conversation's files: beside
+ * the timeline on wide screens (replacing the other panes), in its place on
+ * narrow ones.
  */
 import { useCallback, useEffect, useState } from 'react'
 import { ActivityIndicator, AppState, KeyboardAvoidingView, Platform, Pressable, Text, View, useWindowDimensions } from 'react-native'
 import { useFocusEffect, useLocalSearchParams, useRouter } from 'expo-router'
+import { useSafeAreaInsets } from 'react-native-safe-area-context'
 import { useActiveWorkspace } from '../../../hooks/useActiveWorkspace'
-import { conversationTitle, teamChatApi, type ChatMessage, type ConversationDetail } from '../../../lib/team-chat-api'
+import { conversationTitle, teamChatApi, type ChatMessage, type ConversationDetail, type ConversationFile } from '../../../lib/team-chat-api'
 import { sessionRoute } from '../../../lib/team-chat-nav'
 import { useTeamChatEvents } from '../../../lib/team-chat-connection'
 import {
@@ -30,6 +33,7 @@ import { ConversationHeader } from '../../../components/team-chat/ConversationHe
 import { HuddleBanner } from '../../../components/team-chat/Huddle'
 import { TimelinePane } from '../../../components/team-chat/TimelinePane'
 import { ProjectSidePane } from '../../../components/team-chat/ProjectSidePane'
+import { FilesPane } from '../../../components/team-chat/FilesPane'
 import { SidePaneResizeHandle, useSidePaneWidth } from '../../../components/team-chat/SidePaneResizer'
 import { usePhoneChromeOverlay } from '../../../components/layout/PhoneChromeOverlay'
 
@@ -46,11 +50,12 @@ function first(value: string | string[] | undefined): string | undefined {
 }
 
 export default function ConversationScreen() {
-  const params = useLocalSearchParams<{ conversationId: string; thread?: string; msg?: string; project?: string }>()
+  const params = useLocalSearchParams<{ conversationId: string; thread?: string; msg?: string; project?: string; files?: string }>()
   const conversationId = first(params.conversationId) ?? null
   const threadRootId = first(params.thread) ?? null
   const linkedMessageId = first(params.msg) ?? null
   const projectPaneId = first(params.project) ?? null
+  const filesOpen = first(params.files) === '1'
   const router = useRouter()
   const workspace = useActiveWorkspace()
   const me = useMyUserId()
@@ -61,6 +66,7 @@ export default function ConversationScreen() {
   const [foreground, setForeground] = useState(AppState.currentState === 'active')
   const [headerHeight, setHeaderHeight] = useState(0)
   const chrome = usePhoneChromeOverlay()
+  const insets = useSafeAreaInsets()
 
   const workspaceId = conversation?.workspaceId ?? workspace?.id ?? null
   const mentionables = useMentionables(workspaceId)
@@ -132,16 +138,26 @@ export default function ConversationScreen() {
 
   const openThread = useCallback(
     (message: ChatMessage) => {
-      router.setParams({ thread: message.threadRootId ?? message.id, project: undefined } as any)
+      router.setParams({ thread: message.threadRootId ?? message.id, project: undefined, files: undefined } as any)
     },
     [router],
   )
   const closeThread = useCallback(() => router.setParams({ thread: undefined } as any), [router])
   const openProjectPane = useCallback(
-    (projectId: string) => router.setParams({ project: projectId, thread: undefined } as any),
+    (projectId: string) => router.setParams({ project: projectId, thread: undefined, files: undefined } as any),
     [router],
   )
   const closeProjectPane = useCallback(() => router.setParams({ project: undefined } as any), [router])
+  const openFiles = useCallback(
+    () => router.setParams({ files: '1', thread: undefined, project: undefined } as any),
+    [router],
+  )
+  const closeFiles = useCallback(() => router.setParams({ files: undefined } as any), [router])
+  const showFileInChat = useCallback(
+    (file: ConversationFile) =>
+      router.setParams({ files: undefined, project: undefined, thread: file.threadRootId ?? undefined, msg: file.messageId } as any),
+    [router],
+  )
   const openSession = useCallback(
     (message: ChatMessage) => {
       // The workspace agent has no project; its session opens in the workspace agent chat.
@@ -194,9 +210,9 @@ export default function ConversationScreen() {
   }
 
   const visible = focused && foreground
-  const showProjectPane = sidePane && !!projectPaneId
-  const showThreadPane = !!threadRootId && !showProjectPane
-  const showMain = sidePane || !threadRootId
+  const showProjectPane = sidePane && !!projectPaneId && !filesOpen
+  const showThreadPane = !!threadRootId && !showProjectPane && !filesOpen
+  const showMain = sidePane || (!threadRootId && !filesOpen)
   const projectPaneName =
     (projectPaneId &&
       (conversation.members.find((m) => m.type === 'agent' && m.projectId === projectPaneId)?.name ??
@@ -218,6 +234,7 @@ export default function ConversationScreen() {
       floating={floating}
       onBack={goBack}
       onOpenProjectPane={openProjectPaneCb}
+      onOpenFiles={openFiles}
       onLayout={floating ? (e) => setHeaderHeight(Math.round(e.nativeEvent.layout.height)) : undefined}
     />
   )
@@ -261,7 +278,7 @@ export default function ConversationScreen() {
               conversation={conversation}
               me={me}
               mentionables={mentionables}
-              visible={visible && !(threadRootId && !sidePane)}
+              visible={visible && !((threadRootId || filesOpen) && !sidePane)}
               highlightMessageId={threadRootId ? null : linkedMessageId}
               onOpenThread={openThread}
               onOpenSession={openSession}
@@ -313,6 +330,31 @@ export default function ConversationScreen() {
               onReset={projectPane.reset}
             />
             <ProjectSidePane key={projectPaneId} projectId={projectPaneId} workspaceId={workspaceId} name={projectPaneName} onClose={closeProjectPane} />
+          </View>
+        )}
+        {filesOpen && (
+          <View
+            className={sidePane ? 'relative shrink-0 border-l border-border' : 'flex-1'}
+            style={sidePane ? { width: threadPane.width } : { paddingTop: floating ? insets.top : 0 }}
+          >
+            {sidePane && (
+              <SidePaneResizeHandle
+                width={threadPane.width}
+                minWidth={THREAD_PANE_MIN}
+                maxWidth={maxPaneWidth}
+                onResize={threadPane.setWidth}
+                onResizeEnd={threadPane.commit}
+                onReset={threadPane.reset}
+              />
+            )}
+            <FilesPane
+              key={conversation.id}
+              workspaceId={workspaceId}
+              conversationId={conversation.id}
+              title={huddleLabel}
+              onClose={closeFiles}
+              onShowInChat={showFileInChat}
+            />
           </View>
         )}
       </View>
