@@ -101,7 +101,7 @@ describe('createReadFileTool', () => {
     const ctx = makeCtx({ fileStateCache: new FileStateCache(TEST_DIR) })
     const r = await run(ctx, 'read_file', { path: 'wide.txt' })
     expect(r.details.truncated).toBe(true)
-    expect(r.details.content.length).toBeLessThanOrEqual(62_000)
+    expect(r.details.content.length).toBeLessThanOrEqual(60_000)
     expect(r.details.endLine).toBeLessThan(100)
   })
 
@@ -110,7 +110,7 @@ describe('createReadFileTool', () => {
     const ctx = makeCtx({ fileStateCache: new FileStateCache(TEST_DIR) })
     const r = await run(ctx, 'read_file', { path: 'minified.js' })
     expect(r.details.truncated).toBe(true)
-    expect(r.details.content.length).toBe(60_002)
+    expect(r.details.content.length).toBe(60_000)
   })
 
   test('non-existent file returns error message', async () => {

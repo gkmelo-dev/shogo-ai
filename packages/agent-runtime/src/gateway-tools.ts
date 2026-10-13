@@ -2010,11 +2010,12 @@ function createReadFileTool(ctx: ToolContext): AgentTool {
         const kept: string[] = []
         let chars = 0
         for (const line of lines) {
-          if (kept.length >= MAX_FULL_READ_LINES || chars + line.length + 1 > MAX_FULL_READ_CHARS) break
-          kept.push(`${kept.length + 1}|${line}`)
-          chars += line.length + 1
+          const numbered = `${kept.length + 1}|${line}`
+          if (kept.length >= MAX_FULL_READ_LINES || chars + numbered.length + 1 > MAX_FULL_READ_CHARS) break
+          kept.push(numbered)
+          chars += numbered.length + 1
         }
-        if (kept.length === 0) kept.push(`1|${lines[0].slice(0, MAX_FULL_READ_CHARS)}`)
+        if (kept.length === 0) kept.push(`1|${lines[0].slice(0, MAX_FULL_READ_CHARS - 2)}`)
         ctx.fileStateCache?.recordRead(filePath, mtime, totalLineCount, { offset: 1, limit: kept.length }, undefined)
         return textResult({
           content: kept.join('\n'),
