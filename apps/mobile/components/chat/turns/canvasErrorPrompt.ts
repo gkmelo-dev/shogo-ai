@@ -148,9 +148,10 @@ function linesOf(body: string | null): string[] {
 export function parseCanvasErrorDebugPrompt(
   text: string,
 ): CanvasErrorPrompt | null {
-  const lines = text.trim().split(/\r?\n/)
-  const header = lines[0]?.match(HEADER_PATTERN)
+  const trimmed = text.trim()
+  const header = trimmed.match(HEADER_PATTERN)
   if (!header) return null
+  const lines = trimmed.split(/\r?\n/)
   const error = sectionBody(lines, (line) => line === "**Error**")
   if (error == null) return null
   const route = header[2]
