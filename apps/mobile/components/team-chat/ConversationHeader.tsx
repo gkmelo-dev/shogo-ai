@@ -4,7 +4,7 @@ import { useRef, useState } from 'react'
 import { ActivityIndicator, Alert, Modal, Platform, Pressable, ScrollView, Text, TextInput, View, type LayoutChangeEvent } from 'react-native'
 import { useSafeAreaInsets } from 'react-native-safe-area-context'
 import { useRouter } from 'expo-router'
-import { Archive, Bell, BellOff, Bot, Check, ChevronLeft, FolderOpen, Hash, Lock, LogOut, MoreHorizontal, Pencil, PanelRight, Paperclip, Pin, Radio, Sparkles, Star, UserCircle, UserPlus, Users, X } from 'lucide-react-native'
+import { Archive, Bell, BellOff, Bot, Check, ChevronLeft, FileText, FolderOpen, Hash, Lock, LogOut, MoreHorizontal, Paperclip, Pencil, PanelRight, Pin, Radio, Sparkles, Star, UserCircle, UserPlus, Users, X } from 'lucide-react-native'
 import { cn } from '@shogo/shared-ui/primitives'
 import { LiquidGlassBackdrop } from '../ui/LiquidGlassBackdrop'
 import { CHROME_SIZE, GlassButton, GlassChip } from './FloatingChrome'
@@ -41,6 +41,8 @@ export interface ConversationHeaderProps {
   /** Show the agent's project beside the conversation. Only passed on wide screens. */
   onOpenProjectPane?: (projectId: string, name: string) => void
   onOpenFiles?: () => void
+  /** Open the channel doc. Passed for channels that support one. */
+  onOpenDoc?: () => void
   onLayout?: (event: LayoutChangeEvent) => void
 }
 
@@ -54,7 +56,7 @@ function confirm(title: string, message: string): Promise<boolean> {
   )
 }
 
-export function ConversationHeader({ conversation, mentionables, me, onChanged, onLeft, floating, onBack, onOpenProjectPane, onOpenFiles, onLayout }: ConversationHeaderProps) {
+export function ConversationHeader({ conversation, mentionables, me, onChanged, onLeft, floating, onBack, onOpenProjectPane, onOpenFiles, onOpenDoc, onLayout }: ConversationHeaderProps) {
   const insets = useSafeAreaInsets()
   const router = useRouter()
   const [detailsOpen, setDetailsOpen] = useState(false)
@@ -132,6 +134,14 @@ export function ConversationHeader({ conversation, mentionables, me, onChanged, 
         onPress: () => onOpenProjectPane(agentProjectId, agentName),
       })
     }
+  }
+  if (onOpenDoc && floating) {
+    actions.push({
+      key: 'doc',
+      label: conversation.hasDoc ? 'Channel doc' : 'Create channel doc',
+      icon: (s) => <FileText size={s} className="text-muted-foreground" />,
+      onPress: onOpenDoc,
+    })
   }
   if (canRename) actions.push({ key: 'edit', label: 'Edit channel', icon: (s) => <Pencil size={s} className="text-muted-foreground" />, onPress: () => setEditOpen(true) })
   if (conversation.joined && conversation.kind !== 'activity') {
