@@ -175,7 +175,7 @@ describe('logCacheControlIfEnabled (AI_PROXY_LOG_CACHE=1)', () => {
     console.log = originalLog
   })
 
-  test('logs system=string / blocks=0 on non-streaming Anthropic chat completion', async () => {
+  test('logs the automatic cache breakpoints on a non-streaming Anthropic chat completion', async () => {
     pushJson({
       id: 'msg_1',
       content: [{ type: 'text', text: 'hi' }],
@@ -200,8 +200,8 @@ describe('logCacheControlIfEnabled (AI_PROXY_LOG_CACHE=1)', () => {
     expect(res.status).toBe(200)
     const cacheLog = logs.find(l => l.includes('[AI Proxy] [cache:nonstream]'))
     expect(cacheLog).toBeDefined()
-    expect(cacheLog!).toContain('system_cache_control=0')
-    expect(cacheLog!).toContain('cache_control=0')
+    expect(cacheLog!).toContain('system=array(1) system_cache_control=1')
+    expect(cacheLog!).toContain('lastUserMsg blocks=1 cache_control=1')
   })
 
   test('logs cache:stream on streaming Anthropic chat completion', async () => {
