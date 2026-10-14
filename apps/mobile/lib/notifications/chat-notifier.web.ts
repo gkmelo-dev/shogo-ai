@@ -32,7 +32,6 @@ type ShogoDesktopBridge = {
     at: number
     supported: boolean
   }>
-  sendTestNotification?: () => Promise<{ ok: boolean; error?: string }>
 }
 
 function getDesktop(): ShogoDesktopBridge | null {
@@ -123,17 +122,6 @@ export async function requestNotificationPermissionFromGesture(): Promise<Notifi
     return toState(await Notification.requestPermission())
   } catch {
     return toState(Notification.permission)
-  }
-}
-
-/** Fires a real desktop banner and reports the OS's verdict, for Settings. */
-export async function sendTestNotification(): Promise<{ ok: boolean; error?: string }> {
-  const desktop = getDesktop()
-  if (!desktop?.sendTestNotification) return { ok: false, error: 'Only available in the desktop app' }
-  try {
-    return await desktop.sendTestNotification()
-  } catch (err) {
-    return { ok: false, error: (err as Error)?.message || 'Could not send a test notification' }
   }
 }
 

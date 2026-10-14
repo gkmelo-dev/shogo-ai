@@ -171,7 +171,6 @@ import {
 } from "@shogo/shared-ui/primitives";
 import { useNotifyOnTurnComplete as useNotifyOnTurnCompletePref } from "../../lib/notifications/preferences";
 import { useNotificationPermission } from "../../lib/notifications/useNotificationPermission";
-import { sendTestNotification } from "../../lib/notifications/chat-notifier";
 import type { NotificationPermissionState } from "../../lib/notifications/chat-notifier";
 import { useRequireBiometricApproval } from "../../lib/approval-lock";
 import { useDualPlan } from "../../lib/dual-plan-preference";
@@ -1007,7 +1006,7 @@ function notificationPermissionCopy(
       if (isDesktop) {
         return {
           status:
-            "Blocked by the system. Shogo couldn't deliver its last alert — turn on notifications for Shogo in your system notification settings, then send a test.",
+            "Blocked by the system. Shogo couldn't deliver its last alert — turn on notifications for Shogo in your system notification settings; the next alert will confirm it took.",
           action: null,
         };
       }
@@ -1042,22 +1041,6 @@ function NotificationsCard() {
   const permission = useNotificationPermission();
   const [isDesktop] = useState(isDesktopApp);
   const copy = notificationPermissionCopy(permission.state, isDesktop);
-  const [testState, setTestState] = useState<"idle" | "sending" | "sent" | "failed">("idle");
-  const [testError, setTestError] = useState<string | null>(null);
-
-  const handleSendTest = async () => {
-    setTestState("sending");
-    setTestError(null);
-    const result = await sendTestNotification();
-    if (result.ok) {
-      setTestState("sent");
-    } else {
-      setTestError(result.error ?? "The system refused the notification.");
-      setTestState("failed");
-    }
-    // The test is what makes the OS reveal its verdict, so re-read it.
-    void permission.request();
-  };
 
   return (
     <Card>
@@ -1081,30 +1064,6 @@ function NotificationsCard() {
             </Button>
           ) : null}
         </View>
-        {isDesktop ? (
-          <View className="px-6 py-5 flex-row items-center justify-between border-t border-border">
-            <View className="flex-1 mr-4">
-              <Text className="text-sm font-semibold text-foreground">
-                Send a test notification
-              </Text>
-              <Text className="text-sm text-muted-foreground mt-0.5">
-                {testState === "failed"
-                  ? testError ?? "The system refused the notification."
-                  : testState === "sent"
-                    ? "Sent. If no banner appeared, the system is blocking Shogo."
-                    : "Checks whether the system is letting Shogo through."}
-              </Text>
-            </View>
-            <Button
-              size="sm"
-              variant="outline"
-              disabled={testState === "sending"}
-              onPress={() => void handleSendTest()}
-            >
-              {testState === "sending" ? "Sending…" : "Send test"}
-            </Button>
-          </View>
-        ) : null}
         <View className="px-6 py-5 flex-row items-center justify-between border-t border-border">
           <View className="flex-1 mr-4">
             <Text className="text-sm font-semibold text-foreground">

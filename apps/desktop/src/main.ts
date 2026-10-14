@@ -1486,24 +1486,6 @@ function registerIpcHandlers(): void {
     supported: Notification.isSupported(),
   }))
 
-  // Settings' "Send test notification" button: report the OS's verdict instead
-  // of firing blind.
-  ipcMain.handle('send-test-notification', async () => {
-    const result = notifications.show({
-      title: 'Shogo notifications are on',
-      body: 'If you can see this, agent updates will reach you here.',
-    })
-    if (!result.ok) return { ok: false, error: result.reason ?? 'could not show a notification' }
-    // The OS reports refusal asynchronously — `failed` can arrive after
-    // show() returns — so give it a beat before quoting the outcome.
-    await new Promise((resolve) => setTimeout(resolve, 500))
-    const outcome = notifications.getOutcome()
-    if (outcome.state === 'failed') {
-      return { ok: false, error: outcome.error ?? 'the OS refused the notification' }
-    }
-    return { ok: true }
-  })
-
   // Desktop notification for remote actions
   ipcMain.handle('show-remote-action-notification', (_event, title: string, body: string) => {
     notifications.show({ title, body })

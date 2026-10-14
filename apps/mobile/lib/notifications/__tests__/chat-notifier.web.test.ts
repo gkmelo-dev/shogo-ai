@@ -44,8 +44,6 @@ interface DesktopBridgeState {
   removeListenerCalls: number
   /** Main-process delivery report; omit to model a bridge older than this change. */
   notificationStatus?: { state: 'unknown' | 'shown' | 'failed'; error?: string; at: number; supported: boolean } | null
-  sendTestNotificationResult?: { ok: boolean; error?: string }
-  sendTestNotificationCalls: number
 }
 
 function makeFakeDocument(overrides?: Partial<FakeDocument>): FakeDocument {
@@ -80,8 +78,6 @@ function installEnv(options?: {
         onNotificationClickedCalls: [],
         removeListenerCalls: 0,
         notificationStatus: options.desktop.notificationStatus,
-        sendTestNotificationResult: options.desktop.sendTestNotificationResult,
-        sendTestNotificationCalls: 0,
       }
     : null
 
@@ -106,17 +102,11 @@ function installEnv(options?: {
       },
       isWindowFocused: async () => desktopState.isWindowFocusedReturn,
     }
-    // Left off when a scenario does not set them, so tests can model a bridge
-    // built before getNotificationStatus / sendTestNotification existed.
+    // Left off when a scenario does not set it, so tests can model a bridge
+    // built before getNotificationStatus existed.
     if (desktopOptions.notificationStatus !== undefined) {
       bridge.getNotificationStatus = async () =>
         desktopOptions.notificationStatus ?? { state: 'unknown', at: 0, supported: true }
-    }
-    if (desktopOptions.sendTestNotificationResult) {
-      bridge.sendTestNotification = async () => {
-        desktopState.sendTestNotificationCalls += 1
-        return desktopOptions.sendTestNotificationResult
-      }
     }
     win.shogoDesktop = bridge
   }
@@ -593,34 +583,5 @@ describe('chat-notifier.web — desktop permission state', () => {
     // The gate runs before every notification; returning false here would stop
     // every future attempt, including after the user re-enables alerts.
     expect(await mod.ensureNotificationPermission()).toBe(true)
-  })
-})
-
-describe('chat-notifier.web — sendTestNotification', () => {
-  beforeEach(() => uninstallEnv())
-  afterEach(() => uninstallEnv())
-
-  test('reports the main process verdict', async () => {
-    const { desktop } = installEnv({
-      document: makeFakeDocument(),
-      desktop: {
-        isDesktop: true,
-        sendTestNotificationResult: { ok: false, error: 'the OS refused the notification' },
-      },
-    })
-    const mod = await freshModule()
-    expect(await mod.sendTestNotification()).toEqual({
-      ok: false,
-      error: 'the OS refused the notification',
-    })
-    expect(desktop!.sendTestNotificationCalls).toBe(1)
-  })
-
-  test('reports unavailable outside the desktop app', async () => {
-    installEnv({ document: makeFakeDocument(), withNotification: true })
-    const mod = await freshModule()
-    const result = await mod.sendTestNotification()
-    expect(result.ok).toBe(false)
-    expect(result.error).toContain('desktop app')
   })
 })

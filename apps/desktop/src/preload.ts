@@ -184,9 +184,6 @@ contextBridge.exposeInMainWorld('shogoDesktop', {
     at: number
     supported: boolean
   }> => ipcRenderer.invoke('get-notification-status'),
-  /** Fires a real banner and reports whether the OS actually accepted it. */
-  sendTestNotification: (): Promise<{ ok: boolean; error?: string }> =>
-    ipcRenderer.invoke('send-test-notification'),
 
   codeWorkbench: {
     open: (opts?: { projectId?: string; workspacePath?: string }) => ipcRenderer.invoke('code-workbench:open', opts ?? {}),
