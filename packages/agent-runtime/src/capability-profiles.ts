@@ -52,7 +52,7 @@ export const PROFILE_TOOL_GROUPS: Record<string, string[]> = {
   // Deeper code-review/verification tools. Personal workspaces disable
   // these along with `builder` — there is no builder code of the
   // companion's own to review.
-  code_review: ['impact_radius', 'detect_changes', 'review_context', 'read_lints', 'server_sync'],
+  code_review: ['impact_radius', 'detect_changes', 'review_context', 'read_lints', 'server_sync', 'git_history'],
   // Editing/running the agent's OWN runtime workspace: checkpoints,
   // publishing, plan mutation, canvas/system state. Personal workspaces
   // disable this whole bundle — they delegate real software work to the
@@ -79,7 +79,7 @@ export const PROFILE_TOOL_GROUPS: Record<string, string[]> = {
   // Standard file/web/messaging/etc. tools every profile keeps; broken out
   // so the classification test can verify 100% coverage without lumping
   // everything into CORE_TOOL_NAMES.
-  files: ['read_file', 'write_file', 'edit_file', 'delete_file', 'search', 'share_file'],
+  files: ['read_file', 'write_file', 'edit_file', 'delete_file', 'search', 'grep', 'share_file'],
   web: ['web', 'browser', 'social_media'],
   memory: ['memory_read', 'memory_search'],
   messaging: ['send_message', 'notify_user', 'channel_connect', 'channel_disconnect', 'channel_list'],

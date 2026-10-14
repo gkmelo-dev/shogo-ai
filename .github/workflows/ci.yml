@@ -210,11 +210,10 @@ jobs:
       - name: Lint
         run: bun run lint
 
-      - name: Shogo Code extension (typecheck, unit tests, patch + phase checks)
+      # Unit tests run with the other packages (apps/shogo-ide in TEST_PACKAGES).
+      - name: Shogo Code extension (typecheck, phase checks)
         run: |
           bun run --cwd apps/shogo-ide extension:typecheck
-          bun run --cwd apps/shogo-ide/extensions/shogo-core test
-          bun test apps/shogo-ide/scripts/__tests__
           node apps/shogo-ide/scripts/phase1-check.mjs
           node apps/shogo-ide/scripts/phase3-check.mjs
 
@@ -585,7 +584,7 @@ jobs:
             desktop_bundle: false
             include_e2e: false
           - name: remaining + e2e
-            packages: packages/shared-runtime,packages/model-catalog,packages/authz,packages/sdk,scripts,packages/shared-app,apps/metal-agent,packages/agent,packages/core,packages/email,packages/voice
+            packages: packages/shared-runtime,packages/model-catalog,packages/authz,packages/sdk,scripts,packages/shared-app,apps/metal-agent,apps/shogo-ide,packages/agent,packages/core,packages/email,packages/voice
             shard: ''
             build_templates: true
             desktop_bundle: true
