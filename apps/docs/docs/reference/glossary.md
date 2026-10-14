@@ -62,7 +62,7 @@ A modular capability defined as a Markdown file. Each skill teaches your agent h
 A workspace file that defines your agent's personality, tone, and behavioral boundaries. It shapes how the agent communicates and what guardrails it follows.
 
 ### Template
-A pre-built agent configuration that you can use as a starting point. Templates include configured identity, skills, heartbeat schedule, and recommended integrations. See [Templates](../templates/).
+A pre-built agent configuration that you can use as a starting point. Templates include configured identity, skills, heartbeat schedule, and recommended integrations. See [Templates](/templates).
 
 ### USER.md
 A workspace file where your agent stores information about you — your name, timezone, preferences, and other context that helps it serve you better.

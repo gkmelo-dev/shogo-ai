@@ -142,4 +142,4 @@ You can also ask for a manual refresh at any time:
 
 - [Heartbeat](/concepts/heartbeat) — the canvas is updated on each heartbeat tick
 - [Chat with AI](/features/chat-with-ai) — how to describe canvas changes through chat
-- [Templates](/templates/) — each template includes a pre-built canvas dashboard
+- [Templates](/templates) — each template includes a pre-built canvas dashboard

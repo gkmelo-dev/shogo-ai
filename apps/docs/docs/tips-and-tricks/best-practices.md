@@ -23,7 +23,7 @@ Even rough notes will make your prompts significantly better.
 
 If a template is close to what you need, start there instead of from scratch. It's faster to customize an existing agent than to build one from nothing.
 
-Browse the [Templates](../templates/) to see what's available. You can change everything about a template after starting.
+Browse the [Templates](/templates) to see what's available. You can change everything about a template after starting.
 
 ## 3. Configure one feature at a time
 

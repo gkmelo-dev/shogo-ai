@@ -216,6 +216,6 @@ Channels: Slack #engineering (weekly summary)
 
 These are just starting points. The agents people build most often start as one of the templates above and evolve over weeks as they add integrations, tune the heartbeat, and teach the agent their preferences through memory.
 
-**Start from a template** — [Browse templates →](/templates/)
+**Start from a template** — [Browse templates →](/templates)
 
 **Or describe what you want** — Type it into the chat input on your dashboard and the AI will configure it for you.

@@ -93,5 +93,5 @@ You can adjust the interval, quiet hours, and heartbeat checklist anytime throug
 ## What's next?
 
 - **[Chat with AI](../features/chat-with-ai)** — Learn how to configure your agent effectively.
-- **[Templates](../templates/)** — Explore all 8 agent templates in detail.
+- **[Templates](/templates)** — Explore all 8 agent templates in detail.
 - **[Prompting basics](../prompting/basics)** — Tips for describing what you want your agent to do.

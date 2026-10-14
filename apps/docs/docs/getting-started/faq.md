@@ -36,7 +36,7 @@ The chat panel is where you configure your agent. Type a message describing what
 
 ### What are templates?
 
-Templates are pre-built agent configurations that give you a head start. Instead of starting from scratch, you can choose a template like Research Assistant, GitHub Ops, or Personal Assistant and customize it through chat. Each template comes with a pre-configured identity, skills, heartbeat schedule, and recommended integrations. See [Templates](../templates/) for the full list.
+Templates are pre-built agent configurations that give you a head start. Instead of starting from scratch, you can choose a template like Research Assistant, GitHub Ops, or Personal Assistant and customize it through chat. Each template comes with a pre-configured identity, skills, heartbeat schedule, and recommended integrations. See [Templates](/templates) for the full list.
 
 ### What is the heartbeat?
 
