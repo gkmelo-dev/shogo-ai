@@ -175,7 +175,18 @@ contextBridge.exposeInMainWorld('shogoDesktop', {
     }
   },
   setAppMode: (mode: 'local' | 'cloud') => ipcRenderer.invoke('set-app-mode', mode),
-  setBadgeCount: (count: number) => ipcRenderer.invoke('set-badge-count', count),
+  setBadgeCount: (count: number): Promise<{ ok: boolean; reason?: string }> =>
+    ipcRenderer.invoke('set-badge-count', count),
+  /** Outcome of the last OS notification attempt, for the Settings screen. */
+  getNotificationStatus: (): Promise<{
+    state: 'unknown' | 'shown' | 'failed'
+    error?: string
+    at: number
+    supported: boolean
+  }> => ipcRenderer.invoke('get-notification-status'),
+  /** Fires a real banner and reports whether the OS actually accepted it. */
+  sendTestNotification: (): Promise<{ ok: boolean; error?: string }> =>
+    ipcRenderer.invoke('send-test-notification'),
 
   codeWorkbench: {
     open: (opts?: { projectId?: string; workspacePath?: string }) => ipcRenderer.invoke('code-workbench:open', opts ?? {}),
