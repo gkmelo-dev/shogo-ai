@@ -271,7 +271,7 @@ describe('conditionalPutObject', () => {
         let sentBytes = 0
         const fetchImpl = (async (_url: string, init: RequestInit) => {
           headers = init.headers as Record<string, string>
-          sentBytes = (await new Response(init.body as BodyInit).arrayBuffer()).byteLength
+          sentBytes = (await new Response(init.body as ConstructorParameters<typeof Response>[0]).arrayBuffer()).byteLength
           return new Response(null, { status: 200, headers: { etag: '"e"' } })
         }) as unknown as typeof fetch
         await conditionalPutObject({ target: TARGET, key: 'p/repo.git.tar.gz', body, now, fetchImpl })

@@ -30,13 +30,17 @@ class SweepPool extends MetalWarmPool {
   failExport: Error | null = null
   outcome: RepoWriteOutcome = { status: 'written', etag: '"e"' }
 
-  protected override async fetchRepoExport(): Promise<RepoExport | null> {
+  protected override async fetchRepoExport(_handle: FcVmHandle, _token?: string): Promise<RepoExport | null> {
     this.exports++
     if (this.failExport) throw this.failExport
     return { bytes: new Uint8Array([1, 2, 3]), rootCommitAt: null }
   }
 
-  protected override async uploadRepoGuarded(): Promise<RepoWriteOutcome> {
+  protected override async uploadRepoGuarded(
+    _projectId: string,
+    _bytes: RepoBody,
+    _opts: { lineage: RepoLineage; preserveOnRefusal?: boolean },
+  ): Promise<RepoWriteOutcome> {
     return this.outcome
   }
 
