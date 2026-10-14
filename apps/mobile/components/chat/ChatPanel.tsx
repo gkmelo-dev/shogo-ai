@@ -52,7 +52,8 @@ import {
   type NativeSyntheticEvent,
 } from "react-native"
 import { observer } from "mobx-react-lite"
-import { useChat, type UIMessage } from "@ai-sdk/react"
+import type { UIMessage } from "@ai-sdk/react"
+import { usePacedChat } from "./use-paced-chat"
 import { useRouter } from "expo-router"
 import { useSafeAreaInsets } from "react-native-safe-area-context"
 import { LinearGradient } from "expo-linear-gradient"
@@ -69,6 +70,7 @@ import {
   ERROR_CODE_MESSAGES,
   buildChatStreamErrorReport,
   isReactUpdateDepthError,
+  RENDER_FELL_BEHIND_MESSAGE,
 } from "@shogo/shared-app/chat"
 import {
   useChatTransportConfig,
@@ -112,8 +114,12 @@ import {
   computeRecoveryBackoff,
   getStallRecoveryEffects,
   markStuckToolsInterrupted,
-  shouldAutoRecoverStalledTurn,
+  decideStreamEndRecovery,
 } from "./stall-recovery"
+import {
+  decideRenderErrorRecovery,
+  pollUntilTerminal,
+} from "./render-error-recovery"
 import { recordAutoResumeAttempt } from "./auto-resume-circuit-breaker"
 import {
   runResumeStreamSingleFlight,
@@ -1850,7 +1856,10 @@ const ChatPanelContent = observer(function ChatPanelContent({
   // detect a session switch and bail before reattaching to a stale stream.
   const recoveredTurnIdRef = useRef<string | null>(null)
   const renderDepthErrorTurnIdRef = useRef<string | null>(null)
+  // turnId -> render-error recoveries started (see decideStreamEndRecovery).
+  const renderRecoveryRunsRef = useRef<Map<string, number>>(new Map())
   const stallRecoveryRef = useRef<(() => void) | null>(null)
+  const renderErrorRecoveryRef = useRef<((reattachAttempts: number) => void) | null>(null)
   const currentSessionIdRef = useRef<string | null>(null)
   currentSessionIdRef.current = currentSessionId
 
@@ -1967,7 +1976,8 @@ const ChatPanelContent = observer(function ChatPanelContent({
     [transportConfig],
   )
 
-  // AI SDK useChat hook.
+  // AI SDK useChat hook, with message publication paced off the stream
+  // processing chain (see paced-chat.ts).
   //
   // `resume` is intentionally `false`: we do NOT want the AI SDK firing
   // `resumeStream()` automatically on every mount keyed off
@@ -1990,11 +2000,12 @@ const ChatPanelContent = observer(function ChatPanelContent({
     setMessages,
     stop,
     resumeStream,
-  } = useChat({
+    clearError,
+  } = usePacedChat({
     transport: chatTransport,
     id: currentSessionId || undefined,
     resume: false,
-    experimental_throttle: 50,
+    publishWaitMs: 50,
     onError: (err) => {
       // Stream failures are recoverable UI state: the retry affordance below
       // handles them. React Native treats console.error as a development
@@ -3097,7 +3108,7 @@ const ChatPanelContent = observer(function ChatPanelContent({
   const autoResumeTimestampsRef = useRef<number[]>([])
   const autoResumeCircuitTrippedRef = useRef(false)
   const guardedAutoResumeStream = useCallback(
-    (reason: "live-turn-probe" | "stall-recovery") => {
+    (reason: "live-turn-probe" | "stall-recovery" | "render-error-recovery") => {
       if (autoResumeCircuitTrippedRef.current) {
         return
       }
@@ -3157,6 +3168,7 @@ const ChatPanelContent = observer(function ChatPanelContent({
   // Keep the stop control visible while the transport is recovering a turn
   // whose server-side agent may still be running.
   const [streamAutoRecovering, setStreamAutoRecovering] = useState(false)
+  const [autoRecoveryKind, setAutoRecoveryKind] = useState<"stall" | "render-error">("stall")
   const messagesRef = useRef(messages)
   messagesRef.current = messages
 
@@ -3417,7 +3429,9 @@ const ChatPanelContent = observer(function ChatPanelContent({
     if (isTunnelError)
       return "Connection to desktop instance lost. Tap Reconnect to retry."
     if (streamAutoRecovering)
-      return "Connection interrupted. Reconnecting\u2026"
+      return autoRecoveryKind === "render-error"
+        ? RENDER_FELL_BEHIND_MESSAGE
+        : "Connection interrupted. Reconnecting\u2026"
     return (
       (error ? formatErrorMessage(error.message) : emptyResponseError) ?? ""
     )
@@ -3427,6 +3441,7 @@ const ChatPanelContent = observer(function ChatPanelContent({
     isTunnelError,
     tunnelReconnecting,
     streamAutoRecovering,
+    autoRecoveryKind,
   ])
   useEffect(() => {
     setErrorBannerExpanded(false)
@@ -3752,16 +3767,23 @@ const ChatPanelContent = observer(function ChatPanelContent({
         // (that's an intentional terminal state, not a dropped connection),
         // and fire at most once per turn so we never loop.
         const stalledTurnId = currentTurnIdRef.current
-        if (
-          shouldAutoRecoverStalledTurn({
-            stalledTurnId,
-            recoveredTurnId: recoveredTurnIdRef.current,
-            renderDepthErrorTurnId: renderDepthErrorTurnIdRef.current,
-            userInitiatedStop: userInitiatedStopRef.current,
-          })
-        ) {
+        const renderRecoveryRuns = stalledTurnId
+          ? renderRecoveryRunsRef.current.get(stalledTurnId) ?? 0
+          : 0
+        const recovery = decideStreamEndRecovery({
+          stalledTurnId,
+          recoveredTurnId: recoveredTurnIdRef.current,
+          renderDepthErrorTurnId: renderDepthErrorTurnIdRef.current,
+          renderRecoveryRuns,
+          userInitiatedStop: userInitiatedStopRef.current,
+        })
+        if (recovery === "stall") {
           recoveredTurnIdRef.current = stalledTurnId
           stallRecoveryRef.current?.()
+        } else if (recovery === "render-error" && stalledTurnId) {
+          recoveredTurnIdRef.current = stalledTurnId
+          renderRecoveryRunsRef.current.set(stalledTurnId, renderRecoveryRuns + 1)
+          renderErrorRecoveryRef.current?.(renderRecoveryRuns)
         }
       }
     }
@@ -5999,6 +6021,46 @@ const ChatPanelContent = observer(function ChatPanelContent({
     }
   }, [isCollapsed, setIsCollapsed, onCollapsedChange])
 
+  // Replace the in-memory conversation with the persisted one (no new turn).
+  // Used when the server finished a turn the client lost track of.
+  const reloadPersistedMessages = useCallback(async (): Promise<boolean> => {
+    const sessionId = currentSessionId
+    if (!sessionId || !sessionMessages) return false
+    await sessionMessages.loadPage(
+      { sessionId, agent: "technical" },
+      { limit: MESSAGE_PAGE_SIZE, offset: 0 },
+    )
+    if (currentSessionIdRef.current !== sessionId || isTransportStreamingRef.current) return false
+    const loaded = [...sessionMessages.all].sort(
+      (a: any, b: any) => (a.createdAt || 0) - (b.createdAt || 0),
+    )
+    if (loaded.length === 0) return false
+    const aiMessages = loaded.map((msg: any) => {
+      const next: any = {
+        id: msg.id,
+        role: msg.role as "user" | "assistant",
+        content: msg.content ?? extractTextContent(msg),
+        createdAt: msg.createdAt,
+      }
+      if (msg.parts) {
+        try {
+          next.parts = JSON.parse(msg.parts)
+        } catch {
+          // Keep the text content when a message has malformed parts.
+        }
+      }
+      return next
+    })
+    cachedMessagesRef.current = aiMessages
+    sessionMessageCache.set(sessionId, aiMessages)
+    cacheRefreshedAtRef.current.set(sessionId, performance.now())
+    turnCompletedRef.current = true
+    setMessages(aiMessages)
+    clearError()
+    setEmptyResponseError(null)
+    return true
+  }, [currentSessionId, sessionMessages, setMessages, clearError])
+
   // Error retry handler.
   //
   // Non-destructive triage (see retry-triage.ts). The old behavior truncated
@@ -6008,6 +6070,8 @@ const ChatPanelContent = observer(function ChatPanelContent({
   //
   //   - turn still `active` (transport drop, agent still running) -> reconnect
   //     to the live buffered stream. No re-send, nothing truncated.
+  //   - turn `completed` (only the client lost it) -> reload the persisted
+  //     messages. No new turn.
   //   - terminal but the last assistant turn has resumable work -> ask the
   //     server to continue from the preserved session context (continue:true).
   //   - nothing resumable -> re-send the original user message (last resort),
@@ -6070,6 +6134,13 @@ const ChatPanelContent = observer(function ChatPanelContent({
         return
       }
 
+      if (action === "reload") {
+        reloadPersistedMessages().catch((err) =>
+          console.error("[ChatPanel] Retry reload failed:", err),
+        )
+        return
+      }
+
       if (action === "continue") {
         // Continue from preserved server-side context. The `continue` flag
         // tells the runtime to craft a continuation instruction and reuse the
@@ -6094,6 +6165,7 @@ const ChatPanelContent = observer(function ChatPanelContent({
     messages,
     sendMessageInternal,
     resumeStreamSingleFlight,
+    reloadPersistedMessages,
     currentSessionId,
     projectId,
     localAgentUrl,
@@ -6120,6 +6192,7 @@ const ChatPanelContent = observer(function ChatPanelContent({
     const fromSeqAtStall = turnLastSeqRef.current
     const MAX_ATTEMPTS = 4
 
+    setAutoRecoveryKind("stall")
     setStreamAutoRecovering(true)
     void (async () => {
       try {
@@ -6228,6 +6301,88 @@ const ChatPanelContent = observer(function ChatPanelContent({
     guardedAutoResumeStream,
   ])
   stallRecoveryRef.current = attemptStallRecovery
+
+  // Automatic recovery after the chat view failed mid-turn with React #185
+  // (see render-error-recovery.ts). The server turn is unaffected, so this
+  // never re-sends: it re-attaches once through the snapshot resume while the
+  // turn is still running, otherwise waits for the turn to end and reloads
+  // the persisted conversation.
+  const attemptRenderErrorRecovery = useCallback(
+    (reattachAttempts: number) => {
+      if (!currentSessionId || !API_URL) return
+      const recoverySessionId = currentSessionId
+      const recoveryTurnId = currentTurnIdRef.current
+      const probe = () =>
+        probeChatTurnStatus({
+          url: buildChatTurnUrl(API_URL, projectId, localAgentUrl, recoverySessionId, chatWorkspaceId),
+          fetch: expoFetch,
+          headers: nativeHeaders ? nativeHeaders() : undefined,
+          credentials: Platform.OS === "web" ? "include" : undefined,
+        })
+      const isCancelled = () =>
+        userInitiatedStopRef.current ||
+        currentSessionIdRef.current !== recoverySessionId ||
+        isTransportStreamingRef.current
+
+      setAutoRecoveryKind("render-error")
+      setStreamAutoRecovering(true)
+      void (async () => {
+        try {
+          let turnStatus: ChatTurnStatus = await probe().catch(() => "unknown" as const)
+          if (isCancelled()) return
+          const action = decideRenderErrorRecovery({ turnStatus, reattachAttempts })
+          console.log(
+            `[ChatPanel] render-error recovery: turn ${recoveryTurnId} is ${turnStatus} -> ${action}`,
+          )
+          if (action === "reattach-snapshot") {
+            guardedAutoResumeStream("render-error-recovery")
+            return
+          }
+          if (action === "poll-then-reload") {
+            const polled = await pollUntilTerminal({ probe, isCancelled })
+            if (polled.outcome === "cancelled") return
+            if (polled.outcome === "timeout") {
+              setMessages((prev) => markStuckToolsInterrupted(prev, "Connection interrupted"))
+              setErrorDismissed(false)
+              setEmptyResponseError(STALL_TIMEOUT_USER_MESSAGE)
+              return
+            }
+            turnStatus = polled.turnStatus
+          }
+          const reloaded = await reloadPersistedMessages()
+          if (!reloaded && !isCancelled()) {
+            setErrorDismissed(false)
+            setEmptyResponseError(STALL_TIMEOUT_USER_MESSAGE)
+          }
+          try {
+            Sentry.captureMessage("chat_render_error_recovered", {
+              level: "info",
+              tags: { turnStatus, reloaded: String(reloaded) },
+              extra: { turnId: recoveryTurnId, reattachAttempts },
+            })
+          } catch {
+            // Telemetry must never block recovery.
+          }
+        } catch (err) {
+          console.warn("[ChatPanel] render-error recovery failed:", err)
+        } finally {
+          setStreamAutoRecovering(false)
+        }
+      })()
+    },
+    [
+      currentSessionId,
+      projectId,
+      localAgentUrl,
+      chatWorkspaceId,
+      expoFetch,
+      nativeHeaders,
+      guardedAutoResumeStream,
+      reloadPersistedMessages,
+      setMessages,
+    ],
+  )
+  renderErrorRecoveryRef.current = attemptRenderErrorRecovery
 
   // ─── Edit / Retry from arbitrary user message ────────────────────────────
   //

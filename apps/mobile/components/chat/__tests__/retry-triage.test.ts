@@ -11,7 +11,7 @@
  *   which DELETED the interrupted turn's completed tool calls + partial answer
  *   (potentially minutes of work) and restarted from scratch.
  *
- *   The fix triages into reconnect / continue / resend and NEVER truncates
+ *   The fix triages into reconnect / reload / continue / resend and NEVER truncates
  *   completed work. These tests pin the decision and the no-truncation
  *   guarantee.
  *
@@ -28,14 +28,21 @@ describe("decideRetryAction", () => {
     expect(decideRetryAction({ turnStatus: "active", hasResumableTurn: true })).toBe("reconnect")
   })
 
-  test("terminal/unknown with resumable work -> continue (preserve work)", () => {
-    for (const turnStatus of ["completed", "failed", "aborted", "unknown"] as const) {
+  test("completed turn -> reload, never a new (billed) continue or resend turn", () => {
+    // #1083: the server finished and saved the turn while the client's view
+    // died; Retry used to send `continue: true` for already-finished work.
+    expect(decideRetryAction({ turnStatus: "completed", hasResumableTurn: true })).toBe("reload")
+    expect(decideRetryAction({ turnStatus: "completed", hasResumableTurn: false })).toBe("reload")
+  })
+
+  test("failed/aborted/unknown with resumable work -> continue (preserve work)", () => {
+    for (const turnStatus of ["failed", "aborted", "unknown"] as const) {
       expect(decideRetryAction({ turnStatus, hasResumableTurn: true })).toBe("continue")
     }
   })
 
   test("nothing resumable -> resend (last resort)", () => {
-    for (const turnStatus of ["completed", "failed", "aborted", "unknown"] as const) {
+    for (const turnStatus of ["failed", "aborted", "unknown"] as const) {
       expect(decideRetryAction({ turnStatus, hasResumableTurn: false })).toBe("resend")
     }
   })

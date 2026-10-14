@@ -15,6 +15,7 @@ import { getBasename, getLanguageLabel } from "./file-lang-map"
 import { isDeliverable } from "../../../lib/deliverable"
 import { useChatContextSafe } from "../ChatContext"
 import { DownloadChip } from "./DownloadChip"
+import { countLines, streamingArgsKey } from "./streaming-tool-args"
 
 const MAX_PREVIEW_LINES = 40
 const MAX_PREVIEW_CHARS = 4000
@@ -67,9 +68,12 @@ function stableStringify(val: unknown): string {
 //     state (success / error), we know args + result are frozen and bail
 //     out with cheap primitive comparisons. This is the common case during
 //     long subagent runs where most widgets are already complete.
-//   - Otherwise (streaming, or state transition), fall back to the
-//     full content-equality JSON.stringify check. That's still cheaper
-//     than re-rendering the entire widget subtree.
+//   - While streaming, the widget renders only a size/line summary, so
+//     compare the args by `streamingArgsKey` (string lengths) rather than
+//     stringifying a payload that can be hundreds of KB on every chunk.
+//   - Otherwise (state transition), fall back to the full content-equality
+//     JSON.stringify check. That's still cheaper than re-rendering the
+//     entire widget subtree.
 function toolWidgetPropsEqual(
   prev: WriteFileWidgetProps,
   next: WriteFileWidgetProps,
@@ -89,6 +93,9 @@ function toolWidgetPropsEqual(
     next.tool.state !== "streaming"
   ) {
     return true
+  }
+  if (prev.tool.id === next.tool.id && next.tool.state === "streaming") {
+    return streamingArgsKey(prev.tool.args) === streamingArgsKey(next.tool.args)
   }
   return (
     stableStringify(prev.tool.args) === stableStringify(next.tool.args) &&
@@ -120,16 +127,21 @@ export const WriteFileWidget = memo(function WriteFileWidget({
   // curated allowlist so intermediate source writes don't sprout chips.
   const showDownload =
     tool.state === "success" && path !== "unknown" && isDeliverable(path)
-  const { display, truncated, totalLines } = truncateContent(content)
-  const displayLines = (showFull ? content : display).split("\n")
+  const isStreaming = tool.state === "streaming"
+  const { display, truncated, totalLines } = useMemo(
+    () =>
+      isStreaming
+        ? { display: "", truncated: false, totalLines: countLines(content) }
+        : truncateContent(content),
+    [content, isStreaming],
+  )
+  const displayLines = isStreaming ? [] : (showFull ? content : display).split("\n")
 
   const StateIcon = {
     streaming: Loader2,
     success: CheckCircle2,
     error: XCircle,
   }[tool.state]
-
-  const isStreamingNoContent = tool.state === "streaming" && !content
 
   return (
     <View className={cn("overflow-hidden", className)}>
@@ -195,14 +207,18 @@ export const WriteFileWidget = memo(function WriteFileWidget({
       {/* Expanded code preview */}
       {isExpanded && (
         <View className="border-l border-border/40 ml-2 pl-2 py-1.5">
-          {isStreamingNoContent && (
+          {isStreaming && (
             <View className="flex-row items-center gap-1.5 py-1">
               <Loader2 className="w-3 h-3 text-primary animate-spin" size={12} />
-              <Text className="text-[10px] text-muted-foreground">Writing…</Text>
+              <Text className="text-[10px] text-muted-foreground">
+                {content.length > 0
+                  ? `Writing… ${totalLines} ${totalLines === 1 ? "line" : "lines"} · ${formatBytes(content.length)}`
+                  : "Writing…"}
+              </Text>
             </View>
           )}
 
-          {content.length > 0 && (
+          {!isStreaming && content.length > 0 && (
             <ScrollView nestedScrollEnabled horizontal={false} className="bg-background/50 rounded max-h-64">
               <View className="flex-row">
                 {/* Line number gutter */}

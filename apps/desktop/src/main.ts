@@ -19,6 +19,7 @@ initSentry()
 
 import { app, BrowserWindow, protocol, net, session, ipcMain, Menu, shell, Notification, dialog, powerMonitor, systemPreferences, desktopCapturer } from 'electron'
 import { ensureMediaAccess, ensureMicAccess, MAC_MIC_SETTINGS_URL, type MicAccess } from './media-permissions'
+import { attachRendererLogForwarding } from './renderer-log-forwarding'
 import type { DictationHotkeyService } from './dictation-hotkey'
 import { normalizeDictationConfig } from './dictation-protocol'
 import {
@@ -173,6 +174,13 @@ process.on('uncaughtException', (err) => {
 })
 process.on('unhandledRejection', (reason) => {
   writeLogSync('FATAL', 'Unhandled rejection:', reason)
+})
+
+// Renderer console warnings/errors and renderer crashes only reach DevTools
+// otherwise. Uses writeLog directly (not console.*) to avoid echoing them to
+// stdout a second time.
+app.on('web-contents-created', (_event, contents) => {
+  attachRendererLogForwarding(contents, writeLog)
 })
 
 console.log(`[Desktop] === Shogo starting (v${app.getVersion()}, packaged=${app.isPackaged}) ===`)

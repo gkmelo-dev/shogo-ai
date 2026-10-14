@@ -9,12 +9,16 @@
  * and re-sent the original user message — discarding the interrupted turn's
  * completed tool calls and partial answer (potentially minutes of work).
  *
- * The fix triages the failure into one of three NON-destructive actions:
+ * The fix triages the failure into one of four NON-destructive actions:
  *
  *   - `reconnect`: the runtime reports the turn is still `active` (a transport
  *     drop, not a real inference failure). The agent is still running and
  *     buffering frames server-side; reattach to the live stream. Nothing was
  *     lost and nothing is re-sent.
+ *   - `reload`: the runtime reports the turn `completed` — only the client
+ *     lost track of it (e.g. the view died mid-stream). Reload the persisted
+ *     messages; starting a `continue` turn here would bill the user for work
+ *     that already finished.
  *   - `continue`: the turn genuinely ended but the last assistant turn left
  *     resumable work (completed tool calls / partial text preserved in the
  *     session). Continue from that preserved context instead of restarting.
@@ -29,7 +33,7 @@
 
 import type { ChatTurnStatus } from "./probe-turn-status"
 
-export type RetryAction = "reconnect" | "continue" | "resend"
+export type RetryAction = "reconnect" | "reload" | "continue" | "resend"
 
 export interface RetryTriageInput {
   /** Status from the runtime's read-only `/turn` probe. */
@@ -46,11 +50,13 @@ export interface RetryTriageInput {
  * Decide how the "Retry" button should behave. Pure + total.
  *
  *  - `active`                              -> reconnect (agent still running)
- *  - terminal/unknown + resumable work     -> continue (preserve work)
- *  - terminal/unknown + nothing to resume  -> resend (last resort)
+ *  - `completed`                           -> reload (the work is already saved)
+ *  - failed/aborted/unknown + resumable    -> continue (preserve work)
+ *  - failed/aborted/unknown + nothing      -> resend (last resort)
  */
 export function decideRetryAction({ turnStatus, hasResumableTurn }: RetryTriageInput): RetryAction {
   if (turnStatus === "active") return "reconnect"
+  if (turnStatus === "completed") return "reload"
   if (hasResumableTurn) return "continue"
   return "resend"
 }
