@@ -24,7 +24,12 @@ describe('planWrittenInsteadOfCreated', () => {
     expect(planWrittenInsteadOfCreated('plan', ['update_plan'], chatPlan)).toBe(false)
     expect(planWrittenInsteadOfCreated('plan', ['ask_user'], chatPlan)).toBe(false)
   })
+  test('design and rollout plans written in chat count too', () => {
+    expect(planWrittenInsteadOfCreated('plan', ['read_file'], '## REST → GraphQL Migration Plan\n### Overview\n...')).toBe(true)
+    expect(planWrittenInsteadOfCreated('plan', [], '## Architecture\n### Phase 1: Extract\n...\n### Phase 2: Load\n...')).toBe(true)
+  })
   test('not outside plan mode, and not for an ordinary answer', () => {
+    expect(planWrittenInsteadOfCreated('plan', [], '## How the refresh flow works\n### Access tokens\n### Refresh tokens')).toBe(false)
     expect(planWrittenInsteadOfCreated('agent', [], chatPlan)).toBe(false)
     expect(planWrittenInsteadOfCreated('plan', [], 'The timeout comes from `src/http/client.ts`. ## Problem')).toBe(false)
     expect(planWrittenInsteadOfCreated('plan', [], '## Problem\nOnly one heading here.')).toBe(false)
@@ -76,9 +81,10 @@ describe('plan mode prompt', () => {
 
   test('a change request always ends in create_plan, never a snippet to apply by hand', () => {
     const prompt = buildPlanModePrompt({ searchEnabled: false })
-    expect(prompt).toContain('Every request that would change code ends with `create_plan`')
+    expect(prompt).toContain('Every plan you produce is delivered through `create_plan`')
+    expect(prompt).toContain('design and rollout plans as much as code changes')
     expect(prompt).toContain('even when the user does not say "plan"')
-    expect(prompt).toContain('Never answer with a snippet for the user to apply instead')
+    expect(prompt).toContain('Never answer with a plan or a snippet in chat instead')
     expect(prompt).toContain('The editing and command tools (edit_file, write_file, exec) do not exist in plan mode.')
   })
 

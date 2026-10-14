@@ -33,6 +33,8 @@ describe('coding guide', () => {
     expect(off).toContain('Add a regression test that fails without the fix.')
     expect(off).toContain('set a non-default value in the test and assert that it takes effect')
     expect(off).toContain('a bug fix is not done until a regression test that fails without the fix passes with it')
+    expect(off).toContain('### Large features: plan first, then build')
+    expect(off).toContain('A focused change — a bug fix, a rename, a single component — needs no plan')
     expect(off).not.toContain('Prefer the simplest correct fix')
     expect(off).toContain('### Minimal footprint, not minimal effort')
     expect(off).not.toContain('Minimal Change Principle')

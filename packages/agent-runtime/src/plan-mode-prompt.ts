@@ -49,7 +49,7 @@ export function buildPlanModePrompt({ searchEnabled }: { searchEnabled: boolean 
     'Plan mode is active. You MUST NOT edit source files, run mutating commands, or otherwise change the workspace before the user clicks Build. This supersedes all other instructions.',
     'Exception: you may create or update the plan artifact using create_plan/update_plan; those tools only write under .shogo/plans/ for user review.',
     '',
-    'Every request that would change code ends with `create_plan` (or `ask_user` when you are blocked) — including bug reports and one-line fixes, and even when the user does not say "plan". Never answer with a snippet for the user to apply instead; the plan is how the change gets made.',
+    'Every plan you produce is delivered through `create_plan` — or `update_plan` when the user is revising a plan that already exists in `.shogo/plans/` (find it with `read_file` on that folder), or `ask_user` when you are blocked — design and rollout plans as much as code changes. A request that would change code always ends with a plan, including bug reports and one-line fixes, and even when the user does not say "plan". Never answer with a plan or a snippet in chat instead; the plan card is how the work gets reviewed and built.',
     'The editing and command tools (edit_file, write_file, exec) do not exist in plan mode. The coding guide below describes how changes are made after the user clicks Build — use it to write the plan, not to make the change now.',
     '',
     `Read-only research tools: ${tools.map((t) => `\`${t}\``).join(', ')}.`,
@@ -88,7 +88,7 @@ export function buildPlanModePrompt({ searchEnabled }: { searchEnabled: boolean 
 /** Closes a plan-mode system prompt: the rules above are 30k+ characters back by the time the model answers. */
 export const PLAN_MODE_REMINDER = [
   '## PLAN MODE REMINDER',
-  'You are still in plan mode. Research with the read-only tools, then finish by calling `create_plan` with the required sections (Problem, Root cause, Options considered, Changes, Tests, Verification, Risks). Do not write the plan into your reply instead of calling `create_plan`, and do not try to edit files.',
+  'You are still in plan mode. Research with the read-only tools, then finish by calling `create_plan` (or `update_plan` to revise an existing plan) — for any plan, not only code changes (code-change plans use the required sections: Problem, Root cause, Options considered, Changes, Tests, Verification, Risks). Do not write the plan into your reply instead of calling `create_plan`, and do not try to edit files.',
 ].join('\n')
 
 /** Prepend the plan / ask mode prompt (plan mode also closes with a reminder); agent mode is unchanged. */
@@ -124,7 +124,9 @@ export function planWrittenInsteadOfCreated(
   replyText: string,
 ): boolean {
   if (mode !== 'plan' || toolNames.some((name) => PLAN_DELIVERY_TOOLS.has(name))) return false
-  return PLAN_HEADINGS.filter((title) => hasHeading(replyText, title)).length >= 2
+  if (PLAN_HEADINGS.filter((title) => hasHeading(replyText, title)).length >= 2) return true
+  if (/^#{1,4}\s+.*\bplan\b/im.test(replyText)) return true
+  return (replyText.match(/^#{1,4}\s+(?:phase|step|stage)\s*\d/gim) ?? []).length >= 2
 }
 
 /** One bounded follow-up for {@link planWrittenInsteadOfCreated}. */
