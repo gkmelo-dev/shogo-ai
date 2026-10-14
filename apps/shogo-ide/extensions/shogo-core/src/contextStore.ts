@@ -1,73 +1,48 @@
-import * as vscode from 'vscode'
-import type { ShogoContextItem } from './types'
+import type { IdeChatReference } from './protocol'
 
-const MAX_CONTEXT_TEXT_LENGTH = 24_000
+/** Same cap as the chat composer's MAX_SELECTION_CHARS. */
+export const MAX_CONTEXT_TEXT_LENGTH = 24_000
 
-function now() {
-  return new Date().toISOString()
+export function truncateText(text: string): { text: string; truncated: boolean } {
+  if (text.length <= MAX_CONTEXT_TEXT_LENGTH) return { text, truncated: false }
+  return { text: text.slice(0, MAX_CONTEXT_TEXT_LENGTH), truncated: true }
 }
 
-function truncateText(text: string): string {
-  if (text.length <= MAX_CONTEXT_TEXT_LENGTH) return text
-  return `${text.slice(0, MAX_CONTEXT_TEXT_LENGTH)}\n\n[Truncated by Shogo context guard]`
+export interface ReferenceBatch {
+  batchId: string
+  references: IdeChatReference[]
 }
 
-function createRange(selection: vscode.Selection) {
-  return {
-    startLine: selection.start.line,
-    startCharacter: selection.start.character,
-    endLine: selection.end.line,
-    endCharacter: selection.end.character,
+let batchCounter = 0
+const newBatchId = () => `batch-${Date.now().toString(36)}-${(batchCounter++).toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+
+/**
+ * References waiting to reach the Shogo chat composer. A batch stays here
+ * until the chat iframe acknowledges it (`shogo.ide.referencesAck`), so items
+ * added before the chat view first loads — or while it is reloading — are
+ * re-sent on the next `ready` and delivered once (the chat dedupes by
+ * `batchId`).
+ */
+export class ShogoContextOutbox {
+  private batches: ReferenceBatch[] = []
+
+  enqueue(references: IdeChatReference[]): string {
+    const batchId = newBatchId()
+    this.batches.push({ batchId, references })
+    return batchId
   }
-}
 
-export class ShogoContextStore {
-  private readonly items: ShogoContextItem[] = []
+  pending(): ReferenceBatch[] {
+    return this.batches.map((b) => ({ batchId: b.batchId, references: [...b.references] }))
+  }
 
-  list(): ShogoContextItem[] {
-    return [...this.items]
+  ack(batchId: string): boolean {
+    const before = this.batches.length
+    this.batches = this.batches.filter((b) => b.batchId !== batchId)
+    return this.batches.length !== before
   }
 
   clear(): void {
-    this.items.splice(0, this.items.length)
-  }
-
-  addSelection(editor: vscode.TextEditor): ShogoContextItem | null {
-    if (editor.selection.isEmpty) return null
-
-    const text = editor.document.getText(editor.selection)
-    if (!text.trim()) return null
-
-    const item: ShogoContextItem = {
-      id: `selection:${editor.document.uri.toString()}:${Date.now()}`,
-      kind: 'selection',
-      label: `${editor.document.fileName}:${editor.selection.start.line + 1}`,
-      uri: editor.document.uri.toString(),
-      languageId: editor.document.languageId,
-      text: truncateText(text),
-      range: createRange(editor.selection),
-      createdAt: now(),
-    }
-
-    this.items.unshift(item)
-    return item
-  }
-
-  addActiveFile(editor: vscode.TextEditor): ShogoContextItem | null {
-    const text = editor.document.getText()
-    if (!text.trim()) return null
-
-    const item: ShogoContextItem = {
-      id: `active-file:${editor.document.uri.toString()}:${Date.now()}`,
-      kind: 'active-file',
-      label: editor.document.fileName,
-      uri: editor.document.uri.toString(),
-      languageId: editor.document.languageId,
-      text: truncateText(text),
-      createdAt: now(),
-    }
-
-    this.items.unshift(item)
-    return item
+    this.batches = []
   }
 }

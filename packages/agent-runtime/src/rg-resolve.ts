@@ -4,8 +4,9 @@
 /**
  * Resolves the ripgrep binary path.
  *
- * Prefers the bundled @vscode/ripgrep binary (guaranteed cross-platform),
- * then falls back to a bare 'rg' on PATH.
+ * Order: `SHOGO_RG_PATH` (set by the desktop app, whose compiled runtime has
+ * no node_modules to resolve @vscode/ripgrep from), then the @vscode/ripgrep
+ * binary, then a bare 'rg' on PATH.
  */
 
 import { existsSync } from 'fs'
@@ -33,6 +34,12 @@ export const _rgResolveSeamForTests: {
 
 export function resolveRgPath(): string {
   if (_resolved !== undefined) return _resolved
+
+  const configured = process.env.SHOGO_RG_PATH
+  if (configured && _rgResolveSeamForTests.existsSync(configured)) {
+    _resolved = configured
+    return _resolved
+  }
 
   try {
     const { rgPath } = _rgResolveSeamForTests.require('@vscode/ripgrep') as { rgPath: string }

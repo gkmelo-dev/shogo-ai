@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react"
 import { Platform } from "react-native"
+import { requestChatInsert } from "../../lib/chat-insert-bus"
+import type { ChatReferenceInput } from "../../lib/chat-references"
 
 export interface IdeSelectionContext {
   text: string
@@ -41,6 +43,44 @@ export interface IdeReadFileResult {
 
 const EMPTY_CONTEXT: IdeContextState = { workspaceFolders: [] }
 
+/** Batch ids remembered so a batch Shogo Code re-sends after a reconnect is inserted once. */
+const MAX_REMEMBERED_BATCHES = 100
+
+const isPositiveInt = (v: unknown): v is number => typeof v === "number" && Number.isInteger(v) && v > 0
+
+/** Keep only well-formed file / folder / selection references from Shogo Code. */
+export function parseIdeReferences(raw: unknown): ChatReferenceInput[] {
+  if (!Array.isArray(raw)) return []
+  const out: ChatReferenceInput[] = []
+  for (const item of raw) {
+    if (!item || typeof item !== "object") continue
+    const r = item as Record<string, unknown>
+    if (typeof r.path !== "string" || !r.path || typeof r.name !== "string" || !r.name) continue
+    if (r.type === "file" || r.type === "folder") {
+      out.push({ type: r.type, path: r.path, name: r.name })
+    } else if (
+      r.type === "selection" &&
+      isPositiveInt(r.startLine) &&
+      isPositiveInt(r.endLine) &&
+      r.endLine >= r.startLine &&
+      typeof r.text === "string" &&
+      r.text.trim()
+    ) {
+      out.push({
+        type: "selection",
+        path: r.path,
+        name: r.name,
+        startLine: r.startLine,
+        endLine: r.endLine,
+        text: r.text,
+        ...(typeof r.languageId === "string" ? { languageId: r.languageId } : {}),
+        ...(r.truncated === true ? { truncated: true } : {}),
+      })
+    }
+  }
+  return out
+}
+
 function canUseWindow(): boolean {
   return Platform.OS === "web" && typeof window !== "undefined" && !!window.parent
 }
@@ -66,6 +106,7 @@ export function useIdeBridge(enabled: boolean) {
     if (!enabled || !canUseWindow()) return
     window.parent.postMessage(message, "*")
   }, [enabled])
+  const seenBatchesRef = useRef<string[]>([])
 
   useEffect(() => {
     if (!enabled || !canUseWindow()) return
@@ -87,6 +128,19 @@ export function useIdeBridge(enabled: boolean) {
           workspaceFolders: Array.isArray(message.workspaceFolders) ? message.workspaceFolders : [],
           workspaceItems: Array.isArray(message.workspaceItems) ? message.workspaceItems : [],
         })
+        return
+      }
+
+      // "Add to Chat" in Shogo Code (⌘L, editor/Explorer menus, Explorer drops).
+      if (message.type === "shogo.ide.addReferences") {
+        const batchId = typeof message.batchId === "string" ? message.batchId : ""
+        if (!batchId) return
+        if (!seenBatchesRef.current.includes(batchId)) {
+          seenBatchesRef.current = [...seenBatchesRef.current, batchId].slice(-MAX_REMEMBERED_BATCHES)
+          const references = parseIdeReferences(message.references)
+          if (references.length > 0) requestChatInsert({ references, source: "shogo-code" })
+        }
+        post({ type: "shogo.ide.referencesAck", batchId })
         return
       }
 

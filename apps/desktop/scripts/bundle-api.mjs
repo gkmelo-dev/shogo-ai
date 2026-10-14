@@ -48,6 +48,7 @@ const ITEMS_TO_CLEAN = [
   'canvas-runtime',
   'static',
   'tree-sitter-wasm',
+  'ripgrep',
   'scripts',
   'mcp-packages',
   'package.json',
@@ -515,6 +516,23 @@ function main() {
     console.log(`  ✓ Copied ${copied} language grammar(s)`)
   } else {
     console.warn('  ⚠ tree-sitter-wasms package not found')
+  }
+
+  // --- Copy ripgrep (the agent's grep tool) ---
+  // The compiled agent-runtime has no node_modules to resolve @vscode/ripgrep
+  // from; local-server.ts points SHOGO_RG_PATH at this copy.
+  logStep('Copying ripgrep...')
+  const ripgrepDir = findInstalledPkg('@vscode/ripgrep', agentRuntimeDir)
+  const rgName = process.platform === 'win32' ? 'rg.exe' : 'rg'
+  const rgSrc = ripgrepDir ? path.join(ripgrepDir, 'bin', rgName) : null
+  if (rgSrc && fs.existsSync(rgSrc)) {
+    const rgDest = path.join(RESOURCES_DIR, 'ripgrep')
+    fs.mkdirSync(rgDest, { recursive: true })
+    fs.copyFileSync(rgSrc, path.join(rgDest, rgName))
+    if (process.platform !== 'win32') fs.chmodSync(path.join(rgDest, rgName), 0o755)
+    console.log(`  ✓ ${rgName}`)
+  } else {
+    console.warn('  ⚠ @vscode/ripgrep binary not found; the grep tool will fall back to rg on PATH or its JS search')
   }
 
   // --- Copy runtime install scripts (invoked by API at runtime, e.g. sherpa-onnx installer) ---

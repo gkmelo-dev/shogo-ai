@@ -210,6 +210,14 @@ jobs:
       - name: Lint
         run: bun run lint
 
+      - name: Shogo Code extension (typecheck, unit tests, patch + phase checks)
+        run: |
+          bun run --cwd apps/shogo-ide extension:typecheck
+          bun run --cwd apps/shogo-ide/extensions/shogo-core test
+          bun test apps/shogo-ide/scripts/__tests__
+          node apps/shogo-ide/scripts/phase1-check.mjs
+          node apps/shogo-ide/scripts/phase3-check.mjs
+
       - name: Check CI `bun install` steps authenticate ripgrep-prebuilt
         # Guards against the `@vscode/ripgrep` 403 flake — see
         # scripts/check-ci-bun-install-token.ts for the full writeup.

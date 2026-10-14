@@ -14,6 +14,9 @@ import { FileStateCache } from '../file-state-cache'
 import { buildToolPlanningGuide } from '../optimized-prompts'
 import { buildExploreSystemPrompt, getBuiltinSubagentConfig } from '../subagent'
 import { isSearchEnabled } from '../search-flag'
+import { buildCodeAgentGeneralGuide } from '../code-agent-prompt'
+import { buildPlanModePrompt } from '../plan-mode-prompt'
+import { COORDINATOR_READONLY_TOOLS } from '../coordinator-prompt'
 
 const prev = process.env.SHOGO_SEARCH_ENABLED
 afterEach(() => {
@@ -57,7 +60,7 @@ describe('search advertisement contract (WS6)', () => {
     const prompt = buildExploreSystemPrompt(false)
     expect(prompt).not.toMatch(/exec, search/)
     expect(prompt).not.toContain('Use search for semantic')
-    expect(prompt).toContain('read_file, exec, web, impact_radius')
+    expect(prompt).toContain('read_file, grep, git_history, exec, web, impact_radius')
   })
 
   test('prod-like: explore subagent toolNames are a subset of registered tools', () => {
@@ -80,5 +83,29 @@ describe('search advertisement contract (WS6)', () => {
     expect(buildExploreSystemPrompt(true)).toContain('exec, search, web')
     const cfg = getBuiltinSubagentConfig('explore', makeCtx(), [])
     expect(cfg!.toolNames).toContain('search')
+  })
+
+  test('prod-like: the coding guide and plan prompt only advertise registered tools', () => {
+    delete process.env.SHOGO_SEARCH_ENABLED
+    const registered = registeredToolNames()
+    const guide = buildCodeAgentGeneralGuide({ searchEnabled: false })
+    expect(guide).not.toContain('search({')
+    expect(guide).not.toMatch(/exec\(\{ command: 'rg|exec\\? with ripgrep|exec rg/)
+    expect(guide).toContain('grep({')
+    for (const name of ['grep', 'git_history', 'read_lints', 'impact_radius']) {
+      expect({ name, registered: registered.has(name) }).toEqual({ name, registered: true })
+    }
+    const plan = buildPlanModePrompt({ searchEnabled: false })
+    expect(plan).not.toContain('`search`')
+  })
+
+  test('grep and git_history are registered, and the explore subagent and coordinator can use them', () => {
+    const registered = registeredToolNames()
+    expect(registered.has('grep')).toBe(true)
+    expect(registered.has('git_history')).toBe(true)
+    const cfg = getBuiltinSubagentConfig('explore', makeCtx(), [])
+    expect(cfg!.toolNames).toEqual(expect.arrayContaining(['grep', 'git_history']))
+    expect(COORDINATOR_READONLY_TOOLS.has('grep')).toBe(true)
+    expect(COORDINATOR_READONLY_TOOLS.has('git_history')).toBe(true)
   })
 })

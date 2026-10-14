@@ -73,4 +73,28 @@ describe('resolveRgPath', () => {
     _rgResolveSeamForTests.reset()
     expect(resolveRgPath()).toBe('rg')
   })
+
+  describe('SHOGO_RG_PATH (desktop: compiled runtime ships rg next to it)', () => {
+    const saved = process.env.SHOGO_RG_PATH
+    afterEach(() => {
+      if (saved === undefined) delete process.env.SHOGO_RG_PATH
+      else process.env.SHOGO_RG_PATH = saved
+    })
+
+    test('wins over @vscode/ripgrep when the file exists', () => {
+      _rgResolveSeamForTests.reset()
+      process.env.SHOGO_RG_PATH = '/app/resources/bin/rg'
+      _rgResolveSeamForTests.existsSync = (p) => p === '/app/resources/bin/rg'
+      _rgResolveSeamForTests.require = () => ({ rgPath: '/node_modules/@vscode/ripgrep/bin/rg' })
+      expect(resolveRgPath()).toBe('/app/resources/bin/rg')
+    })
+
+    test('is ignored when the file is missing', () => {
+      _rgResolveSeamForTests.reset()
+      process.env.SHOGO_RG_PATH = '/missing/rg'
+      _rgResolveSeamForTests.existsSync = (p) => p === '/node_modules/@vscode/ripgrep/bin/rg'
+      _rgResolveSeamForTests.require = () => ({ rgPath: '/node_modules/@vscode/ripgrep/bin/rg' })
+      expect(resolveRgPath()).toBe('/node_modules/@vscode/ripgrep/bin/rg')
+    })
+  })
 })
