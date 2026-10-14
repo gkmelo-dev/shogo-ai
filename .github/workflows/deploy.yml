@@ -1158,17 +1158,16 @@ jobs:
           # immutable :<env>-<sha> tag comes from "Resolve release images";
           # apply-release-images.sh re-verifies it downstream as
           # defense-in-depth.
-          RUNTIME_IMAGE="${{ steps.release.outputs.runtime_image }}"
-          echo "Rendering manifests with RUNTIME_IMAGE=${RUNTIME_IMAGE}"
           # The studio image is environment-agnostic; production overlays
-          # carry release-version / GA4 / Facebook Pixel placeholders rendered
-          # here (staging has none).
-          kubectl kustomize "k8s/overlays/${{ env.ENVIRONMENT }}/" \
-            | sed -e "s|RUNTIME_IMAGE_PLACEHOLDER|${RUNTIME_IMAGE}|g" \
-                  -e "s|SHOGO_APP_VERSION_PLACEHOLDER|${{ needs.resolve-config.outputs.app_version }}|g" \
-                  -e "s|GA4_MEASUREMENT_ID_PLACEHOLDER|${{ secrets.GA4_MEASUREMENT_ID }}|g" \
-                  -e "s|FB_PIXEL_ID_PLACEHOLDER|${{ secrets.FB_PIXEL_ID }}|g" \
-            | kubectl apply -f -
+          # also carry release-version / GA4 / Facebook Pixel placeholders
+          # (staging has none).
+          export RUNTIME_IMAGE="${{ steps.release.outputs.runtime_image }}"
+          export APP_VERSION="${{ needs.resolve-config.outputs.app_version }}"
+          export GA4_MEASUREMENT_ID="${{ secrets.GA4_MEASUREMENT_ID }}"
+          export FB_PIXEL_ID="${{ secrets.FB_PIXEL_ID }}"
+          echo "Rendering manifests with RUNTIME_IMAGE=${RUNTIME_IMAGE}"
+          .github/scripts/render-overlay.sh "${{ env.ENVIRONMENT }}" > /tmp/manifests.yaml
+          kubectl apply -f /tmp/manifests.yaml
           # Node-level inotify quota bump — DaemonSet lives in kube-system,
           # outside the kustomize overlay (kustomize blocks reaching into
           # ../../base/ from an overlay). See k8s/base/inotify-tuner.yaml
@@ -1583,9 +1582,10 @@ jobs:
           set -euo pipefail
           bash scripts/ci/metal-rootfs-gate.sh decide "$SHA" fleet/production-us.json fleet/production-eu.json | tee -a "$GITHUB_OUTPUT"
 
+      # Runs even when the gate says no rebuild, to show which image a
+      # rebuild would use.
       - name: Metal runtime image (dry run)
         id: image
-        if: steps.gate.outputs.rebuild == 'true'
         env:
           SHA: ${{ github.sha }}
           REGISTRY: ${{ vars.OCI_REGION }}.ocir.io/${{ vars.OCI_TENANCY_NAMESPACE }}
@@ -1616,12 +1616,11 @@ jobs:
             echo "- Regions: **${REGIONS}** (see the per-region plans above)"
             echo "- Staging e2e (\`e2e/staging-critical\`): **${E2E}**"
             echo "- Metal rootfs rebuild: **${REBUILD:-unknown}** — ${REASON}"
-            if [ "$REBUILD" = "true" ]; then
-              if [ "$SOURCE" = "promoted" ]; then
-                echo "- Metal runtime image: would promote \`${IMAGE##*:}\` (no build)"
-              else
-                echo "- Metal runtime image: would **build** \`${IMAGE##*:}\` (~90 min; no staging image matches)"
-              fi
+            if [ "$REBUILD" = "true" ]; then WHEN="would"; else WHEN="if a rebuild were needed, would"; fi
+            if [ "$SOURCE" = "promoted" ]; then
+              echo "- Metal runtime image: ${WHEN} promote \`${IMAGE##*:}\` (no build)"
+            elif [ "$SOURCE" = "build" ]; then
+              echo "- Metal runtime image: ${WHEN} **build** \`${IMAGE##*:}\` (~90 min; no staging image matches)"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
           if [ "$REGIONS" != "success" ] || [ "$E2E" != "success" ]; then
@@ -1839,17 +1838,16 @@ jobs:
           # immutable :<env>-<sha> tag comes from "Resolve release images";
           # apply-release-images.sh re-verifies it downstream as
           # defense-in-depth.
-          RUNTIME_IMAGE="${{ steps.release.outputs.runtime_image }}"
-          echo "Rendering manifests with RUNTIME_IMAGE=${RUNTIME_IMAGE}"
           # The studio image is environment-agnostic; production overlays
-          # carry release-version / GA4 / Facebook Pixel placeholders rendered
-          # here (staging has none).
-          kubectl kustomize "k8s/overlays/${{ env.ENVIRONMENT }}/" \
-            | sed -e "s|RUNTIME_IMAGE_PLACEHOLDER|${RUNTIME_IMAGE}|g" \
-                  -e "s|SHOGO_APP_VERSION_PLACEHOLDER|${{ needs.resolve-config.outputs.app_version }}|g" \
-                  -e "s|GA4_MEASUREMENT_ID_PLACEHOLDER|${{ secrets.GA4_MEASUREMENT_ID }}|g" \
-                  -e "s|FB_PIXEL_ID_PLACEHOLDER|${{ secrets.FB_PIXEL_ID }}|g" \
-            | kubectl apply -f -
+          # also carry release-version / GA4 / Facebook Pixel placeholders
+          # (staging has none).
+          export RUNTIME_IMAGE="${{ steps.release.outputs.runtime_image }}"
+          export APP_VERSION="${{ needs.resolve-config.outputs.app_version }}"
+          export GA4_MEASUREMENT_ID="${{ secrets.GA4_MEASUREMENT_ID }}"
+          export FB_PIXEL_ID="${{ secrets.FB_PIXEL_ID }}"
+          echo "Rendering manifests with RUNTIME_IMAGE=${RUNTIME_IMAGE}"
+          .github/scripts/render-overlay.sh "${{ env.ENVIRONMENT }}" > /tmp/manifests.yaml
+          kubectl apply -f /tmp/manifests.yaml
           # Node-level inotify quota bump — DaemonSet lives in kube-system,
           # outside the kustomize overlay (kustomize blocks reaching into
           # ../../base/ from an overlay). See k8s/base/inotify-tuner.yaml
@@ -2439,17 +2437,16 @@ jobs:
           # immutable :<env>-<sha> tag comes from "Resolve release images";
           # apply-release-images.sh re-verifies it downstream as
           # defense-in-depth.
-          RUNTIME_IMAGE="${{ steps.release.outputs.runtime_image }}"
-          echo "Rendering manifests with RUNTIME_IMAGE=${RUNTIME_IMAGE}"
           # The studio image is environment-agnostic; production overlays
-          # carry release-version / GA4 / Facebook Pixel placeholders rendered
-          # here (staging has none).
-          kubectl kustomize "k8s/overlays/${{ env.ENVIRONMENT }}/" \
-            | sed -e "s|RUNTIME_IMAGE_PLACEHOLDER|${RUNTIME_IMAGE}|g" \
-                  -e "s|SHOGO_APP_VERSION_PLACEHOLDER|${{ needs.resolve-config.outputs.app_version }}|g" \
-                  -e "s|GA4_MEASUREMENT_ID_PLACEHOLDER|${{ secrets.GA4_MEASUREMENT_ID }}|g" \
-                  -e "s|FB_PIXEL_ID_PLACEHOLDER|${{ secrets.FB_PIXEL_ID }}|g" \
-            | kubectl apply -f -
+          # also carry release-version / GA4 / Facebook Pixel placeholders
+          # (staging has none).
+          export RUNTIME_IMAGE="${{ steps.release.outputs.runtime_image }}"
+          export APP_VERSION="${{ needs.resolve-config.outputs.app_version }}"
+          export GA4_MEASUREMENT_ID="${{ secrets.GA4_MEASUREMENT_ID }}"
+          export FB_PIXEL_ID="${{ secrets.FB_PIXEL_ID }}"
+          echo "Rendering manifests with RUNTIME_IMAGE=${RUNTIME_IMAGE}"
+          .github/scripts/render-overlay.sh "${{ env.ENVIRONMENT }}" > /tmp/manifests.yaml
+          kubectl apply -f /tmp/manifests.yaml
           # Node-level inotify quota bump — DaemonSet lives in kube-system,
           # outside the kustomize overlay (kustomize blocks reaching into
           # ../../base/ from an overlay). See k8s/base/inotify-tuner.yaml

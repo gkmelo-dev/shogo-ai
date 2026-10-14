@@ -98,18 +98,15 @@ else
   RUNTIME_IMAGE="${REGION_REGISTRY}/shogo/shogo-runtime:${CUR_RUNTIME_TAG}"
 fi
 RENDERED=$(mktemp)
-kubectl kustomize "k8s/overlays/${ENVIRONMENT}/" \
-  | sed -e "s|RUNTIME_IMAGE_PLACEHOLDER|${RUNTIME_IMAGE}|g" \
-        -e "s|SHOGO_APP_VERSION_PLACEHOLDER|${APP_VERSION:-}|g" \
-        -e "s|GA4_MEASUREMENT_ID_PLACEHOLDER|${GA4_MEASUREMENT_ID:-}|g" \
-        -e "s|FB_PIXEL_ID_PLACEHOLDER|${FB_PIXEL_ID:-}|g" > "$RENDERED"
-
-if out=$(kubectl apply --dry-run=server -f "$RENDERED" 2>&1); then
+if ! RUNTIME_IMAGE="$RUNTIME_IMAGE" .github/scripts/render-overlay.sh "$ENVIRONMENT" > "$RENDERED"; then
+  block "k8s/overlays/${ENVIRONMENT} does not render"
+elif out=$(kubectl apply --dry-run=server -f "$RENDERED" 2>&1); then
   echo "" >> "$SUMMARY"
-  echo "Manifests: \`kubectl apply --dry-run=server\` accepted $(grep -c . <<<"$out") objects." >> "$SUMMARY"
+  echo "Manifests: \`kubectl apply --dry-run=server\` accepted $(grep -c '(server dry run)' <<<"$out") objects." >> "$SUMMARY"
 else
   block "kubectl apply --dry-run=server rejected the ${ENVIRONMENT} manifests"
-  { echo ""; echo '```'; tail -40 <<<"$out"; echo '```'; } >> "$SUMMARY"
+  grep -v '(server dry run)' <<<"$out" | tail -20 | cut -c1-600 >&2
+  { echo ""; echo '```'; grep -v '(server dry run)' <<<"$out" | tail -40 | cut -c1-600; echo '```'; } >> "$SUMMARY"
 fi
 
 # Image fields are reset to :production-latest by the overlay and re-pinned
@@ -119,7 +116,7 @@ diff_out=$(kubectl diff -f "$RENDERED" 2>&1) || diff_rc=$?
 if [ "$diff_rc" -gt 1 ]; then
   echo "::warning::kubectl diff failed (rc=$diff_rc)"
 fi
-diff_out=$(grep -vE '^[-+][[:space:]]+image: ' <<<"$diff_out" || true)
+diff_out=$(grep -vE '^[-+][[:space:]]+((- )?image|generation): ' <<<"$diff_out" || true)
 {
   echo ""
   echo "<details><summary>Manifest diff against the live cluster (image lines omitted)</summary>"
@@ -146,11 +143,12 @@ else
     kubectl exec -i -n "$NS_SYSTEM" "$PRIMARY" -c postgres -- \
       psql -U postgres -d shogo -At -v ON_ERROR_STOP=1 -c "$1"
   }
-  APPLIED=$(psql_q "select migration_name from _prisma_migrations where finished_at is not null and rolled_back_at is null order by 1")
-  FAILED=$(psql_q "select migration_name from _prisma_migrations where finished_at is null and rolled_back_at is null order by 1")
-  REPO_MIGRATIONS=$(find prisma/migrations -mindepth 1 -maxdepth 1 -type d -exec basename {} \; | sort)
-  PENDING=$(comm -23 <(echo "$REPO_MIGRATIONS") <(echo "$APPLIED") | sed '/^$/d')
-  AHEAD=$(comm -13 <(echo "$REPO_MIGRATIONS") <(echo "$APPLIED") | sed '/^$/d')
+  APPLIED=$(psql_q "select distinct migration_name from _prisma_migrations where finished_at is not null and rolled_back_at is null order by 1")
+  FAILED=$(psql_q "select distinct migration_name from _prisma_migrations where finished_at is null and rolled_back_at is null order by 1")
+  REPO_MIGRATIONS=$(find prisma/migrations -mindepth 1 -maxdepth 1 -type d -exec basename {} \;)
+  sorted() { LC_ALL=C sort -u <<<"$1" | sed '/^$/d'; }
+  PENDING=$(LC_ALL=C comm -23 <(sorted "$REPO_MIGRATIONS") <(sorted "$APPLIED"))
+  AHEAD=$(LC_ALL=C comm -13 <(sorted "$REPO_MIGRATIONS") <(sorted "$APPLIED"))
   [ -z "$FAILED" ] || block "unfinished migration(s) in ${ENVIRONMENT}; prisma migrate deploy will refuse to run: $(tr '\n' ' ' <<<"$FAILED")"
   {
     echo ""
@@ -158,7 +156,7 @@ else
     if [ -n "$PENDING" ]; then echo ""; bullets <<<"$PENDING"; fi
     if [ -n "$AHEAD" ]; then
       echo ""
-      echo "The database has $(grep -c . <<<"$AHEAD") migration(s) this commit doesn't know; they stay applied (this is an older release than the DB):"
+      echo "Applied in the database but not in this commit's \`prisma/migrations\` (a newer release, or a renamed/removed migration; prisma ignores them):"
       bullets <<<"$AHEAD"
     fi
   } >> "$SUMMARY"
@@ -171,7 +169,9 @@ fi
 
 if [ ${#BLOCKERS[@]} -gt 0 ]; then
   { echo ""; echo "**${#BLOCKERS[@]} blocker(s):**"; printf -- '- %s\n' "${BLOCKERS[@]}"; } >> "$SUMMARY"
+  [ "$SUMMARY" = /dev/stdout ] || sed -n '/^## /,$p' "$SUMMARY" | grep -v '^```diff' | head -60
   exit 1
 fi
 echo "" >> "$SUMMARY"
 echo "No blockers in ${ENVIRONMENT}." >> "$SUMMARY"
+[ "$SUMMARY" = /dev/stdout ] || sed -n '/^## /,$p' "$SUMMARY" | head -60
