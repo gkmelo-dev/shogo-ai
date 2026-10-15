@@ -131,7 +131,7 @@ mock.module('../../../lib/team-chat-api', () => ({
     },
   }),
 }))
-mock.module('../../../hooks/usePresence', () => ({ usePresence: () => null }))
+mock.module('../../../hooks/usePresence', () => ({ usePresence: () => null, useInHuddle: () => false }))
 mock.module('../../../hooks/useChatItems', () => ({
   useDraft: () => ({ stored: '', save: () => {} }),
   useIsSaved: () => false,
