@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Shogo Technologies, Inc.
 import { describe, expect, test } from "bun:test"
-import { createPacedPublisher, PacedChat } from "../paced-chat"
+import { Chat } from "@ai-sdk/react"
+import { createPacedPublisher, PACED_CHAT_SDK_HOOKS, PacedChat } from "../paced-chat"
 
 function fakeClock() {
   let t = 0
@@ -118,6 +119,16 @@ describe("createPacedPublisher", () => {
 })
 
 describe("PacedChat", () => {
+  test("the installed @ai-sdk/react Chat still has the internal hooks PacedChat wraps", () => {
+    // Fails on an SDK upgrade that renames or removes them, before the
+    // PacedChat constructor would throw at runtime.
+    const chat = new Chat({})
+    for (const name of PACED_CHAT_SDK_HOOKS) {
+      expect(typeof chat[name]).toBe("function")
+    }
+    expect(() => new PacedChat({})).not.toThrow()
+  })
+
   test("message subscribers are not called synchronously from a messages update", async () => {
     const chat = new PacedChat({ publishWaitMs: 10 })
     let calls = 0

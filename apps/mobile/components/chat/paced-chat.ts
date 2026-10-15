@@ -96,6 +96,13 @@ export type PacedChatInit<M extends UIMessage> = ChatInit<M> & {
   publishWaitMs?: number
 }
 
+/** Internal `Chat` members PacedChat wraps; they are not part of the SDK's public API. */
+export const PACED_CHAT_SDK_HOOKS = [
+  "~registerMessagesCallback",
+  "~registerStatusCallback",
+  "~registerErrorCallback",
+] as const
+
 /**
  * A `Chat` whose message subscribers are paced by {@link createPacedPublisher}.
  * Status and error subscribers stay synchronous, but any pending message
@@ -105,6 +112,13 @@ export type PacedChatInit<M extends UIMessage> = ChatInit<M> & {
 export class PacedChat<M extends UIMessage = UIMessage> extends Chat<M> {
   constructor({ publishWaitMs = DEFAULT_PUBLISH_WAIT_MS, ...init }: PacedChatInit<M>) {
     super(init)
+    for (const name of PACED_CHAT_SDK_HOOKS) {
+      if (typeof this[name] !== "function") {
+        throw new Error(
+          `PacedChat: @ai-sdk/react Chat no longer has a "${name}" function; update paced-chat.ts for the installed SDK version.`,
+        )
+      }
+    }
     const registerMessages = this["~registerMessagesCallback"]
     const registerStatus = this["~registerStatusCallback"]
     const registerError = this["~registerErrorCallback"]

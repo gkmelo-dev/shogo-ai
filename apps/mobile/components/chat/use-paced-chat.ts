@@ -51,6 +51,9 @@ function createChat<M extends UIMessage>(
  * the chat is recreated only when a non-null `id` differs from the current
  * one, and the latest transport and callbacks are always used, so a rebuilt
  * transport never drops the in-memory conversation.
+ *
+ * `publishWaitMs` is read only when the chat is created; changing it later
+ * has no effect until `id` changes.
  */
 export function usePacedChat<M extends UIMessage = UIMessage>({
   id,
