@@ -28,6 +28,7 @@ import { workspaceChatRoutes } from './routes/workspace-chat'
 import { workspaceAgentRoutes, sessionAuthorize } from './routes/workspace-agent'
 import { workspaceMeetingRoutes, sharedMeetingRoutes } from './routes/workspace-meetings'
 import { conversationRoutes } from './routes/conversations'
+import { workBoardRoutes } from './routes/work-boards'
 import { AGENT_REPLY_TIMEOUT_MS, configureConversationAgentDispatcher, settleOrphanedAgentReplies } from './services/conversation-agent-dispatcher'
 import { registerBuiltInChatProviders } from './services/chat-providers'
 import { chatProviderRoutes } from './routes/chat-providers'
@@ -1595,6 +1596,7 @@ configureConversationAgentDispatcher({ runtimeManager: getRuntimeManager() })
 void settleOrphanedAgentReplies(AGENT_REPLY_TIMEOUT_MS + 60_000).catch((err) => console.warn('[Channels] could not settle interrupted replies:', err?.message ?? err))
 registerBuiltInChatProviders()
 app.route('/api', conversationRoutes({ resolveUserId: getAuthUserId }))
+app.route('/api', workBoardRoutes({ resolveUserId: getAuthUserId }))
 app.route('/api', chatProviderRoutes({ resolveUserId: getAuthUserId }))
 app.route('/api', createAgentTaskRoutes({ runtimeManager: getRuntimeManager() }))
 // Resume queued agent tasks after API restarts and keep dueAt-backed work
