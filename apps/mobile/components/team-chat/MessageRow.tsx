@@ -9,7 +9,7 @@ import { createElement, memo, useCallback, useEffect, useRef, useState, type Rea
 import { ActionSheetIOS, Alert, Image, Linking, Modal, Platform, Pressable, Text, TextInput, View } from 'react-native'
 import { useRouter } from 'expo-router'
 import * as Clipboard from 'expo-clipboard'
-import { AlarmClock, AlertCircle, Bookmark, Check, CircleDot, CornerDownRight, FileText, Link2, Loader2, MessageSquare, MoreHorizontal, Pencil, Pin, SmilePlus, Square, Trash2 } from 'lucide-react-native'
+import { AlarmClock, AlertCircle, Bookmark, Check, CircleDot, CornerDownRight, FileText, KanbanSquare, Link2, Loader2, MessageSquare, MoreHorizontal, Pencil, Pin, SmilePlus, Square, Trash2 } from 'lucide-react-native'
 import { cn } from '@shogo/shared-ui/primitives'
 import { ChatMarkdown } from '../chat/ChatMarkdown'
 import { SidebarContextMenu, type SidebarMenuEntry } from '../layout/SidebarContextMenu'
@@ -25,8 +25,11 @@ import { QuestionCardView } from './QuestionCard'
 import { approvalOf, connectRequestsOf, isAskedOf, messageKind, questionRefsOf, questionsOf, statusCardOf, workOf } from '../../lib/team-chat-kinds'
 import { continueAfterConnect } from '../../lib/question-answer'
 import { IntegrationConnectCard } from '../chat/IntegrationConnectCard'
+import { ImagePreviewModal } from '../chat/ImagePreviewModal'
 import { AgentWorkedFor, AgentWorkingStatus } from './AgentWork'
 import { renderMentions, type MentionNames } from '../../lib/team-chat-state'
+import { hasReacted, reactionTooltip } from '../../lib/team-chat-reactions'
+import { WebTooltip } from '../chat/WebTooltip'
 import { useUserStatus } from '../../hooks/useChatPrefs'
 import { PresenceDot } from './PresenceDot'
 import { toggleSaved, useIsSaved } from '../../hooks/useChatItems'
@@ -67,7 +70,8 @@ export interface MessageRowProps {
   workspaceId?: string
   inThread?: boolean
   onReply?: (message: ChatMessage) => void
-  onReact: (message: ChatMessage, emoji: string) => void
+  /** Add (`on: true`) or remove (`on: false`) a reaction; omit to let the handler toggle. */
+  onReact: (message: ChatMessage, emoji: string, on?: boolean) => void
   onEdit: (message: ChatMessage, text: string) => Promise<void>
   onDelete: (message: ChatMessage) => void
   onStopAgent: (message: ChatMessage) => void
@@ -78,6 +82,8 @@ export interface MessageRowProps {
   onOpenProjectPane?: (projectId: string, name: string) => void
   /** Move the read line back to just before this message. */
   onMarkUnread?: (message: ChatMessage) => void
+  /** Turn this message into a card on one of the channel's boards. */
+  onMakeCard?: (message: ChatMessage) => void
   /** Briefly emphasized after opening a link to it. */
   highlighted?: boolean
 }
@@ -298,6 +304,13 @@ function MessageRowImpl(props: MessageRowProps) {
   const [showFullUpdate, setShowFullUpdate] = useState(false)
   const foldBody = askedOfMe && !showFullUpdate && (body?.length ?? 0) > LONG_UPDATE_CHARS
   const isWeb = Platform.OS === 'web'
+  // Clicking an image opens the same viewer the agent chat uses instead of
+  // handing the URL to the browser. The gallery is the message's own images,
+  // so a post with several can be stepped through.
+  const [lightboxIndex, setLightboxIndex] = useState<number | null>(null)
+  const imageAttachments = deleted ? [] : message.attachments.filter((a) => a.mimeType.startsWith('image/'))
+  const imageIndexById = new Map(imageAttachments.map((a, index) => [a.id, index]))
+  const activeLightboxImage = lightboxIndex === null ? null : imageAttachments[lightboxIndex] ?? null
   useEditRequest(message.id, () => {
     if (!mine || deleted || message.authorType !== 'user') return
     setDraft(message.text)
@@ -323,10 +336,15 @@ function MessageRowImpl(props: MessageRowProps) {
   }
   const canAct = !deleted && !message.pending && message.authorType !== 'system'
 
+  /** Clicking a reaction you already have removes it; otherwise it adds it. */
+  const toggleReact = (emoji: string) => {
+    props.onReact(message, emoji, !hasReacted(message.reactions, emoji, props.me))
+  }
+
   const openActions = () => {
     if (deleted || message.pending) return
     const options: Array<{ label: string; run: () => void; destructive?: boolean }> = [
-      ...QUICK_REACTIONS.slice(0, 4).map((emoji) => ({ label: emoji, run: () => props.onReact(message, emoji) })),
+      ...QUICK_REACTIONS.slice(0, 4).map((emoji) => ({ label: emoji, run: () => toggleReact(emoji) })),
       { label: 'Add reaction…', run: () => setPickerOpen(true) },
     ]
     if (props.onReply && !inThread) options.push({ label: 'Reply in thread', run: () => props.onReply!(message) })
@@ -335,6 +353,7 @@ function MessageRowImpl(props: MessageRowProps) {
     options.push({ label: saved ? 'Remove from saved' : 'Save for later', run: save })
     if (props.workspaceId) options.push({ label: 'Remind me in 1 hour', run: () => remind(REMIND_OPTIONS[1].at()) })
     if (props.canPin) options.push({ label: message.pinned ? 'Unpin' : 'Pin to conversation', run: pin })
+    if (props.onMakeCard && canAct) options.push({ label: 'Make a card', run: () => props.onMakeCard!(message) })
     if (mine && message.authorType === 'user') options.push({ label: 'Edit', run: () => { setDraft(message.text); setEditing(true) } })
     if (mine || canManage) options.push({ label: 'Delete', run: () => props.onDelete(message), destructive: true })
     if (Platform.OS === 'ios') {
@@ -365,6 +384,7 @@ function MessageRowImpl(props: MessageRowProps) {
         }
       }
       if (props.canPin) items.push({ label: message.pinned ? 'Unpin' : 'Pin to conversation', icon: icon(Pin, message.pinned ? 'text-amber-600' : undefined), onSelect: pin })
+      if (props.onMakeCard) items.push({ label: 'Make a card', icon: icon(KanbanSquare), onSelect: () => props.onMakeCard!(message) })
     }
     if (mine && message.authorType === 'user') items.push({ label: 'Edit message', icon: icon(Pencil), onSelect: startEditing })
     if (mine || canManage) {
@@ -670,7 +690,13 @@ function MessageRowImpl(props: MessageRowProps) {
           <View className="mt-1.5 flex-row flex-wrap gap-2">
             {message.attachments.map((a) =>
               a.mimeType.startsWith('image/') ? (
-                <Pressable key={a.id} onPress={() => Linking.openURL(absoluteApiUrl(a.url))}>
+                <Pressable
+                  key={a.id}
+                  onPress={() => setLightboxIndex(imageIndexById.get(a.id) ?? 0)}
+                  accessibilityRole="button"
+                  accessibilityLabel={`Open ${a.name}`}
+                  className={isWeb ? 'cursor-pointer' : undefined}
+                >
                   <Image
                     source={{ uri: absoluteApiUrl(a.url) }}
                     className="rounded-lg border border-border"
@@ -711,19 +737,22 @@ function MessageRowImpl(props: MessageRowProps) {
         {!deleted && message.reactions.length > 0 && (
           <View className="mt-1 flex-row flex-wrap gap-1">
             {message.reactions.map((r) => {
-              const reacted = !!me && r.userIds.includes(me)
+              const reacted = hasReacted(message.reactions, r.emoji, me)
+              const who = reactionTooltip(r.emoji, r.userIds, me, names)
               return (
                 <Pressable
                   key={r.emoji}
-                  onPress={() => props.onReact(message, r.emoji)}
-                  accessibilityLabel={`${r.emoji} ${r.count}`}
+                  onPress={() => toggleReact(r.emoji)}
+                  accessibilityLabel={who}
                   className={cn(
                     'flex-row items-center gap-1 rounded-full border px-2 py-0.5',
                     reacted ? 'border-primary/50 bg-primary/10' : 'border-border bg-card',
                   )}
                 >
-                  <ReactionGlyph emoji={r.emoji} />
-                  <Text className={cn('text-[11px]', reacted ? 'text-primary' : 'text-muted-foreground')}>{r.count}</Text>
+                  <WebTooltip label={who}>
+                    <ReactionGlyph emoji={r.emoji} />
+                    <Text className={cn('text-[11px]', reacted ? 'text-primary' : 'text-muted-foreground')}>{r.count}</Text>
+                  </WebTooltip>
                 </Pressable>
               )
             })}
@@ -746,7 +775,7 @@ function MessageRowImpl(props: MessageRowProps) {
       {isWeb && active && !deleted && !message.pending && !editing && (
         <View className="absolute right-3 -top-3 flex-row items-center rounded-lg border border-border bg-card px-1 py-0.5 shadow-sm">
           {QUICK_REACTIONS.slice(0, 3).map((emoji) => (
-            <Pressable key={emoji} onPress={() => props.onReact(message, emoji)} className="rounded px-1.5 py-1 hover:bg-muted">
+            <Pressable key={emoji} onPress={() => toggleReact(emoji)} className="rounded px-1.5 py-1 hover:bg-muted">
               <Text className="text-sm">{emoji}</Text>
             </Pressable>
           ))}
@@ -785,12 +814,24 @@ function MessageRowImpl(props: MessageRowProps) {
                 workspaceId={props.workspaceId}
                 onPick={(code) => {
                   setPickerOpen(false)
-                  props.onReact(message, code)
+                  toggleReact(code)
                 }}
               />
             </Pressable>
           </Pressable>
         </Modal>
+      )}
+      {lightboxIndex !== null && (
+        <ImagePreviewModal
+          visible
+          onClose={() => setLightboxIndex(null)}
+          url={absoluteApiUrl(activeLightboxImage?.url ?? '')}
+          gallery={imageAttachments.map((a) => ({ url: absoluteApiUrl(a.url), title: a.name, alt: a.name }))}
+          initialIndex={lightboxIndex}
+          mediaType={activeLightboxImage?.mimeType}
+          title={activeLightboxImage?.name ?? 'Image'}
+          alt={activeLightboxImage?.name ?? 'Image attachment'}
+        />
       )}
     </Pressable>
   )

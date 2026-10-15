@@ -38,6 +38,7 @@ import {
 import * as Sentry from "@sentry/react-native"
 import {
   Alert,
+  AppState,
   View,
   Text,
   Pressable,
@@ -121,8 +122,9 @@ import {
 } from "./resume-stream-single-flight"
 import { useServerMessageQueue } from "./useServerMessageQueue"
 import {
-  dropUnfinishedAssistantTail,
   applyMessageSnapshot,
+  dropUnfinishedAssistantTail,
+  foldSnapshotContinuation,
   withResumeReplayReset,
 } from "./resume-replay-transport"
 import { cn } from "@shogo/shared-ui/primitives"
@@ -1919,6 +1921,12 @@ const ChatPanelContent = observer(function ChatPanelContent({
   // Set just before the stall watchdog calls `stop()`, so `onFinish` can
   // keep a timeout banner instead of wiping error state (silent dropped turns).
   const stallWatchdogTrippedRef = useRef(false)
+  // Set while the stream on screen came from `resumeStream()` rather than a
+  // send. A joined turn can end and the next one start between the probe and
+  // the reconnect, so the reply shown may belong to a different message; the
+  // saved history replaces it once the turn is over (see `onFinish`).
+  const joinedStreamRef = useRef(false)
+  const refreshHistoryRef = useRef<() => void>(() => {})
 
   // Workspace-scoped chat routes to `/api/workspaces/:workspaceId/chat`
   // instead of the per-project endpoint. Only set when this panel is
@@ -1956,6 +1964,9 @@ const ChatPanelContent = observer(function ChatPanelContent({
   // Set once `useChat` has returned `setMessages`; see resume-replay-transport.ts.
   const beforeResumeReplayRef = useRef<() => void>(() => {})
   const applyResumeSnapshotRef = useRef<(message: UIMessage) => void>(() => {})
+  // The installed snapshot's id; `displayMessages` folds the SDK's
+  // continuation message into it (see `foldSnapshotContinuation`).
+  const resumeSnapshotIdRef = useRef<string | null>(null)
   const chatTransport = useMemo(
     () =>
       transportConfig
@@ -2844,6 +2855,14 @@ const ChatPanelContent = observer(function ChatPanelContent({
       const contentLength =
         (message as any).content?.length ?? message.parts?.length ?? 0
 
+      if (joinedStreamRef.current) {
+        joinedStreamRef.current = false
+        // The reply row is still being written when the stream ends.
+        for (const delayMs of [600, 2500]) {
+          setTimeout(() => refreshHistoryRef.current(), delayMs)
+        }
+      }
+
       // Push a `turn-end` event to the EZ Mode bridge so the translator
       // overlay (voice or text) can summarise the outcome for the user.
       // De-dupe by message id so retries / React strict-mode double-invokes
@@ -3053,8 +3072,10 @@ const ChatPanelContent = observer(function ChatPanelContent({
   })
   beforeResumeReplayRef.current = () =>
     setMessages((prev) => dropUnfinishedAssistantTail(prev))
-  applyResumeSnapshotRef.current = (message) =>
+  applyResumeSnapshotRef.current = (message) => {
+    resumeSnapshotIdRef.current = message.id
     setMessages((prev) => applyMessageSnapshot(prev, message))
+  }
 
   // All resume paths share a single-flight guard. The history-load probe and
   // delegated-task reconciliation can finish at the same time when the app is
@@ -3071,7 +3092,10 @@ const ChatPanelContent = observer(function ChatPanelContent({
     return runResumeStreamSingleFlight(
       resumeStreamInFlightRef.current,
       currentSessionId,
-      resumeStream,
+      () => {
+        joinedStreamRef.current = true
+        return resumeStream()
+      },
     )
   }, [currentSessionId, resumeStream])
 
@@ -3180,13 +3204,25 @@ const ChatPanelContent = observer(function ChatPanelContent({
   const isStreaming =
     (isTransportStreaming || streamAutoRecovering) && stoppedMessages === null
 
+  const reloadAndAttachLiveTurnRef = useRef<
+    (opts?: { settle?: boolean }) => void
+  >(() => {})
   const resumeQueuedTurn = useCallback(
     (queuedUserMessage?: UIMessage) => {
+      // A message already on screen means this window showed that turn some
+      // other way and whatever runs now is a later one; attaching bare would
+      // write its reply over the last one. Load the history (which has the
+      // running turn's message) and attach from there.
+      if (
+        !queuedUserMessage ||
+        messagesRef.current.some((m) => m.id === queuedUserMessage.id)
+      ) {
+        reloadAndAttachLiveTurnRef.current()
+        return
+      }
       // The server saved the queued message and started its turn; show the
       // message before attaching to the reply (see queued-user-message.ts).
-      if (queuedUserMessage) {
-        setMessages((prev) => appendQueuedUserMessage(prev, queuedUserMessage))
-      }
+      setMessages((prev) => appendQueuedUserMessage(prev, queuedUserMessage))
       void resumeStreamSingleFlight().catch((error) => {
         console.warn("[ChatPanel] Failed to attach to queued turn:", error)
       })
@@ -3531,7 +3567,10 @@ const ChatPanelContent = observer(function ChatPanelContent({
   }, [currentSessionId, messages, optimisticUserInput])
 
   const displayMessages = useMemo((): UIMessage[] => {
-    const effectiveMessages = stoppedMessages ?? messages
+    const effectiveMessages = foldSnapshotContinuation(
+      stoppedMessages ?? messages,
+      resumeSnapshotIdRef.current,
+    )
     const currentOptimisticInput =
       optimisticUserInput?.sessionId === currentSessionId
         ? optimisticUserInput
@@ -3613,6 +3652,133 @@ const ChatPanelContent = observer(function ChatPanelContent({
   const isTransportStreamingRef = useRef(false)
   isStreamingRef.current = isStreaming
   isTransportStreamingRef.current = isTransportStreaming
+
+  const probeLiveTurn = useCallback(
+    async (
+      sessionId: string,
+      opts: { retryDelaysMs?: readonly number[]; timeoutMs?: number } = {},
+    ) => {
+      const controller = new AbortController()
+      const timer =
+        opts.timeoutMs !== undefined
+          ? setTimeout(() => controller.abort(), opts.timeoutMs)
+          : undefined
+      try {
+        return await probeChatTurnStatus({
+          url: buildChatTurnUrl(
+            API_URL!,
+            projectId,
+            localAgentUrl,
+            sessionId,
+            chatWorkspaceId,
+          ),
+          fetch: expoFetch,
+          headers: nativeHeaders ? nativeHeaders() : undefined,
+          credentials: Platform.OS === "web" ? "include" : undefined,
+          retryDelaysMs: opts.retryDelaysMs,
+          signal: controller.signal,
+        })
+      } finally {
+        if (timer) clearTimeout(timer)
+      }
+    },
+    [projectId, localAgentUrl, chatWorkspaceId, expoFetch, nativeHeaders],
+  )
+
+  // A turn this panel is not attached to (started in another window, by
+  // another member, by a schedule, or dispatched from a queue another window
+  // filled) streams to nobody here until something attaches to it. Nothing
+  // pushes that to the panel, so check when the person comes back to the
+  // window and right after a turn here ends (when a queued message starts).
+  const lastLiveTurnCheckAtRef = useRef(0)
+  // The live turn's stream carries only the assistant reply; attached on its
+  // own it merges into the previous reply. Reload history first (it has the
+  // turn's user message), which then probes and attaches (Effect 1).
+  const [liveTurnReloadNonce, setLiveTurnReloadNonce] = useState(0)
+  // Set while a reload is chasing a turn believed to be running. If that turn
+  // ends before the reload's probe, the history may hold its reply mid-write,
+  // so Effect 1 loads once more.
+  const liveTurnExpectedRef = useRef(false)
+  const liveTurnReloadNonceRef = useRef(0)
+  // The nonce of a reload that only refreshes the history; Effect 1 skips its
+  // probe so these never count against the auto-resume circuit breaker.
+  const historyOnlyNonceRef = useRef(-1)
+  const reloadAndAttachLiveTurn = useCallback(
+    (opts?: { settle?: boolean }) => {
+      const sessionId = currentSessionIdRef.current
+      if (!sessionId) return
+      liveTurnExpectedRef.current = opts?.settle !== false
+      cacheRefreshedAtRef.current.delete(sessionId)
+      setLiveTurnReloadNonce(++liveTurnReloadNonceRef.current)
+    },
+    [],
+  )
+  reloadAndAttachLiveTurnRef.current = reloadAndAttachLiveTurn
+  refreshHistoryRef.current = () => {
+    const sessionId = currentSessionIdRef.current
+    if (!sessionId) return
+    cacheRefreshedAtRef.current.delete(sessionId)
+    historyOnlyNonceRef.current = ++liveTurnReloadNonceRef.current
+    setLiveTurnReloadNonce(liveTurnReloadNonceRef.current)
+  }
+  const attachToLiveTurnIfAny = useCallback(async () => {
+    const sessionId = currentSessionIdRef.current
+    if (!sessionId || isStreamingRef.current || isSendingMessageRef.current) {
+      return
+    }
+    lastLiveTurnCheckAtRef.current = Date.now()
+    const turnStatus = await probeLiveTurn(sessionId)
+    if (
+      currentSessionIdRef.current !== sessionId ||
+      isStreamingRef.current ||
+      isSendingMessageRef.current
+    ) {
+      return
+    }
+    if (shouldAttachLiveStream(turnStatus)) reloadAndAttachLiveTurn()
+  }, [probeLiveTurn, reloadAndAttachLiveTurn])
+
+  useEffect(() => {
+    if (!isActive || !currentSessionId) return
+    const recheck = () => {
+      // Focus fires on every click back into the window.
+      if (Date.now() - lastLiveTurnCheckAtRef.current < 3000) return
+      void attachToLiveTurnIfAny()
+    }
+    if (Platform.OS === "web") {
+      if (typeof window === "undefined" || typeof document === "undefined") {
+        return
+      }
+      const onVisibility = () => {
+        if (document.visibilityState === "visible") recheck()
+      }
+      window.addEventListener("focus", recheck)
+      document.addEventListener("visibilitychange", onVisibility)
+      return () => {
+        window.removeEventListener("focus", recheck)
+        document.removeEventListener("visibilitychange", onVisibility)
+      }
+    }
+    const subscription = AppState.addEventListener("change", (state) => {
+      if (state === "active") recheck()
+    })
+    return () => subscription.remove()
+  }, [isActive, currentSessionId, attachToLiveTurnIfAny])
+
+  const attachToLiveTurnIfAnyRef = useRef(attachToLiveTurnIfAny)
+  attachToLiveTurnIfAnyRef.current = attachToLiveTurnIfAny
+  const wasTransportStreamingRef = useRef(false)
+  useEffect(() => {
+    const wasStreaming = wasTransportStreamingRef.current
+    wasTransportStreamingRef.current = isTransportStreaming
+    if (!wasStreaming || isTransportStreaming || !isActive) return
+    // The queue dispatcher starts the next message once the API has seen
+    // this turn end, a moment after this window has.
+    const timers = [1500, 4000].map((delay) =>
+      setTimeout(() => void attachToLiveTurnIfAnyRef.current(), delay),
+    )
+    return () => timers.forEach(clearTimeout)
+  }, [isTransportStreaming, isActive])
 
   // A delegated task or a channel mention starts its turn outside this panel.
   // The first history-load probe can therefore see `unknown` while a slot or
@@ -4199,11 +4365,23 @@ const ChatPanelContent = observer(function ChatPanelContent({
         })
 
         const cached = cachedMessagesRef.current
+        const textLength = (m: any): number => {
+          const fromParts = (m?.parts ?? []).reduce(
+            (n: number, p: any) =>
+              n + (p?.type === "text" && typeof p.text === "string" ? p.text.length : 0),
+            0,
+          )
+          return fromParts || (typeof m?.content === "string" ? m.content.length : 0)
+        }
+        // A reply read while the server was still writing it keeps its id and
+        // only grows, so compare its text too.
         const changed =
           !cached ||
           cached.length !== aiMessages.length ||
           cached[cached.length - 1]?.id !==
-            aiMessages[aiMessages.length - 1]?.id
+            aiMessages[aiMessages.length - 1]?.id ||
+          textLength(cached[cached.length - 1]) !==
+            textLength(aiMessages[aiMessages.length - 1])
 
         if (changed) {
           cachedMessagesRef.current = aiMessages
@@ -4246,6 +4424,7 @@ const ChatPanelContent = observer(function ChatPanelContent({
         // message list (the original "I see the same message twice"
         // shape, just from a different angle).
         if (myGeneration !== loadGenerationRef.current) return
+        if (liveTurnReloadNonce === historyOnlyNonceRef.current) return
         const turnUrl = buildChatTurnUrl(
           API_URL!,
           projectId,
@@ -4258,10 +4437,19 @@ const ChatPanelContent = observer(function ChatPanelContent({
           fetch: expoFetch,
           headers: nativeHeaders ? nativeHeaders() : undefined,
           credentials: Platform.OS === "web" ? "include" : undefined,
+          retryDelaysMs: [1000, 3000],
         }).then((turnStatus) => {
           if (myGeneration !== loadGenerationRef.current) return
+          lastLiveTurnCheckAtRef.current = Date.now()
+          const expectedLive = liveTurnExpectedRef.current
+          liveTurnExpectedRef.current = false
           if (shouldAttachLiveStream(turnStatus)) {
             guardedAutoResumeStream("live-turn-probe")
+          } else if (expectedLive) {
+            setTimeout(
+              () => reloadAndAttachLiveTurnRef.current({ settle: false }),
+              750,
+            )
           }
         })
       })
@@ -4273,6 +4461,7 @@ const ChatPanelContent = observer(function ChatPanelContent({
     setMessages,
     isLoadingMessages,
     isStreaming,
+    liveTurnReloadNonce,
   ])
 
   // This chat's last-used model: the most recent loaded message carrying a
@@ -4856,6 +5045,7 @@ const ChatPanelContent = observer(function ChatPanelContent({
           ? bodyExtra.clientTurnId
           : undefined
       pendingClientTurnIdRef.current = clientTurnId
+      joinedStreamRef.current = false
       try {
         await sendMessage(messagePayload, { body: bodyExtra })
       } catch (err) {
@@ -5732,51 +5922,64 @@ const ChatPanelContent = observer(function ChatPanelContent({
 
       const trimmedContent = content.trim()
 
+      const queueMessage = async () => {
+        const queueLocally = () =>
+          setMessageQueue((queue) => [
+            ...queue,
+            {
+              id: `queue-${Date.now()}-${Math.random()
+                .toString(36)
+                .substr(2, 9)}`,
+              content: trimmedContent,
+              files,
+              selectedModel: perMsgModel,
+              references,
+            },
+          ])
+        if (localAgentUrl) {
+          queueLocally()
+          return
+        }
+        try {
+          await enqueueServerMessage(
+            trimmedContent,
+            files,
+            perMsgModel,
+            references,
+          )
+        } catch (error) {
+          console.warn(
+            "[ChatPanel] Server queue unavailable; retaining a local queued message:",
+            error,
+          )
+          queueLocally()
+        }
+      }
+
       if (
         isStreaming ||
         isProcessingQueueRef.current ||
         isSendingMessageRef.current
       ) {
-        if (!localAgentUrl) {
-          try {
-            await enqueueServerMessage(
-              trimmedContent,
-              files,
-              perMsgModel,
-              references,
-            )
-          } catch (error) {
-            console.warn(
-              "[ChatPanel] Server queue unavailable; retaining a local queued message:",
-              error,
-            )
-            setMessageQueue((queue) => [
-              ...queue,
-              {
-                id: `queue-${Date.now()}-${Math.random()
-                  .toString(36)
-                  .substr(2, 9)}`,
-                content: trimmedContent,
-                files,
-                selectedModel: perMsgModel,
-                references,
-              },
-            ])
-          }
-          return
-        }
-        setMessageQueue((queue) => [
-          ...queue,
-          {
-            id: `queue-${Date.now()}-${Math.random()
-              .toString(36)
-              .substr(2, 9)}`,
-            content: trimmedContent,
-            files,
-            selectedModel: perMsgModel,
-            references,
-          },
-        ])
+        await queueMessage()
+        return
+      }
+
+      // The chat can be busy without this window knowing: a turn started in
+      // another window, by another member, or by a schedule. Sending now
+      // would start a second turn behind it with nothing on screen but Stop,
+      // so queue the message behind the live turn and show that turn here.
+      // Bounded: a cold runtime must not hold the message back. If the probe
+      // gives up, the runtime still waits for any live turn before this one.
+      const turnStatus = await probeLiveTurn(currentSessionId, {
+        timeoutMs: 1500,
+      })
+      if (
+        shouldAttachLiveStream(turnStatus) &&
+        currentSessionIdRef.current === currentSessionId
+      ) {
+        await queueMessage()
+        if (!isStreamingRef.current) reloadAndAttachLiveTurn()
         return
       }
 
@@ -5794,6 +5997,8 @@ const ChatPanelContent = observer(function ChatPanelContent({
       localAgentUrl,
       sendMessageInternal,
       currentSessionId,
+      probeLiveTurn,
+      reloadAndAttachLiveTurn,
     ],
   )
 

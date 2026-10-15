@@ -10,11 +10,14 @@
 import { prisma } from '../lib/prisma'
 import { accessibleProjectsWhere, loadAccess as loadAuthzAccess } from '../lib/authz'
 import { publishConversationEvent } from '../lib/conversation-bus'
+import { deleteConversationFile } from '../lib/conversation-files'
 import { flattenMarkdownBlocks, parseMentions, renderMentionsAsText, type AgentTarget, type ParsedMention } from './conversation-mentions'
 import { assertNativeChat } from './chat-mode'
 import type { AgentChain } from './conversation-agent-chain'
 import { publicBlocks } from './conversation-message-kind'
 import { normalizeBuddyLook, type BuddyLook } from '../../../../packages/shared-app/src/buddy-look'
+import { normalizeCapabilitySettings } from '@shogo/shared-runtime/capability-settings'
+import { parseProjectSettings } from '../lib/project-settings'
 
 const db = prisma as any
 
@@ -399,18 +402,34 @@ async function participantNames(workspaceId: string, conversationIds: string[], 
     : null
   const byConversation = new Map<string, any[]>()
   for (const r of rows) {
-    if (r.memberType === 'user' && r.userId === viewerId) continue
     const list = byConversation.get(r.conversationId) ?? []
     list.push(r.memberType === 'agent'
       ? { type: 'agent', projectId: r.projectId ?? null, name: r.projectId ? projectNames.get(r.projectId) ?? 'Agent' : workspaceAgentName }
-      : { type: 'user', id: r.user?.id ?? r.userId, name: r.user?.name || r.user?.email || 'Unknown', image: r.user?.image ?? null })
+      : {
+          type: 'user',
+          id: r.user?.id ?? r.userId,
+          name: r.user?.name || r.user?.email || 'Unknown',
+          image: r.user?.image ?? null,
+          ...(r.userId === viewerId ? { self: true } : {}),
+        })
     byConversation.set(r.conversationId, list)
+  }
+  // You are not one of the people in your own direct message — except in a
+  // note-to-self, where you are the only one and the row still needs a name
+  // and a face. Drop the viewer only when someone else is left to name it.
+  for (const [conversationId, list] of byConversation) {
+    if (list.length < 2) continue
+    const others = list.filter((p: any) => !(p.type === 'user' && p.self))
+    if (others.length) byConversation.set(conversationId, others)
   }
   return { byConversation, orphanedDirectIds }
 }
 
 export async function listConversationsForUser(workspaceId: string, userId: string) {
   const [general] = await ensureDefaultConversations(workspaceId)
+  // Gives every existing member their note-to-self on the next list load, so
+  // the workspace creator and older accounts need no separate backfill.
+  await ensureSelfConversation(workspaceId, userId)
   const memberships = await db.conversationMember.findMany({
     where: { userId, conversation: { workspaceId } },
   })
@@ -572,6 +591,8 @@ export async function getConversationForUser(conversationId: string, userId: str
     canPost: canPost(access),
     canReply: canPost(access, { threadReply: true }),
     canManage: canManage(access),
+    canDelete: deleteBlocker(access) === null,
+    systemManaged: !!access.conversation.systemManagedBy,
     members,
   })
 }
@@ -717,6 +738,75 @@ export async function leaveConversation(conversationId: string, userId: string) 
   publishConversationEvent(access.conversation.workspaceId, { type: 'member.left', conversationId, userId }, audience)
 }
 
+/**
+ * Why `access` can't delete this conversation, or null when it can. Only
+ * channels; #general is permanent; a mirrored channel belongs to its provider;
+ * and a channel an agent system declares would come back on its next apply.
+ */
+export function deleteBlocker(access: ConversationAccess): ConversationError | null {
+  const conv = access.conversation
+  if (conv.kind !== 'public' && conv.kind !== 'private') return new ConversationError(400, 'invalid', 'Only channels can be deleted')
+  if (conv.slug === DEFAULT_CHANNEL_SLUG) return new ConversationError(400, 'invalid', '#general cannot be deleted')
+  if (conv.provider && conv.provider !== 'shogo') {
+    return new ConversationError(400, 'invalid', 'This channel mirrors another chat app; delete it there')
+  }
+  if (!canManage(access)) return new ConversationError(403, 'forbidden', 'Only channel owners and workspace admins can do that')
+  if (conv.systemManagedBy) {
+    return new ConversationError(
+      409,
+      'system_managed',
+      `#${conv.name} is declared by an agent system. Remove it from teamChannels in shogo-system.yaml and run system_apply, then delete it.`,
+      { managedBy: conv.systemManagedBy },
+    )
+  }
+  return null
+}
+
+async function systemManagedError(conv: any): Promise<ConversationError> {
+  const managedBy: string = conv.systemManagedBy
+  const project = await db.project.findUnique({ where: { id: managedBy }, select: { name: true } }).catch(() => null)
+  const owner = project ? `the agent system in "${project.name}"` : 'an agent system'
+  return new ConversationError(
+    409,
+    'system_managed',
+    `#${conv.name} is declared by ${owner}. Remove it from teamChannels in that shogo-system.yaml and run system_apply, then delete it.`,
+    { managedBy, projectName: project?.name ?? null },
+  )
+}
+
+/**
+ * Permanently delete a channel and everything in it: messages, threads,
+ * files, pins, drafts, scheduled posts, huddles and its doc all cascade.
+ * References without a foreign key go in the same transaction — schedules,
+ * triggers and tasks that posted results here stop posting instead of failing,
+ * and the channel's reminders and inbox items are removed. Stored file bytes
+ * are deleted afterwards, best effort.
+ */
+export async function deleteConversation(conversationId: string, userId: string): Promise<void> {
+  const access = await loadAccess(conversationId, userId)
+  const blocker = deleteBlocker(access)
+  if (blocker?.code === 'system_managed') throw await systemManagedError(access.conversation)
+  if (blocker) throw blocker
+  const conv = access.conversation
+  const audience = await conversationAudience(conv)
+  const files = await db.conversationAttachment.findMany({ where: { conversationId }, select: { storageKey: true } })
+  const unlinkNotify = { notifyConversationId: null, notifyThreadRootId: null }
+  await db.$transaction([
+    db.agentSchedule.updateMany({ where: { notifyConversationId: conversationId }, data: unlinkNotify }),
+    db.eventSubscription.updateMany({ where: { notifyConversationId: conversationId }, data: unlinkNotify }),
+    db.agentTask.updateMany({ where: { notifyConversationId: conversationId }, data: { notifyConversationId: null } }),
+    db.integrationCredentialApproval.updateMany({ where: { conversationId }, data: { conversationId: null, messageId: null } }),
+    db.chatReminder.deleteMany({ where: { conversationId } }),
+    db.chatInboxItem.deleteMany({ where: { conversationId } }),
+    db.conversation.delete({ where: { id: conversationId } }),
+  ])
+  console.info(`[conversations] user ${userId} deleted #${conv.name} (${conversationId}) in workspace ${conv.workspaceId}`)
+  publishConversationEvent(conv.workspaceId, { type: 'conversation.deleted', conversationId }, audience)
+  const results = await Promise.allSettled(files.map((f: { storageKey: string }) => deleteConversationFile(f.storageKey)))
+  const failed = results.filter((r) => r.status === 'rejected').length
+  if (failed) console.warn(`[conversations] ${failed} of ${files.length} stored file(s) of deleted ${conversationId} could not be removed`)
+}
+
 export async function addUserMembers(conversationId: string, actorId: string, userIds: string[]) {
   const access = await loadAccess(conversationId, actorId)
   const conv = access.conversation
@@ -831,6 +921,21 @@ export async function openAgentConversation(workspaceId: string, userId: string,
     await db.conversationMember.create({
       data: { conversationId, memberType: 'agent', projectId: target.projectId, agentTrigger: 'all' },
     })
+  })
+}
+
+/**
+ * Everyone has a direct message with themselves — the scratchpad Slack calls
+ * "You", for notes you don't want to send anyone. Idempotent and keyed on
+ * `u:<userId>`, so provisioning twice costs one indexed lookup.
+ */
+export async function ensureSelfConversation(workspaceId: string, userId: string) {
+  const dmKey = `u:${userId}`
+  const existing = await db.conversation.findFirst({ where: { workspaceId, dmKey } })
+  if (existing) return existing
+  if (!(await getWorkspaceRole(workspaceId, userId))) return null
+  return findOrCreateDirect(workspaceId, dmKey, 'dm', userId, async (conversationId) => {
+    await db.conversationMember.create({ data: { conversationId, memberType: 'user', userId } })
   })
 }
 
@@ -1361,7 +1466,7 @@ export async function listMentionables(workspaceId: string, userId: string) {
     }),
     db.project.findMany({
       where: { AND: [{ workspaceId }, readable] },
-      select: { id: true, name: true, description: true, buddyLook: true },
+      select: { id: true, name: true, description: true, buddyLook: true, settings: true },
       orderBy: { updatedAt: 'desc' },
       take: 200,
     }),
@@ -1377,9 +1482,11 @@ export async function listMentionables(workspaceId: string, userId: string) {
   return {
     people,
     agents: [
-      { key: 'ws', projectId: null, name: profile?.name || 'Shogo', description: 'Workspace agent', image: profile?.avatarUrl ?? null, buddyLook: storedAgentBuddyLook(profile?.buddyLook) },
+      { key: 'ws', projectId: null, name: profile?.name || 'Shogo', description: 'Workspace agent', image: profile?.avatarUrl ?? null, buddyLook: storedAgentBuddyLook(profile?.buddyLook), boards: true },
       ...projects.map((p: any) => ({
         key: `p:${p.id}`, projectId: p.id, name: p.name, description: p.description ?? null, image: null, buddyLook: storedAgentBuddyLook(p.buddyLook),
+        /** Whether the agent can work cards (its Boards capability). */
+        boards: normalizeCapabilitySettings(parseProjectSettings(p.settings)).boardsEnabled,
       })),
     ],
   }

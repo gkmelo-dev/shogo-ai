@@ -55,6 +55,7 @@ import {
   removePoolTemplateDist,
   writePoolPreseedManifest,
 } from './workspace-pool-adopt'
+import { LiveTurnGate } from './live-turn-wait'
 import {
   createRuntimeApp, traceOperation,
   initializeS3Sync,
@@ -159,6 +160,7 @@ import {
   type GitHubWorkspaceOpInput,
 } from './github-workspace-git'
 import { isHostMediatedDurability } from './host-durability'
+import { executeRemoteTool } from './remote-tools'
 import { clearGitHubCliEnvCache } from './github-cli-credentials'
 import { HistoryIndex } from './history-index'
 import { WORKTREE_BRANCH_PREFIX } from '@shogo/shared-runtime'
@@ -1282,6 +1284,7 @@ function startWorkspaceDepsInstall(opts: { afterS3Restore?: boolean } = {}): Pro
 // =============================================================================
 
 const streamBufferStore = new StreamBufferStore()
+const liveTurnGate = new LiveTurnGate(streamBufferStore)
 
 // Hono app, CORS, auth middleware, /health, /pool/activity, /pool/assign are
 // provided by createRuntimeApp(). Agent-specific routes follow below.
@@ -1923,6 +1926,16 @@ app.post('/agent/chat', async (c) => {
   // Create a buffer that lives independently of the HTTP connection.
   // The agent writes into this buffer via a background consumer so that
   // a client disconnect (e.g. page refresh) does NOT cancel the agent.
+  // A busy chat finishes its live turn first; see live-turn-wait.ts.
+  if (liveTurnGate.isBusy(chatSessionKey)) {
+    console.log(`[AgentChat] Session ${chatSessionKey} has a live turn; waiting for it before starting the next`)
+    const { waitedMs, stopped } = await liveTurnGate.waitUntilFree(chatSessionKey)
+    if (stopped) {
+      console.log(`[AgentChat] Session ${chatSessionKey} was stopped after ${waitedMs}ms; not starting the waiting turn`)
+      return c.json({ error: 'The chat was stopped before this message started', code: 'turn_stopped' }, 409)
+    }
+    console.log(`[AgentChat] Session ${chatSessionKey} free after ${waitedMs}ms`)
+  }
   console.log(`[AgentChat] Creating stream buffer for session: ${chatSessionKey}`)
   const bufWriter = streamBufferStore.create(chatSessionKey)
   const turnId = bufWriter.turnId
@@ -2569,6 +2582,7 @@ app.post('/agent/stop', async (c) => {
     )
   }
   const stopSessionKey = rawStopSessionKey
+  liveTurnGate.markStopped(stopSessionKey)
   const aborted = agentGateway.abortCurrentTurn(stopSessionKey)
 
   // The main turn signal does not reach subagents because each has its own
@@ -3949,15 +3963,18 @@ app.post('/agent/session/reset', async (c) => {
 })
 
 // Tool mocks — used by eval runner to install deterministic tool responses
+let simWorld: import('./evals/company-sim/world').CompanyWorld | null = null
 app.post('/agent/tool-mocks', async (c) => {
   if (!agentGateway) {
     return c.json({ error: 'Agent gateway not running' }, 503)
   }
   const raw = await c.req.json()
   const { compileInstallBody } = await import('./evals/tool-mocks-runtime')
-  const compiled = compileInstallBody(raw)
+  const simSchemas = raw?.sim ? (await import('./evals/company-sim/tool-defs')).simToolSchemas() : undefined
+  const compiled = compileInstallBody(raw, { simSchemas, workspaceDir: WORKSPACE_DIR })
   agentGateway.setToolMocks(compiled.fns, compiled.syntheticDefs, compiled.hiddenTools)
-  return c.json({ ok: true, mockedTools: Object.keys(compiled.fns), defaults: compiled.defaults })
+  simWorld = compiled.world
+  return c.json({ ok: true, mockedTools: Object.keys(compiled.fns), defaults: compiled.defaults, sim: !!compiled.world })
 })
 
 app.delete('/agent/tool-mocks', (c) => {
@@ -3965,7 +3982,14 @@ app.delete('/agent/tool-mocks', (c) => {
     return c.json({ error: 'Agent gateway not running' }, 503)
   }
   agentGateway.clearToolMocks()
+  simWorld = null
   return c.json({ ok: true })
+})
+
+// Final state of the company simulation installed with the mocks, for graders.
+app.get('/agent/tool-mocks/sim-state', (c) => {
+  if (!simWorld) return c.json({ error: 'No simulation installed' }, 404)
+  return c.json(simWorld.snapshot())
 })
 
 app.post('/agent/workspace/seed', async (c) => {
@@ -4698,6 +4722,18 @@ app.post('/agent/tools/execute', async (c) => {
   const mcpMgr = agentGateway.getMcpClientManager()
   const result = await mcpMgr.callTool(tool, args || {})
   return c.json(result, result.ok ? 200 : 404)
+})
+
+// Remote tool channel (remote-tools.ts): another project of this workspace runs
+// one allow-listed tool against THIS project's root. Reached only through the
+// API (RBAC + wake); auth is the `/agent` runtime-token guard.
+app.post('/agent/remote/tool', async (c) => {
+  if (!agentGateway) {
+    return c.json({ ok: false, error: 'Agent gateway not running' }, 503)
+  }
+  const body = await c.req.json().catch(() => null)
+  const outcome = await executeRemoteTool(agentGateway.getRemoteTools(), body)
+  return c.json(outcome.body, outcome.status)
 })
 
 app.get('/agent/tools/schemas', (c) => {

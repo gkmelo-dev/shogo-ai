@@ -4,14 +4,16 @@ import { useRef, useState } from 'react'
 import { ActivityIndicator, Alert, Modal, Platform, Pressable, ScrollView, Text, TextInput, View, type LayoutChangeEvent } from 'react-native'
 import { useSafeAreaInsets } from 'react-native-safe-area-context'
 import { useRouter } from 'expo-router'
-import { Archive, Bell, BellOff, Bot, Check, ChevronLeft, FileText, FolderOpen, Hash, Lock, LogOut, MoreHorizontal, Paperclip, Pencil, PanelRight, Pin, Radio, Sparkles, Star, UserCircle, UserPlus, Users, X } from 'lucide-react-native'
+import { Archive, Bell, BellOff, Bot, Check, ChevronLeft, FileText, FolderOpen, Hash, Lock, LogOut, MoreHorizontal, NotebookText, Paperclip, Pencil, PanelRight, Pin, Radio, Sparkles, Star, Trash2, UserCircle, UserPlus, Users, X } from 'lucide-react-native'
 import { cn } from '@shogo/shared-ui/primitives'
 import { LiquidGlassBackdrop } from '../ui/LiquidGlassBackdrop'
 import { CHROME_SIZE, GlassButton, GlassChip } from './FloatingChrome'
 import { MarkdownText } from '../chat/MarkdownText'
+import { WebTooltip } from '../chat/WebTooltip'
 import {
   conversationTitle,
   isAgentDm,
+  isSelfDm,
   teamChatApi,
   type CatchUpResult,
   type ChatMessage,
@@ -35,6 +37,8 @@ export interface ConversationHeaderProps {
   me: string | null
   onChanged: () => void
   onLeft: () => void
+  /** The channel was deleted from here; defaults to `onLeft`. */
+  onDeleted?: () => void
   /** Phone presentation: glass back button, title pill and actions sheet over the messages. */
   floating?: boolean
   onBack?: () => void
@@ -56,7 +60,7 @@ function confirm(title: string, message: string): Promise<boolean> {
   )
 }
 
-export function ConversationHeader({ conversation, mentionables, me, onChanged, onLeft, floating, onBack, onOpenProjectPane, onOpenFiles, onOpenDoc, onLayout }: ConversationHeaderProps) {
+export function ConversationHeader({ conversation, mentionables, me, onChanged, onLeft, onDeleted, floating, onBack, onOpenProjectPane, onOpenFiles, onOpenDoc, onLayout }: ConversationHeaderProps) {
   const insets = useSafeAreaInsets()
   const router = useRouter()
   const [detailsOpen, setDetailsOpen] = useState(false)
@@ -73,19 +77,26 @@ export function ConversationHeader({ conversation, mentionables, me, onChanged, 
   const [notifyOpen, setNotifyOpen] = useState(false)
   const [pins, setPins] = useState<ChatMessage[] | null>(null)
   const [editOpen, setEditOpen] = useState(false)
+  const [deleteOpen, setDeleteOpen] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const isChannel = conversation.kind === 'public' || conversation.kind === 'private' || conversation.kind === 'activity'
   const canRename = conversation.canManage && (conversation.kind === 'public' || conversation.kind === 'private') && !conversation.archivedAt
   const canEditTopic = conversation.kind !== 'activity' && !conversation.archivedAt && (conversation.canPost || conversation.canManage)
-  const participants: Participant[] = conversation.members
-    .filter((m) => m.type === 'agent' || m.userId !== me)
-    .map((m) => (m.type === 'agent' ? { type: 'agent', projectId: m.projectId, name: m.name } : { type: 'user', id: m.userId, name: m.name, image: m.image }))
+  // You are not one of the people in your own direct message — except in a
+  // note-to-self, where you are the only one and the header still needs a
+  // name and a face. Keep your row only when nothing else would name it.
+  const others = conversation.members.filter((m) => m.type === 'agent' || m.userId !== me)
+  const named = others.length ? others : conversation.members
+  const participants: Participant[] = named.map((m) => (m.type === 'agent'
+    ? { type: 'agent', projectId: m.projectId, name: m.name }
+    : { type: 'user', id: m.userId, name: m.name, image: m.image, ...(m.userId === me ? { self: true } : {}) }))
   const title = isChannel ? conversation.name ?? 'channel' : conversationTitle({ kind: conversation.kind, name: conversation.name, participants })
   const dmPeer = conversation.kind === 'dm' ? participants.find((p) => p.type === 'user') : undefined
-  const peerId = dmPeer?.type === 'user' ? dmPeer.id : null
+  // Presence next to your own note would be your own status, so drop it.
+  const peerId = dmPeer?.type === 'user' && dmPeer.self !== true ? dmPeer.id : null
   const peerStatus = useUserStatus(conversation.workspaceId, peerId)
   const peerPresence = usePresence(conversation.workspaceId, peerId)
-  const Icon = conversation.kind === 'activity' ? Radio : conversation.kind === 'private' ? Lock : isChannel ? Hash : isAgentDm({ kind: conversation.kind, participants }) ? Bot : Users
+  const Icon = conversation.kind === 'activity' ? Radio : conversation.kind === 'private' ? Lock : isChannel ? Hash : isAgentDm({ kind: conversation.kind, participants }) ? Bot : isSelfDm({ kind: conversation.kind, participants }) ? NotebookText : Users
 
   const run = async (fn: () => Promise<unknown>) => {
     try {
@@ -209,6 +220,17 @@ export function ConversationHeader({ conversation, mentionables, me, onChanged, 
       },
     })
   }
+  // Shown to whoever could delete it but for an agent system declaring it, so
+  // the dialog can explain why instead of the option just being missing.
+  if (conversation.canDelete || (conversation.systemManaged && conversation.canManage)) {
+    actions.push({
+      key: 'delete',
+      label: 'Delete channel',
+      danger: true,
+      icon: (s) => <Trash2 size={s} className="text-destructive" />,
+      onPress: () => setDeleteOpen(true),
+    })
+  }
 
   const leading = peerId ? (
     <View className="w-4 items-center">
@@ -303,6 +325,22 @@ export function ConversationHeader({ conversation, mentionables, me, onChanged, 
           onSaved={() => {
             setEditOpen(false)
             onChanged()
+          }}
+        />
+      )}
+
+      {deleteOpen && (
+        <DeleteChannelModal
+          conversation={conversation}
+          onClose={() => setDeleteOpen(false)}
+          onArchived={() => {
+            setDeleteOpen(false)
+            onChanged()
+          }}
+          onDeleted={() => {
+            setDeleteOpen(false)
+            const leave = onDeleted ?? onLeft
+            leave()
           }}
         />
       )}
@@ -500,7 +538,7 @@ interface HeaderAction {
 function HeaderButton({ label, onPress, children }: { label: string; onPress: () => void; children: React.ReactNode }) {
   return (
     <Pressable onPress={onPress} accessibilityRole="button" accessibilityLabel={label} className="rounded-md p-1.5 active:bg-muted hover:bg-muted">
-      {children}
+      <WebTooltip label={label}>{children}</WebTooltip>
     </Pressable>
   )
 }
@@ -677,6 +715,119 @@ function EditChannelModal({
             >
               <Text className="text-sm font-medium text-primary-foreground">{saving ? 'Saving…' : 'Save'}</Text>
             </Pressable>
+          </View>
+        </Pressable>
+      </Pressable>
+    </Modal>
+  )
+}
+
+/**
+ * Permanent delete, confirmed by typing the channel name (as Slack asks for an
+ * explicit "yes, permanently delete"). Offers archiving instead, which keeps
+ * the history. A channel an agent system declares can't be deleted here, so
+ * the dialog explains where to remove it instead.
+ */
+function DeleteChannelModal({
+  conversation,
+  onClose,
+  onArchived,
+  onDeleted,
+}: {
+  conversation: ConversationDetail
+  onClose: () => void
+  onArchived: () => void
+  onDeleted: () => void
+}) {
+  const name = conversation.name ?? ''
+  const [typed, setTyped] = useState('')
+  const [busy, setBusy] = useState<'delete' | 'archive' | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const confirmed = typed.trim().replace(/^#/, '').toLowerCase() === name.toLowerCase()
+  const blocked = !!conversation.systemManaged
+
+  const act = async (kind: 'delete' | 'archive') => {
+    if (busy || (kind === 'delete' && (!confirmed || blocked))) return
+    setBusy(kind)
+    setError(null)
+    try {
+      if (kind === 'delete') {
+        await api.delete(conversation.id)
+        onDeleted()
+      } else {
+        await api.update(conversation.id, { archived: true })
+        onArchived()
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Something went wrong')
+      setBusy(null)
+    }
+  }
+
+  return (
+    <Modal visible transparent animationType="fade" onRequestClose={onClose}>
+      <Pressable className="flex-1 items-center justify-center bg-black/40 p-6" onPress={onClose}>
+        <Pressable className="w-full max-w-md rounded-xl bg-card p-5" onPress={() => {}}>
+          <View className="mb-3 flex-row items-center">
+            <Text className="flex-1 text-base font-semibold text-foreground">Delete #{name}?</Text>
+            <Pressable onPress={onClose} accessibilityLabel="Close">
+              <X size={16} className="text-muted-foreground" />
+            </Pressable>
+          </View>
+          {blocked ? (
+            <Text className="text-sm text-foreground">
+              An agent system declares this channel in its shogo-system.yaml, so deleting it here would only bring it back
+              on the next apply. Remove it from teamChannels there and run system_apply, then delete it.
+            </Text>
+          ) : (
+            <>
+              <Text className="text-sm text-foreground">
+                This permanently deletes #{name} for everyone, with all of its messages, threads and files. It can’t be undone.
+              </Text>
+              {!conversation.archivedAt && (
+                <Text className="mt-2 text-sm text-muted-foreground">
+                  To keep the history, archive it instead: nobody can post, but everything stays readable.
+                </Text>
+              )}
+              <Text className="mb-1 mt-4 text-xs font-medium text-muted-foreground">Type the channel name to confirm</Text>
+              <TextInput
+                value={typed}
+                onChangeText={setTyped}
+                placeholder={name}
+                placeholderTextColor="#8a8a8a"
+                accessibilityLabel="Channel name to confirm"
+                autoCapitalize="none"
+                autoCorrect={false}
+                className="rounded-md border border-border px-3 py-2 text-sm text-foreground"
+              />
+            </>
+          )}
+          {error && <Text className="mt-2 text-xs text-destructive">{error}</Text>}
+          <View className="mt-4 flex-row flex-wrap justify-end gap-2">
+            <Pressable onPress={onClose} className="rounded-md px-3 py-1.5 active:bg-muted hover:bg-muted">
+              <Text className="text-sm text-muted-foreground">{blocked ? 'Close' : 'Cancel'}</Text>
+            </Pressable>
+            {!blocked && !conversation.archivedAt && (
+              <Pressable
+                onPress={() => void act('archive')}
+                disabled={!!busy}
+                accessibilityLabel="Archive instead"
+                className={cn('rounded-md border border-border px-3 py-1.5 active:bg-muted', busy && 'opacity-60')}
+              >
+                <Text className="text-sm text-foreground">{busy === 'archive' ? 'Archiving…' : 'Archive instead'}</Text>
+              </Pressable>
+            )}
+            {!blocked && (
+              <Pressable
+                onPress={() => void act('delete')}
+                disabled={!confirmed || !!busy}
+                accessibilityLabel="Delete permanently"
+                accessibilityState={{ disabled: !confirmed || !!busy }}
+                className={cn('rounded-md bg-destructive px-3 py-1.5', (!confirmed || busy) && 'opacity-50')}
+              >
+                <Text className="text-sm font-medium text-destructive-foreground">{busy === 'delete' ? 'Deleting…' : 'Delete permanently'}</Text>
+              </Pressable>
+            )}
           </View>
         </Pressable>
       </Pressable>

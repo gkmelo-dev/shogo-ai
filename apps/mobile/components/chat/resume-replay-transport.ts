@@ -6,16 +6,14 @@ import { coalesceChunkBursts } from "./chunk-coalescer"
 /**
  * `resumeStream()` hits the SDK's default `/stream` URL, which carries no
  * `fromSeq`, so the runtime replays the buffered turn from seq 0. The SDK
- * seeds the resumed response with the last message when it is an
- * assistant message and applies every replayed chunk on top of it, so each
- * reasoning/text block already on screen is pushed a second time (tool
- * parts merge by id and don't duplicate).
+ * builds a resumed response as a new assistant message, so an unfinished
+ * copy of that turn already on screen (from history or an earlier attach)
+ * would sit right before it, and the turn list shows only the last
+ * assistant message of a turn.
  *
- * Dropping the unfinished assistant tail right before the replay starts
- * lets the replay rebuild that message from scratch. The SDK reads the last
- * message after `reconnectToStream` resolves, so the drop has to happen
- * inside the transport, and only when a replay stream actually came back —
- * a 204 (nothing buffered) must leave the message on screen.
+ * Dropping the unfinished assistant tail when a replay stream comes back lets
+ * the replay rebuild that message from scratch. A 204 (nothing buffered) must
+ * leave the message on screen.
  */
 
 /**
@@ -49,6 +47,38 @@ export function applyMessageSnapshot<T extends UIMessage>(
   return [
     ...dropUnfinishedAssistantTail(messages.filter((m) => m.id !== snapshot.id)),
     snapshot,
+  ]
+}
+
+/**
+ * The rest of a snapshot stream lands in a new message the SDK appends after
+ * the snapshot, and the turn list shows only a turn's last assistant message.
+ * Shows the two as one message: the snapshot's parts, then the rest of the
+ * turn. The snapshot ends at a step boundary, so no part is split across them.
+ */
+export function foldSnapshotContinuation<T extends UIMessage>(
+  messages: T[],
+  snapshotId: string | null,
+): T[] {
+  const n = messages.length
+  if (!snapshotId || n < 2) return messages
+  const snapshot = messages[n - 2]
+  const continuation = messages[n - 1]
+  if (
+    snapshot.id !== snapshotId ||
+    snapshot.role !== "assistant" ||
+    continuation.role !== "assistant"
+  ) {
+    return messages
+  }
+  return [
+    ...messages.slice(0, -2),
+    {
+      ...continuation,
+      id: snapshot.id,
+      metadata: continuation.metadata ?? snapshot.metadata,
+      parts: [...snapshot.parts, ...continuation.parts],
+    },
   ]
 }
 
