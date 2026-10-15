@@ -1502,6 +1502,144 @@ export async function intakeWorkItem(board: any, input: ItemInput, actor: BoardA
   return { item: await createWorkItem(board, input, actor), created: true }
 }
 
+// ─── Problems ────────────────────────────────────────────────────────────────
+
+export interface ProblemInput {
+  title: string
+  fingerprint: string
+  environment?: string | null
+  release?: string | null
+  message?: string | null
+  stack?: string | null
+  url?: string | null
+  userRef?: string | null
+  context?: Record<string, unknown> | null
+  occurredAt?: string | Date | null
+  eventSubscriptionId?: string | null
+  externalRef?: string | null
+}
+
+export type ProblemOutcome = 'new' | 'occurrence' | 'regressed' | 'dismissed'
+
+function problemDescription(input: ProblemInput): string | null {
+  const parts = [
+    input.message ? input.message.slice(0, 2000) : null,
+    input.stack ? `\`\`\`\n${input.stack.slice(0, 4000)}\n\`\`\`` : null,
+    input.url ? `Seen at ${input.url}` : null,
+  ].filter(Boolean)
+  return parts.length ? parts.join('\n\n') : null
+}
+
+/**
+ * One error report. Reports with the same fingerprint share a card: the
+ * first opens it, repeats add occurrences, and a repeat after the card was
+ * resolved reopens it. Dismissed cards stay dismissed and only count.
+ */
+export async function reportProblem(board: any, input: ProblemInput, actor: BoardActor): Promise<{ item: any; outcome: ProblemOutcome; occurrences: number }> {
+  if (board.itemType !== 'problem') throw bad('not_problem_board', `${board.name} is not a problem board`)
+  const fingerprint = str(input.fingerprint, 500)
+  if (!fingerprint) throw bad('invalid_input', 'fingerprint is required')
+  const title = str(input.title, 300) ?? fingerprint
+  const occurredAt = dateOrNull(input.occurredAt) ?? new Date()
+
+  let item = await db.workItem.findFirst({
+    where: { boardId: board.id, fingerprint, archivedAt: null },
+    orderBy: { createdAt: 'desc' },
+    include: { column: true, board: { include: BOARD_INCLUDE } },
+  })
+  let outcome: ProblemOutcome
+  if (!item) {
+    const created = await createWorkItem(board, {
+      title,
+      description: problemDescription(input),
+      fingerprint,
+      source: 'problem',
+      externalRef: input.externalRef ?? null,
+      eventSubscriptionId: input.eventSubscriptionId ?? null,
+      fields: { ...(input.environment ? { environment: input.environment } : {}), ...(input.release ? { release: input.release } : {}) },
+    }, actor)
+    item = await getItemRow(board.workspaceId, created.id)
+    outcome = 'new'
+  } else if (item.column.category === 'dismissed') {
+    outcome = 'dismissed'
+  } else if (item.column.category === 'done') {
+    await moveWorkItem(item, { column: defaultColumn(board).id }, actor)
+    item = await getItemRow(board.workspaceId, item.id)
+    outcome = 'regressed'
+  } else {
+    outcome = 'occurrence'
+  }
+
+  await db.problemOccurrence.create({
+    data: {
+      workItemId: item.id,
+      workspaceId: board.workspaceId,
+      fingerprint,
+      environment: str(input.environment, 100) ?? null,
+      release: str(input.release, 100) ?? null,
+      message: str(input.message, 10_000) ?? null,
+      stack: str(input.stack, 50_000) ?? null,
+      url: str(input.url, 2000) ?? null,
+      userRef: str(input.userRef, 200) ?? null,
+      occurrenceContext: input.context ?? null,
+      occurredAt,
+    },
+  })
+  const occurrences = await db.problemOccurrence.count({ where: { workItemId: item.id } })
+  const fields = { ...(item.fields ?? {}), occurrences, lastSeenAt: occurredAt.toISOString(), ...(input.release ? { release: input.release } : {}) }
+  await db.workItem.update({ where: { id: item.id }, data: { fields, lastActivityAt: new Date() } })
+  if (outcome !== 'new') {
+    await recordEvent(item, 'occurrence', actor, { environment: input.environment ?? null, release: input.release ?? null, outcome })
+    await publishBoard(board, { action: 'item.updated', itemId: item.id })
+  }
+  if (outcome === 'regressed' && item.threadRootMessageId) {
+    await postActivity(item, board, `${item.key} happened again after it was resolved${input.release ? ` (release ${input.release})` : ''}, so it was reopened.`)
+  }
+  return { item: serializeItem({ ...item, fields }), outcome, occurrences }
+}
+
+/** Recent occurrences, and counts by day and environment. */
+export async function problemOccurrences(item: any, opts: { limit?: number; days?: number } = {}) {
+  const limit = Math.min(Math.max(opts.limit ?? 20, 1), 100)
+  const since = new Date(Date.now() - (opts.days ?? 14) * 86_400_000)
+  const [recent, total, window] = await Promise.all([
+    db.problemOccurrence.findMany({ where: { workItemId: item.id }, orderBy: { occurredAt: 'desc' }, take: limit }),
+    db.problemOccurrence.count({ where: { workItemId: item.id } }),
+    db.problemOccurrence.findMany({ where: { workItemId: item.id, occurredAt: { gte: since } }, select: { occurredAt: true, environment: true, release: true } }),
+  ])
+  const byDay: Record<string, number> = {}
+  const byEnvironment: Record<string, number> = {}
+  const releases = new Set<string>()
+  for (const o of window) {
+    const day = new Date(o.occurredAt).toISOString().slice(0, 10)
+    byDay[day] = (byDay[day] ?? 0) + 1
+    const env = o.environment ?? 'unknown'
+    byEnvironment[env] = (byEnvironment[env] ?? 0) + 1
+    if (o.release) releases.add(o.release)
+  }
+  const first = await db.problemOccurrence.findFirst({ where: { workItemId: item.id }, orderBy: { occurredAt: 'asc' }, select: { occurredAt: true } })
+  return {
+    key: item.key,
+    total,
+    firstSeenAt: first?.occurredAt ?? null,
+    lastSeenAt: recent[0]?.occurredAt ?? null,
+    byDay,
+    byEnvironment,
+    releases: [...releases],
+    recent: recent.map((o: any) => ({
+      id: o.id,
+      occurredAt: o.occurredAt,
+      environment: o.environment,
+      release: o.release,
+      message: o.message,
+      stack: o.stack ? String(o.stack).slice(0, 4000) : null,
+      url: o.url,
+      userRef: o.userRef,
+      context: o.occurrenceContext ?? null,
+    })),
+  }
+}
+
 // ─── Post hooks ──────────────────────────────────────────────────────────────
 
 let hooksRegistered = false

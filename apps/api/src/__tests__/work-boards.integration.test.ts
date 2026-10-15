@@ -310,3 +310,55 @@ describe('agent routes', () => {
     expect(await db.workItemEvent.count({ where: { workItemId: first.item.id, type: 'occurrence' } })).toBe(1)
   })
 })
+
+describe('problems', () => {
+  const report = (body: Record<string, unknown>) => agent('POST', '/agent-boards/Errors/problems?channel=eng', body, seed.projectId)
+
+  test('repeats group into one card; a repeat after resolving reopens it as a regression', async () => {
+    await createBoard({ conversationId: otherChannelId, name: 'Errors', itemType: 'problem' })
+    const error = { title: 'TypeError in CheckoutForm.submit', fingerprint: 'TypeError:CheckoutForm.submit', environment: 'production', release: '1.4.0', message: "Cannot read properties of undefined (reading 'id')", stack: 'at submit (CheckoutForm.tsx:42)' }
+
+    const first = await report(error)
+    expect(first.status).toBe(201)
+    expect(first.json.outcome).toBe('new')
+    expect(first.json.item.column.name).toBe('Detected')
+    expect(first.json.item.fields).toMatchObject({ environment: 'production', occurrences: 1 })
+
+    const again = await report({ ...error, environment: 'staging' })
+    expect(again.status).toBe(200)
+    expect(again.json.outcome).toBe('occurrence')
+    expect(again.json.item.id).toBe(first.json.item.id)
+    expect(again.json.occurrences).toBe(2)
+
+    await call(seed.member, 'POST', `/work-items/${first.json.item.id}/move`, { column: 'Resolved' })
+    const regressed = await report({ ...error, release: '1.4.1' })
+    expect(regressed.json.outcome).toBe('regressed')
+    expect(regressed.json.item.column.name).toBe('Detected')
+    expect(await db.workItemEvent.count({ where: { workItemId: first.json.item.id, type: 'regressed' } })).toBe(1)
+
+    const occ = await agent('GET', `/agent-work-items/${first.json.item.key}/occurrences`, undefined, seed.projectId)
+    expect(occ.status).toBe(200)
+    expect(occ.json.total).toBe(3)
+    expect(occ.json.byEnvironment).toEqual({ production: 2, staging: 1 })
+    expect(occ.json.releases.sort()).toEqual(['1.4.0', '1.4.1'])
+    expect(occ.json.recent[0].release).toBe('1.4.1')
+
+    const asUser = await call(seed.member, 'GET', `/work-items/${first.json.item.id}/occurrences`)
+    expect(asUser.json.total).toBe(3)
+  })
+
+  test('dismissed problems stay dismissed but keep counting', async () => {
+    const first = await report({ title: 'ResizeObserver loop limit exceeded', fingerprint: 'resize-observer' })
+    await call(seed.member, 'POST', `/work-items/${first.json.item.id}/move`, { column: 'Dismissed' })
+    const again = await report({ title: 'ResizeObserver loop limit exceeded', fingerprint: 'resize-observer' })
+    expect(again.json.outcome).toBe('dismissed')
+    expect(again.json.item.column.name).toBe('Dismissed')
+    expect(again.json.occurrences).toBe(2)
+  })
+
+  test('only problem boards take error reports', async () => {
+    const res = await agent('POST', '/agent-boards/Support%20Tickets/problems', { title: 'x', fingerprint: 'x' }, seed.projectId)
+    expect(res.status).toBe(400)
+    expect(res.json.error.code).toBe('not_problem_board')
+  })
+})

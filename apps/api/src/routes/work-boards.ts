@@ -33,7 +33,9 @@ import {
   listBoards,
   listWorkItems,
   moveWorkItem,
+  problemOccurrences,
   registerWorkBoardHooks,
+  reportProblem,
   reorderBoards,
   resolveBoard,
   updateBoard,
@@ -538,6 +540,17 @@ export function workBoardRoutes(config: WorkBoardRoutesConfig): Hono {
     }
   })
 
+  router.get('/work-items/:itemId/occurrences', async (c) => {
+    const userId = await requireUser(c)
+    if (userId instanceof Response) return userId
+    try {
+      const item = await itemFor(c, userId)
+      return c.json(await problemOccurrences(item, { limit: Number(c.req.query('limit')) || undefined, days: Number(c.req.query('days')) || undefined }))
+    } catch (err) {
+      return errorResponse(c, err)
+    }
+  })
+
   router.post('/work-items/:itemId/follow', async (c) => {
     const userId = await requireUser(c)
     if (userId instanceof Response) return userId
@@ -887,6 +900,41 @@ export function agentBoardRoutes(config: AgentBoardRoutesConfig): Hono {
         before: c.req.query('before'),
         filter: (c.req.query('filter') as HistoryFilter) || 'all',
       }))
+    } catch (err) {
+      return errorResponse(c, err)
+    }
+  })
+
+  router.post(`${base}/:board/problems`, async (c) => {
+    const body = await readJson(c)
+    const ctx = await context(c, body)
+    if (ctx instanceof Response) return ctx
+    try {
+      const row = await board(c, ctx.auth.workspaceId, ctx.projectId, c.req.param('board'))
+      const result = await reportProblem(row, {
+        title: body.title,
+        fingerprint: body.fingerprint,
+        environment: body.environment,
+        release: body.release,
+        message: body.message,
+        stack: body.stack,
+        url: body.url,
+        userRef: body.user_ref ?? body.userRef,
+        context: body.context && typeof body.context === 'object' ? body.context : null,
+        occurredAt: body.occurred_at ?? body.occurredAt,
+      }, ctx.actor)
+      return c.json(result, result.outcome === 'new' ? 201 : 200)
+    } catch (err) {
+      return errorResponse(c, err)
+    }
+  })
+
+  router.get(`${items}/:item/occurrences`, async (c) => {
+    const ctx = await context(c)
+    if (ctx instanceof Response) return ctx
+    try {
+      const row = await item(ctx.auth.workspaceId, ctx.projectId, c.req.param('item'))
+      return c.json(await problemOccurrences(row, { limit: Number(c.req.query('limit')) || undefined, days: Number(c.req.query('days')) || undefined }))
     } catch (err) {
       return errorResponse(c, err)
     }
