@@ -311,6 +311,58 @@ describe('agent routes', () => {
   })
 })
 
+describe('work_item triggers', () => {
+  test('events become cards with mapped fields, and repeats with the same dedupe key update the open card', async () => {
+    const subs = await import('../services/event-subscription.service')
+    const delivery = await import('../services/event-delivery-targets')
+    const { subscription } = await subs.createSubscription({
+      workspaceId: seed.workspaceId,
+      ownerUserId: seed.member,
+      name: 'New tickets',
+      eventType: 'member.joined',
+      target: 'work_item',
+      workItemTarget: {
+        board: 'Support Tickets',
+        column: 'Open',
+        mapping: { title: '{{ticket.subject}} ({{ticket.requester}})', priority: 'ticket.priority', externalRef: 'ticket.id', fields: { customer: 'ticket.requester', seats: 'ticket.seats' } },
+        dedupeKey: 'ticket.id',
+      },
+    })
+    expect(subscription.target).toBe('work_item')
+    const row = await db.eventSubscription.findUnique({ where: { id: subscription.id } })
+    const fire = (payload: unknown) => delivery.deliverEvent({
+      deliveryId: crypto.randomUUID(),
+      subscription: row,
+      envelope: { id: crypto.randomUUID(), type: 'member.joined', version: 1, workspaceId: seed.workspaceId, occurredAt: new Date().toISOString(), payload },
+      signal: new AbortController().signal,
+    })
+    const payload = { ticket: { id: 'ZD-1001', subject: 'Cannot export invoices', requester: 'Acme', priority: 'HIGH', seats: 40 } }
+    const first = await fire(payload)
+    expect(first.summary).toMatch(/^Created ST-\d+\.$/)
+    const again = await fire(payload)
+    expect(again.summary).toContain('already open')
+
+    const cards = await db.workItem.findMany({ where: { eventSubscriptionId: subscription.id }, include: { column: true } })
+    expect(cards).toHaveLength(1)
+    const card = cards[0]
+    expect(card.title).toBe('Cannot export invoices (Acme)')
+    expect(card.column.name).toBe('Open')
+    expect(card.priority).toBe('high')
+    expect(card.externalRef).toBe('ZD-1001')
+    expect(card.source).toBe('trigger')
+    const fields = typeof card.fields === 'string' ? JSON.parse(card.fields) : card.fields
+    expect(fields).toEqual({ customer: 'Acme', seats: 40 })
+  })
+
+  test('targets are checked when the trigger is created', async () => {
+    const subs = await import('../services/event-subscription.service')
+    const base = { workspaceId: seed.workspaceId, ownerUserId: seed.member, name: 'x', eventType: 'member.joined', target: 'work_item' }
+    await expect(subs.createSubscription({ ...base, workItemTarget: { board: 'Nope', mapping: { title: 'x' } } })).rejects.toMatchObject({ status: 404 })
+    await expect(subs.createSubscription({ ...base, workItemTarget: { board: 'Support Tickets', mapping: {} } })).rejects.toMatchObject({ code: 'invalid_field' })
+    await expect(subs.createSubscription({ ...base, workItemTarget: { board: 'Support Tickets', column: 'Nowhere', mapping: { title: 'x' } } })).rejects.toMatchObject({ status: 400 })
+  })
+})
+
 describe('problems', () => {
   const report = (body: Record<string, unknown>) => agent('POST', '/agent-boards/Errors/problems?channel=eng', body, seed.projectId)
 
@@ -354,6 +406,34 @@ describe('problems', () => {
     expect(again.json.outcome).toBe('dismissed')
     expect(again.json.item.column.name).toBe('Dismissed')
     expect(again.json.occurrences).toBe(2)
+  })
+
+  test('a work_item trigger on a problem board reports problems', async () => {
+    const subs = await import('../services/event-subscription.service')
+    const delivery = await import('../services/event-delivery-targets')
+    const { subscription } = await subs.createSubscription({
+      workspaceId: seed.workspaceId,
+      ownerUserId: seed.member,
+      name: 'Errors from monitoring',
+      eventType: 'member.joined',
+      target: 'work_item',
+      workItemTarget: { board: 'Errors', channel: 'eng', mapping: { title: '{{error.type}} in {{error.where}}', message: 'error.message', environment: 'env' }, dedupeKey: '{{error.type}}:{{error.where}}' },
+    })
+    const row = await db.eventSubscription.findUnique({ where: { id: subscription.id } })
+    const fire = (payload: unknown) => delivery.deliverEvent({
+      deliveryId: crypto.randomUUID(),
+      subscription: row,
+      envelope: { id: crypto.randomUUID(), type: 'member.joined', version: 1, workspaceId: seed.workspaceId, occurredAt: new Date().toISOString(), payload },
+      signal: new AbortController().signal,
+    })
+    const payload = { error: { type: 'RangeError', where: 'Pager.render', message: 'Invalid array length' }, env: 'production' }
+    const first = await fire(payload)
+    const second = await fire(payload)
+    expect(first.summary).toContain('new problem')
+    expect(second.summary).toContain('occurrence')
+    const card = await db.workItem.findFirst({ where: { eventSubscriptionId: subscription.id } })
+    expect(card.title).toBe('RangeError in Pager.render')
+    expect(await db.problemOccurrence.count({ where: { workItemId: card.id } })).toBe(2)
   })
 
   test('only problem boards take error reports', async () => {

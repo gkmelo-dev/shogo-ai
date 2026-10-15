@@ -1511,7 +1511,7 @@ export interface EventTrigger {
   filter: Record<string, unknown> | null
   ownerUserId: string | null
   source: string
-  target: 'agent' | 'project' | 'webhook'
+  target: 'agent' | 'project' | 'webhook' | 'work_item'
   targetProjectId: string | null
   targetMode: string | null
   prompt: string | null
@@ -1527,13 +1527,14 @@ export interface EventTriggerCreateRequest {
   name: string
   eventType: string
   filter?: Record<string, unknown> | null
-  target?: 'agent' | 'project' | 'webhook'
+  target?: 'agent' | 'project' | 'webhook' | 'work_item'
   targetProjectId?: string
   targetMode?: 'agent' | 'hook'
   prompt?: string
   notifyConversationId?: string | null
   notifyThreadRootId?: string | null
   webhookUrl?: string
+  workItemTarget?: Record<string, unknown>
   triggerConfig?: Record<string, unknown>
   enabled?: boolean
 }
@@ -1549,6 +1550,7 @@ export interface EventTriggerUpdateRequest {
   notifyThreadRootId?: string | null
   webhookUrl?: string
   rotateWebhookSecret?: boolean
+  workItemTarget?: Record<string, unknown>
 }
 
 function triggersPath(workspaceId: string, suffix = ''): string {
