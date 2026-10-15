@@ -10,6 +10,7 @@
  */
 
 import { existsSync } from 'fs'
+import { delimiter, dirname, isAbsolute } from 'path'
 
 let _resolved: string | undefined
 
@@ -51,4 +52,19 @@ export function resolveRgPath(): string {
 
   _resolved = 'rg'
   return _resolved
+}
+
+/**
+ * Put the resolved ripgrep's directory at the front of `env`'s PATH so agent
+ * shells can run `rg` on machines without a system install. No-op when only a
+ * bare `rg` on PATH was found.
+ */
+export function prependRgToPath(env: NodeJS.ProcessEnv): void {
+  const rg = resolveRgPath()
+  if (!isAbsolute(rg)) return
+  const key = Object.keys(env).find((k) => k.toUpperCase() === 'PATH') ?? 'PATH'
+  const dir = dirname(rg)
+  const current = env[key] ?? ''
+  if (current.split(delimiter).includes(dir)) return
+  env[key] = current ? `${dir}${delimiter}${current}` : dir
 }

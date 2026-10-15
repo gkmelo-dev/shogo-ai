@@ -29,6 +29,7 @@
 
 import { execSync } from 'child_process'
 import fs from 'fs'
+import os from 'os'
 import path from 'path'
 import { fileURLToPath } from 'url'
 
@@ -518,13 +519,30 @@ function main() {
     console.warn('  ⚠ tree-sitter-wasms package not found')
   }
 
-  // --- Copy ripgrep (the agent's grep tool) ---
+  // --- Copy ripgrep (agent shells run `rg` from it) ---
   // The compiled agent-runtime has no node_modules to resolve @vscode/ripgrep
   // from; local-server.ts points SHOGO_RG_PATH at this copy.
   logStep('Copying ripgrep...')
   const ripgrepDir = findInstalledPkg('@vscode/ripgrep', agentRuntimeDir)
   const rgName = process.platform === 'win32' ? 'rg.exe' : 'rg'
-  const rgSrc = ripgrepDir ? path.join(ripgrepDir, 'bin', rgName) : null
+  const rgTargetArch = process.env.SHOGO_TARGET_ARCH || process.arch
+  let rgSrc = ripgrepDir ? path.join(ripgrepDir, 'bin', rgName) : null
+  if (ripgrepDir && rgTargetArch !== process.arch) {
+    // The installed binary is for the build host (macOS x64 is built on arm64
+    // runners). Re-run @vscode/ripgrep's downloader in a scratch copy with
+    // npm_config_arch, which it reads to pick the release asset.
+    const pkgDir = fs.realpathSync(ripgrepDir)
+    const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'shogo-rg-'))
+    fs.cpSync(path.join(pkgDir, 'lib'), path.join(scratch, 'lib'), { recursive: true })
+    fs.copyFileSync(path.join(pkgDir, 'package.json'), path.join(scratch, 'package.json'))
+    console.log(`  Fetching ripgrep for ${rgTargetArch} (host ${process.arch})`)
+    execSync('node lib/postinstall.js', {
+      cwd: scratch,
+      stdio: 'inherit',
+      env: { ...process.env, npm_config_arch: rgTargetArch, NODE_PATH: path.resolve(pkgDir, '..', '..') },
+    })
+    rgSrc = path.join(scratch, 'bin', rgName)
+  }
   if (rgSrc && fs.existsSync(rgSrc)) {
     const rgDest = path.join(RESOURCES_DIR, 'ripgrep')
     fs.mkdirSync(rgDest, { recursive: true })
@@ -532,7 +550,7 @@ function main() {
     if (process.platform !== 'win32') fs.chmodSync(path.join(rgDest, rgName), 0o755)
     console.log(`  ✓ ${rgName}`)
   } else {
-    console.warn('  ⚠ @vscode/ripgrep binary not found; the grep tool will fall back to rg on PATH or its JS search')
+    console.warn('  ⚠ @vscode/ripgrep binary not found; agent shells will only have a system rg, if any')
   }
 
   // --- Copy runtime install scripts (invoked by API at runtime, e.g. sherpa-onnx installer) ---

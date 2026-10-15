@@ -2,7 +2,8 @@
 // Copyright (C) 2026 Shogo Technologies, Inc.
 import { afterEach, describe, test, expect } from 'bun:test'
 import { existsSync } from 'fs'
-import { _rgResolveSeamForTests, resolveRgPath } from '../rg-resolve'
+import { delimiter } from 'path'
+import { _rgResolveSeamForTests, prependRgToPath, resolveRgPath } from '../rg-resolve'
 
 describe('resolveRgPath', () => {
   // Snapshot the seam defaults once so we can restore them after each
@@ -95,6 +96,38 @@ describe('resolveRgPath', () => {
       _rgResolveSeamForTests.existsSync = (p) => p === '/node_modules/@vscode/ripgrep/bin/rg'
       _rgResolveSeamForTests.require = () => ({ rgPath: '/node_modules/@vscode/ripgrep/bin/rg' })
       expect(resolveRgPath()).toBe('/node_modules/@vscode/ripgrep/bin/rg')
+    })
+  })
+
+  describe('prependRgToPath', () => {
+    const useRg = (rgPath: string) => {
+      _rgResolveSeamForTests.reset()
+      _rgResolveSeamForTests.existsSync = (p) => p === rgPath
+      _rgResolveSeamForTests.require = () => ({ rgPath })
+    }
+
+    test('puts the resolved rg directory first, once', () => {
+      useRg('/app/resources/ripgrep/rg')
+      const env: NodeJS.ProcessEnv = { PATH: `/usr/bin${delimiter}/bin` }
+      prependRgToPath(env)
+      prependRgToPath(env)
+      expect(env.PATH).toBe(`/app/resources/ripgrep${delimiter}/usr/bin${delimiter}/bin`)
+    })
+
+    test('keeps the existing key casing (Windows `Path`)', () => {
+      useRg('/app/resources/ripgrep/rg')
+      const env: NodeJS.ProcessEnv = { Path: '/usr/bin' }
+      prependRgToPath(env)
+      expect(env.Path).toBe(`/app/resources/ripgrep${delimiter}/usr/bin`)
+      expect(env.PATH).toBeUndefined()
+    })
+
+    test('leaves PATH alone when only a bare rg was found', () => {
+      _rgResolveSeamForTests.reset()
+      _rgResolveSeamForTests.require = () => { throw new Error('missing') }
+      const env: NodeJS.ProcessEnv = { PATH: '/usr/bin' }
+      prependRgToPath(env)
+      expect(env.PATH).toBe('/usr/bin')
     })
   })
 })
