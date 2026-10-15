@@ -1042,20 +1042,20 @@ async function applyBoardOp(
     const res = await agentBoardsRequest(workspaceId, 'POST', '/agent-boards', { body: { ...values, name: op.name, channel: op.channel, system: identity.system, ...who } })
     return res.ok ? null : `${res.error ?? 'create failed'}${res.code ? ` (${res.code})` : ''}`
   }
-  const ref = `/agent-boards/${encodeURIComponent(op.boardId!)}`
+  const board = encodeURIComponent(op.boardId!)
   if (op.action === 'restore') {
-    const res = await agentBoardsRequest(workspaceId, 'POST', `${ref}/archive`, { body: { archived: false, ...who } })
+    const res = await agentBoardsRequest(workspaceId, 'POST', `/agent-boards/${board}/archive`, { body: { archived: false, ...who } })
     if (!res.ok) return res.error ?? 'restore failed'
   }
   if (Object.keys(values).length) {
-    const res = await agentBoardsRequest(workspaceId, 'PATCH', ref, { body: { ...values, ...who } })
+    const res = await agentBoardsRequest(workspaceId, 'PATCH', `/agent-boards/${board}`, { body: { ...values, ...who } })
     if (!res.ok) return res.error ?? 'update failed'
   }
   for (const col of op.columns) {
     const body = { ...columnBody(col.values as Record<string, unknown>), ...(col.after ? { after: col.after } : {}), ...who }
     const res = col.action === 'create'
-      ? await agentBoardsRequest(workspaceId, 'POST', `${ref}/columns`, { body: { ...body, name: col.column } })
-      : await agentBoardsRequest(workspaceId, 'PATCH', `${ref}/columns/${encodeURIComponent(col.column)}`, { body })
+      ? await agentBoardsRequest(workspaceId, 'POST', `/agent-boards/${board}/columns`, { body: { ...body, name: col.column } })
+      : await agentBoardsRequest(workspaceId, 'PATCH', `/agent-boards/${board}/columns/${encodeURIComponent(col.column)}`, { body })
     if (!res.ok) return `column ${col.column}: ${res.error ?? 'failed'}`
   }
   return null
