@@ -25,7 +25,9 @@ describe("referenceKey", () => {
     expect(referenceKey({ type: "file", path: "a/b.ts", name: "b.ts" })).toBe("file:a/b.ts")
     expect(referenceKey({ type: "folder", path: "a", name: "a" })).toBe("folder:a")
     expect(referenceKey(selection("a/b.ts", 3, 9))).toBe("selection:a/b.ts:3-9")
-    expect(referenceKey({ ...selection("a/b.ts", 3, 9), rootId: "mounted-1" })).toBe("selection:mounted-1/a/b.ts:3-9")
+    expect(
+      referenceKey({ type: "selection", path: "a/b.ts", name: "b.ts", startLine: 3, endLine: 9, text: "x", rootId: "mounted-1" }),
+    ).toBe("selection:mounted-1/a/b.ts:3-9")
     expect(referenceKey({ type: "project", id: "p1", name: "P" })).toBe("project:p1")
     expect(referenceKey({ type: "chat", id: "c1", name: "C" })).toBe("chat:c1")
     expect(referenceKey({ type: "plan", planId: "pl1", filename: "x.plan.md", name: "X" })).toBe("plan:pl1")
