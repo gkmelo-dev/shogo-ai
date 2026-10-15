@@ -33,7 +33,7 @@ import { existsSync, readFileSync, writeFileSync } from 'fs'
 import { resolve } from 'path'
 import { createBoardTools } from '../board-tools'
 import type { ToolContext } from '../gateway-tools'
-import { isSafeRelativePath, parseSystemManifest } from '../system-manifest'
+import { isSafeRelativePath, manifestHints, parseSystemManifest } from '../system-manifest'
 import { CompanyWorld, type WorldSeed } from './company-sim/world'
 
 export type SyntheticToolDef = { description: string; paramKeys: string[]; parameters?: unknown }
@@ -238,7 +238,7 @@ function manifestToolFns(world: CompanyWorld, workspaceDir: string): Record<stri
       else if (existsSync(abs)) source = readFileSync(abs, 'utf-8')
       else return { error: `No manifest at ${rel} and none given inline.`, code: 'manifest_missing' }
       const parsed = parseSystemManifest(source)
-      if (!parsed.ok || !parsed.manifest) return { error: 'Manifest is invalid', issues: parsed.errors }
+      if (!parsed.ok || !parsed.manifest) return { error: 'Manifest is invalid', issues: parsed.errors, hints: manifestHints(parsed.errors) }
       const dryRun = params.dryRun === true || params.dryRun === 'true'
       if (!dryRun && typeof params.manifest === 'string' && params.manifest.trim()) writeFileSync(abs, params.manifest)
       return world.applyManifest(parsed.manifest, dryRun)

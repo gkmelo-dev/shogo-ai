@@ -629,6 +629,7 @@ export const BOARDS_GUIDE = [
   '- Escalate across teams by moving the card to the other channel’s board; do not copy it.',
   '- Set up a department’s channel, boards, agents and triggers together in shogo-system.yaml with `system_apply`; use `board_create` and `column_*` for one-off changes.',
   '- Start from a template when one fits: `work_template_list`, then `work_template_add` for a company or department (then `system_apply`), or `board_create { template }` for one board.',
+  '- To turn an event into a card, add a trigger with `target: work_item` and a `card`, e.g. `{ key: onboarding-cards, name: New members get an onboarding card, event: member.joined, target: work_item, card: { board: Onboarding, channel: people, title: "Onboard {{member.name}}" } }`. `trigger_types_list` lists the events.',
 ].join('\n')
 
 export const COMPANY_OPS_GUIDE = [

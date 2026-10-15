@@ -7,6 +7,7 @@
 import { describe, test, expect } from 'bun:test'
 import {
   parseSystemManifest,
+  manifestHints,
   isSafeRelativePath,
   resolveBindings,
   computeSystemDiff,
@@ -131,6 +132,20 @@ describe('parseSystemManifest', () => {
 function live(overrides: Partial<LiveProject> = {}): LiveProject {
   return { id: 'id', name: 'name', description: null, attachments: [], agent: null, ...overrides }
 }
+
+describe('manifestHints', () => {
+  test('gives a valid example for each section that failed', () => {
+    const bad = parseSystemManifest('version: 1\nname: X\nprojects: []\ntriggers:\n  - name: t\n    on: member_joined\nteamChannels:\n  - name: s\n    boards: [{ title: T }]\n')
+    expect(bad.ok).toBe(false)
+    const hints = manifestHints(bad.errors)
+    expect(hints).toHaveLength(3)
+
+    const examples = hints.slice(1).map((h) => h.split('\n').slice(1).join('\n')).join('\n')
+    const good = parseSystemManifest(`version: 1\nname: X\nprojects:\n  - key: support-agent\n    name: Support Agent\n${examples}\n`)
+    expect(good.errors).toEqual([])
+    expect(good.manifest?.triggers[0]).toMatchObject({ event: 'member.joined', target: 'work_item', card: { board: 'Onboarding' } })
+  })
+})
 
 describe('resolveBindings', () => {
   test('binds the anchor key to the caller regardless of lock/name', () => {

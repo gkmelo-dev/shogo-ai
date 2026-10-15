@@ -63,6 +63,7 @@ import {
   IMPLICIT_ANCHOR,
   isSafeRelativePath,
   parseSystemManifest,
+  manifestHints,
   resolveAgentRef,
   summarizeDiff,
   type BoardOp,
@@ -720,7 +721,7 @@ export function createSystemApplyTool(ctx: ToolContext): AgentTool {
       }
 
       const parsed = parseSystemManifest(source)
-      if (!parsed.ok || !parsed.manifest) return textResult({ error: 'Manifest is invalid', issues: parsed.errors })
+      if (!parsed.ok || !parsed.manifest) return textResult({ error: 'Manifest is invalid', issues: parsed.errors, hints: manifestHints(parsed.errors) })
       const manifest = parsed.manifest
 
       const unavailable = manifest.projects

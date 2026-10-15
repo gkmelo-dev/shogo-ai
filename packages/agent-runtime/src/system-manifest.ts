@@ -228,6 +228,42 @@ export function isSafeRelativePath(p: string): boolean {
   return parts.every((seg) => seg !== '' && seg !== '.' && seg !== '..')
 }
 
+const SECTION_EXAMPLES: Record<string, string> = {
+  triggers: [
+    'triggers:',
+    '  - key: onboarding-cards',
+    '    name: New members get an onboarding card',
+    '    event: member.joined',
+    '    target: work_item',
+    '    card:',
+    '      board: Onboarding',
+    '      channel: people',
+    "      title: 'Onboard {{member.name}}'",
+  ].join('\n'),
+  teamChannels: [
+    'teamChannels:',
+    '  - name: support',
+    '    members:',
+    '      - project: support-agent',
+    '    boards:',
+    '      - name: Tickets',
+    '        keyPrefix: SUP',
+    '        columns:',
+    '          - { name: New, category: backlog }',
+    '          - { name: Working, category: active, slaHours: 24 }',
+    '          - { name: Done, category: done }',
+  ].join('\n'),
+}
+
+/** Examples for the manifest sections named in validation errors, so a caller can fix them without guessing. */
+export function manifestHints(errors: string[]): string[] {
+  const hints = ['system_apply reconciles the whole manifest, so edit shogo-system.yaml and keep the sections that are already there.']
+  for (const [section, example] of Object.entries(SECTION_EXAMPLES)) {
+    if (errors.some((e) => e.startsWith(`${section}.`) || e.startsWith(`${section}:`))) hints.push(`Valid ${section} entry:\n${example}`)
+  }
+  return hints
+}
+
 /** Parse + validate YAML (or an already-parsed object). Cross-references are checked too. */
 export function parseSystemManifest(source: string | unknown): ManifestParseResult {
   let raw: unknown = source
