@@ -1,5 +1,5 @@
 import * as vscode from 'vscode'
-import { truncateText } from './contextStore'
+import { truncateText } from './contextOutbox'
 import type { IdeChatReference } from './protocol'
 
 const basename = (path: string) => path.split('/').filter(Boolean).pop() ?? path

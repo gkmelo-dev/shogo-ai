@@ -2,7 +2,7 @@ import * as vscode from 'vscode'
 import { ShogoAgentClient } from './agentClient'
 import { ShogoChatViewProvider } from './chatViewProvider'
 import { registerCommands } from './commands'
-import { ShogoContextOutbox } from './contextStore'
+import { ShogoContextOutbox } from './contextOutbox'
 
 export function activate(context: vscode.ExtensionContext) {
   const services = {

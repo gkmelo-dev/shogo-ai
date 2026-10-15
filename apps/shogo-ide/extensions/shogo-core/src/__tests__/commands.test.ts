@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, test } from 'bun:test'
 import { FakeUri, fakeEditor, resetVscodeMock, state } from './vscode-mock'
 
 const { registerCommands, CHAT_NOT_CONNECTED_MESSAGE } = await import('../commands')
-const { ShogoContextOutbox } = await import('../contextStore')
+const { ShogoContextOutbox } = await import('../contextOutbox')
 
 const LINES = Array.from({ length: 30 }, (_, i) => `line ${i + 1}`)
 

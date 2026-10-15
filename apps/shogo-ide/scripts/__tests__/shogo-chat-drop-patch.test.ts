@@ -85,7 +85,7 @@ describe('shogo-chat-explorer-drop.patch', () => {
 describe('drop parsing (from the patch)', () => {
   test('recognises resource drags only', () => {
     expect(drop.isShogoChatResourceDrag(['ResourceURLs'])).toBe(true)
-    expect(drop.isShogoChatResourceDrag(['Files'])).toBe(true)
+    expect(drop.isShogoChatResourceDrag(['Files'])).toBe(false)
     expect(drop.isShogoChatResourceDrag(['application/vnd.code.tree.views'])).toBe(false)
     expect(drop.isShogoChatResourceDrag(undefined)).toBe(false)
   })

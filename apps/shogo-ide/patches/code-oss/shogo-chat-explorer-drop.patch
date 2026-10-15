@@ -22,7 +22,7 @@ new file mode 100644
 index 00000000..2535ffe1
 --- /dev/null
 +++ b/src/vs/workbench/contrib/webviewView/browser/shogoChatDropData.ts
-@@ -0,0 +1,147 @@
+@@ -0,0 +1,149 @@
 +/*---------------------------------------------------------------------------------------------
 + *  Copyright (c) Shogo Technologies, Inc. All rights reserved.
 + *  Licensed under the MIT License. See License.txt in the project root for license information.
@@ -40,14 +40,16 @@ index 00000000..2535ffe1
 +/** Class set on the webview container while a resource drag hovers it. */
 +export const SHOGO_CHAT_DROP_ACTIVE_CLASS = 'shogo-chat-drop-active';
 +
-+/** Mirrors DataTransfers.RESOURCES / CodeDataTransfers.EDITORS / CodeDataTransfers.FILES / DataTransfers.FILES. */
++/**
++ * Mirrors DataTransfers.RESOURCES / CodeDataTransfers.EDITORS / CodeDataTransfers.FILES. Plain OS file drags
++ * (`Files`) are left to the chat webview, which attaches them itself.
++ */
 +const RESOURCE_URLS = 'ResourceURLs';
 +const CODE_EDITORS = 'CodeEditors';
 +const CODE_FILES = 'CodeFiles';
-+const BROWSER_FILES = 'Files';
 +const URI_LIST = 'text/uri-list';
 +
-+export const SHOGO_CHAT_RESOURCE_DRAG_TYPES: readonly string[] = [RESOURCE_URLS, CODE_EDITORS, CODE_FILES, BROWSER_FILES, URI_LIST];
++export const SHOGO_CHAT_RESOURCE_DRAG_TYPES: readonly string[] = [RESOURCE_URLS, CODE_EDITORS, CODE_FILES, URI_LIST];
 +
 +export interface ShogoDropDataTransfer {
 +	readonly types: ArrayLike<string>;
@@ -250,7 +252,7 @@ index 00000000..8d19464c
 +	test('recognises resource drags only', () => {
 +		assert.strictEqual(isShogoChatResourceDrag(['ResourceURLs']), true);
 +		assert.strictEqual(isShogoChatResourceDrag(['CodeFiles']), true);
-+		assert.strictEqual(isShogoChatResourceDrag(['Files']), true);
++		assert.strictEqual(isShogoChatResourceDrag(['Files']), false);
 +		assert.strictEqual(isShogoChatResourceDrag(['text/uri-list']), true);
 +		assert.strictEqual(isShogoChatResourceDrag(['application/vnd.code.tree.views']), false);
 +		assert.strictEqual(isShogoChatResourceDrag([]), false);

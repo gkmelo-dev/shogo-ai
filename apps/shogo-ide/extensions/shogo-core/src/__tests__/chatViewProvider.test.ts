@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, test } from 'bun:test'
 import { FakeUri, resetVscodeMock, state } from './vscode-mock'
 
 const { ShogoChatViewProvider } = await import('../chatViewProvider')
-const { ShogoContextOutbox } = await import('../contextStore')
+const { ShogoContextOutbox } = await import('../contextOutbox')
 
 function fakeView() {
   const posted: any[] = []

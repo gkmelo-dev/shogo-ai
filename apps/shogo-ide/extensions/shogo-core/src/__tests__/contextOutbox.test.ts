@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { MAX_CONTEXT_TEXT_LENGTH, ShogoContextOutbox, truncateText } from '../contextStore'
+import { MAX_CONTEXT_TEXT_LENGTH, MAX_PENDING_BATCHES, PENDING_BATCH_TTL_MS, ShogoContextOutbox, truncateText } from '../contextOutbox'
 
 const file = (path: string) => ({ type: 'file' as const, path, name: path })
 
@@ -26,6 +26,23 @@ describe('ShogoContextOutbox', () => {
     expect(secondSend).toEqual(firstSend)
     outbox.ack(id)
     expect(outbox.pending()).toEqual([])
+  })
+
+  test(`keeps at most ${MAX_PENDING_BATCHES} batches, dropping the oldest`, () => {
+    const outbox = new ShogoContextOutbox()
+    const ids = Array.from({ length: MAX_PENDING_BATCHES + 3 }, (_, i) => outbox.enqueue([file(`${i}.ts`)]))
+    expect(outbox.pending().map((p) => p.batchId)).toEqual(ids.slice(3))
+  })
+
+  test('batches the chat never acknowledges expire', () => {
+    let now = 1_000_000
+    const outbox = new ShogoContextOutbox(() => now)
+    outbox.enqueue([file('old.ts')])
+    now += PENDING_BATCH_TTL_MS - 1
+    const fresh = outbox.enqueue([file('fresh.ts')])
+    expect(outbox.pending()).toHaveLength(2)
+    now += 2
+    expect(outbox.pending().map((p) => p.batchId)).toEqual([fresh])
   })
 
   test('pending() returns copies', () => {

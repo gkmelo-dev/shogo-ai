@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, test } from 'bun:test'
 import { FakeUri, fakeEditor, resetVscodeMock, state } from './vscode-mock'
 
 const { selectionReferences, uriReferences, skippedMessage } = await import('../references')
-const { MAX_CONTEXT_TEXT_LENGTH } = await import('../contextStore')
+const { MAX_CONTEXT_TEXT_LENGTH } = await import('../contextOutbox')
 
 const LINES = Array.from({ length: 50 }, (_, i) => `line ${i + 1}`)
 

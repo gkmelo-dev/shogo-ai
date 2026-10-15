@@ -319,15 +319,10 @@ test('adding a file with unsaved edits warns that the agent reads the saved file
   })
 })
 
-test('7. dropping an OS file still attaches it', async () => {
-  await clearComposer()
-  await dropOsFile(composer(page), 'dropped-notes.txt', 'notes from the OS')
-  await expect(page.getByText('dropped-notes.txt').first()).toBeVisible({ timeout: 15_000 })
-  await expect(composer(page)).toHaveValue('')
-})
-
 test('6. terminal Ctrl/Cmd+L appends to the draft and keeps the pending attachment', async () => {
-  // Continues from step 7: the composer holds a pending attachment.
+  await clearComposer()
+  await dropOsFile(composer(page), 'terminal-pending.txt', 'pending attachment')
+  await expect(page.getByText('terminal-pending.txt').first()).toBeVisible({ timeout: 15_000 })
   await composer(page).fill('Draft before terminal')
   // ⌘⇧` / Ctrl+Shift+`: new terminal and open the bottom panel, then make sure its Terminal tab is showing.
   await page.keyboard.press('ControlOrMeta+Shift+Backquote')
@@ -338,9 +333,19 @@ test('6. terminal Ctrl/Cmd+L appends to the draft and keeps the pending attachme
   await term.click()
   await page.keyboard.type('echo shogo-term-marker')
   await page.keyboard.press('Enter')
-  // The terminal renders to a canvas, so there is no output DOM to wait on.
-  await page.waitForTimeout(3_000)
-  await page.keyboard.press('ControlOrMeta+L')
-  await expect(composer(page)).toHaveValue(/^Draft before terminal[\s\S]*shogo-term-marker/, { timeout: 15_000 })
-  await expect(page.getByText('dropped-notes.txt').first()).toBeVisible()
+  // The terminal renders to a canvas, so there is no output DOM to wait on:
+  // re-send Ctrl/Cmd+L until the echoed marker has reached the draft.
+  await expect(async () => {
+    await term.click()
+    await page.keyboard.press('ControlOrMeta+L')
+    await expect(composer(page)).toHaveValue(/^Draft before terminal[\s\S]*shogo-term-marker/, { timeout: 2_000 })
+  }).toPass({ timeout: 30_000 })
+  await expect(page.getByText('terminal-pending.txt').first()).toBeVisible()
+})
+
+test('7. dropping an OS file still attaches it', async () => {
+  await clearComposer()
+  await dropOsFile(composer(page), 'dropped-notes.txt', 'notes from the OS')
+  await expect(page.getByText('dropped-notes.txt').first()).toBeVisible({ timeout: 15_000 })
+  await expect(composer(page)).toHaveValue('')
 })

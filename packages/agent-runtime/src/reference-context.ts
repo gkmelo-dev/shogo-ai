@@ -51,6 +51,9 @@ export type ChatReference =
 /** Same cap as the composer (MAX_SELECTION_CHARS) and the live IDE selection. */
 export const MAX_SELECTION_CHARS = 24_000
 
+/** Saved files larger than this are not read to check a selection for unsaved edits. */
+const MAX_SELECTION_COMPARE_BYTES = 2 * 1024 * 1024
+
 /** Per-file inlined-content cap. Larger files are truncated. */
 const MAX_FILE_BYTES = 64 * 1024
 /** Aggregate cap across all referenced files in one message. */
@@ -117,17 +120,20 @@ function renderSelection(
   const flags: string[] = []
   if (truncated) flags.push(' (truncated)')
   const resolved = typeof ref.path === 'string' && ref.path ? resolveInsideRoot(workspaceDir, ref.path) : null
+  let inWorkspace = false
   let onDisk: string | null = null
   if (resolved && existsSync(resolved)) {
     try {
-      if (statSync(resolved).isFile()) onDisk = readFileSync(resolved, 'utf-8')
+      const stat = statSync(resolved)
+      inWorkspace = stat.isFile()
+      if (inWorkspace && stat.size <= MAX_SELECTION_COMPARE_BYTES) onDisk = readFileSync(resolved, 'utf-8')
     } catch {
       onDisk = null
     }
   }
-  if (onDisk === null) {
+  if (!inWorkspace) {
     flags.push(' (not in agent workspace — editor snapshot)')
-  } else if (validLines && !truncated) {
+  } else if (onDisk !== null && validLines && !truncated) {
     // A selection may start or end mid-line, so it only has to occur within the saved lines.
     const saved = normalizeEol(onDisk).split('\n').slice(ref.startLine! - 1, ref.endLine!).join('\n')
     if (!saved.includes(normalizeEol(text).replace(/\n$/, ''))) flags.push(' (includes unsaved editor changes)')

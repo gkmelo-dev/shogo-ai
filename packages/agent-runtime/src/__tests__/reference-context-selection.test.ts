@@ -53,6 +53,14 @@ describe('selection references', () => {
     expect(out).not.toContain('unsaved')
   })
 
+  test('a very large saved file is not read for the comparison, and is not called out of workspace', () => {
+    writeFileSync(join(dir, 'src', 'huge.ts'), `${lines.join('\n')}\n${'x'.repeat(3 * 1024 * 1024)}`)
+    const out = buildReferencedContext([sel({ path: 'src/huge.ts', text: 'line 10\nEDITED\nline 12' })], dir)
+    expect(out).toContain('[Referenced Selection: src/huge.ts lines 10-12 (typescript)]')
+    expect(out).not.toContain('unsaved')
+    expect(out).not.toContain('editor snapshot')
+  })
+
   test('a trailing newline in the selection does not count as a change', () => {
     const out = buildReferencedContext([sel({ text: `${lines.slice(9, 12).join('\n')}\n` })], dir)
     expect(out).not.toContain('unsaved')

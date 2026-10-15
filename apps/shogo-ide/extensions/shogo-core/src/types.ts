@@ -1,4 +1,4 @@
-import type { ShogoContextOutbox } from './contextStore'
+import type { ShogoContextOutbox } from './contextOutbox'
 
 export type ShogoContextKind = 'selection' | 'active-file' | 'workspace' | 'git-diff' | 'diagnostics'
 
