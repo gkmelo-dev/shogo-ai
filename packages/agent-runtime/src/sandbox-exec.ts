@@ -620,6 +620,8 @@ export interface CommandHandle {
   /** True once the child has exited. */
   exited: () => boolean
   startedAt: number
+  /** Subscribe to raw output chunks as they arrive. Returns an unsubscribe function. */
+  onData?: (listener: (chunk: string, stream: 'stdout' | 'stderr') => void) => () => void
 }
 
 export type SandboxExecAsyncOptions = SandboxExecOptions
@@ -701,15 +703,24 @@ export function sandboxExecAsync(opts: SandboxExecAsyncOptions): CommandHandle {
   let killed = false
   let exited = false
 
+  const dataListeners = new Set<(chunk: string, stream: 'stdout' | 'stderr') => void>()
+  const emitData = (chunk: string, stream: 'stdout' | 'stderr') => {
+    for (const listener of dataListeners) {
+      try { listener(chunk, stream) } catch { /* listener errors never affect the child */ }
+    }
+  }
+
   child.stdout?.setEncoding('utf-8')
   child.stderr?.setEncoding('utf-8')
   child.stdout?.on('data', (chunk: string) => {
     stdoutBuf.push(chunk)
     recentOutputBuf.push(chunk)
+    emitData(chunk, 'stdout')
   })
   child.stderr?.on('data', (chunk: string) => {
     stderrBuf.push(chunk)
     recentOutputBuf.push(chunk)
+    emitData(chunk, 'stderr')
   })
 
   // Suppress unhandled-error events; we surface failures via the `done`
@@ -779,6 +790,10 @@ export function sandboxExecAsync(opts: SandboxExecAsyncOptions): CommandHandle {
     },
     exited: () => exited,
     startedAt,
+    onData: (listener) => {
+      dataListeners.add(listener)
+      return () => { dataListeners.delete(listener) }
+    },
   }
 }
 
