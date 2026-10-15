@@ -115,6 +115,7 @@ export function assigneeOptions(mentionables: Mentionables | null): AssigneeOpti
     out.push({ id: `u:${p.id}`, label: p.name || p.email, patch: { assigneeUserId: p.id, assigneeAgentRef: null } })
   }
   for (const a of mentionables?.agents ?? []) {
+    if (a.boards === false) continue
     const ref = a.projectId ? `project:${a.projectId}` : 'workspace'
     out.push({ id: `a:${ref}`, label: `${a.name} (agent)`, patch: { assigneeUserId: null, assigneeAgentRef: ref } })
   }

@@ -57,7 +57,7 @@ never gets team chat, board management, or company operations.
 |------------|------|---------|---------------|
 | Team chat | `teamChatEnabled` | on | `team_chat_*`, `team_directory`, `member_activity`, `fetch_chat_files` |
 | Boards | `boardsEnabled` | on | `board_list`, `board_summary`, `board_health`, `work_item_*` |
-| Board management | `boardAdminEnabled` | opt-in | `board_create`, `board_update`, `board_archive`, `board_reorder`, `column_*`, and board changes in `system_apply` |
+| Board management | `boardAdminEnabled` | opt-in | `board_create`, `board_update`, `board_archive`, `board_reorder`, `column_*`, `work_template_list`, `work_template_add`, and board changes in `system_apply` |
 | Triggers | `workTriggersEnabled` | on | `trigger_create`, `trigger_update`, `trigger_delete`, `trigger_test` (listing triggers always works) |
 | Company operations | `companyOpsEnabled` | opt-in | No tools. Adds heartbeat board sweeps, nudges, and digests to the prompt. Needs Heartbeat and Boards on. |
 | Problems | `problemsEnabled` | opt-in | `problem_report`, `problem_occurrences`. Needs Boards on. |

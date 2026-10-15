@@ -88,6 +88,17 @@ describe('assignees', () => {
     expect(options.map((o) => o.id)).toEqual(['none', 'u:u1', 'a:workspace', 'a:project:p1'])
     for (const option of options) expect(assigneeOptionId(option.patch)).toBe(option.id)
   })
+
+  test('leaves out agents with Boards off', () => {
+    const options = assigneeOptions({
+      people: [],
+      agents: [
+        { key: 'p:p1', projectId: 'p1', name: 'Support', description: null, image: null, boards: true },
+        { key: 'p:p2', projectId: 'p2', name: 'Docs bot', description: null, image: null, boards: false },
+      ],
+    })
+    expect(options.map((o) => o.id)).toEqual(['none', 'a:project:p1'])
+  })
 })
 
 test('age', () => {
