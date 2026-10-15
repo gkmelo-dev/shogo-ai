@@ -460,6 +460,17 @@ describe('teamChannels', () => {
     expect(m.manifest!.teamChannels[0].members).toEqual([{ project: 'a', agentTrigger: 'auto', contextMode: 'shared' }])
   })
 
+  test('a manifest can declare only a channel', () => {
+    const m = parseSystemManifest({ version: 1, name: 'x', teamChannels: [{ name: 'sales', private: true }] })
+    expect(m.errors).toEqual([])
+    const diff = computeSystemDiff(m.manifest!, [], undefined, {
+      callerProjectId: 'p-ws',
+      teamChannels: { channels: [], groups: {} },
+    })
+    expect(diff.create).toEqual([])
+    expect(diff.teamChannels).toMatchObject([{ action: 'create', name: 'sales', private: true }])
+  })
+
   test('rejects unknown project keys, duplicate channels, and keyword triggers without keywords', () => {
     const bad = parseSystemManifest({
       version: 1,

@@ -195,7 +195,7 @@ export const SystemManifestSchema = z.object({
    * every project in the manifest so it can manage them.
    */
   anchor: z.string().regex(KEY_RE).optional(),
-  projects: z.array(ProjectSpecSchema).min(1),
+  projects: z.array(ProjectSpecSchema).default([]),
   /**
    * Workspace team chat channels the system works in, with their members.
    * Distinct from a project's `channels` (Slack/Telegram/... connections).

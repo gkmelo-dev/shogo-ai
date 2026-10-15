@@ -695,7 +695,8 @@ export function createSystemApplyTool(ctx: ToolContext): AgentTool {
     description: [
       'Reconcile a `shogo-system.yaml` manifest against the workspace: create missing projects, attach them as declared, set heartbeat/model/capabilities, write each project\'s prompt files (AGENTS.md, HEARTBEAT.md, .shogo/agents/*.md), create the `teamChannels` the agents work in with their members and `boards`, and set up `triggers` (including ones that turn events into cards).',
       'Idempotent: a second run reports an empty diff. Bindings from manifest key to project id are recorded in .shogo/system.lock.json so renames do not create duplicates.',
-      'Run with `dryRun: true` first and show the plan to the user before applying. Channels and integrations are listed under `manual` because they need credentials.',
+      'This is also how you create a team channel or change one (privacy, topic, members): edit its `teamChannels` entry and apply.',
+      'Run with `dryRun: true` first. If the plan does only what the person asked for, apply it; if it changes more, show the plan and ask before applying. Chat integrations and external channels are listed under `manual` because they need credentials.',
     ].join(' '),
     parameters: Type.Object({
       manifestPath: Type.Optional(Type.String({ description: `Path relative to the project root (default "${DEFAULT_MANIFEST_PATH}").` })),
