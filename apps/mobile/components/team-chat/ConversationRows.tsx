@@ -7,11 +7,11 @@
  */
 import { useState, type ReactNode } from 'react'
 import { Pressable, Text, View } from 'react-native'
-import { Bot, ChevronDown, ChevronRight, Hash, Lock, Pencil, Plus, Radio, Users } from 'lucide-react-native'
+import { Bot, ChevronDown, ChevronRight, Hash, Lock, NotebookText, Pencil, Plus, Radio, Users } from 'lucide-react-native'
 import { cn } from '@shogo/shared-ui/primitives'
 import { densityFor } from '../../lib/phone-density'
 import { usePhoneLayout } from '../../lib/native-phone-layout'
-import { conversationTitle, type ConversationSummary } from '../../lib/team-chat-api'
+import { conversationTitle, isSelfDm, type ConversationSummary } from '../../lib/team-chat-api'
 import { useHasDraft } from '../../hooks/useChatItems'
 import { PresenceDot } from './PresenceDot'
 import { InlineMarkdown } from './InlineMarkdown'
@@ -29,6 +29,7 @@ export function iconFor(c: ConversationSummary) {
   if (c.kind === 'private') return Lock
   if (c.kind === 'public') return Hash
   if (hasAgent(c)) return Bot
+  if (isSelfDm(c)) return NotebookText
   return Users
 }
 
@@ -73,7 +74,8 @@ export function ConversationRow({ conversation: c, workspaceId, active = false, 
   const unread = !active && c.unreadCount > 0 && !c.muted && c.joined
   const title = rowTitle(c)
   const peers = c.kind === 'dm' ? c.participants ?? [] : []
-  const dmPeer = peers.length === 1 && peers[0]!.type === 'user' ? peers[0]!.id : null
+  // Your own note-to-self has no one to be present, so it keeps the icon.
+  const dmPeer = peers.length === 1 && peers[0]!.type === 'user' && !isSelfDm(c) ? peers[0]!.id : null
   const mentions = !active ? c.mentionCount : 0
   return (
     <Pressable
@@ -152,14 +154,16 @@ export interface PanelSectionProps {
   onAdd?: () => void
   /** Hide the chevron and keep the section open. */
   fixed?: boolean
+  /** Start closed, for groups that are rarely needed. */
+  defaultCollapsed?: boolean
   children: ReactNode
 }
 
 /** A collapsible, labelled group of rows with an optional "+" action. */
-export function PanelSection({ label, addLabel, onAdd, fixed, children }: PanelSectionProps) {
+export function PanelSection({ label, addLabel, onAdd, fixed, defaultCollapsed, children }: PanelSectionProps) {
   const comfortable = usePhoneLayout()
   const density = densityFor(comfortable)
-  const [expanded, setExpanded] = useState(true)
+  const [expanded, setExpanded] = useState(!defaultCollapsed)
   const Chevron = expanded ? ChevronDown : ChevronRight
   return (
     <View className={comfortable ? 'mb-2' : 'mb-2 mt-3'}>

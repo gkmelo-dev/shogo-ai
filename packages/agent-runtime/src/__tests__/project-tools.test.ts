@@ -29,6 +29,9 @@ const api = {
   call: { ok: true, status: 200, data: { status: 'completed', reply: 'done', sessionId: 'run:abc' } } as any,
   teamChannels: { ok: true, status: 200, data: { channels: [], groups: {} } } as any,
   upsertChannel: { ok: true, status: 201, data: { created: true, changes: ['created'], channel: { id: 'conv-1', name: 'ops' } } } as any,
+  ownership: { ok: true, status: 200, data: { claimed: [], released: [] } } as any,
+  boards: { ok: true, status: 200, data: { boards: [] } } as any,
+  triggers: { ok: true, status: 200, data: [] } as any,
 }
 
 mock.module('../internal-api', () => ({
@@ -69,6 +72,30 @@ mock.module('../internal-api', () => ({
   upsertTeamChannel: (workspaceId: string, name: string, input: any) => {
     calls.push({ fn: 'upsertTeamChannel', args: [workspaceId, name, input] })
     return api.upsertChannel
+  },
+  syncTeamChannelOwnership: (workspaceId: string, system: string, declared: string[]) => {
+    calls.push({ fn: 'syncTeamChannelOwnership', args: [workspaceId, system, declared] })
+    return api.ownership
+  },
+  agentBoardsRequest: (workspaceId: string, method: string, path: string, options: any) => {
+    calls.push({ fn: 'agentBoardsRequest', args: [workspaceId, method, path, options] })
+    return method === 'GET' ? api.boards : { ok: true, status: 201, data: {} }
+  },
+  listTriggers: (workspaceId: string) => {
+    calls.push({ fn: 'listTriggers', args: [workspaceId] })
+    return api.triggers
+  },
+  createTrigger: (workspaceId: string, input: any) => {
+    calls.push({ fn: 'createTrigger', args: [workspaceId, input] })
+    return { ok: true, status: 201, data: { trigger: { id: 'trig-1' } } }
+  },
+  updateTrigger: (workspaceId: string, id: string, input: any) => {
+    calls.push({ fn: 'updateTrigger', args: [workspaceId, id, input] })
+    return { ok: true, status: 200, data: { trigger: { id } } }
+  },
+  deleteTrigger: (workspaceId: string, id: string, userId: string) => {
+    calls.push({ fn: 'deleteTrigger', args: [workspaceId, id, userId] })
+    return { ok: true, status: 200, data: { ok: true } }
   },
 }))
 
@@ -124,6 +151,9 @@ beforeEach(() => {
   api.call = { ok: true, status: 200, data: { status: 'completed', reply: 'done', sessionId: 'run:abc' } }
   api.teamChannels = { ok: true, status: 200, data: { channels: [], groups: {} } }
   api.upsertChannel = { ok: true, status: 201, data: { created: true, changes: ['created'], channel: { id: 'conv-1', name: 'ops' } } }
+  api.ownership = { ok: true, status: 200, data: { claimed: [], released: [] } }
+  api.boards = { ok: true, status: 200, data: { boards: [] } }
+  api.triggers = { ok: true, status: 200, data: [] }
 })
 
 // ─── project_list ─────────────────────────────────────────────────────────
@@ -608,8 +638,43 @@ projects:
       removeAgentProjectIds: [],
       userEmails: ['lead@example.com'],
       groupHandles: [],
+      system: 'caller-1',
     }])
     expect(calls.findIndex((c) => c.fn === 'createProject')).toBeLessThan(calls.findIndex((c) => c.fn === 'upsertTeamChannel'))
+  })
+
+  test('protects every declared channel and releases the ones the manifest dropped', async () => {
+    api.ownership = { ok: true, status: 200, data: { claimed: ['ops'], released: ['old-standup'] } }
+    const manifest = `${MANIFEST_YAML}teamChannels:
+  - name: ops
+  - name: '#support'
+`
+    const ctx = baseCtx()
+    await run(createSystemApplyTool(ctx), { manifest, dryRun: true })
+    expect(calls.find((c) => c.fn === 'syncTeamChannelOwnership')).toBeUndefined()
+
+    const out = await run(createSystemApplyTool(ctx), { manifest })
+    expect(out.ok).toBe(true)
+    const sync = calls.find((c) => c.fn === 'syncTeamChannelOwnership')!
+    expect(sync.args[0]).toBe('ws-1')
+    expect(sync.args[1]).toBe('caller-1')
+    expect(sync.args[2]).toHaveLength(2)
+    expect(out.applied).toContain('release channel #old-standup')
+    expect(out.applied.some((l: string) => l.includes('#ops') && l.startsWith('release'))).toBe(false)
+  })
+
+  test('a manifest with no channels left releases everything it had declared', async () => {
+    api.ownership = { ok: true, status: 200, data: { claimed: [], released: ['ops'] } }
+    const out = await run(createSystemApplyTool(baseCtx()), { manifest: MANIFEST_YAML })
+    expect(calls.find((c) => c.fn === 'syncTeamChannelOwnership')!.args).toEqual(['ws-1', 'caller-1', []])
+    expect(out.applied).toContain('release channel #ops')
+  })
+
+  test('an API without the ownership endpoint does not fail the apply', async () => {
+    api.ownership = { ok: false, status: 404, error: 'Not found' }
+    const out = await run(createSystemApplyTool(baseCtx()), { manifest: MANIFEST_YAML })
+    expect(out.ok).toBe(true)
+    expect(out.skipped.join('\n')).toContain('channel ownership: Not found')
   })
 
   test('reports channels as manual steps when team chat is unreachable', async () => {
@@ -619,6 +684,64 @@ projects:
 `
     const out = await run(createSystemApplyTool(baseCtx()), { manifest, dryRun: true })
     expect(out.manual.join('\n')).toContain('create #ops by hand')
+  })
+})
+
+describe('system_apply boards and triggers', () => {
+  const manifest = `${MANIFEST_YAML}teamChannels:
+  - name: support
+    members:
+      - { project: intake }
+    boards:
+      - name: Tickets
+        itemType: ticket
+        defaultAgent: intake
+        columns:
+          - { name: New, category: backlog }
+          - { name: Triage, category: active, agent: intake }
+          - { name: Solved, category: done }
+triggers:
+  - key: tickets
+    name: New tickets
+    event: member.joined
+    target: work_item
+    card: { board: Tickets, channel: support, title: "{{ticket.subject}}", dedupeKey: "{{ticket.id}}" }
+`
+  const adminCtx = () => baseCtx({ userId: 'user-1', config: { ...baseCtx().config, boardAdminEnabled: true } as any })
+
+  test('creates boards with resolved agents and triggers that run as the user, then records them in the lock', async () => {
+    api.create = { ok: true, status: 201, data: { id: 'proj-intake', name: 'Intake', description: null, workingMode: 'managed', settings: null } }
+    const ctx = adminCtx()
+    const dry = await run(createSystemApplyTool(ctx), { manifest, dryRun: true })
+    expect(dry.plan).toContain('create board #support Tickets: ticket board, 3 columns')
+    expect(dry.plan).toContain('create trigger tickets "New tickets"')
+    expect(calls.some((c) => c.fn === 'createTrigger' || (c.fn === 'agentBoardsRequest' && c.args[1] === 'POST'))).toBe(false)
+
+    const out = await run(createSystemApplyTool(ctx), { manifest })
+    expect(out.errors).toEqual([])
+    const post = calls.find((c) => c.fn === 'agentBoardsRequest' && c.args[1] === 'POST')!
+    expect(post.args[2]).toBe('/agent-boards')
+    expect((post.args[3] as any).body).toMatchObject({
+      name: 'Tickets',
+      channel: 'support',
+      item_type: 'ticket',
+      system: 'caller-1',
+      default_agent: 'project:proj-intake',
+      columns: [{ name: 'New', category: 'backlog' }, { name: 'Triage', category: 'active', agent: 'project:proj-intake' }, { name: 'Solved', category: 'done' }],
+    })
+    expect(calls.findIndex((c) => c.fn === 'upsertTeamChannel')).toBeLessThan(calls.findIndex((c) => c.fn === 'agentBoardsRequest' && c.args[1] === 'POST'))
+    const trigger = calls.find((c) => c.fn === 'createTrigger')!
+    expect(trigger.args[1]).toMatchObject({ userId: 'user-1', eventType: 'member.joined', target: 'work_item', workItemTarget: { board: 'Tickets', channel: 'support', dedupeKey: '{{ticket.id}}', mapping: { title: '{{ticket.subject}}' } } })
+    const lock = JSON.parse(readFileSync(join(workspaceDir, '.shogo/system.lock.json'), 'utf-8'))
+    expect(lock.triggers.tickets.id).toBe('trig-1')
+    expect(lock.triggers.tickets.hash).toMatch(/^[0-9a-f]{16}$/)
+  })
+
+  test('without board management or a person, boards and triggers are manual steps', async () => {
+    const out = await run(createSystemApplyTool(baseCtx()), { manifest, dryRun: true })
+    expect(out.manual.join('\n')).toContain('board management is off')
+    expect(out.manual.join('\n')).toContain('no one started this run')
+    expect(calls.some((c) => c.fn === 'agentBoardsRequest' || c.fn === 'listTriggers')).toBe(false)
   })
 })
 

@@ -3,7 +3,9 @@
 import { describe, expect, test } from "bun:test"
 import type { UIMessage } from "ai"
 import {
+  applyMessageSnapshot,
   dropUnfinishedAssistantTail,
+  foldSnapshotContinuation,
   isUnfinishedAssistant,
   withResumeReplayReset,
 } from "../resume-replay-transport"
@@ -61,6 +63,51 @@ describe("dropUnfinishedAssistantTail", () => {
       message("assistant", [{ type: "data-turn-complete", data: {} }]),
     ]
     expect(dropUnfinishedAssistantTail(history)).toBe(history)
+  })
+})
+
+describe("foldSnapshotContinuation", () => {
+  const user = { id: "u1", role: "user", parts: [{ type: "text", text: "go" }] } as UIMessage
+  const snapshot = {
+    id: "msg_live",
+    role: "assistant",
+    parts: [
+      { type: "step-start" },
+      { type: "text", text: "step one done", state: "done" },
+    ],
+  } as UIMessage
+  // What the SDK appends for the rest of the stream: a new id, only the
+  // unfinished step.
+  const continuation = {
+    id: "sdk-generated",
+    role: "assistant",
+    parts: [{ type: "step-start" }, { type: "text", text: "writing step two", state: "streaming" }],
+  } as UIMessage
+
+  test("shows the snapshot and the SDK's continuation as one message", () => {
+    const installed = applyMessageSnapshot([user], snapshot)
+    const folded = foldSnapshotContinuation([...installed, continuation], snapshot.id)
+    expect(folded).toHaveLength(2)
+    expect(folded[0]).toBe(user)
+    expect(folded[1].id).toBe("msg_live")
+    expect(folded[1].parts).toEqual([...snapshot.parts, ...continuation.parts])
+  })
+
+  test("shows the snapshot alone before the continuation arrives", () => {
+    const installed = applyMessageSnapshot([user], snapshot)
+    expect(foldSnapshotContinuation(installed, snapshot.id)).toBe(installed)
+  })
+
+  test("leaves messages alone once the snapshot is gone or a new turn starts", () => {
+    const history = [user, { ...continuation, id: "persisted" } as UIMessage]
+    expect(foldSnapshotContinuation(history, snapshot.id)).toBe(history)
+    const nextTurn = [user, snapshot, { ...user, id: "u2" } as UIMessage]
+    expect(foldSnapshotContinuation(nextTurn, snapshot.id)).toBe(nextTurn)
+    expect(foldSnapshotContinuation([user, snapshot, continuation], null)).toEqual([
+      user,
+      snapshot,
+      continuation,
+    ])
   })
 })
 

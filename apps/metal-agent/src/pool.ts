@@ -75,6 +75,7 @@ import {
   type RepoWriteOutcome,
 } from './repo-archive'
 import { readSerialTail } from './serial-watcher'
+import { stagedRootfsPath } from './self-update'
 import type { ArchiveRef } from './archive-ref'
 import { describeHomeStateArchive, uploadHomeStateGuarded } from './home-state-archive'
 
@@ -197,6 +198,20 @@ export function repoKeepPaths(sourceTimes: Record<string, number | null>, repoLa
     .sort()
 }
 
+/**
+ * Members a snapshot was stamped with that its runtime may not hold. Such a
+ * snapshot is from before the single-runtime rule and would bring them back
+ * online, so it is never resumed.
+ */
+function foreignStampedMembers(
+  runtimeKey: string,
+  s: Pick<SuspendedVm, 'memberDataEtags' | 'memberSourceEtags'>,
+): string[] {
+  const own = ownMemberIds(runtimeKey)
+  const ids = new Set([...Object.keys(s.memberDataEtags ?? {}), ...Object.keys(s.memberSourceEtags ?? {})])
+  return [...ids].filter((id) => !own.includes(id)).sort()
+}
+
 /** Rebuild per-member lineage from the ETags a snapshot was stamped with. */
 function resumedMemberData(s: Pick<SuspendedVm, 'memberDataEtags' | 'memberSourceEtags'>): Record<string, MemberDataState> | undefined {
   const ids = new Set([...Object.keys(s.memberDataEtags ?? {}), ...Object.keys(s.memberSourceEtags ?? {})])
@@ -257,6 +272,21 @@ export interface ProjectStatus {
   lastRealActivityAt?: number
   realIdleMs?: number
   activeStreams?: number
+  /** Rootfs the running guest booted from (assigned) or the local snapshot was taken on (suspended). */
+  snapshotRootfsIdentity?: string
+  /** A pre-warmed snapshot on the staged rootfs is held for this key (see `stagedSuspended`). */
+  stagedSnapshotIdentity?: string
+}
+
+/** How a suspend request ended (see `suspendOrRetire`). */
+export type SuspendOutcome =
+  | { kind: 'suspended'; s: SuspendedVm; staged: boolean }
+  /** Booted from a superseded rootfs: backed up and stopped without a snapshot. */
+  | { kind: 'retired' }
+
+/** `open({ rootfs: 'staged' })` on a host that holds no staged rootfs for the class. */
+export class StagedRootfsUnavailableError extends Error {
+  readonly code = 'no_staged_rootfs'
 }
 
 export interface AssignedVm {
@@ -519,6 +549,15 @@ export interface RecycleStep {
   detail?: string
 }
 
+/** One foreign member `drainForeignMembers()` took off a workspace VM. */
+export interface ForeignMemberDrainResult {
+  runtimeKey: string
+  projectId: string
+  /** `conflict`: the export was quarantined; `failed`: the member is still mounted. */
+  outcome: 'exported' | 'conflict' | 'empty' | 'failed'
+  detail?: string
+}
+
 /** What `recycle()` did. `aborted` means nothing was removed. */
 export interface RecycleReport {
   runtimeKey: string
@@ -594,6 +633,10 @@ export interface SuspendedVm {
    * compatible (never mass-cold-boots the fleet on the first deploy of this).
    */
   rootfsIdentity?: string
+  /** See CacheEntry.workspaceOrigin. */
+  workspaceOrigin?: 'template' | 'backup' | 'snapshot'
+  /** See CacheEntry.durablePending. */
+  durablePending?: boolean
 }
 
 export interface GcReport {
@@ -699,6 +742,71 @@ function workspaceMemberIdsFromEnv(env: Record<string, string>): string[] | unde
 }
 
 /**
+ * The only projects a runtime may hold online. A project is live in exactly
+ * one VM — its own `ws:proj:<id>` — so that VM's single member is itself, and a
+ * workspace session runtime (`ws:<workspaceId>`) holds none; other runtimes
+ * reach a project through the remote tool channel. Two VMs holding one project
+ * both wrote its backups, and each write made the other's snapshot stale.
+ */
+export function ownMemberIds(runtimeKey: string): string[] {
+  if (runtimeKey.startsWith('ws:proj:')) {
+    const id = runtimeKey.slice('ws:proj:'.length)
+    return id ? [id] : []
+  }
+  return []
+}
+
+/** A mount that would put a project online in a runtime other than its own. */
+export class ForeignMemberError extends Error {
+  constructor(
+    readonly runtimeKey: string,
+    readonly projectId: string,
+  ) {
+    super(
+      `refusing to mount ${projectId} into ${runtimeKey}: a project is only online in its own runtime ` +
+        `(ws:proj:${projectId})`,
+    )
+  }
+}
+
+/** Assign-env keys holding member id lists the pool or guest acts on. */
+const MEMBER_ID_ENV_KEYS = ['WORKSPACE_PROJECT_IDS', 'WORKSPACE_NEW_PROJECT_IDS', 'WORKSPACE_READONLY_PROJECT_IDS'] as const
+
+/**
+ * Drop every member id a `ws:` runtime may not hold from its assign env and
+ * bind. Strips rather than fails so an API replica still sending the old
+ * member lists keeps opening runtimes during a rollout.
+ */
+export function restrictToOwnMembers<B extends { attachedProjectIds?: string[] } | undefined>(
+  runtimeKey: string,
+  env: Record<string, string>,
+  bind?: B,
+): { env: Record<string, string>; bind?: B; foreign: string[] } {
+  if (!runtimeKey.startsWith('ws:')) return { env, bind, foreign: [] }
+  const own = ownMemberIds(runtimeKey)
+  const foreign = new Set<string>()
+  const keep = (ids: string[]) =>
+    ids.filter((id) => {
+      if (own.includes(id)) return true
+      foreign.add(id)
+      return false
+    })
+  let out = env
+  for (const key of MEMBER_ID_ENV_KEYS) {
+    if (typeof env[key] !== 'string') continue
+    const ids = env[key].split(',').map((id) => id.trim()).filter(Boolean)
+    const kept = keep(ids)
+    if (kept.length !== ids.length) out = { ...out, [key]: kept.join(',') }
+  }
+  let outBind = bind
+  if (bind?.attachedProjectIds) {
+    const kept = keep(bind.attachedProjectIds)
+    if (kept.length !== bind.attachedProjectIds.length) outBind = { ...bind, attachedProjectIds: kept }
+  }
+  return { env: out, bind: outBind, foreign: [...foreign] }
+}
+
+/**
  * Which VM class an assign/resume env is requesting (Phase 1 docker project
  * class). Mirrors the same `SHOGO_RUNTIME_CLASS` key the API's
  * build-project-env.ts injects (gated by the runtime.docker_class_enabled
@@ -723,6 +831,14 @@ export class MetalWarmPool {
   private available: PooledVm[] = []
   private assigned = new Map<string, AssignedVm>()
   private suspended = new Map<string, SuspendedVm>()
+  /**
+   * Snapshots taken on the STAGED rootfs (pre-warm before a switch), kept apart
+   * from `suspended` so the project's current snapshot keeps serving opens
+   * until activation promotes these. Local only: never pushed durably while
+   * staged, never resumed before activation.
+   */
+  private stagedSuspended = new Map<string, SuspendedVm>()
+  private stagedIndex: CacheIndex
   /** One stale-snapshot drain at a time (see reclaimStaleSnapshots). */
   private staleReclaimRunning = false
   protected repoHydratedSlackMs = REPO_HYDRATED_SLACK_MS
@@ -735,7 +851,7 @@ export class MetalWarmPool {
    * map, but legitimately live. Kept out of the orphan reaper's sights. */
   private inFlight = new Set<string>()
   /** Collapses concurrent open (assign|resume) calls for the same project. */
-  private openFlight = new Singleflight<OpenResult | null>()
+  private openFlight = new Singleflight<OpenResult | PrewarmedResult | null>()
   /** Why the most recent resume attempt for a project declined its snapshot; read by open(). */
   private lastStaleReason = new Map<string, StaleReason>()
   /** Collapses concurrent suspend calls for the same project. */
@@ -803,6 +919,7 @@ export class MetalWarmPool {
     }
     this.rootfsId = this.rootfsIds.standard
     this.index = new CacheIndex(cfg.snapDir)
+    this.stagedIndex = new CacheIndex(join(cfg.snapDir, 'staged'))
     this.live = new LiveRegistry(cfg.runDir)
     rmSync(this.exportSpoolDir, { recursive: true, force: true })
     this.heavy = new Semaphore(parseInt(process.env.METAL_HEAVY_CONCURRENCY ?? '2', 10))
@@ -889,11 +1006,11 @@ export class MetalWarmPool {
     throw new Error(`VM ${handle.id} never became healthy`)
   }
 
-  private async bootOne(pool = true, vmClass: VmClass = 'standard'): Promise<PooledVm> {
+  private async bootOne(pool = true, vmClass: VmClass = 'standard', rootfsBase?: string): Promise<PooledVm> {
     // No memoryMB/cpus override here — startVM resolves both from the class's
     // own config (classConfig in config.ts), so a docker-class VM gets its own
     // sizing rather than the standard fleet's.
-    const handle = await this.mgr.startVM({ vmClass })
+    const handle = await this.mgr.startVM(rootfsBase ? { vmClass, rootfsBase } : { vmClass })
     // startVM self-cleans a partial boot; a VM that boots but never becomes
     // healthy is our responsibility to stop, or its FC process leaks (never
     // enters `available`/`assigned`, so nothing else would ever kill it).
@@ -1026,6 +1143,27 @@ export class MetalWarmPool {
   }
 
   /**
+   * The staged golden image for `vmClass` (built beside the live one, see
+   * self-update.ts), or null. Read from disk on every call: a rebuild replaces
+   * the file under a running agent. A pinned `METAL_ROOTFS_IDENTITY` can't tell
+   * two images apart, so staged boots are off on such a host.
+   */
+  stagedRootfs(vmClass: VmClass = 'standard'): { path: string; identity: string } | null {
+    if (this.cfg.rootfsIdentity) return null
+    const path = stagedRootfsPath(classConfig(this.cfg, vmClass).baseRootfs)
+    if (!existsSync(path)) return null
+    const identity = computeRootfsIdentity(this.cfg, path)
+    return identity === 'unknown' ? null : { path, identity }
+  }
+
+  /** Is this VM on the host's current image, the staged one, or neither (stale)? */
+  private rootfsGeneration(identity: string, vmClass: VmClass): 'current' | 'staged' | 'stale' {
+    if (identity === this.classRootfsIdentity(vmClass)) return 'current'
+    if (identity === this.stagedRootfs(vmClass)?.identity) return 'staged'
+    return 'stale'
+  }
+
+  /**
    * Re-adopt microVMs that survived a node-agent restart (rolling deploy). For
    * each entry in the durable live registry, verify the firecracker pid is still
    * alive, its API socket still exists, and the guest still answers /health; if
@@ -1106,6 +1244,7 @@ export class MetalWarmPool {
         homeParentEtag: e.homeParentEtag,
         homeUntrustedReason: e.homeUntrustedReason,
         memberData: e.memberData,
+        workspaceMemberIds: e.workspaceMemberIds,
         repoParentEtag: e.repoParentEtag,
         repoUntrustedReason: e.repoUntrustedReason,
         sourceUntrustedReason: e.sourceUntrustedReason,
@@ -1170,6 +1309,7 @@ export class MetalWarmPool {
       homeParentEtag: a.homeParentEtag,
       homeUntrustedReason: a.homeUntrustedReason,
       memberData: a.memberData,
+      workspaceMemberIds: a.workspaceMemberIds,
       repoParentEtag: a.repoParentEtag,
       repoUntrustedReason: a.repoUntrustedReason,
       sourceUntrustedReason: a.sourceUntrustedReason,
@@ -1187,46 +1327,67 @@ export class MetalWarmPool {
   rehydrate(): number {
     let n = 0
     for (const e of this.index.all()) {
-      const artifactsPresent =
-        existsSync(e.snapshotPath) && existsSync(e.memFilePath) && existsSync(e.rootfs)
-      if (!artifactsPresent) {
+      const s = this.entryToSuspended(e)
+      if (!s) {
         this.index.remove(e.projectId)
         continue
       }
-      const snapshot: FcSnapshot = {
-        vmId: e.vmId,
-        snapshotPath: e.snapshotPath,
-        memFilePath: e.memFilePath,
-        rootfs: e.rootfs,
-        net: e.net,
-        vcpus: e.vcpus,
-        memoryMB: e.memoryMB,
-        createdAt: e.createdAt,
-        bytesMem: e.bytesMem,
-        bytesState: e.bytesState,
-        bytesRootfs: e.bytesRootfs,
-        vmClass: e.vmClass,
-        dataDrive: e.dataDrive,
-        workspaceDrive: e.workspaceDrive,
-      }
-      this.suspended.set(e.projectId, {
-        projectId: e.projectId,
-        snapshot,
-        suspendedAt: e.suspendedAt,
-        lastAccessAt: e.lastAccessAt,
-        rootfsIdentity: e.rootfsIdentity,
-        backupEtag: e.backupEtag,
-        dataEtag: e.dataEtag,
-        homeEtag: e.homeEtag,
-        publishedDataLoaded: e.publishedDataLoaded,
-        memberDataEtags: e.memberDataEtags,
-        memberSourceEtags: e.memberSourceEtags,
-        repoEtag: e.repoEtag,
-      })
+      this.suspended.set(e.projectId, s)
       n++
     }
+    // Staged snapshots survive a restart only while the image they were taken
+    // on is still the staged one; after a newer rebuild they can never be used.
+    let staged = 0
+    for (const e of this.stagedIndex.all()) {
+      const s = this.entryToSuspended(e)
+      if (!s || s.rootfsIdentity !== this.stagedRootfs(s.snapshot.vmClass ?? 'standard')?.identity) {
+        if (s) this.deleteLocalArtifacts(s.snapshot)
+        this.stagedIndex.remove(e.projectId)
+        continue
+      }
+      this.stagedSuspended.set(e.projectId, s)
+      staged++
+    }
     if (n) console.log(`[pool] rehydrated ${n} suspended snapshot(s) from cache index`)
+    if (staged) console.log(`[pool] rehydrated ${staged} pre-warmed snapshot(s) on the staged rootfs`)
     return n
+  }
+
+  /** A cache-index entry as a suspended VM, or null when its artifacts are gone. */
+  private entryToSuspended(e: CacheEntry): SuspendedVm | null {
+    if (!existsSync(e.snapshotPath) || !existsSync(e.memFilePath) || !existsSync(e.rootfs)) return null
+    const snapshot: FcSnapshot = {
+      vmId: e.vmId,
+      snapshotPath: e.snapshotPath,
+      memFilePath: e.memFilePath,
+      rootfs: e.rootfs,
+      net: e.net,
+      vcpus: e.vcpus,
+      memoryMB: e.memoryMB,
+      createdAt: e.createdAt,
+      bytesMem: e.bytesMem,
+      bytesState: e.bytesState,
+      bytesRootfs: e.bytesRootfs,
+      vmClass: e.vmClass,
+      dataDrive: e.dataDrive,
+      workspaceDrive: e.workspaceDrive,
+    }
+    return {
+      projectId: e.projectId,
+      snapshot,
+      suspendedAt: e.suspendedAt,
+      lastAccessAt: e.lastAccessAt,
+      rootfsIdentity: e.rootfsIdentity,
+      backupEtag: e.backupEtag,
+      dataEtag: e.dataEtag,
+      homeEtag: e.homeEtag,
+      publishedDataLoaded: e.publishedDataLoaded,
+      memberDataEtags: e.memberDataEtags,
+      memberSourceEtags: e.memberSourceEtags,
+      repoEtag: e.repoEtag,
+      workspaceOrigin: e.workspaceOrigin,
+      durablePending: e.durablePending,
+    }
   }
 
   private claim(vmClass: VmClass = 'standard'): PooledVm | null {
@@ -1261,16 +1422,36 @@ export class MetalWarmPool {
     console.error(`[pool] guest serial tail (${reason}) project=${a.projectId} vm=${a.handle.id}:\n${tail}`)
   }
 
+  /** {@link restrictToOwnMembers}, logging and counting whatever it had to strip. */
+  private ownMembersOnly<B extends { attachedProjectIds?: string[] } | undefined>(
+    runtimeKey: string,
+    env: Record<string, string>,
+    bind?: B,
+  ): { env: Record<string, string>; bind?: B } {
+    const r = restrictToOwnMembers(runtimeKey, env, bind)
+    if (r.foreign.length) {
+      metrics.inc(M.foreignMembersStripped, r.foreign.length)
+      console.error(
+        `[pool] refusing foreign workspace members for ${runtimeKey}: ${r.foreign.join(',')} ` +
+          `(a project is only online in its own runtime)`,
+      )
+    }
+    return { env: r.env, bind: r.bind }
+  }
+
   /** Mount a project archive into an already-running workspace microVM. */
   async mountWorkspaceMember(
     runtimeKey: string,
     projectId: string,
     destDir: string,
   ): Promise<{ hydrated: boolean }> {
+    if (!ownMemberIds(runtimeKey).includes(projectId)) {
+      metrics.inc(M.foreignMemberMountRefused)
+      throw new ForeignMemberError(runtimeKey, projectId)
+    }
     const assigned = this.assigned.get(runtimeKey)
     if (!assigned) throw new Error(`workspace runtime ${runtimeKey} is not assigned`)
     const env: Record<string, string> = assigned.runtimeToken ? { RUNTIME_AUTH_SECRET: assigned.runtimeToken } : {}
-    await this.flushMembersHeldElsewhere(runtimeKey, [projectId])
     const ref = await this.sourceRef(projectId)
     if (ref) {
       await this.applyArchive(assigned.handle, env, ref, `${projectId} workspace member`, destDir)
@@ -1305,10 +1486,37 @@ export class MetalWarmPool {
   ): Promise<{ exported: boolean }> {
     const assigned = this.assigned.get(runtimeKey)
     if (!assigned) return { exported: false }
+    const r = await this.evictMember(assigned, projectId, destDir)
+    return { exported: r.outcome === 'exported' }
+  }
+
+  /**
+   * Export a member under its lineage, save its writable state, then remove it
+   * from the guest. The guest deletes the member's folder, so a source export
+   * that landed nowhere durable (neither the backup nor a quarantine key)
+   * throws and leaves the member mounted.
+   */
+  private async evictMember(
+    assigned: AssignedVm,
+    projectId: string,
+    destDir: string,
+  ): Promise<{ outcome: 'exported' | 'conflict' | 'empty'; detail?: string }> {
     const bytes = await this.fetchExport(assigned.handle, assigned.runtimeToken, destDir)
-    let exported = false
+    let outcome: 'exported' | 'conflict' | 'empty' = 'empty'
+    let detail: string | undefined
     if (bytes) {
-      exported = (await this.storeMemberSource(assigned, projectId, bytes)).ok
+      const stored = await this.storeMemberSource(assigned, projectId, bytes)
+      if (stored.ok) {
+        outcome = 'exported'
+        detail = stored.outcome.status
+      } else if (stored.outcome.status === 'conflict' && stored.outcome.quarantineKey) {
+        outcome = 'conflict'
+        detail = `quarantined at ${stored.outcome.quarantineKey}`
+      } else {
+        throw new Error(
+          `source export of ${projectId} from ${assigned.projectId} is not durable (${stored.outcome.status}); left mounted`,
+        )
+      }
     }
     const slot = this.memberDataSlot(assigned, projectId, destDir)
     await this.dataFlight
@@ -1316,22 +1524,82 @@ export class MetalWarmPool {
       .catch((err) =>
         console.error(`[pool] writable-state backup for unmounted member ${projectId} failed:`, err?.message ?? err),
       )
-    const response = await fetch(
-      `${assigned.handle.agentUrl}/internal/workspace/members/${encodeURIComponent(projectId)}`,
-      {
-        method: 'DELETE',
-        headers: assigned.runtimeToken ? { 'x-runtime-token': assigned.runtimeToken } : {},
-        signal: AbortSignal.timeout(10_000),
-      },
-    )
-    if (!response.ok) {
-      throw new Error(`workspace member unmount failed (${response.status}): ${await response.text().catch(() => '')}`)
-    }
+    await this.removeGuestMember(assigned, projectId)
     assigned.workspaceMemberIds = (assigned.workspaceMemberIds ?? []).filter((id) => id !== projectId)
     if (assigned.memberData) delete assigned.memberData[projectId]
     this.dataTags.delete(slot.flightKey)
     this.writeLive(assigned)
-    return { exported }
+    return { outcome, detail }
+  }
+
+  /** Unmount a member in the guest, which deletes its folder. `protected` for tests. */
+  protected async removeGuestMember(a: AssignedVm, projectId: string): Promise<void> {
+    const response = await fetch(`${a.handle.agentUrl}/internal/workspace/members/${encodeURIComponent(projectId)}`, {
+      method: 'DELETE',
+      headers: a.runtimeToken ? { 'x-runtime-token': a.runtimeToken } : {},
+      signal: AbortSignal.timeout(10_000),
+    })
+    if (!response.ok) {
+      throw new Error(`workspace member unmount failed (${response.status}): ${await response.text().catch(() => '')}`)
+    }
+  }
+
+  /**
+   * Take every foreign member (see {@link ownMemberIds}) off every running
+   * workspace VM on this host: export it under its lineage (written, or
+   * quarantined on a mismatch), save its writable state, and unmount it. For
+   * VMs that predate the single-runtime rule; new assigns never mount one.
+   */
+  async drainForeignMembers(): Promise<ForeignMemberDrainResult[]> {
+    const results: ForeignMemberDrainResult[] = []
+    for (const a of [...this.assigned.values()]) {
+      if (!a.projectId.startsWith('ws:') || !this.mgr.isRunning(a.handle)) continue
+      // Those drain themselves before their final backups.
+      if (this.suspendFlight.has(a.projectId) || this.recycleFlight.has(a.projectId)) continue
+      results.push(...(await this.drainForeignMembersOf(a)))
+    }
+    return results
+  }
+
+  private async drainForeignMembersOf(a: AssignedVm, listTimeoutMs?: number): Promise<ForeignMemberDrainResult[]> {
+    return this.sourceLock.run(a.projectId, async () => {
+      const own = ownMemberIds(a.projectId)
+      const mounted = (await this.guestMountedMembers(a, listTimeoutMs)) ?? []
+      const foreign = [...new Set([...(a.workspaceMemberIds ?? []), ...mounted])].filter((id) => !own.includes(id))
+      const results: ForeignMemberDrainResult[] = []
+      for (const projectId of foreign) {
+        let r: ForeignMemberDrainResult
+        try {
+          r = { runtimeKey: a.projectId, projectId, ...(await this.evictMember(a, projectId, `/app/workspace/${projectId}`)) }
+        } catch (err: any) {
+          r = { runtimeKey: a.projectId, projectId, outcome: 'failed', detail: err?.message ?? String(err) }
+        }
+        metrics.inc(`${M.foreignMemberDrained}{outcome="${r.outcome}"}`)
+        const line = `[pool] drained foreign member ${projectId} from ${a.projectId}: ${r.outcome}${r.detail ? ` (${r.detail})` : ''}`
+        if (r.outcome === 'failed') console.error(line)
+        else console.log(line)
+        results.push(r)
+      }
+      return results
+    })
+  }
+
+  /**
+   * Runtimes on this host that hold `projectId` online: its own runtime, plus
+   * any workspace VM that tracks or has mounted it. One entry is the invariant.
+   */
+  async memberHolders(projectId: string): Promise<string[]> {
+    const own = `ws:proj:${projectId}`
+    const vms = [...this.assigned.values()]
+    const held = await Promise.all(
+      vms.map(async (a) => {
+        if (a.projectId === own || a.projectId === projectId) return true
+        if (!a.projectId.startsWith('ws:')) return false
+        if (a.workspaceMemberIds?.includes(projectId)) return true
+        return ((await this.guestMountedMembers(a, 3_000)) ?? []).includes(projectId)
+      }),
+    )
+    return vms.filter((_, i) => held[i]).map((a) => a.projectId).sort()
   }
 
   /**
@@ -1345,13 +1613,55 @@ export class MetalWarmPool {
     env: Record<string, string> = {},
     bind?: { workspaceId?: string; attachedProjectIds?: string[] },
   ): Promise<OpenResult> {
-    const r = await this.openFlight.run(projectId, async () => {
+    ;({ env, bind } = this.ownMembersOnly(projectId, env, bind))
+    const r = await this.openOnce(projectId, env, bind, null)
+    // Joined a concurrent staged open that had nothing to boot: this caller
+    // needs a running VM, so open again (now as the flight's owner).
+    if (r.mode === 'prewarmed') return this.open(projectId, env, bind)
+    return r
+  }
+
+  /**
+   * Pre-warm open on the STAGED rootfs (switch-over): boot a fresh VM from the
+   * staged image without touching the project's current snapshot, so its
+   * suspend lands in `stagedSuspended`. An already-live project is handed back
+   * as-is (`bootRootfsIdentity` tells the caller which image it is on).
+   */
+  async openStaged(
+    projectId: string,
+    env: Record<string, string> = {},
+    bind?: { workspaceId?: string; attachedProjectIds?: string[] },
+  ): Promise<OpenResult | PrewarmedResult> {
+    ;({ env, bind } = this.ownMembersOnly(projectId, env, bind))
+    const staged = this.stagedRootfs(this.resolveVmClass(projectId, env))
+    if (!staged) throw new StagedRootfsUnavailableError(`no staged rootfs on this host for ${projectId}`)
+    return this.openOnce(projectId, env, bind, staged)
+  }
+
+  private async openOnce(
+    projectId: string,
+    env: Record<string, string>,
+    bind: { workspaceId?: string; attachedProjectIds?: string[] } | undefined,
+    staged: { path: string; identity: string } | null,
+  ): Promise<OpenResult | PrewarmedResult> {
+    const r = await this.openFlight.run(projectId, async (): Promise<OpenResult | PrewarmedResult> => {
       const timer = new PhaseTimer()
       const done = (res: Omit<OpenResult, 'phases' | 'totalMs'>): OpenResult => ({
         ...res,
         phases: timer.phases(),
         totalMs: timer.totalMs(),
       })
+      if (staged) {
+        const held = this.stagedSuspended.get(projectId)
+        if (held && held.rootfsIdentity === staged.identity && !this.assigned.has(projectId)) {
+          return { mode: 'prewarmed', stagedSnapshotIdentity: staged.identity }
+        }
+        if (held) this.dropStaged(projectId)
+      } else if (this.stagedSuspended.has(projectId)) {
+        // A user open changes the project's data, so a snapshot pre-warmed
+        // before it is already behind.
+        this.dropStaged(projectId)
+      }
       // Idempotent: if the project is already live here, hand back the same VM
       // rather than restoring a duplicate from the store (which a re-/assign
       // for a live project — e.g. a control-plane replica routing to the placed
@@ -1397,7 +1707,12 @@ export class MetalWarmPool {
           // `reused`: re-attached an already-running VM (no boot, no resume).
           // The control plane records this as a warm hit, not a cold miss.
           timer.add('live_check', performance.now() - liveT0)
-          return done({ handle: live.handle, mode: 'assigned', reused: true })
+          return done({
+            handle: live.handle,
+            mode: 'assigned',
+            reused: true,
+            bootRootfsIdentity: this.bootRootfsIdentity(live),
+          })
         }
         const mute = this.mgr.isRunning(live.handle)
         if (mute) {
@@ -1414,6 +1729,12 @@ export class MetalWarmPool {
         await this.discardDeadVm(live, mute ? 'health-gate: guest mute' : 'health-gate: fc process gone')
         timer.add('live_check', performance.now() - liveT0)
       }
+      if (staged) {
+        // Never resume here: the current snapshot stays the project's serving
+        // copy until activation, and this boot is on the new image.
+        const a = await this.assign(projectId, env, bind, timer, staged)
+        return done({ handle: a.handle, mode: 'assigned', bootRootfsIdentity: staged.identity })
+      }
       let staleReason: StaleReason | undefined
       if (await timer.time('can_resume', () => this.canResume(projectId))) {
         try {
@@ -1424,6 +1745,7 @@ export class MetalWarmPool {
               mode: 'resumed',
               source: res.source,
               readyMs: res.readyMs,
+              bootRootfsIdentity: this.bootRootfsIdentity(res.assigned),
             })
           staleReason = this.lastStaleReason.get(projectId) ?? 'no_snapshot'
         } catch (err: any) {
@@ -1443,8 +1765,9 @@ export class MetalWarmPool {
       }
       this.lastStaleReason.delete(projectId)
       const a = await this.assign(projectId, env, bind, timer)
-      return done({ handle: a.handle, mode: 'assigned', staleReason })
+      return done({ handle: a.handle, mode: 'assigned', staleReason, bootRootfsIdentity: this.bootRootfsIdentity(a) })
     })
+    if (r?.mode === 'prewarmed') return r
     // Always-on: paid tiers (control plane sets SHOGO_ALWAYS_ON) must never be
     // idle-suspended by the reaper. Re-assert on EVERY open — this is the one
     // path with `env`, so it also (re)applies the flag after a resume (which
@@ -1472,8 +1795,32 @@ export class MetalWarmPool {
     env: Record<string, string> = {},
     bind?: { workspaceId?: string; attachedProjectIds?: string[] },
     timer = new PhaseTimer(),
+    staged?: { path: string; identity: string },
   ): Promise<AssignedVm> {
-    let vmClass = vmClassFromEnv(env)
+    ;({ env, bind } = this.ownMembersOnly(projectId, env, bind))
+    const vmClass = this.resolveVmClass(projectId, env)
+    if (projectId.startsWith('ws:')) {
+      env = await timer.time('confirm_members', () => this.withConfirmedNewMembers(env))
+    }
+    // Pool VMs boot from the current image, so a staged boot always starts fresh.
+    let vm = staged ? null : this.claim(vmClass)
+    if (!vm) {
+      const t0 = performance.now()
+      let waited = 0
+      vm = await this.heavy.run(
+        () => this.bootOne(false, vmClass, staged?.path),
+        (ms) => {
+          waited = ms
+          timer.add('heavy_wait', ms)
+        },
+      )
+      timer.add('boot', performance.now() - t0 - waited)
+    }
+    return this.assignVm(projectId, env, bind, timer, vm, staged?.identity)
+  }
+
+  private resolveVmClass(projectId: string, env: Record<string, string>): VmClass {
+    const vmClass = vmClassFromEnv(env)
     if (vmClass !== 'standard' && !isVmClassSupported(this.cfg, vmClass)) {
       // Fail closed to 'standard' rather than boot a docker-class VM off a
       // nonexistent/wrong image (see classConfig's own fallback for the same
@@ -1487,26 +1834,19 @@ export class MetalWarmPool {
         `[pool] project ${projectId} requested vmClass=${vmClass} but this host does not support it ` +
           `(METAL_DOCKER_ROOTFS unset) — falling back to a standard VM`,
       )
-      vmClass = 'standard'
+      return 'standard'
     }
-    if (projectId.startsWith('ws:')) {
-      await timer.time('flush_members', () => this.flushMembersHeldElsewhere(projectId, workspaceMemberIdsFromEnv(env) ?? []))
-      env = await timer.time('confirm_members', () => this.withConfirmedNewMembers(env))
-    }
-    let vm = this.claim(vmClass)
-    if (!vm) {
-      const t0 = performance.now()
-      let waited = 0
-      vm = await this.heavy.run(
-        () => this.bootOne(false, vmClass),
-        (ms) => {
-          waited = ms
-          timer.add('heavy_wait', ms)
-        },
-      )
-      timer.add('boot', performance.now() - t0 - waited)
-    }
+    return vmClass
+  }
 
+  private async assignVm(
+    projectId: string,
+    env: Record<string, string>,
+    bind: { workspaceId?: string; attachedProjectIds?: string[] } | undefined,
+    timer: PhaseTimer,
+    vm: PooledVm,
+    stagedIdentity: string | undefined,
+  ): Promise<AssignedVm> {
     // The claimed/booted VM is now off the pool and not yet in `assigned`. If
     // the guest /pool/assign call fails or times out we must stop it, or its FC
     // process leaks (tracked by no map). Guard the whole in-flight window.
@@ -1544,7 +1884,7 @@ export class MetalWarmPool {
       lastRealActivityAt: now,
       // Warm VMs never outlive the agent process (prepareForRestart kills
       // them), so this one booted from the image this process was started on.
-      bootRootfsIdentity: this.classRootfsIdentity(vm.handle.vmClass),
+      bootRootfsIdentity: stagedIdentity ?? this.classRootfsIdentity(vm.handle.vmClass),
       runtimeToken: env.RUNTIME_AUTH_SECRET,
       workspaceMemberIds: workspaceMemberIdsFromEnv(env),
       publishedSubdomain,
@@ -2046,20 +2386,33 @@ export class MetalWarmPool {
   }
 
   /**
-   * The members to back up: the host's list plus anything the guest has
-   * mounted that the host lost track of. A resume or a reused open rebuilds the
-   * host's list from the caller's env, which never includes projects mounted
-   * live, so the guest is the authority on what is on its disk.
+   * The members to back up: the runtime's own members (see {@link ownMemberIds})
+   * that the host tracks or the guest has mounted. A resume or a reused open
+   * rebuilds the host's list from the caller's env, so the guest is the
+   * authority on what is on its disk — but a foreign member it reports (a VM
+   * from before the single-runtime rule) is never tracked or exported here:
+   * `drainForeignMembers` takes it off under its own lineage.
    */
   private async workspaceMembersForBackup(
     a: AssignedVm,
     timeoutMs?: number,
   ): Promise<{ ids: string[]; guestConfirmed: boolean }> {
+    const own = ownMemberIds(a.projectId)
     const known = a.workspaceMemberIds ?? []
     const mounted = await this.guestMountedMembers(a, timeoutMs)
-    if (!mounted) return { ids: known, guestConfirmed: false }
-    const untracked = mounted.filter((id) => !known.includes(id))
-    const notMounted = known.filter((id) => !mounted.includes(id))
+    const foreign = [...new Set([...known, ...(mounted ?? [])])].filter((id) => !own.includes(id))
+    if (foreign.length) {
+      metrics.inc(M.foreignMemberBackupSkipped, foreign.length)
+      console.error(
+        `[pool] not backing up foreign workspace members ${foreign.join(',')} of ${a.projectId} ` +
+          `(a project is only online in its own runtime; POST /drain-foreign-members exports and unmounts them)`,
+      )
+    }
+    const ownKnown = known.filter((id) => own.includes(id))
+    if (!mounted) return { ids: ownKnown, guestConfirmed: false }
+    const ownMounted = mounted.filter((id) => own.includes(id))
+    const untracked = ownMounted.filter((id) => !ownKnown.includes(id))
+    const notMounted = ownKnown.filter((id) => !ownMounted.includes(id))
     if (untracked.length || notMounted.length) {
       metrics.inc(M.workspaceMemberDrift)
       console.warn(
@@ -2072,45 +2425,7 @@ export class MetalWarmPool {
       a.workspaceMemberIds = [...known, ...untracked]
       this.writeLive(a)
     }
-    return { ids: [...known, ...untracked], guestConfirmed: true }
-  }
-
-  /**
-   * Before `runtimeKey` hydrates `memberIds` from the store, export each one
-   * from any other live VM on this host that holds it, so the new runtime
-   * starts from those files rather than an older backup or, for a project
-   * with no backup yet, the starter. Without this, opening a project in Studio
-   * while a team-chat VM had it mounted gave Studio a fresh starter while the
-   * real work stayed in the other VM. Best effort: never fails the open, and
-   * later writes from either VM stay under the lineage guard.
-   */
-  private async flushMembersHeldElsewhere(runtimeKey: string, memberIds: string[]): Promise<void> {
-    if (!memberIds.length) return
-    const others = [...this.assigned.values()].filter(
-      (o) => o.projectId !== runtimeKey && o.projectId.startsWith('ws:') && this.mgr.isRunning(o.handle),
-    )
-    await Promise.all(
-      others.map(async (other) => {
-        const { ids } = await this.workspaceMembersForBackup(other, 3_000)
-        for (const memberId of memberIds.filter((id) => ids.includes(id))) {
-          try {
-            const bytes = await this.fetchExport(other.handle, other.runtimeToken, `/app/workspace/${memberId}`)
-            if (!bytes) continue
-            const { ok, outcome } = await this.storeMemberSource(other, memberId, bytes)
-            if (ok) metrics.inc(M.memberFlushedForOpen)
-            console.log(
-              `[pool] ${ok ? 'flushed' : `could not flush (${outcome.status})`} ${memberId} from ${other.projectId} ` +
-                `before ${runtimeKey} hydrates it (${bytes.byteLength} bytes)`,
-            )
-          } catch (err: any) {
-            console.warn(
-              `[pool] could not flush ${memberId} from ${other.projectId} before ${runtimeKey} hydrates it:`,
-              err?.message ?? err,
-            )
-          }
-        }
-      }),
-    )
+    return { ids: [...ownKnown, ...untracked], guestConfirmed: true }
   }
 
   /** Back up each member's source. Returns the members whose latest source is NOT the durable backup. */
@@ -2161,9 +2476,15 @@ export class MetalWarmPool {
     const state = this.memberDataState(a, memberId)
     const outcome = await this.uploadBackupGuarded(memberId, bytes, {
       parentEtag: state.sourceParentEtag,
-      // Lineage from before member source was tracked (an adopted or resumed VM
-      // from older code) is unknown rather than mismatched; keep trusting it.
-      adoptWhenUnknown: !state.sourceLinked && !state.sourceParentEtag,
+      // Unknown lineage is trusted only for the runtime's own project restored
+      // from a snapshot that predates member stamping. A member this VM merely
+      // found mounted in the guest has no lineage at all, and adopting it is how
+      // a second VM overwrote a project's backup from a stale copy.
+      adoptWhenUnknown:
+        ownMemberIds(a.projectId).includes(memberId) &&
+        a.workspaceOrigin === 'snapshot' &&
+        !state.sourceLinked &&
+        !state.sourceParentEtag,
       untrusted: !!state.sourceUntrustedReason,
     })
     switch (outcome.status) {
@@ -2838,7 +3159,8 @@ export class MetalWarmPool {
   async saveWorkspaceMemberDataToStore(a: AssignedVm, opts: DataSaveOpts = {}): Promise<boolean> {
     let wrote = false
     let firstError: unknown
-    for (const memberId of a.workspaceMemberIds ?? []) {
+    const own = ownMemberIds(a.projectId)
+    for (const memberId of (a.workspaceMemberIds ?? []).filter((id) => own.includes(id))) {
       const slot = this.memberDataSlot(a, memberId)
       try {
         if (await this.dataFlight.run(slot.flightKey, () => this.saveDataSlotInner(a, slot, opts))) wrote = true
@@ -3440,41 +3762,55 @@ export class MetalWarmPool {
       const a = this.assigned.get(projectId)
       if (!a) throw new Error(`project ${projectId} not assigned`)
 
+      // A pre-warm nobody used holds exactly what it hydrated from the durable
+      // backups. Re-pushing them would move their etags past the project's
+      // current snapshot, and every open before activation would cold-boot.
+      const untouchedPrewarm =
+        this.rootfsGeneration(this.bootRootfsIdentity(a), a.handle.vmClass) === 'staged' &&
+        !((a.lastRealActivityAt ?? 0) > a.assignedAt)
+
       // Write-side durability FIRST, while the guest is still fully live: pull
       // the latest source and push it to the durable S3 backup so a resume on a
       // DIFFERENT metal machine (snapshot miss) still cold-hydrates real source.
       // Best-effort — the snapshot below is the primary cross-host resume path.
-      if (a.projectId.startsWith('ws:')) {
-        await this.saveWorkspaceMembersToStore(a)
-      } else {
-        await this.saveBackupToStore(a).catch((err) =>
-          console.error(`[pool] source backup for ${a.projectId} failed (snapshot still durable):`, err?.message ?? err),
+      if (!untouchedPrewarm) {
+        if (a.projectId.startsWith('ws:')) {
+          // A legacy VM's foreign members are only in this guest; once suspended,
+          // its snapshot is never resumed (see foreignStampedMembers).
+          await this.drainForeignMembersOf(a, 3_000).catch((err) =>
+            console.error(`[pool] draining foreign members of ${a.projectId} failed:`, err?.message ?? err),
+          )
+          await this.saveWorkspaceMembersToStore(a)
+        } else {
+          await this.saveBackupToStore(a).catch((err) =>
+            console.error(`[pool] source backup for ${a.projectId} failed (snapshot still durable):`, err?.message ?? err),
+          )
+        }
+
+        // Same for writable state (database + uploads), and for the same reason:
+        // the snapshot is not a backup. A rootfs rebuild invalidates every
+        // snapshot at once, and the cold boot that follows restores source only —
+        // so without this the user's data is gone.
+        await this.saveProjectDataToStore(a, { final: true }).catch((err) =>
+          console.error(`[pool] writable-state backup for ${a.projectId} failed:`, err?.message ?? err),
         )
-      }
 
-      // Same for writable state (database + uploads), and for the same reason:
-      // the snapshot is not a backup. A rootfs rebuild invalidates every
-      // snapshot at once, and the cold boot that follows restores source only —
-      // so without this the user's data is gone.
-      await this.saveProjectDataToStore(a, { final: true }).catch((err) =>
-        console.error(`[pool] writable-state backup for ${a.projectId} failed:`, err?.message ?? err),
-      )
-
-      await this.saveHomeStateToStore(a, { final: true }).catch((err) =>
-        console.error(`[pool] home-directory backup for ${a.projectId} failed:`, err?.message ?? err),
-      )
-
-      await this.saveRepoToStore(a).catch((err) =>
-        console.error(`[pool] repo backup for ${a.projectId} failed:`, err?.message ?? err),
-      )
-
-      // Server-backed published VM: also flush the live writable state to the
-      // published-data bucket so a resume on a DIFFERENT host (snapshot miss)
-      // — or a republish/data-push — sees the latest end-user data.
-      if (a.publishedSubdomain) {
-        await this.exportPublishedData(a).catch((err) =>
-          console.error(`[pool] published-data export for ${a.publishedSubdomain} failed (snapshot still durable):`, err?.message ?? err),
+        await this.saveHomeStateToStore(a, { final: true }).catch((err) =>
+          console.error(`[pool] home-directory backup for ${a.projectId} failed:`, err?.message ?? err),
         )
+
+        await this.saveRepoToStore(a).catch((err) =>
+          console.error(`[pool] repo backup for ${a.projectId} failed:`, err?.message ?? err),
+        )
+
+        // Server-backed published VM: also flush the live writable state to the
+        // published-data bucket so a resume on a DIFFERENT host (snapshot miss)
+        // — or a republish/data-push — sees the latest end-user data.
+        if (a.publishedSubdomain) {
+          await this.exportPublishedData(a).catch((err) =>
+            console.error(`[pool] published-data export for ${a.publishedSubdomain} failed (snapshot still durable):`, err?.message ?? err),
+          )
+        }
       }
 
       await this.callGuestHook(a.handle.agentUrl, 'quiesce', this.cfg.quiesceTimeoutMs, a.runtimeToken)
@@ -3506,14 +3842,34 @@ export class MetalWarmPool {
         memberDataEtags: this.trustedMemberDataEtags(a),
         memberSourceEtags: this.trustedMemberSourceEtags(a),
         repoEtag: this.trustedRepoEtag(a),
+        workspaceOrigin: a.workspaceOrigin,
       }
+      const untrustedSource = this.sourceUntrustedReason(a)
+
+      if (this.rootfsGeneration(s.rootfsIdentity!, a.handle.vmClass) === 'staged') {
+        // Pre-warm on the staged image: held apart until activation (see
+        // `stagedSuspended`); the project's current snapshot keeps serving.
+        if (untrustedSource) {
+          console.error(`[pool] not keeping a pre-warmed snapshot of ${projectId} — source tree untrusted (${untrustedSource})`)
+          this.deleteLocalArtifacts(snapshot)
+          return s
+        }
+        this.dropStaged(projectId)
+        this.stagedSuspended.set(projectId, s)
+        this.writeIndex(s, this.stagedIndex)
+        return s
+      }
+
+      // Replaces a current snapshot only a staged boot leaves behind (a normal
+      // assign resumes, which consumes it).
+      const prior = this.suspended.get(projectId)
+      if (prior && prior.snapshot.snapshotPath !== snapshot.snapshotPath) this.deleteLocalArtifacts(prior.snapshot)
       this.suspended.set(projectId, s)
       this.writeIndex(s)
 
       // A tree we could not vouch for must not come back by resume: it would
       // carry the backup lineage stamped above and write itself over the
       // backup on its next suspend. Cold-boot from the durable backups instead.
-      const untrustedSource = this.sourceUntrustedReason(a)
       if (untrustedSource) {
         console.error(
           `[pool] not keeping a snapshot of ${projectId} — its source tree is untrusted (${untrustedSource}). ` +
@@ -3532,79 +3888,118 @@ export class MetalWarmPool {
             `host is on ${this.classRootfsIdentity(a.handle.vmClass)}`,
         )
       } else if (this.store.kind !== 'none') {
-        // Anti-clobber for the DURABLE SNAPSHOT tier (mirrors the backup guard):
-        // a template-origin VM must not push a template snapshot over a real
-        // one. If this workspace is still the template AND a durable snapshot
-        // already exists, that existing snapshot descends from real source we
-        // must not overwrite — keep the hot local snapshot and skip the push.
-        // (A genuinely new project has origin 'template' but no durable snapshot
-        // yet, so its first push still creates one.)
-        if (a.workspaceOrigin === 'template' && (await this.store.head(projectId)) != null) {
-          metrics.inc(M.backupTemplateSnapshotBlocked)
-          // Don't clobber the durable snapshot — AND don't keep this template
-          // snapshot locally either: resume() prefers the hot local copy, so a
-          // retained template snapshot would SHADOW the real durable one on the
-          // next open (a template served over real source). Evict it so the next
-          // resume misses locally and pulls the real durable snapshot instead.
-          console.error(
-            `[pool] REFUSED durable snapshot push for ${projectId} — template-origin VM would clobber an ` +
-              `existing durable snapshot. Evicting local template snapshot so the next open restores the ` +
-              `real durable copy; durable snapshot left intact.`,
-          )
-          this.evictLocal(projectId)
-          return s
-        }
-        // In dm mode the durable rootfs artifact is the small CoW *diff*, not
-        // the mapper device; in full/reflink it's the image file itself.
-        const durable = this.mgr.durableRootfs(snapshot.rootfs)
-        const meta: SnapshotMeta = {
-          projectId,
-          net: snapshot.net,
-          vcpus: snapshot.vcpus,
-          memoryMB: snapshot.memoryMB,
-          bytesMem: snapshot.bytesMem,
-          bytesState: snapshot.bytesState,
-          createdAt: snapshot.createdAt,
-          rootfsPath: snapshot.rootfs,
-          rootfsArtifactPath: this.mgr.restoreRootfsArtifactPath(snapshot.rootfs),
-          rootfsMode: durable.mode,
-          baseIdentity: this.bootRootfsIdentity(a),
-          rootfsIdentity: this.bootRootfsIdentity(a),
-          vmClass: a.handle.vmClass,
-          // Not durably persisted (see data-drive.ts header) — recorded only so
-          // a cross-host/cold resume can provision a FRESH empty drive of the
-          // right size instead of failing outright when the file isn't local.
-          dataDriveMiB: a.handle.dataDrive ? classConfig(this.cfg, a.handle.vmClass).dataDriveMiB : undefined,
-          backupEtag: a.backupParentEtag,
-          dataEtag: this.trustedDataEtag(a),
-          homeEtag: this.trustedHomeEtag(a),
-          publishedDataLoaded: a.publishedDataLoaded,
-          memberDataEtags: this.trustedMemberDataEtags(a),
-          memberSourceEtags: this.trustedMemberSourceEtags(a),
-          repoEtag: this.trustedRepoEtag(a),
-          v: 1,
-        }
-        await this.heavy
-          .run(() =>
-            this.store.push(
-              {
-                vmstate: snapshot.snapshotPath,
-                mem: snapshot.memFilePath,
-                rootfs: durable.path,
-                workspaceDrive: snapshot.workspaceDrive,
-              },
-              meta,
-            ),
-          )
-          .catch((err) =>
-            console.error(`[pool] durable push failed for ${projectId} (local snapshot kept):`, err?.message ?? err),
-          )
+        if ((await this.pushDurable(s, a.workspaceOrigin)) === 'blocked') this.evictLocal(projectId)
       }
       return s
     })
   }
 
-  private writeIndex(s: SuspendedVm): void {
+  /**
+   * Push a suspended snapshot to the durable store. Best-effort: a failure
+   * keeps the hot local snapshot. `'blocked'` means the anti-clobber guard
+   * refused, and the caller must evict the local copy (see below).
+   */
+  private async pushDurable(
+    s: SuspendedVm,
+    origin: SuspendedVm['workspaceOrigin'],
+  ): Promise<'pushed' | 'blocked' | 'failed'> {
+    const { projectId, snapshot } = s
+    const vmClass = snapshot.vmClass ?? 'standard'
+    // Anti-clobber for the DURABLE SNAPSHOT tier (mirrors the backup guard):
+    // a template-origin VM must not push a template snapshot over a real
+    // one. If this workspace is still the template AND a durable snapshot
+    // already exists, that existing snapshot descends from real source we
+    // must not overwrite — keep the hot local snapshot and skip the push.
+    // (A genuinely new project has origin 'template' but no durable snapshot
+    // yet, so its first push still creates one.)
+    if (origin === 'template' && (await this.store.head(projectId)) != null) {
+      metrics.inc(M.backupTemplateSnapshotBlocked)
+      // Don't clobber the durable snapshot — AND don't keep this template
+      // snapshot locally either: resume() prefers the hot local copy, so a
+      // retained template snapshot would SHADOW the real durable one on the
+      // next open (a template served over real source). Evict it so the next
+      // resume misses locally and pulls the real durable snapshot instead.
+      console.error(
+        `[pool] REFUSED durable snapshot push for ${projectId} — template-origin VM would clobber an ` +
+          `existing durable snapshot. Evicting local template snapshot so the next open restores the ` +
+          `real durable copy; durable snapshot left intact.`,
+      )
+      return 'blocked'
+    }
+    const identity = s.rootfsIdentity ?? this.classRootfsIdentity(vmClass)
+    // In dm mode the durable rootfs artifact is the small CoW *diff*, not
+    // the mapper device; in full/reflink it's the image file itself.
+    const durable = this.mgr.durableRootfs(snapshot.rootfs)
+    const meta: SnapshotMeta = {
+      projectId,
+      net: snapshot.net,
+      vcpus: snapshot.vcpus,
+      memoryMB: snapshot.memoryMB,
+      bytesMem: snapshot.bytesMem,
+      bytesState: snapshot.bytesState,
+      createdAt: snapshot.createdAt,
+      rootfsPath: snapshot.rootfs,
+      rootfsArtifactPath: this.mgr.restoreRootfsArtifactPath(snapshot.rootfs),
+      rootfsMode: durable.mode,
+      baseIdentity: identity,
+      rootfsIdentity: identity,
+      vmClass,
+      // Not durably persisted (see data-drive.ts header) — recorded only so
+      // a cross-host/cold resume can provision a FRESH empty drive of the
+      // right size instead of failing outright when the file isn't local.
+      dataDriveMiB: snapshot.dataDrive ? classConfig(this.cfg, vmClass).dataDriveMiB : undefined,
+      backupEtag: s.backupEtag,
+      dataEtag: s.dataEtag,
+      homeEtag: s.homeEtag,
+      publishedDataLoaded: s.publishedDataLoaded,
+      memberDataEtags: s.memberDataEtags,
+      memberSourceEtags: s.memberSourceEtags,
+      repoEtag: s.repoEtag,
+      v: 1,
+    }
+    try {
+      await this.heavy.run(() =>
+        this.store.push(
+          {
+            vmstate: snapshot.snapshotPath,
+            mem: snapshot.memFilePath,
+            rootfs: durable.path,
+            workspaceDrive: snapshot.workspaceDrive,
+          },
+          meta,
+        ),
+      )
+      return 'pushed'
+    } catch (err: any) {
+      console.error(`[pool] durable push failed for ${projectId} (local snapshot kept):`, err?.message ?? err)
+      return 'failed'
+    }
+  }
+
+  /**
+   * Suspend, unless the VM booted from a rootfs this host has since replaced
+   * (neither current nor staged). Such a snapshot could never be resumed, so
+   * instead back everything up and stop it without one (the `recycle` path);
+   * the control plane re-warms it on the current image (placement `refresh`).
+   * A recycle that refuses (busy, a backup failed) falls back to a plain
+   * suspend, which keeps today's behavior: the work is safe either way.
+   */
+  async suspendOrRetire(projectId: string): Promise<SuspendOutcome> {
+    const a = this.assigned.get(projectId)
+    if (a && this.rootfsGeneration(this.bootRootfsIdentity(a), a.handle.vmClass) === 'stale') {
+      const r = await this.recycle(projectId, { reason: 'stale-rootfs' })
+      if (!r.aborted) {
+        metrics.inc(M.suspendRetiredStale)
+        console.log(`[pool] retired ${projectId}: booted from superseded rootfs ${this.bootRootfsIdentity(a)}`)
+        return { kind: 'retired' }
+      }
+      console.warn(`[pool] retiring ${projectId} aborted (${JSON.stringify(r.steps.at(-1))}) — suspending instead`)
+    }
+    const s = await this.suspend(projectId)
+    return { kind: 'suspended', s, staged: this.stagedSuspended.get(projectId) === s }
+  }
+
+  private writeIndex(s: SuspendedVm, index = this.index): void {
     const vmClass = s.snapshot.vmClass ?? 'standard'
     const e: CacheEntry = {
       projectId: s.projectId,
@@ -3632,9 +4027,11 @@ export class MetalWarmPool {
       memberDataEtags: s.memberDataEtags,
       memberSourceEtags: s.memberSourceEtags,
       repoEtag: s.repoEtag,
+      workspaceOrigin: s.workspaceOrigin,
+      durablePending: s.durablePending,
       v: 1,
     }
-    this.index.put(e)
+    index.put(e)
   }
 
   /** True if the project can be woken here — hot locally OR in the durable store. */
@@ -3767,6 +4164,7 @@ export class MetalWarmPool {
     env: Record<string, string> = {},
     timer = new PhaseTimer(),
   ): Promise<{ assigned: AssignedVm; apiMs: number; readyMs: number; source: 'local' | 'store' } | null> {
+    ;({ env } = this.ownMembersOnly(projectId, env))
     let s = this.suspended.get(projectId)
     let source: 'local' | 'store' = 'local'
     let repair: SnapshotDrift[] = []
@@ -3792,6 +4190,18 @@ export class MetalWarmPool {
     }
 
     if (s) {
+      const foreign = foreignStampedMembers(projectId, s)
+      if (foreign.length) {
+        skipStale('foreign_members')
+        console.warn(
+          `[pool] local snapshot for ${projectId} holds foreign workspace members ${foreign.join(',')}; evicting it`,
+        )
+        this.evictLocal(projectId)
+        s = undefined
+      }
+    }
+
+    if (s) {
       const local = s
       const drift = await timer.time('stale_check', () => this.snapshotDrift(projectId, local))
       if (drift.length && this.repairableDrift(projectId, drift)) {
@@ -3811,6 +4221,15 @@ export class MetalWarmPool {
         return null
       }
       const meta = await timer.time('store_head', () => this.store.head(projectId))
+      const foreign = meta ? foreignStampedMembers(projectId, meta) : []
+      if (foreign.length) {
+        skipStale('foreign_members')
+        console.warn(
+          `[pool] durable snapshot for ${projectId} holds foreign workspace members ${foreign.join(',')}; cold-booting instead`,
+        )
+        metrics.inc(M.resumeColdMiss)
+        return null
+      }
       const drift = meta ? await timer.time('stale_check', () => this.snapshotDrift(projectId, meta)) : []
       if (drift.length && !this.repairableDrift(projectId, drift)) {
         skipStale(drift[0].kind)
@@ -4230,7 +4649,7 @@ export class MetalWarmPool {
    */
   async reapIdle(
     idleMs = this.cfg.idleSuspendMs,
-    opts: { maxPerPass?: number; tier?: string } = {},
+    opts: { maxPerPass?: number; tier?: string; retired?: string[] } = {},
   ): Promise<string[]> {
     if (idleMs <= 0) return []
     const now = Date.now()
@@ -4256,8 +4675,9 @@ export class MetalWarmPool {
     const done: string[] = []
     for (const a of stale) {
       try {
-        await this.suspend(a.projectId)
-        done.push(a.projectId)
+        const outcome = await this.suspendOrRetire(a.projectId)
+        if (outcome.kind === 'retired') opts.retired?.push(a.projectId)
+        else done.push(a.projectId)
         metrics.inc(`${M.idleSuspendedByTier}{tier="${opts.tier ?? 'static'}"}`)
       } catch (err: any) {
         console.error(`[pool] idle-suspend failed for ${a.projectId}:`, err?.message ?? err)
@@ -4460,6 +4880,7 @@ export class MetalWarmPool {
   private cacheBytes(): number {
     let n = 0
     for (const s of this.suspended.values()) n += this.entryBytes(s)
+    for (const s of this.stagedSuspended.values()) n += this.entryBytes(s)
     return n
   }
 
@@ -4503,6 +4924,16 @@ export class MetalWarmPool {
       cacheMaxBytes: this.cfg.cacheMaxBytes,
       force: opts.force,
     })
+
+    // Under pressure, pre-warmed snapshots go first: they are only an
+    // optimisation for the next switch, and losing one costs a cold boot later.
+    if (decision.triggered) {
+      for (const s of [...this.stagedSuspended.values()]) {
+        if (this.openFlight.has(s.projectId) || this.suspendFlight.has(s.projectId)) continue
+        bytesReclaimed += this.entryBytes(s)
+        this.dropStaged(s.projectId)
+      }
+    }
 
     for (const projectId of decision.evict) {
       const s = this.suspended.get(projectId)
@@ -4713,7 +5144,7 @@ export class MetalWarmPool {
         protectedPaths.add(a.restoredFrom.mem)
       }
     }
-    for (const s of this.suspended.values()) {
+    for (const s of [...this.suspended.values(), ...this.stagedSuspended.values()]) {
       protectedPaths.add(s.snapshot.snapshotPath)
       protectedPaths.add(s.snapshot.memFilePath)
       protectedPaths.add(s.snapshot.rootfs)
@@ -4819,6 +5250,7 @@ export class MetalWarmPool {
     for (const vm of this.available) add(vm.handle.rootfs)
     for (const a of this.assigned.values()) add(a.handle.rootfs)
     for (const s of this.suspended.values()) add(s.snapshot.rootfs)
+    for (const s of this.stagedSuspended.values()) add(s.snapshot.rootfs)
     return ids
   }
 
@@ -4853,6 +5285,7 @@ export class MetalWarmPool {
     for (const vm of this.available) add(vm.handle.net)
     for (const a of this.assigned.values()) add(a.handle.net)
     for (const s of this.suspended.values()) add(s.snapshot.net)
+    for (const s of this.stagedSuspended.values()) add(s.snapshot.net)
     return idx
   }
 
@@ -4966,6 +5399,87 @@ export class MetalWarmPool {
     return true
   }
 
+  /** Delete a project's pre-warmed staged snapshot, if any. */
+  dropStaged(projectId: string): boolean {
+    const s = this.stagedSuspended.get(projectId)
+    if (!s) return false
+    this.deleteLocalArtifacts(s.snapshot)
+    this.stagedSuspended.delete(projectId)
+    this.stagedIndex.remove(projectId)
+    return true
+  }
+
+  /**
+   * Drop staged snapshots not taken on one of `keep` (a newer staged build
+   * replaced their image, so they can never be resumed). Returns the count.
+   */
+  dropStagedSnapshots(keep: string[] = []): number {
+    let n = 0
+    for (const s of [...this.stagedSuspended.values()]) {
+      if (s.rootfsIdentity && keep.includes(s.rootfsIdentity)) continue
+      if (this.dropStaged(s.projectId)) n++
+    }
+    if (n) console.log(`[pool] dropped ${n} pre-warmed snapshot(s) for a superseded staged rootfs`)
+    return n
+  }
+
+  /**
+   * Activation: make staged snapshots taken on `identities` the projects'
+   * current ones, replacing (and deleting) the old-rootfs snapshot each one
+   * supersedes. Called right before the staged image is renamed over the base
+   * and the agent restarts, so the restarted pool rehydrates them as current.
+   * Their durable push was deferred while staged; `pushPendingDurable` does it
+   * after the restart. Staged snapshots for any other identity are dropped.
+   */
+  promoteStagedSnapshots(identities: string[]): number {
+    let n = 0
+    for (const s of [...this.stagedSuspended.values()]) {
+      if (!s.rootfsIdentity || !identities.includes(s.rootfsIdentity) || this.assigned.has(s.projectId)) {
+        this.dropStaged(s.projectId)
+        continue
+      }
+      this.evictLocal(s.projectId)
+      const promoted: SuspendedVm = { ...s, durablePending: this.store.kind !== 'none' }
+      this.stagedSuspended.delete(s.projectId)
+      this.stagedIndex.remove(s.projectId)
+      this.suspended.set(s.projectId, promoted)
+      this.writeIndex(promoted)
+      n++
+    }
+    if (n) console.log(`[pool] promoted ${n} pre-warmed snapshot(s) to current`)
+    metrics.inc(M.stagedSnapshotsPromoted, n)
+    return n
+  }
+
+  /**
+   * Push the durable copies of promoted snapshots (see `durablePending`), one
+   * at a time under the heavy-op semaphore. A snapshot opened or evicted
+   * meanwhile is skipped: its fate is no longer this sweep's to decide.
+   */
+  async pushPendingDurable(): Promise<number> {
+    let n = 0
+    for (const s of [...this.suspended.values()]) {
+      if (!s.durablePending) continue
+      if (this.suspended.get(s.projectId) !== s || this.openFlight.has(s.projectId)) continue
+      const outcome = await this.pushDurable(s, s.workspaceOrigin)
+      if (this.suspended.get(s.projectId) !== s) continue
+      if (outcome === 'blocked') {
+        this.evictLocal(s.projectId)
+        continue
+      }
+      if (outcome === 'failed') continue
+      s.durablePending = false
+      this.writeIndex(s)
+      n++
+    }
+    return n
+  }
+
+  /** Staged snapshot held for a project (read-only view for status/tests). */
+  stagedSnapshot(projectId: string): SuspendedVm | undefined {
+    return this.stagedSuspended.get(projectId)
+  }
+
   /**
    * Permanently remove a project from this host — the metal analog of Knative's
    * `deleteProject` (ksvc + DomainMapping teardown). Called by the control-plane
@@ -5001,6 +5515,7 @@ export class MetalWarmPool {
       stoppedVm = true
     }
 
+    if (this.dropStaged(projectId)) removedLocal = true
     const s = this.suspended.get(projectId)
     if (s) {
       this.deleteLocalArtifacts(s.snapshot)
@@ -5127,11 +5642,15 @@ export class MetalWarmPool {
     const isWorkspace = a.projectId.startsWith('ws:')
 
     if (isWorkspace) {
+      await run('foreign_members', async () => {
+        const failed = (await this.drainForeignMembersOf(a, 3_000)).filter((r) => r.outcome === 'failed')
+        return failed.length ? failed.map((r) => `${r.projectId}: ${r.detail}`).join('; ') : null
+      })
       // A resume learns the members from the caller's env; unless the guest can
       // confirm what it has mounted, an empty list means every member backup
       // below would silently cover nothing.
       const members = await this.workspaceMembersForBackup(a)
-      if (!members.guestConfirmed && !members.ids.length) {
+      if (!members.guestConfirmed && !members.ids.length && ownMemberIds(a.projectId).length) {
         steps.push({ step: 'members', ok: false, detail: 'workspace member list unknown; member backups would be skipped' })
       }
     }
@@ -5209,6 +5728,7 @@ export class MetalWarmPool {
    *   neither   → does not exist here
    */
   getProjectStatus(projectId: string): ProjectStatus {
+    const staged = this.stagedSuspended.get(projectId)
     const a = this.assigned.get(projectId)
     if (a) {
       const now = Date.now()
@@ -5223,11 +5743,31 @@ export class MetalWarmPool {
         lastRealActivityAt: a.lastRealActivityAt ?? a.assignedAt,
         realIdleMs: now - (a.lastRealActivityAt ?? a.assignedAt),
         activeStreams: a.activeStreams ?? 0,
+        snapshotRootfsIdentity: this.bootRootfsIdentity(a),
+        ...(staged ? { stagedSnapshotIdentity: staged.rootfsIdentity } : {}),
       }
     }
     const s = this.suspended.get(projectId)
-    if (s) return { exists: true, ready: false, replicas: 0, state: 'suspended', rootfsFresh: !this.localSnapshotIsStale(s) }
-    return { exists: false, ready: false, replicas: 0, state: 'none' }
+    if (s) {
+      return {
+        exists: true,
+        ready: false,
+        replicas: 0,
+        state: 'suspended',
+        rootfsFresh: !this.localSnapshotIsStale(s),
+        snapshotRootfsIdentity: s.rootfsIdentity,
+        ...(staged ? { stagedSnapshotIdentity: staged.rootfsIdentity } : {}),
+      }
+    }
+    // A pre-warmed snapshot alone is not resumable until activation, so the
+    // project does not exist here as far as routing is concerned.
+    return {
+      exists: false,
+      ready: false,
+      replicas: 0,
+      state: 'none',
+      ...(staged ? { stagedSnapshotIdentity: staged.rootfsIdentity } : {}),
+    }
   }
 
   /** Capacity + cache summary for the registration heartbeat (scalars only). */
@@ -5239,6 +5779,7 @@ export class MetalWarmPool {
       usedPct: +disk.usedPct.toFixed(2),
       cacheBytes: this.cacheBytes(),
       localCount: this.suspended.size,
+      stagedCount: this.stagedSuspended.size,
     }
   }
 
@@ -5251,7 +5792,7 @@ export class MetalWarmPool {
       idleSuspendMs: this.cfg.idleSuspendMs,
       rootfsCow: this.cfg.rootfsCow,
       disk: this.disk(),
-      cache: { localCount: this.suspended.size, localBytes: this.cacheBytes() },
+      cache: { localCount: this.suspended.size, stagedCount: this.stagedSuspended.size, localBytes: this.cacheBytes() },
       available: this.available.length,
       // Per-class warm-pool breakdown (Phase 1 docker project class). A host
       // that hasn't opted into the docker class simply reports poolSize:0,
@@ -5323,9 +5864,17 @@ export interface SnapshotDrift {
   detail: string
 }
 
+/** `openStaged` found a snapshot on the staged rootfs already held: nothing to boot. */
+export interface PrewarmedResult {
+  mode: 'prewarmed'
+  stagedSnapshotIdentity: string
+}
+
 export interface OpenResult {
   handle: FcVmHandle
   mode: 'assigned' | 'resumed'
+  /** Rootfs the serving guest booted from (for a resume, the snapshot's). */
+  bootRootfsIdentity?: string
   source?: 'local' | 'store'
   readyMs?: number
   /** `mode:'assigned'` re-attached an already-running VM rather than a fresh

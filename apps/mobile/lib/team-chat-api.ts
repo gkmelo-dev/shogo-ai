@@ -33,7 +33,7 @@ export function nativeChatVisible(mode: ChatModeValue | null | undefined): boole
 export type AgentStatus = 'running' | 'done' | 'error' | 'stopped'
 
 export type Participant =
-  | { type: 'user'; id: string; name: string; image: string | null }
+  | { type: 'user'; id: string; name: string; image: string | null; /** Your own row, in the note-to-self conversation. */ self?: boolean }
   | { type: 'agent'; projectId: string | null; name: string | null }
 
 export interface ConversationSummary {
@@ -76,6 +76,10 @@ export interface ConversationDetail extends Omit<ConversationSummary, 'unreadCou
   /** Can reply in threads (true in #activity even though top-level posts are system-only). */
   canReply: boolean
   canManage: boolean
+  /** This user may permanently delete the channel (older servers omit it). */
+  canDelete?: boolean
+  /** An agent system's manifest declares this channel, so it can't be deleted until it stops. */
+  systemManaged?: boolean
   members: ConversationMember[]
 }
 
@@ -190,7 +194,8 @@ export type PresenceStatus = 'active' | 'away' | 'offline'
 
 export interface Mentionables {
   people: Array<{ id: string; name: string; email: string; image: string | null; role: string }>
-  agents: Array<{ key: string; projectId: string | null; name: string; description: string | null; image: string | null; buddyLook?: BuddyLook | null }>
+  /** `boards` is false for agents with the Boards capability off; they can't be given cards. */
+  agents: Array<{ key: string; projectId: string | null; name: string; description: string | null; image: string | null; buddyLook?: BuddyLook | null; boards?: boolean }>
   statuses?: Record<string, UserStatus>
   groups?: UserGroup[]
 }
@@ -374,6 +379,7 @@ export type TeamChatEvent =
   | { type: 'agent.delta'; conversationId: string; messageId: string; text: string; tool: string | null; tools?: Array<{ name: string; done: boolean }> }
   | { type: 'conversation.created'; conversationId: string; conversation: ConversationSummary }
   | { type: 'conversation.updated'; conversationId: string; conversation: ConversationSummary }
+  | { type: 'conversation.deleted'; conversationId: string }
   | { type: 'member.joined' | 'member.left'; conversationId: string; userId?: string; userIds?: string[] }
   | { type: 'read'; conversationId: string; userId: string; seq: number; unreadCount?: number }
   | { type: 'typing'; conversationId: string; threadRootId: string | null; userId: string; name: string }
@@ -396,6 +402,7 @@ export type TeamChatEvent =
   | { type: 'groups.changed' }
   | { type: 'agent.updated'; projectId: string | null }
   | { type: 'emoji.changed' }
+  | { type: 'board.changed'; boardId: string; conversationId?: string; action: string; itemId?: string }
   | { type: 'huddle.updated'; conversationId: string; huddle: Huddle | null }
   | {
       type: 'huddle.ring'
@@ -502,7 +509,13 @@ export const mentionToken = {
 
 export function conversationTitle(c: Pick<ConversationSummary, 'kind' | 'name' | 'participants'>): string {
   if (c.kind === 'dm' || c.kind === 'group_dm') {
-    const names = (c.participants ?? []).map((p) => p.name ?? 'Agent').filter(Boolean)
+    const names = (c.participants ?? [])
+      .map((p) => {
+        const name = p.name ?? 'Agent'
+        // A note-to-self lists you, so say which row is you.
+        return p.type === 'user' && p.self ? `${name} (you)` : name
+      })
+      .filter(Boolean)
     return names.length ? names.join(', ') : 'Direct message'
   }
   return c.name ?? 'channel'
@@ -510,6 +523,11 @@ export function conversationTitle(c: Pick<ConversationSummary, 'kind' | 'name' |
 
 export function isAgentDm(c: Pick<ConversationSummary, 'kind' | 'participants'>): boolean {
   return c.kind === 'dm' && (c.participants ?? []).some((p) => p.type === 'agent')
+}
+
+/** The note-to-self conversation: a direct message whose only member is you. */
+export function isSelfDm(c: Pick<ConversationSummary, 'kind' | 'participants'>): boolean {
+  return c.kind === 'dm' && (c.participants ?? []).some((p) => p.type === 'user' && p.self === true)
 }
 
 export function teamChatApi() {
@@ -533,6 +551,11 @@ export function teamChatApi() {
     async openAgentDm(workspaceId: string, projectId: string | null) {
       return (await http.post<{ conversation: ConversationSummary }>(`${ws(workspaceId)}/dms`, { agent: { projectId } }))
         .data.conversation
+    },
+    /** The note-to-self conversation. Same endpoint: you are the only member. */
+    async openSelfDm(workspaceId: string, userId: string) {
+      return (await http.post<{ conversation: ConversationSummary }>(`${ws(workspaceId)}/dms`, { userIds: [userId] })).data
+        .conversation
     },
     async search(
       workspaceId: string,
@@ -717,6 +740,10 @@ export function teamChatApi() {
     async update(id: string, patch: { name?: string; topic?: string | null; archived?: boolean }) {
       return (await http.patch<{ conversation: ConversationDetail }>(conv(id), patch)).data.conversation
     },
+    /** Permanently delete a channel with all its messages and files. */
+    async delete(id: string) {
+      await http.delete(conv(id))
+    },
     async join(id: string) {
       await http.post(`${conv(id)}/join`, {})
     },
@@ -852,9 +879,13 @@ export function teamChatApi() {
   }
 }
 
-/** Server file links are root-relative; resolve them against the API origin. */
+/**
+ * Server file links are root-relative; resolve them against the API origin.
+ * `<img>` loads bypass the fetch router, so a cloud workspace's links are
+ * routed here or they'd hit the desktop's local API.
+ */
 export function absoluteApiUrl(url: string): string {
-  return url.startsWith('/') && API_URL ? `${API_URL}${url}` : url
+  return url.startsWith('/') && API_URL ? routeUrl(`${API_URL}${url}`, API_URL) : url
 }
 
 export function nativeCookieHeader(): Record<string, string> {
