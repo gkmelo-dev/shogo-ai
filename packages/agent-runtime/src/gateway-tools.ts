@@ -43,6 +43,7 @@ import { Type, type Static } from '@sinclair/typebox'
 import type { AgentTool, AgentToolResult } from '@mariozechner/pi-agent-core'
 import { sandboxExec, sandboxExecAsync, shouldSandbox, type CommandHandle } from './sandbox-exec'
 import { commandTargetsGateway, gatewayKillRefusal } from './gateway-self-protect'
+import { checkSelfDetach, selfDetachRefusal } from './exec-detach'
 import { CommandRegistry, type CommandEntry } from './command-registry'
 import type { TaskEntry } from './task-registry'
 import { tailLines } from './task-output'
@@ -1119,7 +1120,7 @@ export const BACKGROUND_TASK_HINT =
 function createExecTool(ctx: ToolContext): AgentTool {
   return {
     name: 'exec',
-    description: `Run a shell command. The shell remembers your working directory across calls — do NOT prepend cd to commands, the cwd from your last exec call is preserved automatically. The result includes the current cwd. Destructive commands are blocked. Quote file paths containing spaces. Use && to chain dependent commands, ; for independent ones. Never use interactive flags (-i). Prefer read_file over cat/head/tail, and the \`search\` tool over grep/rg for finding code. Tokens saved to .env are auto-loaded. Long-running commands become background tasks: set \`background: true\` to start one immediately, and any command still running after \`timeout\` ms (default ${DEFAULT_EXEC_SOFT_TIMEOUT_MS}) is handed back as \`{ status: "running", task_id, output_file }\` while it keeps running.`,
+    description: `Run a shell command. The shell remembers your working directory across calls — do NOT prepend cd to commands, the cwd from your last exec call is preserved automatically. The result includes the current cwd. Destructive commands are blocked. Quote file paths containing spaces. Use && to chain dependent commands, ; for independent ones. Never use interactive flags (-i). Prefer read_file over cat/head/tail, and the \`search\` tool over grep/rg for finding code. Tokens saved to .env are auto-loaded. Long-running commands become background tasks: set \`background: true\` to start one immediately (never detach it yourself with \`&\` or \`nohup\`; those are refused), and any command still running after \`timeout\` ms (default ${DEFAULT_EXEC_SOFT_TIMEOUT_MS}) is handed back as \`{ status: "running", task_id, output_file }\` while it keeps running.`,
     label: 'Execute Command',
     parameters: Type.Object({
       command: Type.String({ description: 'Shell command to execute' }),
@@ -1175,6 +1176,9 @@ function createExecTool(ctx: ToolContext): AgentTool {
           error: gatewayKillRefusal(gatewayGuard.reason ?? 'kill targets the runtime'),
         })
       }
+
+      const detach = checkSelfDetach(command)
+      if (detach.detached) return textResult({ error: selfDetachRefusal(detach) })
 
       // Desktop auto-redirect: when the user asks the agent to run a
       // dev server / long-lived process, route through terminalExec

@@ -13,6 +13,7 @@ import { mkdirSync, rmSync, existsSync, readFileSync } from 'fs'
 import { join } from 'path'
 import { createTools, HIDDEN_LEGACY_TOOLS, type ToolContext } from '../gateway-tools'
 import { TaskRegistry } from '../task-registry'
+import { sandboxExecAsync } from '../sandbox-exec'
 import { taskOutputDir } from '../task-output'
 import { trustWorkspaceForTests, clearTrustForTests } from './helpers/test-trust'
 
@@ -200,12 +201,30 @@ describe('task_cancel on a shell task', () => {
     expect(() => process.kill(childPid, 0)).toThrow()
   })
 
-  test('killAll also stops what a finished command detached with &', async () => {
+  test('exec refuses a command that detaches itself and starts nothing', async () => {
     const ctx = makeCtx(registry)
-    const started = await run(ctx, 'exec', { command: 'sleep 30 > /dev/null 2>&1 & echo "child $!"', background: true })
-    const done = await run(ctx, 'wait', { task_ids: [started.task_id], timeout_ms: 5_000 })
-    expect(done.status).toBe('completed')
-    const childPid = Number(String(done.output ?? done.stdout).match(/child (\d+)/)![1])
+    const refused = await run(ctx, 'exec', {
+      command: `nohup touch ${join(TEST_DIR, 'ran')} > export.log 2>&1 &`,
+      background: true,
+    })
+    expect(refused.error).toContain('detaches itself')
+    expect(refused.error).toContain('background: true')
+    expect(refused.task_id).toBeUndefined()
+    expect(registry.listRunning()).toEqual([])
+    await new Promise((r) => setTimeout(r, 200))
+    expect(existsSync(join(TEST_DIR, 'ran'))).toBe(false)
+  })
+
+  test('killAll also stops what a finished command detached with &', async () => {
+    // exec refuses these, so register the shell directly to cover the safety net.
+    const pidFile = join(TEST_DIR, 'child.pid')
+    const handle = sandboxExecAsync({
+      command: `sleep 30 > /dev/null 2>&1 & echo $! > ${pidFile}`,
+      workspaceDir: TEST_DIR,
+    })
+    registry.register('detaching shell', handle)
+    await handle.done
+    const childPid = Number(readFileSync(pidFile, 'utf-8').trim())
     expect(() => process.kill(childPid, 0)).not.toThrow()
 
     registry.killAll()
