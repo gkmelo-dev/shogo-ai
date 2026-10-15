@@ -100,21 +100,7 @@ function questionsForApi(questions: QuestionInput[] | undefined) {
   return questions.map(({ question, secret_name, ...rest }) => ({ ...rest, prompt: question, secretName: secret_name }))
 }
 
-export const CHANNEL_TOOL_NAMES = [
-  'team_chat_list',
-  'team_chat_read',
-  'team_chat_post',
-  'team_chat_update',
-  'team_chat_search',
-  'team_chat_dm',
-  'team_chat_add_member',
-  'fetch_chat_files',
-  'team_chat_doc_read',
-  'team_chat_doc_update',
-  'team_directory',
-  'member_activity',
-  'team_chat_question_secret',
-] as const
+export { CHANNEL_TOOL_NAMES } from './work-tool-names'
 
 /** True when this runtime registers the team chat tools (non-personal workspace runtimes). */
 export function teamChatToolsAvailable(capabilityProfile?: string): boolean {

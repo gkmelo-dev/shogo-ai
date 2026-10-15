@@ -28,13 +28,12 @@ import {
   CAPABILITY_INFO,
   CAPABILITY_KEYS,
   mergeCapabilitySettingsIntoConfig,
-  normalizeCapabilitySettings,
   type CapabilityKey,
   type CapabilitySettings,
 } from '@shogo/shared-runtime/capability-settings'
 import type { ToolContext } from './gateway-tools'
 import { textResult } from './gateway-tools'
-import { capabilityState, effectiveCapabilityValue, lockedCapabilityKeys } from './capability-status-prompt'
+import { capabilityState, effectiveCapabilityValue, lockedCapabilityKeys, resolveRuntimeCapabilities } from './capability-status-prompt'
 import { resolveWorkspaceConfigFilePath } from './workspace-defaults'
 import { isMetalRuntime } from './remote-tools'
 import { availableModelsHint, isAvailableModel } from './available-models'
@@ -415,7 +414,7 @@ function capabilityChangesSchema() {
 }
 
 function capabilityStatus(config: ToolContext['config'], changed: boolean) {
-  const caps = normalizeCapabilitySettings(config)
+  const caps = resolveRuntimeCapabilities(config as unknown as Record<string, unknown>)
   const view = capabilityState(config)
   const resolved: CapabilitySettings = { ...caps }
   for (const key of view.locked) {
@@ -475,7 +474,7 @@ export function createCapabilitiesConfigureTool(ctx: ToolContext): AgentTool {
         return textResult({ error: 'changes must be an object of capability flags', code: 'bad_request' })
       }
 
-      const current = normalizeCapabilitySettings(ctx.config)
+      const current = resolveRuntimeCapabilities(ctx.config as unknown as Record<string, unknown>)
       const locked = new Set(lockedCapabilityKeys(ctx.config.capabilityProfile))
       const patch: Partial<CapabilitySettings> = {}
       for (const [key, value] of Object.entries(raw)) {
