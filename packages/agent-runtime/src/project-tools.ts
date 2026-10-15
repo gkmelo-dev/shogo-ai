@@ -938,6 +938,7 @@ export function createSystemApplyTool(ctx: ToolContext): AgentTool {
           userEmails: op.userEmails,
           groupHandles: op.groupHandles,
           system: ctx.projectId,
+          ...(ctx.userId ? { onBehalfOfUserId: ctx.userId } : {}),
         })
         if (!res.ok) report.errors.push(`channel #${op.name}: ${res.error ?? 'failed'}${res.code ? ` (${res.code})` : ''}`)
         else report.applied.push(`${res.data?.created ? 'create' : 'update'} channel #${op.name}`)

@@ -1251,6 +1251,8 @@ export async function upsertTeamChannel(
     groupHandles?: string[]
     /** Project whose manifest declares the channel; it stays undeletable while declared. */
     system?: string
+    /** The person this run works for; a newly created channel gets them as its owner. */
+    onBehalfOfUserId?: string
   },
 ): Promise<CheckpointCallResult<{ created: boolean; changes: string[]; channel: { id: string; name: string } }>> {
   return personalFetch(channelsPath(workspaceId, `/team-channels/${encodeURIComponent(name)}`), {
