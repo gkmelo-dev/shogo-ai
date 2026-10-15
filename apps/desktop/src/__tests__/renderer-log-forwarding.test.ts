@@ -6,12 +6,13 @@ import {
   attachRendererLogForwarding,
   formatConsoleMessage,
   parseConsoleMessage,
+  stripUrlQuery,
 } from '../renderer-log-forwarding'
 
 function fakeContents(id = 7) {
   const emitter = new EventEmitter() as EventEmitter & { id: number; getURL: () => string }
   emitter.id = id
-  emitter.getURL = () => 'http://localhost:8081/projects/p1'
+  emitter.getURL = () => 'http://localhost:8081/projects/p1?token=secret#chat'
   return emitter
 }
 
@@ -23,20 +24,20 @@ function capture() {
 describe('parseConsoleMessage', () => {
   test('Electron >= 35 single event object', () => {
     expect(
-      parseConsoleMessage([{ level: 'error', message: 'boom', lineNumber: 12, sourceId: 'index.js' }]),
+      parseConsoleMessage({ level: 'error', message: 'boom', lineNumber: 12, sourceId: 'index.js' }),
     ).toEqual({ level: 'error', message: 'boom', lineNumber: 12, sourceId: 'index.js' })
   })
-  test('legacy positional arguments', () => {
-    expect(parseConsoleMessage([{}, 2, 'careful', 3, 'a.js'])).toEqual({
-      level: 'warning',
-      message: 'careful',
-      lineNumber: 3,
-      sourceId: 'a.js',
-    })
-  })
   test('unrecognised shapes are ignored', () => {
-    expect(parseConsoleMessage([{}])).toBeNull()
-    expect(parseConsoleMessage([])).toBeNull()
+    expect(parseConsoleMessage({})).toBeNull()
+    expect(parseConsoleMessage(undefined)).toBeNull()
+  })
+})
+
+describe('stripUrlQuery', () => {
+  test('drops the query string and fragment', () => {
+    expect(stripUrlQuery('http://localhost:8081/p?token=abc#x')).toBe('http://localhost:8081/p')
+    expect(stripUrlQuery('shogo://app/index.js#frag')).toBe('shogo://app/index.js')
+    expect(stripUrlQuery('http://localhost:8081/p')).toBe('http://localhost:8081/p')
   })
 })
 
@@ -47,7 +48,7 @@ describe('attachRendererLogForwarding', () => {
     attachRendererLogForwarding(c, writeLog)
     c.emit('console-message', { level: 'info', message: 'hello' })
     c.emit('console-message', { level: 'debug', message: 'noise' })
-    c.emit('console-message', { level: 'warning', message: 'careful', sourceId: 'x.js', lineNumber: 4 })
+    c.emit('console-message', { level: 'warning', message: 'careful', sourceId: 'x.js?v=1', lineNumber: 4 })
     c.emit('console-message', {
       level: 'error',
       message: '[ChatPanel] Stream error: Error: Minified React error #185',
@@ -80,7 +81,13 @@ describe('attachRendererLogForwarding', () => {
     let t = 0
     const c = fakeContents()
     const { lines, writeLog } = capture()
-    attachRendererLogForwarding(c, writeLog, { now: () => t, limit: 3, windowMs: 1000 })
+    attachRendererLogForwarding(c, writeLog, {
+      now: () => t,
+      limit: 3,
+      windowMs: 1000,
+      schedule: () => 'timer',
+      cancelScheduled: () => {},
+    })
     for (let i = 0; i < 10; i++) c.emit('console-message', { level: 'error', message: `e${i}` })
     expect(lines.map((l) => l.text)).toEqual([
       '[renderer:7] console.error: e0',
@@ -93,9 +100,38 @@ describe('attachRendererLogForwarding', () => {
     t = 1000
     c.emit('console-message', { level: 'error', message: 'later' })
     expect(lines.slice(-2).map((l) => l.text)).toEqual([
-      '[renderer:7] 7 console lines suppressed (over 3/min)',
+      '[renderer:7] 7 console lines suppressed (over 3 per 1s)',
       '[renderer:7] console.error: later',
     ])
+  })
+
+  test('reports the suppressed count when the window ends even if the renderer goes quiet', () => {
+    let t = 0
+    const scheduled: Array<{ fn: () => void; ms: number }> = []
+    const c = fakeContents()
+    const { lines, writeLog } = capture()
+    attachRendererLogForwarding(c, writeLog, {
+      now: () => t,
+      limit: 1,
+      schedule: (fn, ms) => scheduled.push({ fn, ms }),
+      cancelScheduled: () => {},
+    })
+    t = 10_000
+    for (let i = 0; i < 4; i++) c.emit('console-message', { level: 'error', message: `e${i}` })
+    expect(scheduled).toHaveLength(1)
+    expect(scheduled[0].ms).toBe(50_000)
+    scheduled[0].fn()
+    expect(lines.at(-1)?.text).toBe('[renderer:7] 3 console lines suppressed (over 1/min)')
+  })
+
+  test('flushes the suppressed count when the webContents is destroyed', () => {
+    const c = fakeContents()
+    const { lines, writeLog } = capture()
+    attachRendererLogForwarding(c, writeLog, { limit: 1, schedule: () => 'timer', cancelScheduled: () => {} })
+    c.emit('console-message', { level: 'error', message: 'a' })
+    c.emit('console-message', { level: 'error', message: 'b' })
+    c.emit('destroyed')
+    expect(lines.at(-1)?.text).toBe('[renderer:7] 1 console lines suppressed (over 1/min)')
   })
 
   test('truncates very long messages', () => {

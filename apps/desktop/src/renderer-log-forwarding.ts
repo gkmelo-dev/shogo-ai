@@ -17,6 +17,7 @@ export type WriteLog = (level: string, ...args: unknown[]) => void
 export interface WebContentsLike {
   id: number
   on(event: string, listener: (...args: any[]) => void): unknown
+  once?(event: string, listener: (...args: any[]) => void): unknown
   getURL?: () => string
 }
 
@@ -32,77 +33,91 @@ interface ConsoleMessage {
   sourceId?: string
 }
 
-const LEGACY_LEVELS = ['debug', 'info', 'warning', 'error'] as const
-
-/**
- * Electron ≥ 35 passes one event object carrying `level`/`message`; older
- * versions passed `(event, level: number, message, line, sourceId)`.
- */
-export function parseConsoleMessage(args: unknown[]): ConsoleMessage | null {
-  const [event, level, message, lineNumber, sourceId] = args as [any, unknown, unknown, unknown, unknown]
-  if (event && typeof event === 'object' && typeof event.level === 'string' && typeof event.message === 'string') {
-    return {
-      level: event.level,
-      message: event.message,
-      lineNumber: typeof event.lineNumber === 'number' ? event.lineNumber : undefined,
-      sourceId: typeof event.sourceId === 'string' ? event.sourceId : undefined,
-    }
+/** Electron ≥ 35 passes one event object carrying `level`/`message`. */
+export function parseConsoleMessage(event: unknown): ConsoleMessage | null {
+  const e = event as any
+  if (!e || typeof e !== 'object' || typeof e.level !== 'string' || typeof e.message !== 'string') return null
+  return {
+    level: e.level,
+    message: e.message,
+    lineNumber: typeof e.lineNumber === 'number' ? e.lineNumber : undefined,
+    sourceId: typeof e.sourceId === 'string' ? e.sourceId : undefined,
   }
-  if (typeof level === 'number' && typeof message === 'string') {
-    return {
-      level: LEGACY_LEVELS[Math.max(0, Math.min(3, level))],
-      message,
-      lineNumber: typeof lineNumber === 'number' ? lineNumber : undefined,
-      sourceId: typeof sourceId === 'string' ? sourceId : undefined,
-    }
-  }
-  return null
 }
 
 function truncate(text: string): string {
   return text.length > MAX_MESSAGE_CHARS ? `${text.slice(0, MAX_MESSAGE_CHARS)}… [${text.length} chars]` : text
 }
 
+/** Drops the query string and fragment, which can carry tokens. */
+export function stripUrlQuery(url: string): string {
+  const cut = url.search(/[?#]/)
+  return cut === -1 ? url : url.slice(0, cut)
+}
+
 export function formatConsoleMessage(webContentsId: number, msg: ConsoleMessage): string {
-  const where = msg.sourceId ? ` (${msg.sourceId}${msg.lineNumber ? `:${msg.lineNumber}` : ''})` : ''
+  const source = msg.sourceId ? stripUrlQuery(msg.sourceId) : ''
+  const where = source ? ` (${source}${msg.lineNumber ? `:${msg.lineNumber}` : ''})` : ''
   return `[renderer:${webContentsId}] console.${msg.level === 'warning' ? 'warn' : msg.level}: ${truncate(msg.message)}${where}`
+}
+
+function describeRate(limit: number, windowMs: number): string {
+  if (windowMs % 60_000 === 0) return windowMs === 60_000 ? `${limit}/min` : `${limit} per ${windowMs / 60_000} min`
+  return `${limit} per ${windowMs / 1000}s`
 }
 
 export function attachRendererLogForwarding(
   contents: WebContentsLike,
   writeLog: WriteLog,
-  { now = Date.now, limit = RENDERER_LOG_LIMIT, windowMs = RENDERER_LOG_WINDOW_MS } = {},
+  {
+    now = Date.now,
+    limit = RENDERER_LOG_LIMIT,
+    windowMs = RENDERER_LOG_WINDOW_MS,
+    schedule = (fn: () => void, ms: number): unknown => setTimeout(fn, ms),
+    cancelScheduled = (handle: unknown) => clearTimeout(handle as ReturnType<typeof setTimeout>),
+  } = {},
 ): void {
   let windowStart = now()
   let count = 0
   let suppressed = 0
+  let flushTimer: unknown = null
+
+  const flushSuppressed = () => {
+    if (flushTimer !== null) cancelScheduled(flushTimer)
+    flushTimer = null
+    if (suppressed > 0) {
+      writeLog('WARN', `[renderer:${contents.id}] ${suppressed} console lines suppressed (over ${describeRate(limit, windowMs)})`)
+    }
+    suppressed = 0
+  }
 
   const emit = (level: RendererLogLevel, line: string, { always = false } = {}) => {
     const t = now()
     if (t - windowStart >= windowMs) {
-      if (suppressed > 0) {
-        writeLog('WARN', `[renderer:${contents.id}] ${suppressed} console lines suppressed (over ${limit}/min)`)
-      }
+      flushSuppressed()
       windowStart = t
       count = 0
-      suppressed = 0
     }
     if (!always && count >= limit) {
       suppressed++
+      // Report the suppressed count when the window ends even if the renderer goes quiet.
+      if (flushTimer === null) {
+        flushTimer = schedule(flushSuppressed, Math.max(0, windowStart + windowMs - t))
+      }
       return
     }
     count++
     writeLog(level, line)
   }
 
-  contents.on('console-message', (...args: unknown[]) => {
-    const msg = parseConsoleMessage(args)
+  contents.on('console-message', (event: unknown) => {
+    const msg = parseConsoleMessage(event)
     if (!msg || (msg.level !== 'warning' && msg.level !== 'error')) return
     emit(msg.level === 'error' ? 'ERROR' : 'WARN', formatConsoleMessage(contents.id, msg))
   })
 
   contents.on('render-process-gone', (_event: unknown, details: { reason?: string; exitCode?: number } = {}) => {
-    const url = contents.getURL?.() ?? ''
+    const url = stripUrlQuery(contents.getURL?.() ?? '')
     emit(
       'ERROR',
       `[renderer:${contents.id}] render process gone: reason=${details.reason ?? 'unknown'} exitCode=${details.exitCode ?? '?'}${url ? ` url=${url}` : ''}`,
@@ -121,4 +136,6 @@ export function attachRendererLogForwarding(
     const detail = error instanceof Error ? error.stack || error.message : String(error)
     emit('ERROR', `[renderer:${contents.id}] preload error in ${preloadPath}: ${truncate(detail)}`, { always: true })
   })
+
+  contents.once?.('destroyed', flushSuppressed)
 }

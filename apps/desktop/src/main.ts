@@ -176,13 +176,6 @@ process.on('unhandledRejection', (reason) => {
   writeLogSync('FATAL', 'Unhandled rejection:', reason)
 })
 
-// Renderer console warnings/errors and renderer crashes only reach DevTools
-// otherwise. Uses writeLog directly (not console.*) to avoid echoing them to
-// stdout a second time.
-app.on('web-contents-created', (_event, contents) => {
-  attachRendererLogForwarding(contents, writeLog)
-})
-
 console.log(`[Desktop] === Shogo starting (v${app.getVersion()}, packaged=${app.isPackaged}) ===`)
 
 // Must be called before app 'ready' — gives shogo:// a real origin instead of "null"
@@ -216,7 +209,12 @@ app.on('second-instance', () => {
 const IS_DEV = !app.isPackaged
 
 let islandWindow: IslandWindow | null = null
+// Renderer console warnings/errors and renderer crashes only reach DevTools
+// otherwise. Only Shogo's own windows are attached: preview views load
+// third-party pages whose console output must not land in main.log. Uses
+// writeLog directly (not console.*) to avoid echoing to stdout a second time.
 const windowManager = new WindowManager({
+  onWindowCreated: (window) => attachRendererLogForwarding(window.webContents, writeLog),
   onWindowClosed: (window) => {
     closeAllForWindow(window)
     // The island is itself a BrowserWindow, so `window-all-closed` never
@@ -2005,7 +2003,10 @@ app.whenReady().then(async () => {
   createWindow()
   void loadDictation().then((service) => service.start(readConfig().dictation))
   islandWindow = new IslandWindow(windowManager, {
-    loadApp: (window) => loadAppWindow(window, '/island'),
+    loadApp: (window) => {
+      attachRendererLogForwarding(window.webContents, writeLog)
+      loadAppWindow(window, '/island')
+    },
     ...(isCloudMode
       ? {}
       : {
