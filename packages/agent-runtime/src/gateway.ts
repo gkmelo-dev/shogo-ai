@@ -2106,15 +2106,7 @@ export class AgentGateway {
     return {
       sessionKey: sessionId,
       workspaceDir: this.workspaceDir,
-      clearHistory: () => {
-        this.sessionManager.clearHistory(sessionId)
-        // History wipe = prefix rewrite. Drop per-session compaction state
-        // so fresh decisions are taken against the new (empty) history.
-        this.contentReplacementStates.delete(sessionId)
-        this.turnCounters.delete(sessionId)
-        // Kill any backgrounded shell commands; they belong to the wiped session.
-        this.disposeSessionState(sessionId)
-      },
+      clearHistory: () => this.clearSessionHistory(sessionId),
       getMessages: () => [...session.messages],
       reloadConfig: () => this.reloadConfig(),
       setModelOverride: (model: string) => {
@@ -2273,6 +2265,16 @@ export class AgentGateway {
    */
   killSessionProcess(sessionId: string, runId: string): boolean {
     return this.getOrCreateCommandRegistry(sessionId).kill(runId)
+  }
+
+  /** Wipe a session's history and everything tied to it, including its background tasks. */
+  clearSessionHistory(sessionId: string): void {
+    this.sessionManager.clearHistory(sessionId)
+    // History wipe = prefix rewrite. Drop per-session compaction state
+    // so fresh decisions are taken against the new (empty) history.
+    this.contentReplacementStates.delete(sessionId)
+    this.turnCounters.delete(sessionId)
+    this.disposeSessionState(sessionId)
   }
 
   /** Tear down per-session bookkeeping. Kills any backgrounded shell runs and releases browsers. */

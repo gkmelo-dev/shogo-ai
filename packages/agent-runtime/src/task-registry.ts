@@ -950,12 +950,15 @@ export class TaskRegistry {
         clearTimeout(entry.visibilityTimer)
         entry.visibilityTimer = undefined
       }
-      if (entry.stale || entry.remote || entry.status !== 'running') continue
+      if (entry.stale || entry.remote) continue
+      if (entry.status !== 'running') {
+        // A finished shell can leave behind processes it detached (`cmd &`) in its process group.
+        if (entry.handle) try { entry.handle.kill('SIGKILL') } catch { /* already gone */ }
+        continue
+      }
       entry.notify = false
       if (entry.handle) {
-        if (!entry.handle.exited()) {
-          try { entry.handle.kill('SIGKILL') } catch { /* already gone */ }
-        }
+        try { entry.handle.kill('SIGKILL') } catch { /* already gone */ }
       } else {
         try { void this.cancels.get(entry.id)?.() } catch { /* ignore */ }
       }

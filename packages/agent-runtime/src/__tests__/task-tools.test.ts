@@ -134,12 +134,34 @@ describe('wait', () => {
     expect(res.status).toBe('completed')
   })
 
-  test('rejects unknown ids and bad regexes; sleeps with no ids', async () => {
+  test('rejects unknown ids and bad regexes; sleeps with no ids when nothing runs', async () => {
     const ctx = makeCtx(registry)
     expect((await run(ctx, 'wait', { task_ids: ['t_nope'] })).error).toContain('Unknown task id')
+    expect((await run(ctx, 'wait', { timeout_ms: 10 })).status).toBe('slept')
     const task = registry.registerTask({ source: 'subagent', title: 'x' })
     expect((await run(ctx, 'wait', { task_ids: [task.entry.id], until: '(' })).error).toContain('Invalid until regex')
-    expect((await run(ctx, 'wait', { timeout_ms: 10 })).status).toBe('slept')
+  })
+
+  test('with no task_ids, a task that already failed comes back instead of a sleep', async () => {
+    const ctx = makeCtx(registry)
+    const started = await run(ctx, 'exec', { command: 'echo nope > missing-dir/out.log', background: true })
+    await new Promise((r) => setTimeout(r, 200))
+    const res = await run(ctx, 'wait', { timeout_ms: 5_000 })
+    expect(res.task_id).toBe(started.task_id)
+    expect(res.status).toBe('failed')
+    expect(registry.consumeCompletionNotes()).toEqual([])
+  })
+
+  test('with no task_ids, until watches every running task', async () => {
+    const ctx = makeCtx(registry)
+    const started = await run(ctx, 'exec', {
+      command: 'echo compiling; sleep 0.2; echo "ready on port 4321"; sleep 5',
+      background: true,
+    })
+    const res = await run(ctx, 'wait', { until: 'ready on port \\d+', timeout_ms: 10_000 })
+    expect(res.task_id).toBe(started.task_id)
+    expect(res.matched).toBe('ready on port \\d+')
+    expect(res.output).toContain('ready on port 4321')
   })
 })
 
@@ -162,6 +184,33 @@ describe('task_list and task_cancel', () => {
     const finished = await run(ctx, 'wait', { task_ids: [shell.task_id], timeout_ms: 5_000 })
     expect(['cancelled', 'failed']).toContain(finished.status)
     expect((await run(ctx, 'task_cancel', { task_id: 't_missing' })).error).toContain('Unknown task id')
+  })
+})
+
+describe('task_cancel on a shell task', () => {
+  test('stops the processes the shell started, not just the shell', async () => {
+    const ctx = makeCtx(registry)
+    const started = await run(ctx, 'exec', { command: 'sleep 30 & echo "child $!"; wait', background: true })
+    const seen = await run(ctx, 'wait', { task_ids: [started.task_id], until: 'child \\d+', timeout_ms: 5_000 })
+    const childPid = Number(seen.output.match(/child (\d+)/)![1])
+    expect(() => process.kill(childPid, 0)).not.toThrow()
+
+    await run(ctx, 'task_cancel', { task_id: started.task_id })
+    await new Promise((r) => setTimeout(r, 300))
+    expect(() => process.kill(childPid, 0)).toThrow()
+  })
+
+  test('killAll also stops what a finished command detached with &', async () => {
+    const ctx = makeCtx(registry)
+    const started = await run(ctx, 'exec', { command: 'sleep 30 > /dev/null 2>&1 & echo "child $!"', background: true })
+    const done = await run(ctx, 'wait', { task_ids: [started.task_id], timeout_ms: 5_000 })
+    expect(done.status).toBe('completed')
+    const childPid = Number(String(done.output ?? done.stdout).match(/child (\d+)/)![1])
+    expect(() => process.kill(childPid, 0)).not.toThrow()
+
+    registry.killAll()
+    await new Promise((r) => setTimeout(r, 300))
+    expect(() => process.kill(childPid, 0)).toThrow()
   })
 })
 

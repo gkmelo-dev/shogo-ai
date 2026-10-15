@@ -1969,21 +1969,29 @@ function createWaitTool(ctx: ToolContext): AgentTool {
     name: 'wait',
     description:
       'Wait for background tasks. Returns as soon as any task in `task_ids` finishes, `until` (a regex) matches its output, ' +
-      `or \`timeout_ms\` elapses (default ${DEFAULT_WAIT_TIMEOUT_MS}). With no task_ids it simply sleeps for timeout_ms. ` +
+      `or \`timeout_ms\` elapses (default ${DEFAULT_WAIT_TIMEOUT_MS}). With no task_ids it waits on every running task in this conversation ` +
+      '(returning at once with any that finished since you last heard), and only sleeps for timeout_ms when there are none. ' +
       'Every task writes its full output to output_file, which you can read_file or search.',
     label: 'Wait',
     parameters: Type.Object({
-      task_ids: Type.Optional(Type.Array(Type.String(), { description: 'Task ids to wait on' })),
+      task_ids: Type.Optional(Type.Array(Type.String(), { description: 'Task ids to wait on (default: every running task)' })),
       timeout_ms: Type.Optional(
         Type.Number({ description: `Max milliseconds to wait (default ${DEFAULT_WAIT_TIMEOUT_MS}, max ${MAX_WAIT_TIMEOUT_MS}). 0 = check without blocking.` }),
       ),
       until: Type.Optional(Type.String({ description: 'Regex; return early once a task\'s output matches (e.g. "ready on port")' })),
     }),
     execute: async (toolCallId, params, signal) => {
-      const { task_ids = [], timeout_ms = DEFAULT_WAIT_TIMEOUT_MS, until } = params as {
+      const { timeout_ms = DEFAULT_WAIT_TIMEOUT_MS, until } = params as {
         task_ids?: string[]
         timeout_ms?: number
         until?: string
+      }
+      let task_ids = (params as { task_ids?: string[] }).task_ids ?? []
+      if (task_ids.length === 0 && ctx.commandRegistry) {
+        task_ids = [
+          ...ctx.commandRegistry.peekNotifications().map((n) => n.taskId),
+          ...ctx.commandRegistry.listRunning().map((t) => t.id),
+        ]
       }
       const timeoutMs = Math.min(Math.max(0, timeout_ms), MAX_WAIT_TIMEOUT_MS)
       const startedAt = Date.now()

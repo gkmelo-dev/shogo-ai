@@ -3983,8 +3983,7 @@ app.post('/agent/session/reset', async (c) => {
     return c.json({ error: 'Agent gateway not running' }, 503)
   }
   const body = await c.req.json().catch(() => ({})) as { evalLabel?: string }
-  const sm = agentGateway.getSessionManager()
-  sm.clearHistory('chat')
+  agentGateway.clearSessionHistory('chat')
   agentGateway.reloadConfig()
   agentGateway.setActiveMode('canvas')
   agentGateway.setEvalLabel(body.evalLabel ?? null)

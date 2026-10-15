@@ -112,7 +112,7 @@ describe('task wake', () => {
     const calls: Message[][] = []
     const gw = await startGateway([
       buildToolUseResponse([{ name: 'exec', arguments: { command: 'sleep 0.2', background: true }, id: 'tc-1' }]),
-      buildToolUseResponse([{ name: 'wait', arguments: { timeout_ms: 800 }, id: 'tc-2' }]),
+      buildToolUseResponse([{ name: 'exec', arguments: { command: 'sleep 0.8' }, id: 'tc-2' }]),
       buildTextResponse('The build finished.'),
     ], (_i, msgs) => calls.push([...msgs]))
 
@@ -176,5 +176,22 @@ describe('task wake', () => {
     expect(apiCalls.filter((c) => c.path === '/api/internal/tasks/notify')).toHaveLength(0)
     const tasks = await gw.listSessionTasks('stopped')
     expect(tasks.filter((t) => t.status === 'running')).toHaveLength(0)
+  }, 15_000)
+
+  test('clearing a session\'s history stops its background tasks', async () => {
+    const calls: Message[][] = []
+    const gw = await startGateway([
+      buildToolUseResponse([{ name: 'exec', arguments: { command: 'sleep 30', background: true }, id: 'tc-1' }]),
+      buildTextResponse('Started.'),
+    ], (_i, msgs) => calls.push([...msgs]))
+
+    await gw.processChatMessageStream('start the server', writer() as any, { chatSessionId: 'cleared' })
+    const pid = Number(textOf(calls[1]!.find((m) => m.role === 'toolResult')!).match(/"pid":\s*(\d+)/)![1])
+    expect(() => process.kill(pid, 0)).not.toThrow()
+
+    gw.clearSessionHistory('cleared')
+    await sleep(500)
+    expect(() => process.kill(pid, 0)).toThrow()
+    expect(await gw.listSessionTasks('cleared')).toHaveLength(0)
   }, 15_000)
 })
