@@ -24,11 +24,13 @@ afterEach(() => {
   bus._resetChatInsertBusForTests()
 })
 
-function deliver(data: unknown) {
+function deliver(data: unknown, source: MessageEventSource | null = window.parent) {
   act(() => {
-    window.dispatchEvent(new MessageEvent("message", { data }))
+    window.dispatchEvent(new MessageEvent("message", { data, source }))
   })
 }
+
+const acks = () => posted.filter((m) => m.type === "shogo.ide.referencesAck")
 
 const selection = {
   type: "selection",
@@ -41,7 +43,7 @@ const selection = {
 }
 
 describe("useIdeBridge — Shogo Code Add to Chat", () => {
-  test("addReferences becomes a shogo-code insert request and is acknowledged with its batchId", () => {
+  test("addReferences becomes a shogo-code insert request, acknowledged once the composer applies it", () => {
     const seen: any[] = []
     bus.subscribeChatInsert((r) => seen.push(r))
     renderHook(() => useIdeBridge(true))
@@ -49,10 +51,19 @@ describe("useIdeBridge — Shogo Code Add to Chat", () => {
     expect(seen).toHaveLength(1)
     expect(seen[0].source).toBe("shogo-code")
     expect(seen[0].references).toEqual([selection, { type: "file", path: "a.ts", name: "a.ts" }])
-    expect(posted).toContainEqual({ type: "shogo.ide.referencesAck", batchId: "b1" })
+    expect(acks()).toEqual([])
+    act(() => seen[0].onApplied())
+    expect(acks()).toEqual([{ type: "shogo.ide.referencesAck", batchId: "b1" }])
   })
 
-  test("a re-sent batch (after reconnect) is inserted once but acknowledged again", () => {
+  test("a batch queued with no composer open is not acknowledged", () => {
+    renderHook(() => useIdeBridge(true))
+    deliver({ type: "shogo.ide.addReferences", batchId: "q1", references: [selection] })
+    expect(bus.hasChatInsertSubscriber()).toBe(false)
+    expect(acks()).toEqual([])
+  })
+
+  test("a re-sent batch (after reconnect) is inserted once; it is acked again only after it was applied", () => {
     const seen: any[] = []
     bus.subscribeChatInsert((r) => seen.push(r))
     renderHook(() => useIdeBridge(true))
@@ -60,7 +71,21 @@ describe("useIdeBridge — Shogo Code Add to Chat", () => {
     deliver(msg)
     deliver(msg)
     expect(seen).toHaveLength(1)
-    expect(posted.filter((m) => m.type === "shogo.ide.referencesAck")).toHaveLength(2)
+    expect(acks()).toHaveLength(0)
+    act(() => seen[0].onApplied())
+    deliver(msg)
+    expect(seen).toHaveLength(1)
+    expect(acks()).toHaveLength(2)
+  })
+
+  test("messages from any window other than the embedding IDE are ignored", () => {
+    const seen: any[] = []
+    bus.subscribeChatInsert((r) => seen.push(r))
+    renderHook(() => useIdeBridge(true))
+    const other = { postMessage: () => {} } as unknown as MessageEventSource
+    deliver({ type: "shogo.ide.addReferences", batchId: "x1", references: [selection] }, other)
+    deliver({ type: "shogo.ide.addReferences", batchId: "x2", references: [selection] }, null)
+    expect(seen).toEqual([])
   })
 
   test("malformed references are dropped", () => {

@@ -68,6 +68,33 @@ describe("useChatInsertQueue", () => {
     expect(bus.hasChatInsertSubscriber()).toBe(false)
   })
 
+  test("applying a request calls its onApplied", () => {
+    const onApplied = mock(() => {})
+    const { result } = renderHook(() => useChatInsertQueue({ isActive: true, expand: () => {} }))
+    act(() => {
+      bus.requestChatInsert({ source: "shogo-code", text: "x", onApplied })
+    })
+    expect(onApplied).not.toHaveBeenCalled()
+    act(() => result.current.markApplied(result.current.insertRequest!.nonce))
+    expect(onApplied).toHaveBeenCalledTimes(1)
+  })
+
+  test("a panel that goes inactive stops showing its queue and hands it to the next active panel", () => {
+    const { result, rerender } = renderHook(({ isActive }) => useChatInsertQueue({ isActive, expand: () => {} }), {
+      initialProps: { isActive: true },
+    })
+    act(() => {
+      bus.requestChatInsert({ source: "ide-tree", text: "one" })
+      bus.requestChatInsert({ source: "ide-tree", text: "two" })
+    })
+    act(() => rerender({ isActive: false }))
+    expect(result.current.insertRequest).toBeNull()
+    const next = renderHook(() => useChatInsertQueue({ isActive: true, expand: () => {} }))
+    expect(next.result.current.insertRequest).toMatchObject({ text: "one" })
+    act(() => next.result.current.markApplied(next.result.current.insertRequest!.nonce))
+    expect(next.result.current.insertRequest).toMatchObject({ text: "two" })
+  })
+
   test("empty requests are ignored", () => {
     const expand = mock(() => {})
     const { result } = renderHook(() => useChatInsertQueue({ isActive: true, expand }))

@@ -106,12 +106,16 @@ export function useIdeBridge(enabled: boolean) {
     if (!enabled || !canUseWindow()) return
     window.parent.postMessage(message, "*")
   }, [enabled])
-  const seenBatchesRef = useRef<string[]>([])
+  // Batch ids, in arrival order, and whether the composer has inserted them yet.
+  const batchesRef = useRef(new Map<string, "pending" | "applied">())
 
   useEffect(() => {
     if (!enabled || !canUseWindow()) return
 
     const handleMessage = (event: MessageEvent) => {
+      // Only the IDE host embedding this chat may drive it; another frame or
+      // an opener could otherwise inject "selected" code as context.
+      if (event.source !== window.parent) return
       const message = event.data
       if (!message || typeof message.type !== "string") return
 
@@ -135,12 +139,22 @@ export function useIdeBridge(enabled: boolean) {
       if (message.type === "shogo.ide.addReferences") {
         const batchId = typeof message.batchId === "string" ? message.batchId : ""
         if (!batchId) return
-        if (!seenBatchesRef.current.includes(batchId)) {
-          seenBatchesRef.current = [...seenBatchesRef.current, batchId].slice(-MAX_REMEMBERED_BATCHES)
-          const references = parseIdeReferences(message.references)
-          if (references.length > 0) requestChatInsert({ references, source: "shogo-code" })
+        const batches = batchesRef.current
+        const ack = () => post({ type: "shogo.ide.referencesAck", batchId })
+        const known = batches.get(batchId)
+        // A re-sent batch is acked once it has been inserted; a pending one
+        // acks when the composer applies it.
+        if (known === "applied") ack()
+        if (known) return
+        batches.set(batchId, "pending")
+        while (batches.size > MAX_REMEMBERED_BATCHES) batches.delete(batches.keys().next().value!)
+        const markApplied = () => {
+          if (batches.has(batchId)) batches.set(batchId, "applied")
+          ack()
         }
-        post({ type: "shogo.ide.referencesAck", batchId })
+        const references = parseIdeReferences(message.references)
+        if (references.length > 0) requestChatInsert({ references, source: "shogo-code", onApplied: markApplied })
+        else markApplied()
         return
       }
 

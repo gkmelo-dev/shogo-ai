@@ -443,11 +443,15 @@ export class ShogoChatViewProvider implements vscode.WebviewViewProvider {
     window.addEventListener('message', (event) => {
       const message = event.data;
       if (!message || typeof message.type !== 'string') return;
-      if (iframeToIdeMessages.has(message.type)) {
+      // Chat messages must come from the chat frame itself, and extension
+      // messages from the webview host, so a nested frame can't spoof either.
+      const fromChat = !!frame && event.source === frame.contentWindow;
+      const fromHost = !event.source || event.source === window.parent || event.source === window;
+      if (fromChat && iframeToIdeMessages.has(message.type)) {
         vscode.postMessage(message);
         return;
       }
-      if (ideToIframeMessages.has(message.type)) {
+      if (fromHost && ideToIframeMessages.has(message.type)) {
         postToChat(message);
       }
     });

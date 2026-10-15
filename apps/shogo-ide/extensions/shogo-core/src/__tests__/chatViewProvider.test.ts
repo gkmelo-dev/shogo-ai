@@ -83,6 +83,33 @@ describe('ShogoChatViewProvider', () => {
     expect(ideToIframe).toContain("'shogo.ide.addReferences'")
   })
 
+  test('the relay forwards chat messages only from the chat frame, and host messages only from the host', () => {
+    const { view } = setup()
+    const script = /<script nonce="[^"]*">([\s\S]*?)<\/script>/.exec(view.webview.html)![1]
+    const toExtension: any[] = []
+    const toChat: any[] = []
+    const chatWindow = { postMessage: (m: unknown) => toChat.push(m) }
+    const frame = { contentWindow: chatWindow, addEventListener: () => {} }
+    const listeners: Array<(event: { data: unknown; source: unknown }) => void> = []
+    const webviewWindow: any = { parent: {}, addEventListener: (_type: string, fn: any) => listeners.push(fn) }
+    const document = { getElementById: (id: string) => (id === 'chatFrame' ? frame : null) }
+    new Function('window', 'document', 'acquireVsCodeApi', script)(webviewWindow, document, () => ({
+      postMessage: (m: unknown) => toExtension.push(m),
+    }))
+    const dispatch = (data: unknown, source: unknown) => listeners.forEach((fn) => fn({ data, source }))
+    const nested = { postMessage: () => {} }
+
+    dispatch({ type: 'shogo.ide.referencesAck', batchId: 'b1' }, chatWindow)
+    dispatch({ type: 'shogo.ide.referencesAck', batchId: 'spoof' }, nested)
+    dispatch({ type: 'shogo.ide.referencesAck', batchId: 'spoof-host' }, null)
+    expect(toExtension).toEqual([{ type: 'shogo.ide.referencesAck', batchId: 'b1' }])
+
+    dispatch({ type: 'shogo.ide.addReferences', batchId: 'b2', references: [] }, null)
+    dispatch({ type: 'shogo.ide.addReferences', batchId: 'spoof', references: [] }, nested)
+    dispatch({ type: 'shogo.ide.addReferences', batchId: 'loop', references: [] }, chatWindow)
+    expect(toChat).toEqual([{ type: 'shogo.ide.addReferences', batchId: 'b2', references: [] }])
+  })
+
   test('reports whether the chat is connected', () => {
     const { provider } = setup()
     expect(provider.isChatConnected()).toBe(true)

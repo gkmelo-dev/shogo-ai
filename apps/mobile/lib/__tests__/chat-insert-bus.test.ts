@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Shogo Technologies, Inc.
-import { beforeEach, describe, expect, test } from "bun:test"
+import { beforeEach, describe, expect, spyOn, test } from "bun:test"
 import {
   _resetChatInsertBusForTests,
   ensureWindowAdapter,
@@ -8,6 +8,7 @@ import {
   MAX_QUEUED_CHAT_INSERTS,
   onChatInsertRequested,
   requestChatInsert,
+  returnChatInserts,
   subscribeChatInsert,
   TERMINAL_ADD_TO_CHAT_EVENT,
   type ChatInsertRequest,
@@ -86,5 +87,35 @@ describe("chat insert bus", () => {
     subscribeChatInsert((r) => seen.push(r))
     window.dispatchEvent(new CustomEvent(TERMINAL_ADD_TO_CHAT_EVENT, { detail: { text: "once" } }))
     expect(seen).toHaveLength(1)
+  })
+
+  test("a second module copy shares the subscribers, so the terminal listener reaches them", async () => {
+    const copy = await import(`../chat-insert-bus?copy=${Date.now()}`)
+    const seen: ChatInsertRequest[] = []
+    copy.subscribeChatInsert((r: ChatInsertRequest) => seen.push(r))
+    requestChatInsert(req("from first copy"))
+    window.dispatchEvent(new CustomEvent(TERMINAL_ADD_TO_CHAT_EVENT, { detail: { text: "from terminal" } }))
+    expect(seen.map((r) => r.text)).toEqual(["from first copy", "from terminal"])
+  })
+
+  test("reports whether a request was delivered or queued, and warns when queued requests are dropped", () => {
+    expect(requestChatInsert(req("q"))).toBe("queued")
+    const warn = spyOn(console, "warn").mockImplementation(() => {})
+    for (let i = 0; i < MAX_QUEUED_CHAT_INSERTS; i++) requestChatInsert(req(String(i)))
+    expect(warn).toHaveBeenCalledTimes(1)
+    warn.mockRestore()
+    subscribeChatInsert(() => {})
+    expect(requestChatInsert(req("live"))).toBe("delivered")
+  })
+
+  test("returned requests go first, without notifying observers again", () => {
+    const observed: string[] = []
+    onChatInsertRequested((r) => observed.push(r.text!))
+    requestChatInsert(req("later"))
+    returnChatInserts([req("first"), req("second")])
+    const seen: string[] = []
+    subscribeChatInsert((r) => seen.push(r.text!))
+    expect(seen).toEqual(["first", "second", "later"])
+    expect(observed).toEqual(["later"])
   })
 })

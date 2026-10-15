@@ -68,7 +68,7 @@ export type ChatReferenceInput = DistributiveOmit<ChatReference, "label">;
 export function referenceKey(ref: ChatReferenceInput): string {
   if (ref.type === "file") return `file:${ref.path}`;
   if (ref.type === "folder") return `folder:${ref.path}`;
-  if (ref.type === "selection") return `selection:${ref.path}:${ref.startLine}-${ref.endLine}`;
+  if (ref.type === "selection") return `selection:${ref.rootId ? `${ref.rootId}/` : ""}${ref.path}:${ref.startLine}-${ref.endLine}`;
   if (ref.type === "project") return `project:${ref.id}`;
   if (ref.type === "chat") return `chat:${ref.id}`;
   if (ref.type === "plan") return `plan:${ref.planId}`;
