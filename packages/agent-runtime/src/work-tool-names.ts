@@ -47,6 +47,8 @@ export const BOARD_ADMIN_TOOL_NAMES = [
   'column_create',
   'column_update',
   'column_delete',
+  'work_template_list',
+  'work_template_add',
 ] as const
 
 /** Problem cards: `problemsEnabled`. */

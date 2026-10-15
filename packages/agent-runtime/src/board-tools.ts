@@ -18,6 +18,12 @@ import { textResult } from './gateway-tools'
 import { channelIdentity } from './channel-tools'
 import { resolveRuntimeIdentity } from './workspace-runtime-mode'
 import { agentBoardsRequest } from './internal-api'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { dirname, resolve } from 'node:path'
+import { isSafeRelativePath, parseSystemManifest } from './system-manifest'
+import { BOARD_TEMPLATES, boardTemplateArgs, findWorkTemplate, listWorkTemplates, mergeWorkTemplate } from './work-templates'
+
+const MANIFEST_PATH = 'shogo-system.yaml'
 
 export { BOARD_ADMIN_TOOL_NAMES, BOARD_TOOL_NAMES, PROBLEM_TOOL_NAMES } from './work-tool-names'
 
@@ -360,10 +366,12 @@ function boardCreate(ctx: ToolContext) {
     label: 'Create Board',
     description:
       'Add a Kanban board to a channel (a channel can hold several). Omit columns to get the item type’s defaults. ' +
-      'For a whole department (channel, boards, agents, triggers) declare it in shogo-system.yaml and use system_apply instead.',
+      'Pass template (a board id from work_template_list, e.g. "renewals") to start from a ready-made board; anything else you pass overrides it. ' +
+      'For a whole department (channel, boards, agents, triggers) use work_template_add or shogo-system.yaml and system_apply instead.',
     parameters: Type.Object({
-      channel: CHANNEL,
-      name: Type.String(),
+      template: Type.Optional(Type.String({ description: 'Board template id, e.g. "support-tickets", "sales-pipeline", "okrs".' })),
+      channel: Type.Optional(Type.String({ description: 'Channel name (without #) or id. Required unless the template names one.' })),
+      name: Type.Optional(Type.String({ description: 'Required unless a template is given.' })),
       item_type: Type.Optional(ITEM_TYPE),
       description: Type.Optional(Type.String()),
       columns: Type.Optional(Type.Array(COLUMN)),
@@ -373,7 +381,16 @@ function boardCreate(ctx: ToolContext) {
       default_agent: Type.Optional(Type.String({ description: `${AGENT_REF} New cards go to it unless assigned.` })),
       key_prefix: Type.Optional(Type.String({ description: 'Card key prefix, e.g. "SUP".' })),
     }),
-  }, async (ws, p) => {
+  }, async (ws, raw) => {
+    const { template, ...given } = raw
+    let p: Params = given
+    if (template) {
+      if (findWorkTemplate(template)?.kind !== 'board') {
+        return { ok: false, error: `No board template "${template}". Board templates: ${BOARD_TEMPLATES.map((t) => t.id).join(', ')}.`, code: 'unknown_template' }
+      }
+      p = { ...boardTemplateArgs(template), ...Object.fromEntries(Object.entries(given).filter(([, v]) => v !== undefined)) }
+    }
+    if (!p.channel || !p.name) return { ok: false, error: 'channel and name are required (or pass a board template).', code: 'invalid' }
     const body = { ...p, columns: Array.isArray(p.columns) ? p.columns.map(columnBody) : undefined, ...identity(ctx) }
     const r = await agentBoardsRequest(ws, 'POST', '/agent-boards', { body })
     return r.ok ? { ...r, data: { board: compactBoard(r.data?.board) } } : r
@@ -519,6 +536,60 @@ function problemOccurrences(ctx: ToolContext) {
   }, (ws, p) => agentBoardsRequest(ws, 'GET', `/agent-work-items/${enc(p.item)}/occurrences`, { query: { limit: p.limit, projectId: identity(ctx).projectId } }))
 }
 
+// ─── Templates (boardAdminEnabled) ───────────────────────────────────────────
+
+function templateList(): AgentTool {
+  return {
+    name: 'work_template_list',
+    label: 'List Work Templates',
+    description:
+      'Ready-made setups: company bundles (several departments at once), department bundles (a channel, its boards, a department agent and triggers) and single boards. ' +
+      'Add a company or department with work_template_add, then run system_apply; add a single board with board_create { template }.',
+    parameters: Type.Object({ kind: Type.Optional(Type.Union([Type.Literal('company'), Type.Literal('department'), Type.Literal('board')])) }),
+    execute: async (_id, params) => textResult({ templates: listWorkTemplates((params as Params)?.kind) }),
+  }
+}
+
+function templateAdd(ctx: ToolContext): AgentTool {
+  return {
+    name: 'work_template_add',
+    label: 'Add Work Template',
+    description:
+      'Merge a company or department template into shogo-system.yaml (created if missing). Nothing already in the manifest is changed, so adding the same template twice is a no-op. ' +
+      'Review or edit the file, then run system_apply (dryRun first to show the plan). A board template can be added only to a channel the manifest already declares; otherwise use board_create { template }.',
+    parameters: Type.Object({
+      template: Type.String({ description: 'Template id from work_template_list, e.g. "saas-startup" or "support".' }),
+      channel: Type.Optional(Type.String({ description: 'For a board template: the channel to add it to (default: the template’s).' })),
+      manifestPath: Type.Optional(Type.String({ description: `Path relative to the project root (default "${MANIFEST_PATH}").` })),
+    }),
+    execute: async (_id, params) => {
+      const p = (params ?? {}) as Params
+      const rel = typeof p.manifestPath === 'string' && p.manifestPath ? p.manifestPath : MANIFEST_PATH
+      if (!isSafeRelativePath(rel)) return textResult({ error: `Unsafe manifestPath "${rel}"`, code: 'invalid' })
+      const abs = resolve(ctx.workspaceDir, rel)
+      try {
+        const existing = existsSync(abs) ? readFileSync(abs, 'utf-8') : null
+        const merged = mergeWorkTemplate(existing, String(p.template), { channel: p.channel })
+        const check = parseSystemManifest(merged.yaml)
+        if (!check.ok) return textResult({ error: 'The merged manifest does not validate; nothing was written.', errors: check.errors, code: 'invalid_manifest' })
+        if (merged.added.length) {
+          mkdirSync(dirname(abs), { recursive: true })
+          writeFileSync(abs, merged.yaml, 'utf-8')
+        }
+        return textResult({
+          ok: true,
+          manifestPath: rel,
+          added: merged.added,
+          ...(merged.skipped.length ? { already_there: merged.skipped } : {}),
+          next: merged.added.length ? `Run system_apply { manifestPath: "${rel}", dryRun: true } to show the plan, then apply it.` : 'Nothing new to add.',
+        })
+      } catch (err) {
+        return textResult({ error: err instanceof Error ? err.message : String(err), code: 'template_failed' })
+      }
+    },
+  }
+}
+
 export function createBoardTools(ctx: ToolContext): AgentTool[] {
   return [
     boardList(ctx),
@@ -540,6 +611,8 @@ export function createBoardTools(ctx: ToolContext): AgentTool[] {
     columnCreate(ctx),
     columnUpdate(ctx),
     columnDelete(ctx),
+    templateList(),
+    templateAdd(ctx),
     problemReport(ctx),
     problemOccurrences(ctx),
   ]
@@ -555,6 +628,7 @@ export const BOARDS_GUIDE = [
   '- On boards that require human review, move finished cards to the review column; a person closes them.',
   '- Escalate across teams by moving the card to the other channel’s board; do not copy it.',
   '- Set up a department’s channel, boards, agents and triggers together in shogo-system.yaml with `system_apply`; use `board_create` and `column_*` for one-off changes.',
+  '- Start from a template when one fits: `work_template_list`, then `work_template_add` for a company or department (then `system_apply`), or `board_create { template }` for one board.',
 ].join('\n')
 
 export const COMPANY_OPS_GUIDE = [

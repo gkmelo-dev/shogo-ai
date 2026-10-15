@@ -188,3 +188,44 @@ describe('board tools', () => {
     expect(calls).toHaveLength(0)
   })
 })
+
+describe('templates', () => {
+  test('board_create starts from a board template; given values win', async () => {
+    reply = { board: BOARD }
+    await run('board_create', { template: 'renewals', channel: 'cs' })
+    expect(calls[0].body).toMatchObject({ channel: 'cs', name: 'Renewals', item_type: 'deal', key_prefix: 'REN' })
+    expect(calls[0].body.columns.map((c: any) => c.name)).toEqual(['Upcoming', 'In conversation', 'At risk', 'Renewed', 'Churned'])
+    expect(calls[0].body.template).toBeUndefined()
+  })
+
+  test('board_create rejects an unknown template and a missing name', async () => {
+    expect((await run('board_create', { template: 'support' })).code).toBe('unknown_template')
+    expect((await run('board_create', { channel: 'sales' })).code).toBe('invalid')
+    expect(calls).toHaveLength(0)
+  })
+
+  test('work_template_add writes shogo-system.yaml and is a no-op the second time', async () => {
+    const { mkdtempSync, readFileSync, rmSync } = await import('node:fs')
+    const { tmpdir } = await import('node:os')
+    const { join } = await import('node:path')
+    const dir = mkdtempSync(join(tmpdir(), 'work-template-'))
+    try {
+      const first = await run('work_template_add', { template: 'freelancer' }, ctx({ workspaceDir: dir }))
+      expect(first.added).toContain('board #sales Pipeline')
+      const yaml = readFileSync(join(dir, 'shogo-system.yaml'), 'utf-8')
+      expect(yaml).toContain('key: finance-agent')
+      const again = await run('work_template_add', { template: 'sales' }, ctx({ workspaceDir: dir }))
+      expect(again.added).toEqual([])
+      expect(readFileSync(join(dir, 'shogo-system.yaml'), 'utf-8')).toBe(yaml)
+      expect((await run('work_template_add', { template: 'x', manifestPath: '../evil.yaml' }, ctx({ workspaceDir: dir }))).code).toBe('invalid')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+    expect(calls).toHaveLength(0)
+  })
+
+  test('work_template_list filters by kind', async () => {
+    const out = await run('work_template_list', { kind: 'company' })
+    expect(out.templates.map((t: any) => t.id)).toEqual(['saas-startup', 'agency', 'ecommerce', 'nonprofit', 'freelancer', 'local-services'])
+  })
+})
