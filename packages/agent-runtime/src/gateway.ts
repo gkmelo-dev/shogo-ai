@@ -584,7 +584,7 @@ export class AgentGateway {
   /** Tool execute overrides for eval mocking (tool name -> mock fn) */
   private toolMocks = new Map<string, (params: Record<string, any>) => any>()
   /** Synthetic tool definitions for mocked MCP tools that don't exist in the base tool set */
-  private syntheticTools = new Map<string, { description: string; paramKeys: string[] }>()
+  private syntheticTools = new Map<string, { description: string; paramKeys: string[]; parameters?: unknown }>()
   /** Tools that have mock responses but should not appear until promoted via connect */
   private hiddenMockTools = new Set<string>()
   /** Hidden mocks promoted to visible after connect is called during a turn */
@@ -900,7 +900,7 @@ export class AgentGateway {
    */
   setToolMocks(
     mocks: Record<string, (params: Record<string, any>) => any | Promise<any>>,
-    syntheticDefs?: Record<string, { description: string; paramKeys: string[] }>,
+    syntheticDefs?: Record<string, { description: string; paramKeys: string[]; parameters?: unknown }>,
     hiddenTools?: Set<string>,
   ): void {
     this.toolMocks.clear()
@@ -2660,7 +2660,7 @@ export class AgentGateway {
           name,
           description: synDef?.description || `External integration tool: ${name}`,
           label: name.replace(/__/g, ' > ').replace(/_/g, ' '),
-          parameters: Type.Object(paramProps),
+          parameters: (synDef?.parameters as any) ?? Type.Object(paramProps),
           execute: async (_id: string, params: any) => runMockAndUnwrap(mockFn, params),
         }
         staticTools.push(syntheticTool)

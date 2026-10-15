@@ -97,6 +97,8 @@ export interface WorkerSetupOptions {
   promptProfile?: string
   evalLabel?: string
   mocks?: Record<string, unknown>
+  /** Company simulation seed, installed with the mocks. */
+  sim?: unknown
   verbose?: boolean
 }
 
@@ -505,7 +507,7 @@ export async function configureWorkerForTask(
     }
   }
 
-  if (opts.mocks) {
+  if (opts.mocks || opts.sim) {
     if (opts.verbose) console.log(`      [setup] Installing tool mocks...`)
     try {
       // Belt-and-suspenders isolation between evals: explicitly DELETE any
@@ -519,7 +521,7 @@ export async function configureWorkerForTask(
       await fetch(`${base}/agent/tool-mocks`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ mocks: opts.mocks }),
+        body: JSON.stringify({ mocks: opts.mocks ?? {}, ...(opts.sim ? { sim: opts.sim, defaults: { delayMs: 0 } } : {}) }),
       })
     } catch (e: any) {
       console.warn(`      [setup] Mock install failed: ${e.message}`)
