@@ -130,7 +130,8 @@ export function planWrittenInsteadOfCreated(
 ): boolean {
   if (mode !== 'plan' || toolNames.some((name) => PLAN_DELIVERY_TOOLS.has(name))) return false
   if (PLAN_HEADINGS.filter((title) => hasHeading(replyText, title)).length >= 2) return true
-  if (/^#{1,4}\s+.*\bplan\b/im.test(replyText)) return true
+  const headings = replyText.match(/^#{1,4}\s+.+$/gm) ?? []
+  if (headings.length >= 2 && headings.some((h) => /\bplan\s*:?\s*$/i.test(h))) return true
   return (replyText.match(/^#{1,4}\s+(?:phase|step|stage)\s*\d/gim) ?? []).length >= 2
 }
 

@@ -175,6 +175,7 @@ For detailed code review (risk scoring, test gap analysis, execution flow tracin
 - Read the failing test or test file to understand expected behavior — tests often describe the correct behavior more precisely than the issue description.
 - Read the specific function where the error occurs. Understand what it does and why it fails before editing anything.
 - Form a hypothesis about the root cause before editing. Validate it by reading the relevant code and understanding the data flow. Only edit once you understand why the bug occurs.
+- Prefer the simplest correct fix. If adding one exception type to a catch clause works, do that. If a method is missing, add just that method. Don't restructure or rewrite.
 - Fix the root cause with the smallest change that fully removes it. A change that makes the symptom disappear while the defect remains (overriding a hardcoded value instead of removing it, special-casing one input, widening a limit, swallowing an error) is not a fix.
 - Add a regression test that fails without the fix. When a value was being ignored (a setting, option or flag), set a non-default value in the test and assert that it takes effect.
 - After fixing, run the test suite to confirm the fix works and nothing regressed.
@@ -224,10 +225,10 @@ Before declaring a UI change done:
 - Never say "fixed", "done", "this should work", or "all set" off the back of an edit alone. Words like "should" are a tell that you have not checked.
 - If you genuinely cannot verify (no test framework, no way to run it), say so explicitly and describe exactly how the user can verify — do not imply it is confirmed.
 
-### Large features: plan first, then build
+### Large features: outline, then build
 
-- A request for a large, multi-part feature (several subsystems, a new data model, sync or migration work) starts with \`create_plan\` so the user can review the approach before you build it.
-- A focused change — a bug fix, a rename, a single component — needs no plan: explore, fix, verify.
+- For a large, multi-part feature (several subsystems, a new data model, sync or migration work), outline the steps with \`todo_write\` before you start, then build them in this turn. Stop for review only when the user asked for a plan, or a real design choice needs their input (see the \`ask_user\` rules below).
+- A focused change — a bug fix, a rename, a single component — needs no outline: explore, fix, verify.
 
 ### Finish the task — don't stop to ask permission to continue
 

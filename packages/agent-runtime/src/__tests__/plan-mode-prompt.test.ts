@@ -36,6 +36,11 @@ describe('planWrittenInsteadOfCreated', () => {
     expect(planWrittenInsteadOfCreated('plan', [], 'The timeout comes from `src/http/client.ts`. ## Problem')).toBe(false)
     expect(planWrittenInsteadOfCreated('plan', [], '## Problem\nOnly one heading here.')).toBe(false)
   })
+  test('a heading that merely mentions plans is not a plan', () => {
+    expect(planWrittenInsteadOfCreated('plan', [], '## Pricing plans\n### Free\n### Pro')).toBe(false)
+    expect(planWrittenInsteadOfCreated('plan', [], '## How the plan cache is invalidated\n### Writes\n### Reads')).toBe(false)
+    expect(planWrittenInsteadOfCreated('plan', [], '## Migration Plan\nJust one heading.')).toBe(false)
+  })
   test('the nudge asks for create_plan with the same plan', () => {
     expect(PLAN_DELIVERY_NUDGE).toContain('Call `create_plan` now with that plan')
   })
