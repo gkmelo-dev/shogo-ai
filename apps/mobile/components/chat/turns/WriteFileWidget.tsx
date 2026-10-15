@@ -15,7 +15,7 @@ import { getBasename, getLanguageLabel } from "./file-lang-map"
 import { isDeliverable } from "../../../lib/deliverable"
 import { useChatContextSafe } from "../ChatContext"
 import { DownloadChip } from "./DownloadChip"
-import { countLines, streamingArgsKey } from "./streaming-tool-args"
+import { countLines, fileToolWidgetPropsEqual } from "./streaming-tool-args"
 
 const MAX_PREVIEW_LINES = 40
 const MAX_PREVIEW_CHARS = 4000
@@ -53,54 +53,6 @@ function truncateContent(text: string): { display: string; truncated: boolean; t
   const kept = lines.slice(0, MAX_PREVIEW_LINES)
   const trimmed = kept.join("\n").slice(0, MAX_PREVIEW_CHARS)
   return { display: trimmed, truncated: true, totalLines }
-}
-
-function stableStringify(val: unknown): string {
-  if (val === null || val === undefined) return ""
-  if (typeof val === "string") return val
-  try { return JSON.stringify(val) } catch { return "" }
-}
-
-// Memo equality for the tool widget. `groupConsecutiveParts` upstream
-// rebuilds the `tool` object reference on every commit, so we can't use
-// referential equality on `tool` itself. Instead:
-//   - If `tool.id` matches AND state hasn't changed AND we're in a terminal
-//     state (success / error), we know args + result are frozen and bail
-//     out with cheap primitive comparisons. This is the common case during
-//     long subagent runs where most widgets are already complete.
-//   - While streaming, the widget renders only a size/line summary, so
-//     compare the args by `streamingArgsKey` (string lengths) rather than
-//     stringifying a payload that can be hundreds of KB on every chunk.
-//   - Otherwise (state transition), fall back to the full content-equality
-//     JSON.stringify check. That's still cheaper than re-rendering the
-//     entire widget subtree.
-function toolWidgetPropsEqual(
-  prev: WriteFileWidgetProps,
-  next: WriteFileWidgetProps,
-) {
-  if (
-    prev.isExpanded !== next.isExpanded ||
-    prev.onToggle !== next.onToggle ||
-    prev.className !== next.className
-  ) {
-    return false
-  }
-  if (prev.tool.state !== next.tool.state) return false
-  if (prev.tool.error !== next.tool.error) return false
-  // Fast path: terminal-state tool with the same id can never mutate.
-  if (
-    prev.tool.id === next.tool.id &&
-    next.tool.state !== "streaming"
-  ) {
-    return true
-  }
-  if (prev.tool.id === next.tool.id && next.tool.state === "streaming") {
-    return streamingArgsKey(prev.tool.args) === streamingArgsKey(next.tool.args)
-  }
-  return (
-    stableStringify(prev.tool.args) === stableStringify(next.tool.args) &&
-    stableStringify(prev.tool.result) === stableStringify(next.tool.result)
-  )
 }
 
 export const WriteFileWidget = memo(function WriteFileWidget({
@@ -260,6 +212,6 @@ export const WriteFileWidget = memo(function WriteFileWidget({
       )}
     </View>
   )
-}, toolWidgetPropsEqual)
+}, fileToolWidgetPropsEqual)
 
 export default WriteFileWidget

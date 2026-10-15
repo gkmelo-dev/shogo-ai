@@ -60,6 +60,7 @@ import { useSafeAreaInsets } from "react-native-safe-area-context"
 import { LinearGradient } from "expo-linear-gradient"
 import { DefaultChatTransport } from "ai"
 import { appendQueuedUserMessage } from "./queued-user-message"
+import { toAiMessages } from "./persisted-messages"
 import AsyncStorage from "@react-native-async-storage/async-storage"
 import {
   extractTextContent,
@@ -3844,22 +3845,7 @@ const ChatPanelContent = observer(function ChatPanelContent({
       const promptIndex = pendingExternalPromptIndex(loaded)
       if (promptIndex < 0 || !externalPromptHasResponse(loaded, promptIndex)) return
 
-      const aiMessages = loaded.map((message: any) => {
-        const next: any = {
-          id: message.id,
-          role: message.role as "user" | "assistant",
-          content: message.content ?? extractTextContent(message),
-          createdAt: message.createdAt,
-        }
-        if (message.parts) {
-          try {
-            next.parts = JSON.parse(message.parts)
-          } catch {
-            // Keep the text content when an older message has malformed parts.
-          }
-        }
-        return next
-      })
+      const aiMessages = toAiMessages(loaded)
       cachedMessagesRef.current = aiMessages
       sessionMessageCache.set(currentSessionId, aiMessages)
       setMessages(aiMessages)
@@ -4373,26 +4359,7 @@ const ChatPanelContent = observer(function ChatPanelContent({
 
         if (loaded.length === 0) return
 
-        const aiMessages = loaded.map((msg: any) => {
-          const baseMessage: any = {
-            id: msg.id,
-            role: msg.role as "user" | "assistant",
-            content: msg.content,
-            // Carried through so `extractTurnTiming`'s createdAt fallback
-            // and the `TurnFooter` relative-time label ("2m ago") have a
-            // real timestamp for historical (pre-`data-turn-timing`)
-            // messages loaded from the server.
-            createdAt: msg.createdAt,
-          }
-          if (msg.parts) {
-            try {
-              baseMessage.parts = JSON.parse(msg.parts)
-            } catch (err) {
-              console.warn("[ChatPanel] Failed to parse message parts:", err)
-            }
-          }
-          return baseMessage
-        })
+        const aiMessages = toAiMessages(loaded)
 
         const cached = cachedMessagesRef.current
         const textLength = (m: any): number => {
@@ -4618,22 +4585,7 @@ const ChatPanelContent = observer(function ChatPanelContent({
         (a: any, b: any) => (a.createdAt || 0) - (b.createdAt || 0),
       )
 
-      const aiMessages = allLoaded.map((msg: any) => {
-        const baseMessage: any = {
-          id: msg.id,
-          role: msg.role as "user" | "assistant",
-          content: msg.content,
-          createdAt: msg.createdAt,
-        }
-        if (msg.parts) {
-          try {
-            baseMessage.parts = JSON.parse(msg.parts)
-          } catch (err) {
-            console.warn("[ChatPanel] Failed to parse message parts:", err)
-          }
-        }
-        return baseMessage
-      })
+      const aiMessages = toAiMessages(allLoaded)
 
       cachedMessagesRef.current = aiMessages
       sessionMessageCache.set(currentSessionId, aiMessages)
@@ -6249,22 +6201,7 @@ const ChatPanelContent = observer(function ChatPanelContent({
       (a: any, b: any) => (a.createdAt || 0) - (b.createdAt || 0),
     )
     if (loaded.length === 0) return false
-    const aiMessages = loaded.map((msg: any) => {
-      const next: any = {
-        id: msg.id,
-        role: msg.role as "user" | "assistant",
-        content: msg.content ?? extractTextContent(msg),
-        createdAt: msg.createdAt,
-      }
-      if (msg.parts) {
-        try {
-          next.parts = JSON.parse(msg.parts)
-        } catch {
-          // Keep the text content when a message has malformed parts.
-        }
-      }
-      return next
-    })
+    const aiMessages = toAiMessages(loaded)
     cachedMessagesRef.current = aiMessages
     sessionMessageCache.set(sessionId, aiMessages)
     cacheRefreshedAtRef.current.set(sessionId, performance.now())

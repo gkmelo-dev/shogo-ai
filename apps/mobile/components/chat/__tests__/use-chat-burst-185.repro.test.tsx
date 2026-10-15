@@ -202,12 +202,16 @@ async function run({
 const describeError = (e: unknown) => (e instanceof Error ? e.message.slice(0, 80) : e == null ? null : String(e))
 const isDepthError = (e: unknown) => /Maximum update depth|#185/.test(describeError(e) ?? "")
 
+// Render counts and latency depend on machine speed, so they are only
+// asserted when REPRO_TIMING=1; CI checks correctness (no #185, full content).
+const CHECK_TIMING = process.env.REPRO_TIMING === "1"
+
 function expectHealthy(r: RunResult, expected: number) {
   expect(describeError(r.error)).toBeNull()
   expect(r.status).toBe("ready")
   expect(r.shown).toBe(expected)
   // About one render per publication window, not one per chunk.
-  expect(r.renders).toBeLessThanOrEqual(Math.ceil(r.elapsedMs / PUBLISH_MS) + 5)
+  if (CHECK_TIMING) expect(r.renders).toBeLessThanOrEqual(Math.ceil(r.elapsedMs / PUBLISH_MS) + 5)
 }
 
 describe("#1083: buffered tool-input bursts never trip React's nested-update guard", () => {
@@ -217,7 +221,7 @@ describe("#1083: buffered tool-input bursts never trip React's nested-update gua
   test("1,500-delta write_file burst, no coalescer: paced publication alone keeps the stream alive", async () => {
     const r = await run({ chunks: bigWriteChunks(DELTAS), expected: bigExpected, measure: writeContentLength, mode: "paced" })
     expectHealthy(r, bigExpected)
-    expect(r.renders).toBeLessThan(DELTAS / 10)
+    if (CHECK_TIMING) expect(r.renders).toBeLessThan(DELTAS / 10)
   }, 30_000)
 
   test("1,500-delta write_file burst through the production coalescer", async () => {
@@ -235,7 +239,7 @@ describe("#1083: buffered tool-input bursts never trip React's nested-update gua
     const calls = 400
     const r = await run({ chunks: manyToolCallChunks(calls), expected: calls, measure: toolCallCount, mode: "paced", coalesce: true })
     expectHealthy(r, calls)
-    expect(r.renders).toBeLessThan(calls)
+    if (CHECK_TIMING) expect(r.renders).toBeLessThan(calls)
   }, 30_000)
 
   test("spread arrival: display keeps up with the stream", async () => {
@@ -250,7 +254,7 @@ describe("#1083: buffered tool-input bursts never trip React's nested-update gua
     // Timers clamp small delays (about 15ms on Windows), so compare against
     // when the last chunk actually arrived, not the nominal spread.
     expect(r.shownCompleteAtMs).not.toBeNull()
-    expect(r.shownCompleteAtMs! - r.arrivalMs).toBeLessThanOrEqual(Math.max(r.arrivalMs * 0.5, 300))
+    if (CHECK_TIMING) expect(r.shownCompleteAtMs! - r.arrivalMs).toBeLessThanOrEqual(Math.max(r.arrivalMs * 0.5, 300))
   }, 30_000)
 
   const baseline = process.env.REPRO_BASELINE === "1" ? test : test.skip

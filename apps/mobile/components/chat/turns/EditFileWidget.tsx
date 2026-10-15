@@ -15,7 +15,7 @@ import { FileEdit, Loader2, CheckCircle2, XCircle, ChevronRight, ChevronDown } f
 import type { ToolCallData } from "../tools/types"
 import { getBasename, getLanguageLabel } from "./file-lang-map"
 import { computeLineDiff } from "./diff-utils"
-import { countLines, streamingArgsKey } from "./streaming-tool-args"
+import { countLines, fileToolWidgetPropsEqual } from "./streaming-tool-args"
 import { useChatContextSafe } from "../ChatContext"
 
 export interface EditFileWidgetProps {
@@ -31,41 +31,6 @@ function extractEditData(tool: ToolCallData) {
   const newString = (tool.args?.new_string ?? "") as string
   const replaceAll = tool.args?.replace_all as boolean | undefined
   return { path: path || "unknown", oldString, newString, replaceAll }
-}
-
-function stableStringify(val: unknown): string {
-  if (val === null || val === undefined) return ""
-  if (typeof val === "string") return val
-  try { return JSON.stringify(val) } catch { return "" }
-}
-
-// See WriteFileWidget.tsx for rationale on the terminal-state fast path.
-function toolWidgetPropsEqual(
-  prev: EditFileWidgetProps,
-  next: EditFileWidgetProps,
-) {
-  if (
-    prev.isExpanded !== next.isExpanded ||
-    prev.onToggle !== next.onToggle ||
-    prev.className !== next.className
-  ) {
-    return false
-  }
-  if (prev.tool.state !== next.tool.state) return false
-  if (prev.tool.error !== next.tool.error) return false
-  if (
-    prev.tool.id === next.tool.id &&
-    next.tool.state !== "streaming"
-  ) {
-    return true
-  }
-  if (prev.tool.id === next.tool.id && next.tool.state === "streaming") {
-    return streamingArgsKey(prev.tool.args) === streamingArgsKey(next.tool.args)
-  }
-  return (
-    stableStringify(prev.tool.args) === stableStringify(next.tool.args) &&
-    stableStringify(prev.tool.result) === stableStringify(next.tool.result)
-  )
 }
 
 export const EditFileWidget = memo(function EditFileWidget({
@@ -227,6 +192,6 @@ export const EditFileWidget = memo(function EditFileWidget({
       )}
     </View>
   )
-}, toolWidgetPropsEqual)
+}, fileToolWidgetPropsEqual)
 
 export default EditFileWidget
