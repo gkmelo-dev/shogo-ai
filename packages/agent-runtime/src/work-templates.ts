@@ -945,7 +945,14 @@ export function mergeWorkTemplate(existingYaml: string | null, id: string, opts:
     const channel = (opts.channel ?? t.channel).replace(/^#/, '')
     // A channel the manifest does not declare would be created (or made public) by system_apply.
     if (!base.teamChannels.some((x: any) => String(x?.name ?? '').replace(/^#/, '') === channel)) {
-      throw new Error(`#${channel} is not in shogo-system.yaml. Use board_create with template "${id}" to add this board to an existing channel.`)
+      const dept = DEPARTMENTS.find((d) => d.boards.includes(id) && d.channel.name === channel)
+      throw new Error([
+        `#${channel} is not in shogo-system.yaml.`,
+        `If the channel already exists, use board_create with template "${id}".`,
+        dept
+          ? `To create it, add the "${dept.id}" department template (its channel, boards and agent), or add #${channel} to teamChannels and run this again.`
+          : `To create it, add #${channel} to teamChannels (set private: true if it should be private) and run this again.`,
+      ].join(' '))
     }
     incoming = { projects: [], teamChannels: [{ name: channel, boards: [t.board] }], triggers: [] }
   } else {

@@ -206,9 +206,10 @@ export function compileInstallBody(
 }
 
 /**
- * system_apply against the simulated workspace, plus the real template
- * tools. The template tools only edit shogo-system.yaml, so they run for
- * real; system_apply parses that file and applies it to the world.
+ * system_apply and project_list against the simulated workspace, plus the
+ * real template tools. The template tools only edit shogo-system.yaml, so
+ * they run for real; system_apply parses that file and applies it to the
+ * world.
  */
 function manifestToolFns(world: CompanyWorld, workspaceDir: string): Record<string, (params: Record<string, any>) => Promise<any>> {
   const tools = createBoardTools({ workspaceDir, channels: new Map(), workspaceId: 'ws-sim', config: { channels: [] } } as unknown as ToolContext)
@@ -219,6 +220,14 @@ function manifestToolFns(world: CompanyWorld, workspaceDir: string): Record<stri
   }
   return {
     work_template_list: real('work_template_list'),
+    project_list: async () => ({
+      workspaceId: 'ws-sim',
+      currentProjectId: null,
+      projects: world.snapshot().agents.map((a) => ({
+        id: `proj-${a.key}`, name: a.name, description: null, manifestKey: a.key, isCurrent: false, onDisk: false, attachments: [],
+        agent: { capabilities: a.capabilities, ...(a.heartbeatInterval ? { heartbeat: { enabled: true, interval: a.heartbeatInterval } } : {}) },
+      })),
+    }),
     work_template_add: real('work_template_add'),
     system_apply: async (params: Record<string, any>) => {
       const rel = typeof params.manifestPath === 'string' && params.manifestPath ? params.manifestPath : 'shogo-system.yaml'

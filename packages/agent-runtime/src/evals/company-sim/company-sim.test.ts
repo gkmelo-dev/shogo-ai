@@ -317,3 +317,13 @@ describe('company ops', () => {
     expect(await fns.column_delete({ board: 'Campaigns', channel: 'marketing', column: 'Brief' })).toMatchObject({ code: 'not_empty' })
   })
 })
+
+test('project_list reports the simulated agents', async () => {
+  const { COMPANY_OPS_EVALS } = await import('../test-cases-company-ops')
+  const ev = COMPANY_OPS_EVALS.find((e) => e.id === 'ops-capabilities')!
+  const { mkdtempSync } = await import('fs')
+  const dir = mkdtempSync(require('path').join(require('os').tmpdir(), 'ops-sim-'))
+  const c = compileInstallBody({ mocks: {}, sim: ev.sim }, { simSchemas: simToolSchemas(), workspaceDir: dir })
+  const out = await c.fns.project_list({})
+  expect(out.projects).toContainEqual(expect.objectContaining({ manifestKey: 'support-agent', agent: expect.objectContaining({ capabilities: expect.objectContaining({ boardAdminEnabled: false }) }) }))
+})

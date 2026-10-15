@@ -213,6 +213,7 @@ describe('mergeWorkTemplate', () => {
     const r = mergeWorkTemplate(base, 'legal-review', { channel: '#sales' })
     expect(r.added).toEqual(['board #sales Contracts'])
     expect(() => mergeWorkTemplate(base, 'support-tickets')).toThrow(/board_create with template "support-tickets"/)
+    expect(() => mergeWorkTemplate(base, 'hiring-candidates', { channel: 'people' })).toThrow(/"people" department template/)
     expect(() => mergeWorkTemplate(base, 'nope')).toThrow(/Unknown template/)
   })
 })
