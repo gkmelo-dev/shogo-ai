@@ -127,12 +127,12 @@ export interface SubagentStreamCallbacks {
  * Build the explore subagent system prompt. `search` is only registered when
  * SHOGO_SEARCH_ENABLED=1; when off we must not tell the subagent to use it
  * (it would call a tool that isn't bound and get "Tool search not found").
- * The grep tool covers exact/regex code search in that case.
+ * exec + rg/grep covers code search in that case.
  */
 export function buildExploreSystemPrompt(searchEnabled: boolean = isSearchEnabled()): string {
   const toolsLine = searchEnabled
-    ? 'read_file, grep, git_history, exec, search, web, impact_radius — exploration and analysis tools.'
-    : 'read_file, grep, git_history, exec, web, impact_radius — exploration and analysis tools.'
+    ? 'read_file, exec, search, web, impact_radius — exploration and analysis tools.'
+    : 'read_file, exec, web, impact_radius — exploration and analysis tools.'
   const searchGuideline = searchEnabled
     ? '- Use search for semantic code search.\n'
     : ''
@@ -145,9 +145,8 @@ Read-only codebase exploration. Find files, search for patterns, read code, and 
 ${toolsLine}
 
 ## Guidelines
-- Use grep for exact/regex search: every usage of an identifier, literal, config key or error message.
-- Use git_history to learn why code is the way it is (log with search to find when a literal appeared, blame for a line range).
-- Use exec for file discovery (e.g. find, ls).
+- Use exec to run shell commands (e.g. find, rg, ls) for file discovery and searching.
+- Use exec with git (\`git log -S '<literal>'\`, \`git blame -L a,b <file>\`) to learn why code is the way it is.
 ${searchGuideline}- Read files to understand implementation details.
 - Use web to look up documentation or external references when needed.
 - Use impact_radius to check blast radius for specific files when assessing change scope.
@@ -397,8 +396,8 @@ export function getBuiltinSubagentConfig(
         systemPrompt: buildExploreSystemPrompt(),
         // Only advertise `search` when it's actually registered (SHOGO_SEARCH_ENABLED=1).
         toolNames: isSearchEnabled()
-          ? ['read_file', 'grep', 'git_history', 'exec', 'search', 'web', 'impact_radius']
-          : ['read_file', 'grep', 'git_history', 'exec', 'web', 'impact_radius'],
+          ? ['read_file', 'exec', 'search', 'web', 'impact_radius']
+          : ['read_file', 'exec', 'web', 'impact_radius'],
         disallowedTools: ['task', 'skill'],
         model: AUTO_MODEL_ID,
         maxTurns: 100,

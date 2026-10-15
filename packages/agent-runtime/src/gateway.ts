@@ -92,6 +92,7 @@ import {
   PLAN_DELIVERY_NUDGE,
   planWrittenInsteadOfCreated,
 } from './plan-mode-prompt'
+import { restrictToReadOnlyTools } from './read-only-command'
 import { isSearchEnabled } from './search-flag'
 import { getShogoSdkGuide } from './shogo-sdk-prompt'
 import { refreshAvailableModels } from './available-models'
@@ -2534,7 +2535,7 @@ export class AgentGateway {
     if (this.config.coordinatorMode) {
       restrictedMode = restrictedMode ?? 'coordinator'
       const { COORDINATOR_READONLY_TOOLS } = await import('./coordinator-prompt')
-      assembledTools = assembledTools.filter(t => COORDINATOR_READONLY_TOOLS.has(t.name))
+      assembledTools = restrictToReadOnlyTools(assembledTools, COORDINATOR_READONLY_TOOLS)
     }
 
     // WS7: in agent (edit) mode, guarantee the core tools are always callable.

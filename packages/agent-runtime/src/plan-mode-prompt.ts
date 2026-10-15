@@ -6,13 +6,18 @@
  * plus the Auto-routing floor for plan turns.
  */
 
+import type { AgentTool } from '@mariozechner/pi-agent-core'
+import { restrictToReadOnlyTools } from './read-only-command'
+
 export type InteractionMode = 'agent' | 'plan' | 'ask'
 
-/** Read-only tools a plan-mode turn may use (create_plan/update_plan write only under .shogo/plans/). */
+/**
+ * Read-only tools a plan-mode turn may use (create_plan/update_plan write only
+ * under .shogo/plans/; `exec` is swapped for its read-only form).
+ */
 export const PLAN_MODE_ALLOWED_TOOLS: ReadonlySet<string> = new Set([
   'read_file',
-  'grep',
-  'git_history',
+  'exec',
   'impact_radius',
   'read_lints',
   'search',
@@ -29,9 +34,9 @@ export const PLAN_MODE_ALLOWED_TOOLS: ReadonlySet<string> = new Set([
 ])
 
 /** `ask` -> no tools; `plan` -> the read-only allowlist; `agent` -> unchanged. */
-export function filterToolsForMode<T extends { name: string }>(tools: T[], mode: InteractionMode | undefined): T[] {
+export function filterToolsForMode(tools: AgentTool[], mode: InteractionMode | undefined): AgentTool[] {
   if (mode === 'ask') return []
-  if (mode === 'plan') return tools.filter((t) => PLAN_MODE_ALLOWED_TOOLS.has(t.name))
+  if (mode === 'plan') return restrictToReadOnlyTools(tools, PLAN_MODE_ALLOWED_TOOLS)
   return tools
 }
 
@@ -42,7 +47,7 @@ export const ASK_MODE_PROMPT = [
 ].join('\n')
 
 export function buildPlanModePrompt({ searchEnabled }: { searchEnabled: boolean }): string {
-  const tools = ['read_file', 'grep', 'git_history', 'impact_radius', 'read_lints', 'web', ...(searchEnabled ? ['search'] : [])]
+  const tools = ['read_file', 'exec', 'impact_radius', 'read_lints', 'web', ...(searchEnabled ? ['search'] : [])]
   return [
     '## PLAN MODE ACTIVE',
     '',
@@ -50,14 +55,14 @@ export function buildPlanModePrompt({ searchEnabled }: { searchEnabled: boolean 
     'Exception: you may create or update the plan artifact using create_plan/update_plan; those tools only write under .shogo/plans/ for user review.',
     '',
     'Every plan you produce is delivered through `create_plan` — or `update_plan` when the user is revising a plan that already exists in `.shogo/plans/` (find it with `read_file` on that folder), or `ask_user` when you are blocked — design and rollout plans as much as code changes. A request that would change code always ends with a plan, including bug reports and one-line fixes, and even when the user does not say "plan". Never answer with a plan or a snippet in chat instead; the plan card is how the work gets reviewed and built.',
-    'The editing and command tools (edit_file, write_file, exec) do not exist in plan mode. The coding guide below describes how changes are made after the user clicks Build — use it to write the plan, not to make the change now.',
+    'The editing tools (edit_file, write_file) do not exist in plan mode, and `exec` only runs read-only commands: `rg`, `git log|show|blame|grep|diff|status|ls-files|rev-parse`, `ls`, `find`, `cat`, `head`, `tail`, `wc` — one command per call, no pipes or redirects. The coding guide below describes how changes are made after the user clicks Build — use it to write the plan, not to make the change now.',
     '',
     `Read-only research tools: ${tools.map((t) => `\`${t}\``).join(', ')}.`,
     '',
     '### Investigation protocol (required before `create_plan`)',
-    '1. `grep` for every symbol, literal, config key and error message in the request.',
+    "1. Search with `exec` + `rg` (e.g. `rg -n 'MAX_TOKENS'`) for every symbol, literal, config key and error message in the request.",
     '2. Read the full path from where a value is configured (UI, settings, env, DB, config file) to where it is used — read every hop, not just the line that looks wrong.',
-    '3. If the workspace is a git repository, check `git_history` (log with search, or blame) for suspicious hardcodes and recent changes, to learn why the code is the way it is.',
+    "3. If the workspace is a git repository, check history with `exec` (`git log -S '<literal>'` to find when a value appeared, `git blame -L a,b <file>` for a line range) for suspicious hardcodes and recent changes, to learn why the code is the way it is.",
     '4. Find the existing tests for the code path.',
     '5. Run `impact_radius` on the files you plan to change.',
     '',

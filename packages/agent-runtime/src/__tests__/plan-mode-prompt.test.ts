@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Shogo Technologies, Inc.
 import { describe, expect, test } from 'bun:test'
+import type { AgentTool } from '@mariozechner/pi-agent-core'
+import { READ_ONLY_COMMANDS } from '../read-only-command'
 import {
   applyInteractionModePrompt,
   ASK_MODE_PROMPT,
@@ -52,9 +54,10 @@ describe('missingCodePlanSections', () => {
   })
 })
 
-/** Backticked identifiers that look like tool names (lowercase snake_case). */
+/** Backticked identifiers that look like tool names (lowercase snake_case), minus the read-only exec commands. */
 function advertisedTools(prompt: string): string[] {
-  return [...prompt.matchAll(/`([a-z][a-z_]*)`/g)].map((m) => m[1])
+  const commands = new Set<string>(READ_ONLY_COMMANDS)
+  return [...prompt.matchAll(/`([a-z][a-z_]*)`/g)].map((m) => m[1]).filter((name) => !commands.has(name))
 }
 
 describe('plan mode prompt', () => {
@@ -85,7 +88,9 @@ describe('plan mode prompt', () => {
     expect(prompt).toContain('design and rollout plans as much as code changes')
     expect(prompt).toContain('even when the user does not say "plan"')
     expect(prompt).toContain('Never answer with a plan or a snippet in chat instead')
-    expect(prompt).toContain('The editing and command tools (edit_file, write_file, exec) do not exist in plan mode.')
+    expect(prompt).toContain('The editing tools (edit_file, write_file) do not exist in plan mode, and `exec` only runs read-only commands')
+    expect(prompt).not.toContain('git_history')
+    expect(prompt).toContain("`git log -S '<literal>'`")
   })
 
   test('no longer asks for a concise plan', () => {
@@ -101,10 +106,10 @@ describe('plan mode prompt', () => {
 
 describe('PLAN_MODE_ALLOWED_TOOLS', () => {
   test('includes the exploration tools and nothing that mutates', () => {
-    for (const name of ['grep', 'git_history', 'impact_radius', 'read_lints', 'read_file']) {
+    for (const name of ['exec', 'impact_radius', 'read_lints', 'read_file']) {
       expect(PLAN_MODE_ALLOWED_TOOLS.has(name)).toBe(true)
     }
-    for (const name of ['exec', 'write_file', 'edit_file', 'delete_file', 'terminal_exec', 'publish']) {
+    for (const name of ['write_file', 'edit_file', 'delete_file', 'terminal_exec', 'exec_wait', 'publish']) {
       expect(PLAN_MODE_ALLOWED_TOOLS.has(name)).toBe(false)
     }
   })
@@ -129,10 +134,27 @@ describe('applyInteractionModePrompt', () => {
 })
 
 describe('filterToolsForMode', () => {
-  const tools = ['read_file', 'grep', 'git_history', 'exec', 'write_file', 'create_plan', 'search'].map((name) => ({ name }))
+  const ran: string[] = []
+  const tools = ['read_file', 'exec', 'write_file', 'create_plan', 'search'].map((name) => ({
+    name,
+    label: name,
+    description: name,
+    parameters: {},
+    execute: async (_id: string, params: any) => {
+      ran.push(params.command)
+      return { content: [], details: {} }
+    },
+  })) as unknown as AgentTool[]
   test('plan keeps registered allowlisted tools only', () => {
-    expect(filterToolsForMode(tools, 'plan').map((t) => t.name)).toEqual(['read_file', 'grep', 'git_history', 'create_plan', 'search'])
+    expect(filterToolsForMode(tools, 'plan').map((t) => t.name)).toEqual(['read_file', 'exec', 'create_plan', 'search'])
     expect(filterToolsForMode(tools.filter((t) => t.name !== 'search'), 'plan').map((t) => t.name)).not.toContain('search')
+  })
+  test('plan-mode exec only runs read-only commands', async () => {
+    const exec = filterToolsForMode(tools, 'plan').find((t) => t.name === 'exec')!
+    const refused = await exec.execute('t1', { command: 'rm -rf src' } as any)
+    expect(JSON.stringify(refused.content)).toContain('Read-only mode')
+    await exec.execute('t2', { command: "rg -n 'TODO'" } as any)
+    expect(ran).toEqual(["rg --no-config -n 'TODO'"])
   })
   test('ask has no tools; agent keeps all', () => {
     expect(filterToolsForMode(tools, 'ask')).toEqual([])

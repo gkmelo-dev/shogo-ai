@@ -123,7 +123,7 @@ const PHASE_1: AgentEval = {
         const priorTools = r.toolCalls.slice(0, createIdx)
         return priorTools.some(tc =>
           tc.name === 'read_file' || tc.name === 'search' || tc.name === 'web' ||
-          tc.name === 'grep' || tc.name === 'git_history'
+          tc.name === 'exec'
         )
       },
     },
@@ -315,7 +315,7 @@ function makePlanCreationEval(spec: PlanCreationSpec): AgentEval {
         const priorTools = r.toolCalls.slice(0, createIdx)
         return priorTools.some(tc =>
           tc.name === 'read_file' || tc.name === 'search' || tc.name === 'web' ||
-          tc.name === 'grep' || tc.name === 'git_history'
+          tc.name === 'exec'
         )
       },
     })

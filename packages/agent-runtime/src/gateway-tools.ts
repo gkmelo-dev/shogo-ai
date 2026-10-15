@@ -105,8 +105,6 @@ import { withActionRules, withPermissionGate, assertWithinWorkspace as assertWit
 import { assertAllowedPath as assertAllowedPathRaw, getRuntimeTrust } from './runtime-trust'
 import { isBinaryFilePath } from '@shogo/shared-runtime'
 import { withShogoPrFooter } from '@shogo/shared-runtime/agent-attribution'
-import { createGrepTool } from './grep-tool'
-import { createGitHistoryTool } from './git-history-tool'
 import { missingCodePlanSections } from './plan-mode-prompt'
 
 /**
@@ -8066,8 +8064,6 @@ export function createTools(ctx: ToolContext, extraTools?: AgentTool[]): AgentTo
     g(createGitHubConnectTool(ctx), 'network'),
     createExposePortTool(ctx),
     g(r(createReadFileTool(ctx)), 'file_read'),
-    g(createGrepTool(ctx), 'file_read'),
-    g(createGitHistoryTool(ctx), 'file_read'),
     g(r(createWriteFileTool(ctx)), 'file_write'),
     g(r(createEditFileTool(ctx)), 'file_write'),
     g(r(createDeleteFileTool(ctx)), 'file_delete'),

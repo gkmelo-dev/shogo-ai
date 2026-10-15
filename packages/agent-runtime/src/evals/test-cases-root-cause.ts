@@ -10,7 +10,7 @@ import { spawnSync } from 'child_process'
 import { existsSync, readdirSync, statSync } from 'fs'
 import { join } from 'path'
 import type { AgentEval, EvalResult } from './types'
-import { readWorkspaceFile, usedTool } from './eval-helpers'
+import { readWorkspaceFile, searchedCode } from './eval-helpers'
 
 // ---------------------------------------------------------------------------
 // Fixture 1: a small TS RAG app whose pipeline ignores the token setting
@@ -471,11 +471,11 @@ const ROOT_CAUSE_PLAN_HARDCODED_LIMIT: AgentEval = {
   maxScore: 100,
   validationCriteria: [
     {
-      id: 'used-grep',
-      description: 'Searched the code with grep',
+      id: 'searched-code',
+      description: 'Searched the code with rg (exec)',
       points: 15,
       phase: 'intention',
-      validate: (r) => usedTool(r, 'grep'),
+      validate: (r) => searchedCode(r),
     },
     {
       id: 'read-consumer-and-source',
@@ -530,11 +530,11 @@ const ROOT_CAUSE_PLAN_TIMEOUT: AgentEval = {
   maxScore: 100,
   validationCriteria: [
     {
-      id: 'used-grep',
-      description: 'Searched the code with grep',
+      id: 'searched-code',
+      description: 'Searched the code with rg (exec)',
       points: 15,
       phase: 'intention',
-      validate: (r) => usedTool(r, 'grep'),
+      validate: (r) => searchedCode(r),
     },
     {
       id: 'read-consumer-and-source',

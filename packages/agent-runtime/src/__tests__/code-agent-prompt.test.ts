@@ -8,23 +8,34 @@ const off = buildCodeAgentGeneralGuide({ searchEnabled: false })
 const on = buildCodeAgentGeneralGuide({ searchEnabled: true })
 
 describe('coding guide', () => {
-  test('without search: no search() examples and no "exec with rg" advice', () => {
+  test('without search: no search() examples; exact search goes through exec + rg', () => {
     expect(off).not.toContain('search({')
     expect(off).not.toContain('### search')
-    expect(off).not.toMatch(/exec\(\{ command: 'rg|exec\\?` with ripgrep|exec rg/)
-    expect(off).toContain('### grep — exact / regex search')
+    expect(off).not.toContain('`search`')
+    expect(off).toContain('### Exact / regex search with ripgrep')
+    expect(off).toContain(`exec({ command: "rg -n 'MAX_INPUT_TOKENS'" })`)
   })
 
-  test('with search: the semantic search section is present, and exact search still points at grep', () => {
+  test('with search: the semantic search section is present, and exact search still points at rg', () => {
     expect(on).toContain('### search — Semantic Workspace Search')
     expect(on).toContain('search({ query:')
-    expect(on).toContain('When NOT to use search (use `grep` instead)')
+    expect(on).toContain('When NOT to use search (use `exec` with `rg` instead)')
+    expect(on).toContain('Use `read_file`, `search` and `exec`')
+    expect(on).not.toContain('\\`search\\`')
+  })
+
+  test('only advertises tools that exist', () => {
+    for (const guide of [off, on]) {
+      expect(guide).not.toContain('`grep`')
+      expect(guide).not.toContain('grep({')
+      expect(guide).not.toContain('git_history')
+    }
   })
 
   test('explore section traces values to their source of truth', () => {
     expect(off).toContain('### Explore before you change — trace to the source of truth')
     expect(off).toContain('remove the shadowing and plumb the configured value through')
-    expect(off).toContain('`git_history`')
+    expect(off).toContain("`git log -S '<literal>'`")
     expect(off).not.toContain('Explore First — MANDATORY')
   })
 

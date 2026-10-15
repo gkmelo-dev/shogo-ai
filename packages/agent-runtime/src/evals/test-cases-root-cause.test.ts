@@ -179,7 +179,7 @@ export function buildContext(chunks: string[]): string {
 describe('root-cause-plan-hardcoded-limit', () => {
   const evalCase = byId('root-cause-plan-hardcoded-limit')
   const research = [
-    call('grep', { pattern: 'MAX_INPUT_TOKENS' }),
+    call('exec', { command: "rg -n 'MAX_INPUT_TOKENS'" }),
     call('read_file', { path: 'src/rag/pipeline.ts' }),
     call('read_file', { path: 'src/settings/store.ts' }),
   ]
@@ -196,9 +196,9 @@ describe('root-cause-plan-hardcoded-limit', () => {
     expect(r.failed).toEqual(expect.arrayContaining(['plan-replaces-hardcode', 'no-workaround']))
   })
 
-  test('skipping grep and reading only the pipeline costs the intention points', () => {
+  test('skipping the code search and reading only the pipeline costs the intention points', () => {
     const r = score(evalCase, result([call('read_file', { path: 'src/rag/pipeline.ts' }), planCall(GOOD_RAG_PLAN)]))
-    expect(r.failed).toEqual(['used-grep', 'read-consumer-and-source'])
+    expect(r.failed).toEqual(['searched-code', 'read-consumer-and-source'])
     expect(r.score).toBe(70)
   })
 
@@ -210,7 +210,7 @@ describe('root-cause-plan-hardcoded-limit', () => {
 
   test('Windows-style read paths count', () => {
     const r = score(evalCase, result([
-      call('grep', { pattern: 'x' }),
+      call('exec', { command: "rg -n 'x'" }),
       call('read_file', { path: 'src\\rag\\pipeline.ts' }),
       call('read_file', { path: 'src\\settings\\store.ts' }),
       planCall(GOOD_RAG_PLAN),
@@ -228,7 +228,7 @@ describe('root-cause-plan-hardcoded-limit', () => {
 describe('root-cause-plan-timeout', () => {
   const evalCase = byId('root-cause-plan-timeout')
   const research = [
-    call('grep', { pattern: 'timeout' }),
+    call('exec', { command: "rg -n 'timeout'" }),
     call('read_file', { path: 'src/http/client.ts' }),
     call('read_file', { path: 'src/settings/settings.ts' }),
   ]

@@ -60,7 +60,7 @@ describe('search advertisement contract (WS6)', () => {
     const prompt = buildExploreSystemPrompt(false)
     expect(prompt).not.toMatch(/exec, search/)
     expect(prompt).not.toContain('Use search for semantic')
-    expect(prompt).toContain('read_file, grep, git_history, exec, web, impact_radius')
+    expect(prompt).toContain('read_file, exec, web, impact_radius')
   })
 
   test('prod-like: explore subagent toolNames are a subset of registered tools', () => {
@@ -90,22 +90,22 @@ describe('search advertisement contract (WS6)', () => {
     const registered = registeredToolNames()
     const guide = buildCodeAgentGeneralGuide({ searchEnabled: false })
     expect(guide).not.toContain('search({')
-    expect(guide).not.toMatch(/exec\(\{ command: 'rg|exec\\? with ripgrep|exec rg/)
-    expect(guide).toContain('grep({')
-    for (const name of ['grep', 'git_history', 'read_lints', 'impact_radius']) {
+    expect(guide).not.toContain('grep({')
+    expect(guide).not.toContain('git_history')
+    for (const name of ['exec', 'read_lints', 'impact_radius']) {
       expect({ name, registered: registered.has(name) }).toEqual({ name, registered: true })
     }
     const plan = buildPlanModePrompt({ searchEnabled: false })
     expect(plan).not.toContain('`search`')
+    expect(plan).not.toContain('git_history')
   })
 
-  test('grep and git_history are registered, and the explore subagent and coordinator can use them', () => {
+  test('there are no separate grep/git_history tools: code search and history go through exec', () => {
     const registered = registeredToolNames()
-    expect(registered.has('grep')).toBe(true)
-    expect(registered.has('git_history')).toBe(true)
+    expect(registered.has('grep')).toBe(false)
+    expect(registered.has('git_history')).toBe(false)
     const cfg = getBuiltinSubagentConfig('explore', makeCtx(), [])
-    expect(cfg!.toolNames).toEqual(expect.arrayContaining(['grep', 'git_history']))
-    expect(COORDINATOR_READONLY_TOOLS.has('grep')).toBe(true)
-    expect(COORDINATOR_READONLY_TOOLS.has('git_history')).toBe(true)
+    expect(cfg!.toolNames).toContain('exec')
+    expect(COORDINATOR_READONLY_TOOLS.has('exec')).toBe(true)
   })
 })
