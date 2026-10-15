@@ -442,3 +442,44 @@ describe('problems', () => {
     expect(res.json.error.code).toBe('not_problem_board')
   })
 })
+
+describe('#activity', () => {
+  async function workLines(itemId: string) {
+    const activity = await db.conversation.findFirst({ where: { workspaceId: seed.workspaceId, kind: 'activity' } })
+    if (!activity) return []
+    const rows = await db.conversationMessage.findMany({ where: { conversationId: activity.id }, orderBy: { seq: 'asc' } })
+    return rows
+      .map((r: any) => (typeof r.blocks === 'string' ? JSON.parse(r.blocks) : r.blocks))
+      .filter((b: any) => b?.type === 'activity' && b.workItemId === itemId)
+  }
+
+  test('opening, finishing and reopening a card in a public channel post work lines', async () => {
+    const board = await createBoard({ conversationId: channelId, name: 'Escalations' })
+    const created = await call(seed.member, 'POST', `/boards/${board.id}/items`, { title: 'VIP refund stuck' })
+    const id = created.json.item.id
+    const done = board.columns.find((c: any) => c.category === 'done')
+    expect((await call(seed.member, 'POST', `/work-items/${id}/move`, { column: done.id })).status).toBe(200)
+    expect((await call(seed.member, 'POST', `/work-items/${id}/move`, { column: board.columns[0].id })).status).toBe(200)
+    const lines = await waitFor(async () => {
+      const found = await workLines(id)
+      return found.length >= 3 ? found : null
+    })
+    expect(lines.map((l: any) => l.kind)).toEqual(['work.created', 'work.done', 'work.regressed'])
+    expect(lines[0]).toMatchObject({ conversationId: channelId, boardId: board.id })
+    expect(lines[0].link).toContain(`card=${id}`)
+  })
+
+  test('cards in private channels stay out of #activity', async () => {
+    const secret = await createChannel(seed.member, 'exec', { kind: 'private' })
+    const board = await createBoard({ conversationId: secret, name: 'Board prep' })
+    const created = await call(seed.member, 'POST', `/boards/${board.id}/items`, { title: 'Comp review' })
+    expect(await workLines(created.json.item.id)).toEqual([])
+  })
+
+  test('card detail carries the board columns for the column picker', async () => {
+    const board = await createBoard({ conversationId: channelId, name: 'Picker' })
+    const created = await call(seed.member, 'POST', `/boards/${board.id}/items`, { title: 'Pick me' })
+    const detail = await call(seed.member, 'GET', `/work-items/${created.json.item.id}`)
+    expect(detail.json.board.columns.map((c: any) => c.name)).toEqual(board.columns.map((c: any) => c.name))
+  })
+})

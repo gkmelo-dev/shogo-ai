@@ -288,7 +288,7 @@ const CAPABILITIES: CapabilityDef[] = [
     detail: 'Lets the agent add, rename, reorder and archive boards and edit their columns, and lets system_apply change the boards in shogo-system.yaml. On by default for the workspace agent.',
     disabledDescription: 'Cannot change board structure',
     icon: Wrench,
-    toolNames: ['board_create', 'board_update', 'board_archive', 'board_reorder', 'column_create', 'column_update', 'column_delete'],
+    toolNames: ['board_create', 'board_update', 'board_archive', 'board_reorder', 'column_create', 'column_update', 'column_delete', 'work_template_list', 'work_template_add'],
     examples: ['"Add a Renewals board to #sales"', '"Put a Legal review column between Proposal and Won"'],
   },
   {

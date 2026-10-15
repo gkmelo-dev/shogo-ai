@@ -969,6 +969,8 @@ app.get('/api/config', async (c) => {
     // have been explicitly enabled; local design work stays opt-in by default.
     agentShell: localMode,
     mobileAgentShell: localMode,
+    // Boards are dogfooded on staging first: WORK_BOARDS_ENABLED or the admin flag turns them on.
+    workBoards: localMode || process.env.WORK_BOARDS_ENABLED === 'true',
   }
 
   // Super-admin overrides from PlatformSetting (absence = use default).
@@ -986,6 +988,7 @@ app.get('/api/config', async (c) => {
             'feature.personal_shell',
             'feature.agent_shell',
             'feature.mobile_agent_shell',
+            'feature.work_boards',
           ],
         },
       },
@@ -1004,6 +1007,7 @@ app.get('/api/config', async (c) => {
       if (row.key === 'feature.personal_shell') overrides.personalShell = bool
       if (row.key === 'feature.agent_shell') overrides.agentShell = bool
       if (row.key === 'feature.mobile_agent_shell') overrides.mobileAgentShell = bool
+      if (row.key === 'feature.work_boards') overrides.workBoards = bool
     }
   } catch (err) {
     console.error('[config] Failed to load feature flag overrides:', err)
@@ -6741,6 +6745,7 @@ const FEATURE_FLAG_KEYS = {
   personalShell: 'feature.personal_shell',
   agentShell: 'feature.agent_shell',
   mobileAgentShell: 'feature.mobile_agent_shell',
+  workBoards: 'feature.work_boards',
 } as const
 
 type FeatureFlagName = keyof typeof FEATURE_FLAG_KEYS
@@ -6759,6 +6764,7 @@ app.get('/api/admin/settings/features', async (c) => {
       personalShell: null,
       agentShell: null,
       mobileAgentShell: null,
+      workBoards: null,
     }
     for (const row of rows) {
       const bool = row.value === 'true'
@@ -6805,6 +6811,7 @@ app.put('/api/admin/settings/features', async (c) => {
       personalShell: null,
       agentShell: null,
       mobileAgentShell: null,
+      workBoards: null,
     }
     for (const row of rows) {
       const bool = row.value === 'true'

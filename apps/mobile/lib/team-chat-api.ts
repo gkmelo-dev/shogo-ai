@@ -401,6 +401,7 @@ export type TeamChatEvent =
   | { type: 'groups.changed' }
   | { type: 'agent.updated'; projectId: string | null }
   | { type: 'emoji.changed' }
+  | { type: 'board.changed'; boardId: string; conversationId?: string; action: string; itemId?: string }
   | { type: 'huddle.updated'; conversationId: string; huddle: Huddle | null }
   | {
       type: 'huddle.ring'

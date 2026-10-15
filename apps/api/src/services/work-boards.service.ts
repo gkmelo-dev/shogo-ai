@@ -163,12 +163,29 @@ export function serializeItem(i: any) {
   }
 }
 
-export function itemUrl(item: { id: string; conversationId?: string | null; threadRootMessageId?: string | null }): string {
-  const base = getFrontendUrl()
+/** App path for a card: its thread in the channel, or the inbox for cards without one. */
+export function itemPath(item: { id: string; conversationId?: string | null; threadRootMessageId?: string | null }): string {
   if (item.conversationId && item.threadRootMessageId) {
-    return `${base}/c/${encodeURIComponent(item.conversationId)}?thread=${encodeURIComponent(item.threadRootMessageId)}&card=${encodeURIComponent(item.id)}`
+    return `/c/${encodeURIComponent(item.conversationId)}?thread=${encodeURIComponent(item.threadRootMessageId)}&card=${encodeURIComponent(item.id)}`
   }
-  return `${base}/inbox?card=${encodeURIComponent(item.id)}`
+  return `/work?card=${encodeURIComponent(item.id)}`
+}
+
+export function itemUrl(item: { id: string; conversationId?: string | null; threadRootMessageId?: string | null }): string {
+  return `${getFrontendUrl()}${itemPath(item)}`
+}
+
+async function workActivity(kind: 'work.created' | 'work.done' | 'work.regressed', item: any, board: any, actor: BoardActor, ref: string) {
+  const { recordWorkItemActivity } = await import('./conversation-activity')
+  await recordWorkItemActivity(kind, {
+    item,
+    board,
+    actor: await actorLabel(item.workspaceId, actor),
+    link: itemPath(item),
+    projectId: actor.agentRef ? agentRefProjectId(actor.agentRef) : null,
+    actorUserId: actor.agentRef ? null : actor.userId ?? null,
+    ref,
+  })
 }
 
 // ─── Access ──────────────────────────────────────────────────────────────────
@@ -859,7 +876,9 @@ export async function createWorkItem(board: any, input: ItemInput, actor: BoardA
   const handoff = assigneeAgentRef ?? column.agentRef
   if (handoff) await wakeAgent(item.id, handoff, actor, assigneeAgentRef ? 'assigned' : `new card in ${column.name}`)
   await publishBoard(board, { action: 'item.created', itemId: item.id })
-  return serializeItem(await db.workItem.findUnique({ where: { id: item.id }, include: { column: true, board: true } }))
+  const fresh = await db.workItem.findUnique({ where: { id: item.id }, include: { column: true, board: true } })
+  await workActivity('work.created', fresh, board, actor, 'created')
+  return serializeItem(fresh)
 }
 
 export interface ItemPatch {
@@ -1025,7 +1044,12 @@ export async function moveWorkItem(item: any, input: MoveInput, actor: BoardActo
     from: { boardId: fromBoard.id, board: fromBoard.name, columnId: fromColumn.id, column: fromColumn.name, category: fromColumn.category },
     to: { boardId: toBoard.id, board: toBoard.name, columnId: toColumn.id, column: toColumn.name, category: toColumn.category },
   })
-  if (isClosed(fromColumn.category) && !isClosed(toColumn.category)) await recordEvent(item, 'regressed', actor, { from: fromColumn.name })
+  if (isClosed(fromColumn.category) && !isClosed(toColumn.category)) {
+    await recordEvent(item, 'regressed', actor, { from: fromColumn.name })
+    await workActivity('work.regressed', updated, toBoard, actor, `regressed:${now.getTime()}`)
+  } else if (toColumn.category === 'done') {
+    await workActivity('work.done', updated, toBoard, actor, `done:${now.getTime()}`)
+  }
   await linkActorSession(item, actor)
 
   if (toBoard.conversationId && toBoard.conversationId !== fromBoard.conversationId) {
@@ -1265,17 +1289,32 @@ export async function getWorkItemDetail(item: any, viewer: BoardViewer) {
   const visibleLinks = await redactLinks(links, viewer)
   const sessionIds = links.filter((l: any) => l.kind === 'chat_session').map((l: any) => l.refId)
   const sessions = sessionIds.length
-    ? await db.chatSession.findMany({ where: { id: { in: sessionIds } }, select: { id: true, name: true, inferredName: true, createdAt: true, updatedAt: true } }).catch(() => [])
+    ? await db.chatSession.findMany({ where: { id: { in: sessionIds } }, select: { id: true, name: true, inferredName: true, contextType: true, contextId: true, createdAt: true, updatedAt: true } }).catch(() => [])
     : []
   return {
     item: serializeItem(item),
-    board: { id: item.board.id, name: item.board.name, slug: item.board.slug, itemType: item.board.itemType, conversationId: item.board.conversationId ?? null, fieldsSchema: item.board.fieldsSchema ?? [] },
+    board: {
+      id: item.board.id,
+      name: item.board.name,
+      slug: item.board.slug,
+      itemType: item.board.itemType,
+      conversationId: item.board.conversationId ?? null,
+      fieldsSchema: item.board.fieldsSchema ?? [],
+      columns: (item.board.columns ?? []).slice().sort((a: any, b: any) => a.position - b.position).map(serializeColumn),
+    },
     column: serializeColumn(item.column),
     url: itemUrl(item),
     following: !!subscription,
     recentMessages: messages,
     links: visibleLinks.filter((l) => l.kind !== 'chat_session'),
-    agentRuns: sessions.map((s: any) => ({ sessionId: s.id, name: s.name || s.inferredName || 'Agent run', startedAt: s.createdAt, lastActiveAt: s.updatedAt })),
+    agentRuns: sessions.map((s: any) => ({
+      sessionId: s.id,
+      name: s.name || s.inferredName || 'Agent run',
+      projectId: s.contextType === 'project' ? s.contextId ?? null : null,
+      agentRef: links.find((l: any) => l.kind === 'chat_session' && l.refId === s.id)?.addedByAgentRef ?? null,
+      startedAt: s.createdAt,
+      lastActiveAt: s.updatedAt,
+    })),
     events: events.reverse().map(serializeEvent),
   }
 }
