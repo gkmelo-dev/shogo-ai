@@ -54,13 +54,16 @@ export type PollUntilTerminalResult =
 export async function pollUntilTerminal({
   probe,
   isCancelled,
-  sleep = (ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
+  signal,
+  sleep = (ms) => abortableSleep(ms, signal),
   now = Date.now,
   maxWaitMs = RENDER_RECOVERY_MAX_WAIT_MS,
   unknownIsTerminalAfter = 4,
 }: {
   probe: () => Promise<ChatTurnStatus>
   isCancelled: () => boolean
+  /** Aborting ends the poll immediately, including a pending backoff sleep. */
+  signal?: AbortSignal
   sleep?: (ms: number) => Promise<void>
   now?: () => number
   maxWaitMs?: number
@@ -69,14 +72,15 @@ export async function pollUntilTerminal({
   const deadline = now() + maxWaitMs
   let unknownRun = 0
   let last: ChatTurnStatus = "unknown"
+  const cancelled = () => signal?.aborted === true || isCancelled()
   for (let attempt = 1; ; attempt++) {
-    if (isCancelled()) return { outcome: "cancelled" }
+    if (cancelled()) return { outcome: "cancelled" }
     try {
       last = await probe()
     } catch {
       last = "unknown"
     }
-    if (isCancelled()) return { outcome: "cancelled" }
+    if (cancelled()) return { outcome: "cancelled" }
     if (last === "completed" || last === "failed" || last === "aborted") {
       return { outcome: "terminal", turnStatus: last }
     }
@@ -85,4 +89,17 @@ export async function pollUntilTerminal({
     if (now() >= deadline) return { outcome: "timeout", turnStatus: last }
     await sleep(computeRecoveryBackoff(attempt, { initialMs: 1_000, maxMs: 10_000 }))
   }
+}
+
+function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise<void>((resolve) => {
+    if (signal?.aborted) return resolve()
+    const done = () => {
+      clearTimeout(timer)
+      signal?.removeEventListener("abort", done)
+      resolve()
+    }
+    const timer = setTimeout(done, ms)
+    signal?.addEventListener("abort", done, { once: true })
+  })
 }

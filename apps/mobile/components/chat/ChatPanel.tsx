@@ -1862,8 +1862,17 @@ const ChatPanelContent = observer(function ChatPanelContent({
   const renderRecoveryRunsRef = useRef<Map<string, number>>(new Map())
   const stallRecoveryRef = useRef<(() => void) | null>(null)
   const renderErrorRecoveryRef = useRef<((reattachAttempts: number) => void) | null>(null)
+  const renderRecoveryAbortRef = useRef<AbortController | null>(null)
   const currentSessionIdRef = useRef<string | null>(null)
   currentSessionIdRef.current = currentSessionId
+
+  useEffect(() => {
+    renderRecoveryRunsRef.current.clear()
+    return () => {
+      renderRecoveryAbortRef.current?.abort()
+      renderRecoveryAbortRef.current = null
+    }
+  }, [currentSessionId])
 
   const [toolErrorBanner, setToolErrorBanner] = useState<{
     toolkitName: string
@@ -6275,8 +6284,8 @@ const ChatPanelContent = observer(function ChatPanelContent({
   //
   //   - turn still `active` (transport drop, agent still running) -> reconnect
   //     to the live buffered stream. No re-send, nothing truncated.
-  //   - turn `completed` (only the client lost it) -> reload the persisted
-  //     messages. No new turn.
+  //   - turn `completed` and the client lost it -> reload the persisted
+  //     messages. No new turn. If the reload fails, fall through below.
   //   - terminal but the last assistant turn has resumable work -> ask the
   //     server to continue from the preserved session context (continue:true).
   //   - nothing resumable -> re-send the original user message (last resort),
@@ -6327,9 +6336,13 @@ const ChatPanelContent = observer(function ChatPanelContent({
         }
       }
 
-      const action = decideRetryAction({
+      const hasResumableTurn = lastAssistantHasResumableWork(messages as any)
+      let action = decideRetryAction({
         turnStatus,
-        hasResumableTurn: lastAssistantHasResumableWork(messages as any),
+        hasResumableTurn,
+        clientLostStream:
+          !turnCompletedRef.current ||
+          emptyResponseError === STALL_TIMEOUT_USER_MESSAGE,
       })
 
       if (action === "reconnect") {
@@ -6340,10 +6353,12 @@ const ChatPanelContent = observer(function ChatPanelContent({
       }
 
       if (action === "reload") {
-        reloadPersistedMessages().catch((err) =>
-          console.error("[ChatPanel] Retry reload failed:", err),
-        )
-        return
+        const reloaded = await reloadPersistedMessages().catch((err) => {
+          console.error("[ChatPanel] Retry reload failed:", err)
+          return false
+        })
+        if (reloaded) return
+        action = decideRetryAction({ turnStatus, hasResumableTurn, clientLostStream: false })
       }
 
       if (action === "continue") {
@@ -6368,6 +6383,7 @@ const ChatPanelContent = observer(function ChatPanelContent({
     })()
   }, [
     messages,
+    emptyResponseError,
     sendMessageInternal,
     resumeStreamSingleFlight,
     reloadPersistedMessages,
@@ -6517,14 +6533,20 @@ const ChatPanelContent = observer(function ChatPanelContent({
       if (!currentSessionId || !API_URL) return
       const recoverySessionId = currentSessionId
       const recoveryTurnId = currentTurnIdRef.current
+      renderRecoveryAbortRef.current?.abort()
+      const controller = new AbortController()
+      renderRecoveryAbortRef.current = controller
+      const { signal } = controller
       const probe = () =>
         probeChatTurnStatus({
           url: buildChatTurnUrl(API_URL, projectId, localAgentUrl, recoverySessionId, chatWorkspaceId),
           fetch: expoFetch,
           headers: nativeHeaders ? nativeHeaders() : undefined,
           credentials: Platform.OS === "web" ? "include" : undefined,
+          signal,
         })
       const isCancelled = () =>
+        signal.aborted ||
         userInitiatedStopRef.current ||
         currentSessionIdRef.current !== recoverySessionId ||
         isTransportStreamingRef.current
@@ -6544,7 +6566,7 @@ const ChatPanelContent = observer(function ChatPanelContent({
             return
           }
           if (action === "poll-then-reload") {
-            const polled = await pollUntilTerminal({ probe, isCancelled })
+            const polled = await pollUntilTerminal({ probe, isCancelled, signal })
             if (polled.outcome === "cancelled") return
             if (polled.outcome === "timeout") {
               setMessages((prev) => markStuckToolsInterrupted(prev, "Connection interrupted"))
@@ -6554,6 +6576,7 @@ const ChatPanelContent = observer(function ChatPanelContent({
             }
             turnStatus = polled.turnStatus
           }
+          if (isCancelled()) return
           const reloaded = await reloadPersistedMessages()
           if (!reloaded && !isCancelled()) {
             setErrorDismissed(false)

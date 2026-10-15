@@ -15,8 +15,8 @@
  *     drop, not a real inference failure). The agent is still running and
  *     buffering frames server-side; reattach to the live stream. Nothing was
  *     lost and nothing is re-sent.
- *   - `reload`: the runtime reports the turn `completed` — only the client
- *     lost track of it (e.g. the view died mid-stream). Reload the persisted
+ *   - `reload`: the runtime reports the turn `completed` and the client lost
+ *     track of it (e.g. the view died mid-stream). Reload the persisted
  *     messages; starting a `continue` turn here would bill the user for work
  *     that already finished.
  *   - `continue`: the turn genuinely ended but the last assistant turn left
@@ -44,19 +44,25 @@ export interface RetryTriageInput {
    * thrown away. Compute via {@link lastAssistantHasResumableWork}.
    */
   hasResumableTurn: boolean
+  /**
+   * True when the client never saw the turn finish (no `data-turn-complete`,
+   * a stall, or the view crashed mid-turn). When false the client already
+   * rendered the whole turn, so reloading it would show the same result.
+   */
+  clientLostStream: boolean
 }
 
 /**
  * Decide how the "Retry" button should behave. Pure + total.
  *
  *  - `active`                              -> reconnect (agent still running)
- *  - `completed`                           -> reload (the work is already saved)
- *  - failed/aborted/unknown + resumable    -> continue (preserve work)
- *  - failed/aborted/unknown + nothing      -> resend (last resort)
+ *  - `completed` + client lost the stream  -> reload (the work is already saved)
+ *  - otherwise + resumable                 -> continue (preserve work)
+ *  - otherwise + nothing                   -> resend (last resort)
  */
-export function decideRetryAction({ turnStatus, hasResumableTurn }: RetryTriageInput): RetryAction {
+export function decideRetryAction({ turnStatus, hasResumableTurn, clientLostStream }: RetryTriageInput): RetryAction {
   if (turnStatus === "active") return "reconnect"
-  if (turnStatus === "completed") return "reload"
+  if (turnStatus === "completed" && clientLostStream) return "reload"
   if (hasResumableTurn) return "continue"
   return "resend"
 }

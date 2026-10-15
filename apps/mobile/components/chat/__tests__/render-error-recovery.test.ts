@@ -98,6 +98,20 @@ describe("pollUntilTerminal", () => {
     expect(r).toEqual({ outcome: "cancelled" })
   })
 
+  test("aborting the signal ends a pending backoff sleep right away", async () => {
+    const controller = new AbortController()
+    const started = Date.now()
+    const poll = pollUntilTerminal({
+      probe: async () => "active",
+      isCancelled: () => false,
+      signal: controller.signal,
+    })
+    // The first backoff sleep is 1s; abort well before it would end.
+    setTimeout(() => controller.abort(), 20)
+    expect(await poll).toEqual({ outcome: "cancelled" })
+    expect(Date.now() - started).toBeLessThan(500)
+  })
+
   test("gives up after maxWaitMs while the turn stays active", async () => {
     let t = 0
     const s = scripted(["active"])

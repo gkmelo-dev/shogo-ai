@@ -22,28 +22,43 @@ import { decideRetryAction, lastAssistantHasResumableWork } from "../retry-triag
 
 describe("decideRetryAction", () => {
   test("active turn -> reconnect (agent still running, transport drop)", () => {
-    expect(decideRetryAction({ turnStatus: "active", hasResumableTurn: false })).toBe("reconnect")
-    // 'active' wins even if there is resumable work — reconnecting to the live
-    // stream is strictly better than restarting a continuation.
-    expect(decideRetryAction({ turnStatus: "active", hasResumableTurn: true })).toBe("reconnect")
+    for (const clientLostStream of [true, false]) {
+      expect(decideRetryAction({ turnStatus: "active", hasResumableTurn: false, clientLostStream })).toBe("reconnect")
+      // 'active' wins even if there is resumable work — reconnecting to the live
+      // stream is strictly better than restarting a continuation.
+      expect(decideRetryAction({ turnStatus: "active", hasResumableTurn: true, clientLostStream })).toBe("reconnect")
+    }
   })
 
-  test("completed turn -> reload, never a new (billed) continue or resend turn", () => {
+  test("completed turn the client lost -> reload, never a new (billed) continue or resend turn", () => {
     // #1083: the server finished and saved the turn while the client's view
     // died; Retry used to send `continue: true` for already-finished work.
-    expect(decideRetryAction({ turnStatus: "completed", hasResumableTurn: true })).toBe("reload")
-    expect(decideRetryAction({ turnStatus: "completed", hasResumableTurn: false })).toBe("reload")
+    expect(decideRetryAction({ turnStatus: "completed", hasResumableTurn: true, clientLostStream: true })).toBe("reload")
+    expect(decideRetryAction({ turnStatus: "completed", hasResumableTurn: false, clientLostStream: true })).toBe("reload")
+  })
+
+  test("completed turn the client saw end with an empty response -> resend, not a no-op reload", () => {
+    // Reloading would show the same empty turn and Retry would do nothing.
+    expect(decideRetryAction({ turnStatus: "completed", hasResumableTurn: false, clientLostStream: false })).toBe("resend")
+  })
+
+  test("completed turn the client saw end with partial work -> continue", () => {
+    expect(decideRetryAction({ turnStatus: "completed", hasResumableTurn: true, clientLostStream: false })).toBe("continue")
   })
 
   test("failed/aborted/unknown with resumable work -> continue (preserve work)", () => {
     for (const turnStatus of ["failed", "aborted", "unknown"] as const) {
-      expect(decideRetryAction({ turnStatus, hasResumableTurn: true })).toBe("continue")
+      for (const clientLostStream of [true, false]) {
+        expect(decideRetryAction({ turnStatus, hasResumableTurn: true, clientLostStream })).toBe("continue")
+      }
     }
   })
 
   test("nothing resumable -> resend (last resort)", () => {
     for (const turnStatus of ["failed", "aborted", "unknown"] as const) {
-      expect(decideRetryAction({ turnStatus, hasResumableTurn: false })).toBe("resend")
+      for (const clientLostStream of [true, false]) {
+        expect(decideRetryAction({ turnStatus, hasResumableTurn: false, clientLostStream })).toBe("resend")
+      }
     }
   })
 })
@@ -104,6 +119,7 @@ describe("REGRESSION: retry must never truncate completed work", () => {
     const action = decideRetryAction({
       turnStatus: "failed",
       hasResumableTurn: lastAssistantHasResumableWork(messages),
+      clientLostStream: true,
     })
     // Must NOT be 'resend' — resend was the destructive path that truncated.
     expect(action).toBe("continue")
@@ -113,6 +129,7 @@ describe("REGRESSION: retry must never truncate completed work", () => {
     const action = decideRetryAction({
       turnStatus: "active",
       hasResumableTurn: lastAssistantHasResumableWork(messages),
+      clientLostStream: true,
     })
     expect(action).toBe("reconnect")
   })
@@ -122,6 +139,7 @@ describe("REGRESSION: retry must never truncate completed work", () => {
     decideRetryAction({
       turnStatus: "failed",
       hasResumableTurn: lastAssistantHasResumableWork(messages),
+      clientLostStream: true,
     })
     // Pure functions: the completed assistant + tool-call messages are intact.
     expect(messages).toEqual(snapshot)
