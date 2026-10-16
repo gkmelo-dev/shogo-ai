@@ -529,6 +529,7 @@ export const HomeScreen = observer(function HomeScreen({
         void api.prewarmWorkspaceRuntime(http, workspaceId, {
           sessionId: draft.chatSessionId,
           attachProjectIds: [draft.projectId],
+          source: 'home_draft',
         })
       } else {
         void api.prewarmProjectRuntime(http, draft.projectId)
