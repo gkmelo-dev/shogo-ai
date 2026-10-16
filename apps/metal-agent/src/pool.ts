@@ -64,6 +64,8 @@ import {
 } from './project-data-archive'
 import {
   describeRepoArchive,
+  describeRepoBundles,
+  fetchRepoManifest,
   preserveRepoArchive,
   REPO_MAX_BYTES,
   repoBodySha256,
@@ -72,6 +74,7 @@ import {
   uploadRepoArchiveGuarded,
   type RepoBody,
   type RepoLineage,
+  type RepoManifestRead,
   type RepoWriteOutcome,
 } from './repo-archive'
 import { readSerialTail } from './serial-watcher'
@@ -2988,6 +2991,9 @@ export class MetalWarmPool {
     env: Record<string, string>,
     sourceTimes: Record<string, number | null> = {},
   ): Promise<{ hydrated: boolean; parentEtag?: string; keptPaths?: string[] }> {
+    // A manifest is authoritative once it exists, so the tarball is never read then.
+    const read = await this.repoManifest(projectId)
+    if (read) return this.hydrateRepoFromBundles(projectId, handle, env, read, sourceTimes)
     const ref = await this.repoRef(projectId)
     if (!ref) {
       console.log(`[pool] no durable repo for ${projectId} — guest keeps its seeded .git`)
@@ -3013,6 +3019,64 @@ export class MetalWarmPool {
       )
     }
     await this.applyArchive(handle, env, ref, `${projectId} repo`, REPO_STAGING_DIR)
+    await this.adoptStagedRepo(handle, env, keepPaths)
+    console.log(
+      `[pool] hydrated .git for ${projectId} (${ref.bytes} bytes, etag=${ref.etag ?? 'none'}` +
+        `${keepPaths.length ? `, kept newer source at ${keepPaths.join(', ')}` : ''})`,
+    )
+    return { hydrated: true, parentEtag: ref.etag ?? undefined, keptPaths: keepPaths }
+  }
+
+  /**
+   * Restore from the incremental format: the guest downloads and verifies each
+   * bundle into the staging dir, then adopts it like a tarball. A guest without
+   * the capability is refused, not handed the stale tarball.
+   */
+  private async hydrateRepoFromBundles(
+    projectId: string,
+    handle: FcVmHandle,
+    env: Record<string, string>,
+    read: RepoManifestRead,
+    sourceTimes: Record<string, number | null>,
+  ): Promise<{ hydrated: boolean; parentEtag?: string; keptPaths?: string[] }> {
+    const probe = await this.callRepoHydrated(handle, env, { probe: true })
+    if (probe?.bundles !== true) {
+      throw new Error(
+        `guest cannot restore incremental repo bundles for ${projectId}; refusing to restore a stale tarball`,
+      )
+    }
+    const keepPaths = repoKeepPaths(sourceTimes, read.lastModified)
+    if (keepPaths.length && probe.deadline !== true) {
+      throw new Error(
+        `durable repo is older than the source of ${keepPaths.join(', ')} and this guest cannot keep ` +
+          `paths out of the reset — leaving the tree as hydrated`,
+      )
+    }
+    const bundles = await this.presignRepoBundles(projectId, read.manifest)
+    const totalBytes = bundles.reduce((n, b) => n + b.bytes, 0)
+    const downloadMs = Math.max(this.cfg.hydrateTimeoutMs, this.hydrateBudgetMs(totalBytes))
+    // Staging only: a failure here leaves the live tree exactly as it was.
+    await this.callRepoBundlesHydrate(
+      handle,
+      env,
+      {
+        stagingDir: REPO_STAGING_DIR,
+        manifest: read.manifest,
+        bundles: bundles.map(({ sha256, url }) => ({ sha256, url })),
+        timeoutMs: downloadMs,
+      },
+      downloadMs + this.repoHydratedSlackMs,
+    )
+    await this.adoptStagedRepo(handle, env, keepPaths)
+    console.log(
+      `[pool] hydrated .git for ${projectId} from ${bundles.length} bundle(s) (${totalBytes} bytes, ` +
+        `manifest etag=${read.etag ?? 'none'}${keepPaths.length ? `, kept newer source at ${keepPaths.join(', ')}` : ''})`,
+    )
+    return { hydrated: true, parentEtag: read.etag ?? undefined, keptPaths: keepPaths }
+  }
+
+  /** Swap the staged `.git` in and reset the tree. Past the deadline the guest declines. */
+  private async adoptStagedRepo(handle: FcVmHandle, env: Record<string, string>, keepPaths: string[]): Promise<void> {
     const timeoutMs = this.cfg.hydrateTimeoutMs
     try {
       await this.callRepoHydrated(
@@ -3027,11 +3091,48 @@ export class MetalWarmPool {
         `guest did not answer /pool/repo-hydrated (${err?.message ?? err}); it may still reset the tree`,
       )
     }
-    console.log(
-      `[pool] hydrated .git for ${projectId} (${ref.bytes} bytes, etag=${ref.etag ?? 'none'}` +
-        `${keepPaths.length ? `, kept newer source at ${keepPaths.join(', ')}` : ''})`,
-    )
-    return { hydrated: true, parentEtag: ref.etag ?? undefined, keptPaths: keepPaths }
+  }
+
+  /** Presigned GETs for each bundle of the manifest, in chain order. */
+  protected presignRepoBundles(projectId: string, manifest: RepoManifestRead['manifest']) {
+    return describeRepoBundles(projectId, manifest, this.cfg, PRESIGN_TTL_SEC)
+  }
+
+  /** The project's incremental manifest, or null when it has none. */
+  protected repoManifest(projectId: string): Promise<RepoManifestRead | null> {
+    return fetchRepoManifest(projectId, this.cfg)
+  }
+
+  /**
+   * Lineage stamp for the repo: the manifest's ETag once one exists, else the
+   * tarball's. Snapshot drift compares against this.
+   */
+  protected async repoStampRef(projectId: string): Promise<ArchiveRef | null> {
+    const read = await this.repoManifest(projectId)
+    if (read) return { etag: read.etag, bytes: 0, lastModified: read.lastModified, url: null }
+    return this.repoRef(projectId)
+  }
+
+  /** Stage a restored repo in the guest, verified bundle by bundle. */
+  protected async callRepoBundlesHydrate(
+    handle: FcVmHandle,
+    env: Record<string, string>,
+    body: {
+      stagingDir: string
+      manifest: RepoManifestRead['manifest']
+      bundles: Array<{ sha256: string; url: string }>
+      timeoutMs: number
+    },
+    waitMs: number,
+  ): Promise<void> {
+    const token = env.RUNTIME_AUTH_SECRET
+    const res = await fetch(`${handle.agentUrl}/pool/repo-bundles-hydrate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(waitMs),
+    })
+    if (!res.ok) throw new Error(`/pool/repo-bundles-hydrate failed (${res.status}): ${await res.text()}`)
   }
 
   /**
@@ -3044,7 +3145,7 @@ export class MetalWarmPool {
     env: Record<string, string>,
     body: { probe: true } | { stagingDir: string; timeoutMs?: number; keepPaths?: string[] },
     waitMs: number = this.cfg.hydrateTimeoutMs,
-  ): Promise<{ deadline?: boolean } | null> {
+  ): Promise<{ deadline?: boolean; bundles?: boolean } | null> {
     const token = env.RUNTIME_AUTH_SECRET
     const res = await fetch(`${handle.agentUrl}/pool/repo-hydrated`, {
       method: 'POST',
@@ -3054,7 +3155,7 @@ export class MetalWarmPool {
     })
     if (res.status === 404) return null
     if (!res.ok) throw new RepoHydrateRefusedError(res.status, await res.text())
-    return ((await res.json().catch(() => ({}))) ?? {}) as { deadline?: boolean }
+    return ((await res.json().catch(() => ({}))) ?? {}) as { deadline?: boolean; bundles?: boolean }
   }
 
   protected repoRef(projectId: string): Promise<ArchiveRef | null> {
@@ -4084,7 +4185,7 @@ export class MetalWarmPool {
     type Check = { kind: StaleReason; what: string; stamped?: string; memberId?: string; ref: () => Promise<ArchiveRef | null> }
     const checks: Check[] = [
       { kind: 'source', what: 'source', stamped: stamps.backupEtag, ref: () => this.sourceRef(publishedSourceId(projectId) ?? projectId) },
-      { kind: 'repo', what: 'repo', stamped: stamps.repoEtag, ref: () => this.repoRef(projectId) },
+      { kind: 'repo', what: 'repo', stamped: stamps.repoEtag, ref: () => this.repoStampRef(projectId) },
       { kind: 'data', what: 'data', stamped: stamps.dataEtag, ref: () => this.projectDataRef(projectId) },
       { kind: 'home', what: 'home', stamped: stamps.homeEtag, ref: () => this.homeStateRef(projectId) },
       ...Object.entries(stamps.memberDataEtags ?? {}).map(([memberId, etag]): Check => ({

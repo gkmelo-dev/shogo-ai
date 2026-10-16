@@ -24,6 +24,12 @@
  */
 
 import { describeObject, type ArchiveRef } from './archive-ref'
+import {
+  bundleObjectName,
+  parseRepoManifest,
+  type RepoManifest,
+  type RepoManifestBundle,
+} from '../../../packages/shared-runtime/src/repo-bundles'
 import type { MetalConfig } from './config'
 import {
   type DataLineage,
@@ -120,11 +126,72 @@ export async function describeRepoArchive(
   return describeObject(s3.client, repoArchiveKey(projectId), expiresInSec)
 }
 
+/**
+ * Incremental repo format (see `@shogo/shared-runtime/repo-bundles`). Once a
+ * project has a manifest it is the authority for the repo; the tarball above
+ * becomes legacy and is never read in preference to it.
+ */
+export function repoManifestKey(projectId: string): string {
+  return `${projectId}/repo/manifest.json`
+}
+
+export interface RepoManifestRead {
+  manifest: RepoManifest
+  etag: string | null
+  lastModified: number | null
+}
+
+/**
+ * The project's manifest, or null when it has none. A manifest that exists but
+ * does not parse throws: falling back to the tarball would restore a stale repo.
+ */
+export async function fetchRepoManifest(projectId: string, cfg: MetalConfig): Promise<RepoManifestRead | null> {
+  const s3 = workspaceS3(cfg)
+  if (!s3) return null
+  const file = s3.client.file(repoManifestKey(projectId))
+  if (!(await file.exists())) return null
+  const meta = await statMeta(file)
+  const text = await file.text()
+  const manifest = parseRepoManifest(JSON.parse(text))
+  return { manifest, etag: meta.etag, lastModified: await lastModifiedOf(file) }
+}
+
+async function lastModifiedOf(file: import('bun').S3File): Promise<number | null> {
+  try {
+    const st = await file.stat()
+    const ms = st.lastModified ? new Date(st.lastModified).getTime() : NaN
+    return Number.isFinite(ms) ? ms : null
+  } catch {
+    return null
+  }
+}
+
+/** Presigned GETs for every bundle in the manifest, in chain order. */
+export async function describeRepoBundles(
+  projectId: string,
+  manifest: RepoManifest,
+  cfg: MetalConfig,
+  expiresInSec: number,
+): Promise<Array<RepoManifestBundle & { url: string }>> {
+  const s3 = workspaceS3(cfg)
+  if (!s3) throw new Error('object storage is not configured; cannot presign repo bundles')
+  const out: Array<RepoManifestBundle & { url: string }> = []
+  for (const entry of manifest.bundles) {
+    const ref = await describeObject(s3.client, `${projectId}/${bundleObjectName(entry.sha256)}`, expiresInSec)
+    if (!ref?.url) throw new Error(`repo bundle ${entry.sha256} for ${projectId} is missing from the store`)
+    out.push({ ...entry, url: ref.url })
+  }
+  return out
+}
+
 /** ETag and last-write time of the durable repo, or null when there is none. */
 export async function statRepoArchive(
   projectId: string,
   cfg: MetalConfig,
 ): Promise<{ etag: string | null; lastModified: number | null } | null> {
+  // The manifest, once it exists, is the repo's lineage object.
+  const manifest = await fetchRepoManifest(projectId, cfg)
+  if (manifest) return { etag: manifest.etag, lastModified: manifest.lastModified }
   const s3 = workspaceS3(cfg)
   if (!s3) return null
   const file = s3.client.file(repoArchiveKey(projectId))

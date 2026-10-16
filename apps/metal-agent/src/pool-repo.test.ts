@@ -22,6 +22,7 @@ import {
   type RepoExport,
 } from './pool'
 import type { RepoLineage, RepoWriteOutcome } from './repo-archive'
+import { parseRepoManifest } from '../../../packages/shared-runtime/src/repo-bundles'
 import type { FirecrackerVMManager } from './firecracker-vm-manager'
 import type { SnapshotStore } from './snapshot-store'
 
@@ -324,6 +325,88 @@ describe('pool host-mediated repo persist', () => {
           new Response('{"error":"reset failed"}', { status: path === '/pool/repo-hydrated' && body?.stagingDir ? 500 : 200 }),
         ),
       ).rejects.toThrow('/pool/repo-hydrated failed (500)')
+    })
+  })
+
+  describe('cold-boot hydrate from the incremental manifest', () => {
+    const manifest = parseRepoManifest({
+      v: 1,
+      head: { ref: 'refs/heads/main' },
+      refs: { 'refs/heads/main': 'a'.repeat(40) },
+      config: '[core]\n',
+      rootCommitAt: null,
+      bundles: [{ sha256: 'b'.repeat(64), bytes: 9, kind: 'base' }],
+    })
+    const read = { manifest, etag: '"m1"', lastModified: null }
+    const bundleRefs = [{ ...manifest.bundles[0], url: 'https://store/repo/bundles/b.bundle' }]
+
+    function hydrateFromManifest(pool: TestPool, guest: (path: string, body: any) => Response) {
+      const seen: Array<{ path: string; body: any }> = []
+      const realFetch = globalThis.fetch
+      globalThis.fetch = mock((url: string, init?: RequestInit) => {
+        const path = new URL(url).pathname
+        const body = init?.body && typeof init.body === 'string' ? JSON.parse(init.body) : null
+        seen.push({ path, body })
+        return Promise.resolve(guest(path, body))
+      }) as any
+      ;(pool as any).repoManifest = async () => read
+      ;(pool as any).presignRepoBundles = async () => bundleRefs
+      ;(pool as any).repoRef = async () => {
+        throw new Error('the legacy tarball must not be read when a manifest exists')
+      }
+      return { seen, restore: () => { globalThis.fetch = realFetch } }
+    }
+
+    test('stages from the bundles, adopts them, and keeps the manifest etag as lineage', async () => {
+      const pool = makePool(dir)
+      const h = hydrateFromManifest(pool, (path) =>
+        Response.json(path === '/pool/repo-hydrated' ? { ok: true, deadline: true, bundles: true } : { ok: true }),
+      )
+      try {
+        const r = await (pool as any).hydrateRepo('p1', HANDLE, { RUNTIME_AUTH_SECRET: 'tok' })
+        expect(r).toEqual({ hydrated: true, parentEtag: '"m1"', keptPaths: [] })
+        expect(h.seen.map((s) => s.path)).toEqual(['/pool/repo-hydrated', '/pool/repo-bundles-hydrate', '/pool/repo-hydrated'])
+        expect(h.seen[1].body.bundles).toEqual([{ sha256: 'b'.repeat(64), url: 'https://store/repo/bundles/b.bundle' }])
+        expect(h.seen[1].body.manifest.refs).toEqual({ 'refs/heads/main': 'a'.repeat(40) })
+        expect(h.seen[1].body.stagingDir).toBe(REPO_STAGING_DIR)
+        expect(h.seen[2].body).toEqual({ stagingDir: REPO_STAGING_DIR, timeoutMs: config.hydrateTimeoutMs })
+      } finally {
+        h.restore()
+      }
+    })
+
+    test('refuses a guest without bundle support rather than restoring the stale tarball', async () => {
+      const pool = makePool(dir)
+      const h = hydrateFromManifest(pool, () => Response.json({ ok: true, supported: true, deadline: true }))
+      try {
+        await expect((pool as any).hydrateRepo('p1', HANDLE, {})).rejects.toThrow(/refusing to restore a stale tarball/)
+        expect(h.seen.map((s) => s.path)).toEqual(['/pool/repo-hydrated'])
+      } finally {
+        h.restore()
+      }
+    })
+
+    test('a bundle the guest cannot verify stops before the live tree is touched', async () => {
+      const pool = makePool(dir)
+      const h = hydrateFromManifest(pool, (path) =>
+        path === '/pool/repo-bundles-hydrate'
+          ? Response.json({ error: 'bundle failed its checksum' }, { status: 500 })
+          : Response.json({ ok: true, deadline: true, bundles: true }),
+      )
+      try {
+        await expect((pool as any).hydrateRepo('p1', HANDLE, {})).rejects.toThrow(/repo-bundles-hydrate failed \(500\)/)
+        expect(h.seen.map((s) => s.path)).toEqual(['/pool/repo-hydrated', '/pool/repo-bundles-hydrate'])
+      } finally {
+        h.restore()
+      }
+    })
+
+    test('drift stamps the manifest etag once a manifest exists', async () => {
+      const pool = makePool(dir)
+      ;(pool as any).repoManifest = async () => read
+      ;(pool as any).repoRef = async () => ({ etag: '"tar"', bytes: 1 })
+      const ref = await (pool as any).repoStampRef('p1')
+      expect(ref.etag).toBe('"m1"')
     })
   })
 
