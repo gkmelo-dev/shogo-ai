@@ -1328,8 +1328,19 @@ export async function listRewarmCandidatesFromDb(sinceMs: number, maxRuntimes: n
 
   const out = await projectCandidates(projectActivity)
   out.push(...workspaceCandidates(workspaceSessions))
-  const local = await homeRegionOnly(out)
+  const local = await withoutE2eAccounts(await homeRegionOnly(out))
   return local.sort((a, b) => b.lastActiveAt - a.lastActiveAt).slice(0, Math.max(0, maxRuntimes))
+}
+
+/**
+ * Drop runtimes whose workspace holds only e2e test accounts. Each hosted e2e
+ * run creates dozens of them, and warming them crowded real users out of every
+ * staging pre-warm.
+ */
+async function withoutE2eAccounts(out: RewarmCandidate[]): Promise<RewarmCandidate[]> {
+  const { e2eOnlyWorkspaceIds } = await import('../services/e2e-test-accounts')
+  const e2eOnly = await e2eOnlyWorkspaceIds(out.map((c) => c.workspaceId))
+  return e2eOnly.size ? out.filter((c) => !e2eOnly.has(c.workspaceId)) : out
 }
 
 /**
