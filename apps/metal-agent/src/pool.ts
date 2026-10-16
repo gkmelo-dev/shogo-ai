@@ -67,16 +67,28 @@ import {
   describeRepoBundles,
   fetchRepoManifest,
   preserveRepoArchive,
+  preserveRepoManifest,
+  REPO_BUNDLE_GRACE_MS,
   REPO_MAX_BYTES,
   repoBodySha256,
   repoBodySize,
   statRepoArchive,
+  sweepRepoBundles,
   uploadRepoArchiveGuarded,
+  uploadRepoBundle,
+  uploadRepoManifestGuarded,
   type RepoBody,
   type RepoLineage,
   type RepoManifestRead,
   type RepoWriteOutcome,
 } from './repo-archive'
+import {
+  needsCompaction,
+  nextBundleChain,
+  parseRepoManifest,
+  type RepoManifest,
+  type RepoManifestBundle,
+} from '../../../packages/shared-runtime/src/repo-bundles'
 import { readSerialTail } from './serial-watcher'
 import { stagedRootfsPath } from './self-update'
 import type { ArchiveRef } from './archive-ref'
@@ -96,6 +108,36 @@ const PRESIGN_TTL_SEC = 30 * 60
  * swaps it in. Under `.shogo/local`, which the guest's committer never stages.
  */
 export const REPO_STAGING_DIR = '.shogo/local/repo-staging'
+
+/**
+ * Writer gate for the incremental repo format. Off by default. It only decides
+ * which projects migrate: once a project has a manifest it stays on the
+ * manifest whatever the flag says.
+ */
+export function repoBundlesEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.METAL_REPO_BUNDLES === 'on'
+}
+
+/** Outcome of one bundle-format persist. `unchanged` means durable already. */
+type RepoPersist = 'written' | 'unchanged' | 'quarantined' | 'lost' | 'empty'
+
+/** What `/pool/export-repo-bundle` answers with. `bundle` is null when nothing new needs sending. */
+interface RepoBundleExport {
+  bundle: RepoManifestBundle | null
+  head: RepoManifest['head']
+  refs: Record<string, string>
+  config: string
+  rootCommitAt: number | null
+}
+
+/** How often a project's unreferenced bundles are swept, at most. */
+const REPO_BUNDLE_SWEEP_INTERVAL_MS = 6 * 60 * 60 * 1000
+
+/** Same ref state, bundles and config: writing it again would change nothing. */
+function sameManifestState(a: RepoManifest, b: RepoManifest): boolean {
+  const canon = (m: RepoManifest) => JSON.stringify([m.head, m.refs, m.config, m.rootCommitAt, m.bundles])
+  return canon(a) === canon(b)
+}
 
 /**
  * How long past its own deadline the host waits on `/pool/repo-hydrated`. The
@@ -2837,6 +2879,11 @@ export class MetalWarmPool {
       return false
     }
     const head = a.repoHeadSha
+    const bundled = await this.storeRepoBundles(a)
+    if (bundled !== null) {
+      if (bundled !== 'lost' && head && a.repoHeadSha === head) a.repoExportedHeadSha = head
+      return bundled === 'written'
+    }
     let exported: RepoExport | null
     try {
       exported = await this.fetchRepoExport(a.handle, a.runtimeToken)
@@ -2930,6 +2977,21 @@ export class MetalWarmPool {
    * superseding with it discards the durable history it never contained.
    */
   private async promoteUnlinkedRepo(a: AssignedVm, bytes: RepoBody, rootCommitAt: number | null): Promise<boolean> {
+    return this.promoteUnlinkedWith(a, rootCommitAt, {
+      preserve: () => this.preserveDurableRepo(a.projectId),
+      write: (lineage) => this.uploadRepoGuarded(a.projectId, bytes, { lineage }),
+    })
+  }
+
+  /** Same supersede rules for either format; `io` supplies the store operations. */
+  private async promoteUnlinkedWith(
+    a: AssignedVm,
+    rootCommitAt: number | null,
+    io: {
+      preserve: () => Promise<string | null>
+      write: (lineage: RepoLineage) => Promise<RepoWriteOutcome>
+    },
+  ): Promise<boolean> {
     const since = a.stateSince ?? a.assignedAt
     if (rootCommitAt === null || rootCommitAt >= since - REPO_BORN_ON_BOOT_SLACK_MS) {
       console.warn(
@@ -2948,11 +3010,9 @@ export class MetalWarmPool {
     }
     if (!current?.etag || current.lastModified === null || current.lastModified >= since) return false
 
-    const preservedKey = await this.preserveDurableRepo(a.projectId).catch(() => null)
+    const preservedKey = await io.preserve().catch(() => null)
     if (!preservedKey) return false
-    const outcome = await this.uploadRepoGuarded(a.projectId, bytes, {
-      lineage: { kind: 'descends', etag: current.etag },
-    })
+    const outcome = await io.write({ kind: 'descends', etag: current.etag })
     if (outcome.status !== 'written' && outcome.status !== 'created') return false
 
     metrics.inc(M.repoPromoted)
@@ -2964,6 +3024,159 @@ export class MetalWarmPool {
         `${new Date(since).toISOString()}); previous archive kept at ${preservedKey}`,
     )
     return true
+  }
+
+  /**
+   * The incremental writer. Returns null when the legacy tarball path should
+   * run instead: the flag is off and no manifest exists, or the guest predates
+   * `/pool/export-repo-bundle`. A project with a manifest never falls back.
+   */
+  private async storeRepoBundles(a: AssignedVm): Promise<RepoPersist | null> {
+    const current = await this.repoManifest(a.projectId)
+    if (!current && !repoBundlesEnabled()) return null
+    // Past the compaction threshold the export is a full base, which restarts the chain.
+    const compact = !!current && needsCompaction(current.manifest.bundles)
+    const since = current && !compact ? Object.values(current.manifest.refs) : null
+    const exported = await this.exportRepoBundle(a, since)
+    if (!exported) {
+      if (current) {
+        throw new Error(`guest cannot export incremental repo for ${a.projectId}; refusing the tarball fallback`)
+      }
+      return null
+    }
+    if (exported.bundle) await this.publishRepoBundle(a, exported.bundle)
+    if (compact && exported.bundle?.kind === 'base') metrics.inc(M.repoBundleCompactions)
+    const bundles = nextBundleChain(current?.manifest.bundles ?? null, exported.bundle)
+    if (bundles.length === 0) return 'empty'
+    const next = parseRepoManifest({
+      v: 1,
+      head: exported.head,
+      refs: exported.refs,
+      config: exported.config,
+      rootCommitAt: exported.rootCommitAt,
+      bundles,
+    })
+    if (current && sameManifestState(current.manifest, next)) return 'unchanged'
+    return this.writeRepoManifest(a, next)
+  }
+
+  /**
+   * Ask the guest for the next bundle. `since` holds the tips the manifest
+   * records; null asks for a full base.
+   */
+  protected async exportRepoBundle(a: AssignedVm, since: string[] | null): Promise<RepoBundleExport | null> {
+    const res = await fetch(`${a.handle.agentUrl}/pool/export-repo-bundle`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...(a.runtimeToken ? { Authorization: `Bearer ${a.runtimeToken}` } : {}) },
+      body: JSON.stringify(since ? { since } : { full: true }),
+      signal: AbortSignal.timeout(this.cfg.hydrateTimeoutMs),
+    })
+    if (res.status === 404) return null
+    if (!res.ok) throw new Error(`/pool/export-repo-bundle failed (${res.status}): ${await res.text()}`)
+    return (await res.json()) as RepoBundleExport
+  }
+
+  /**
+   * Fetch one bundle from the guest, check it against what the export promised,
+   * and store it. It goes up before the manifest that references it, so a
+   * failed manifest write leaves only an unreferenced bundle for GC.
+   */
+  private async publishRepoBundle(a: AssignedVm, entry: RepoManifestBundle): Promise<void> {
+    const path = this.exportSpoolPath(a.handle.id, 'bundle')
+    try {
+      const res = await fetch(`${a.handle.agentUrl}/pool/export-repo-bundle/${entry.sha256}`, {
+        headers: a.runtimeToken ? { Authorization: `Bearer ${a.runtimeToken}` } : {},
+        signal: AbortSignal.timeout(this.cfg.hydrateTimeoutMs),
+      })
+      if (!res.ok) throw new Error(`bundle ${entry.sha256} download failed (${res.status})`)
+      const spooled = await spoolResponse(res, path, REPO_MAX_BYTES)
+      if (spooled.sha256 !== entry.sha256 || spooled.size !== entry.bytes) {
+        throw new Error(`bundle ${entry.sha256} did not match its export (${spooled.size} bytes)`)
+      }
+      await this.uploadRepoBundleGuarded(a.projectId, entry, Bun.file(path))
+      metrics.inc(M.repoBundleBytes, entry.bytes)
+      if (entry.kind === 'base') metrics.inc(M.repoBundleFull)
+    } finally {
+      rmSync(path, { force: true })
+    }
+  }
+
+  protected uploadRepoBundleGuarded(projectId: string, entry: RepoManifestBundle, body: ReturnType<typeof Bun.file>) {
+    return uploadRepoBundle(projectId, entry, body, this.cfg)
+  }
+
+  private async writeRepoManifest(a: AssignedVm, manifest: RepoManifest): Promise<RepoPersist> {
+    const outcome = await this.uploadManifestGuarded(a.projectId, manifest, {
+      lineage: this.repoLineageOf(a),
+      preserveOnRefusal: true,
+    })
+    switch (outcome.status) {
+      case 'created':
+      case 'written':
+        a.repoParentEtag = outcome.etag ?? a.repoParentEtag
+        this.writeLive(a)
+        console.log(
+          `[pool] saved repo manifest for ${a.projectId} (${manifest.bundles.length} bundle(s), ${outcome.status}, etag=${outcome.etag ?? 'none'})`,
+        )
+        this.scheduleRepoBundleSweep(a.projectId)
+        return 'written'
+      case 'conflict':
+        if (!a.repoParentEtag && !a.repoLinked && (await this.promoteUnlinkedManifest(a, manifest))) {
+          return 'written'
+        }
+        metrics.inc(M.repoManifestConflict)
+        console.error(
+          `[pool] REFUSED to overwrite repo manifest for ${a.projectId} — lineage ` +
+            `(etag=${a.repoParentEtag ?? 'none'}) does not match. Quarantined at ${outcome.quarantineKey}.`,
+        )
+        return outcome.quarantineKey ? 'quarantined' : 'lost'
+      case 'refused':
+        metrics.inc(M.repoRefused)
+        return outcome.quarantineKey ? 'quarantined' : 'lost'
+      case 'too-large':
+        metrics.inc(M.repoTooLarge)
+        return 'lost'
+      case 'skipped':
+        return 'lost'
+    }
+    return 'lost'
+  }
+
+  /**
+   * Sweep a project's unreferenced bundles, at most once per interval. It runs
+   * in the background and never blocks an export. Retired bundles are removed
+   * only after the grace period, so the timing is not critical.
+   */
+  protected scheduleRepoBundleSweep(projectId: string, now = Date.now()): void {
+    if (now - (this.repoBundleSweptAt.get(projectId) ?? 0) < REPO_BUNDLE_SWEEP_INTERVAL_MS) return
+    this.repoBundleSweptAt.set(projectId, now)
+    sweepRepoBundles(projectId, this.cfg, now, REPO_BUNDLE_GRACE_MS)
+      .then((r) => {
+        if (r?.deleted) metrics.inc(M.repoBundlesGced, r.deleted)
+      })
+      .catch((err: any) => console.warn(`[pool] repo bundle sweep failed for ${projectId}:`, err?.message ?? err))
+  }
+
+  /** Last sweep per project, so a busy writer does not list the bucket on every save. */
+  private repoBundleSweptAt = new Map<string, number>()
+
+  private promoteUnlinkedManifest(a: AssignedVm, manifest: RepoManifest): Promise<boolean> {
+    return this.promoteUnlinkedWith(a, manifest.rootCommitAt, {
+      preserve: () => this.preserveDurableManifest(a.projectId),
+      write: (lineage) => this.uploadManifestGuarded(a.projectId, manifest, { lineage }),
+    })
+  }
+
+  protected uploadManifestGuarded(
+    projectId: string,
+    manifest: RepoManifest,
+    opts: { lineage: RepoLineage; preserveOnRefusal?: boolean },
+  ): Promise<RepoWriteOutcome> {
+    return uploadRepoManifestGuarded(projectId, manifest, opts, this.cfg)
+  }
+
+  protected preserveDurableManifest(projectId: string): Promise<string | null> {
+    return preserveRepoManifest(projectId, this.cfg)
   }
 
   protected statDurableRepo(projectId: string): Promise<{ etag: string | null; lastModified: number | null } | null> {
@@ -3109,7 +3322,17 @@ export class MetalWarmPool {
    */
   protected async repoStampRef(projectId: string): Promise<ArchiveRef | null> {
     const read = await this.repoManifest(projectId)
-    if (read) return { etag: read.etag, bytes: 0, lastModified: read.lastModified, url: null }
+    if (read) {
+      return {
+        etag: read.etag,
+        bytes: 0,
+        lastModified: read.lastModified,
+        url: null,
+        load: async () => {
+          throw new Error('the repo manifest is a lineage stamp, not restorable bytes')
+        },
+      }
+    }
     return this.repoRef(projectId)
   }
 
@@ -5775,6 +5998,11 @@ export class MetalWarmPool {
       let out: 'written' | 'quarantined' | 'lost' | 'empty' | undefined
       const exportRepo = () =>
         this.repoFlight.run(a.projectId, async () => {
+          const bundled = await this.storeRepoBundles(a)
+          if (bundled !== null) {
+            out = bundled === 'unchanged' ? 'written' : bundled
+            return out === 'written'
+          }
           const exported = await this.fetchRepoExport(a.handle, a.runtimeToken)
           try {
             out = exported ? await this.storeRepoBytes(a, exported.bytes, exported.rootCommitAt) : 'empty'

@@ -144,6 +144,39 @@ export function parseRepoManifest(raw: unknown): RepoManifest {
   }
 }
 
+/** Start a fresh full base once the chain grows past this many bundles. */
+export const REPO_COMPACT_MAX_BUNDLES = 50
+
+/** ...or once the incrementals together exceed this share of the base. */
+export const REPO_COMPACT_INCR_RATIO = 0.25
+
+/**
+ * Whether the next export should be a full base. Restores replay the whole
+ * chain, so a long chain makes every cold boot slower and more fragile. A
+ * compaction costs one base upload and retires the old chain for GC.
+ */
+export function needsCompaction(chain: RepoManifestBundle[]): boolean {
+  if (chain.length <= 1) return false
+  if (chain.length > REPO_COMPACT_MAX_BUNDLES) return true
+  const base = chain[0].bytes
+  const incr = chain.slice(1).reduce((n, b) => n + b.bytes, 0)
+  return base > 0 ? incr > base * REPO_COMPACT_INCR_RATIO : incr > 0
+}
+
+/**
+ * The chain a new manifest records after one export. A base restarts it (full
+ * export, or history rewritten under the old tips). An incremental extends the
+ * previous chain. No bundle means the chain is unchanged, because only refs moved.
+ */
+export function nextBundleChain(
+  previous: RepoManifestBundle[] | null,
+  exported: RepoManifestBundle | null,
+): RepoManifestBundle[] {
+  if (exported?.kind === 'base') return [exported]
+  if (exported) return [...(previous ?? []), exported]
+  return previous ?? []
+}
+
 // ---------------------------------------------------------------------------
 // git plumbing
 // ---------------------------------------------------------------------------

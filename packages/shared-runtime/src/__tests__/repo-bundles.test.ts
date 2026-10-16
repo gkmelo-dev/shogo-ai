@@ -15,6 +15,8 @@ import { randomBytes } from 'node:crypto'
 import {
   buildRepoBundle,
   materializeRepoFromBundles,
+  needsCompaction,
+  nextBundleChain,
   parseRepoManifest,
   readRepoSnapshotFields,
   RepoBundleError,
@@ -295,6 +297,47 @@ describe('repo bundles: fail closed', () => {
     })
     await expect(restore(forged, objects)).rejects.toThrow(RepoBundleError)
     expect(existsSync(join(root, 'nope'))).toBe(false)
+  })
+})
+
+describe('repo bundles: chain bookkeeping', () => {
+  const base = { sha256: 'a'.repeat(64), bytes: 10, kind: 'base' as const }
+  const incr = { sha256: 'c'.repeat(64), bytes: 2, kind: 'incr' as const }
+
+  test('a base restarts the chain', () => {
+    expect(nextBundleChain([base, incr], base)).toEqual([base])
+  })
+
+  test('an incremental extends the chain', () => {
+    expect(nextBundleChain([base], incr)).toEqual([base, incr])
+  })
+
+  test('no new bundle keeps the chain as it was', () => {
+    expect(nextBundleChain([base, incr], null)).toEqual([base, incr])
+    expect(nextBundleChain(null, null)).toEqual([])
+  })
+})
+
+describe('repo bundles: compaction rule', () => {
+  const b = (kind: 'base' | 'incr', bytes: number) => ({ sha256: 'd'.repeat(64), bytes, kind })
+
+  test('a lone base never compacts', () => {
+    expect(needsCompaction([b('base', 1_000_000)])).toBe(false)
+  })
+
+  test('small incrementals keep appending', () => {
+    expect(needsCompaction([b('base', 1_000_000), b('incr', 100_000), b('incr', 100_000)])).toBe(false)
+  })
+
+  test('incrementals beyond a quarter of the base trigger a full base', () => {
+    expect(needsCompaction([b('base', 1_000_000), b('incr', 200_000), b('incr', 100_000)])).toBe(true)
+  })
+
+  test('more than fifty bundles trigger a full base regardless of size', () => {
+    const chain = [b('base', 1e9), ...Array.from({ length: 49 }, () => b('incr', 1))]
+    expect(chain).toHaveLength(50)
+    expect(needsCompaction(chain)).toBe(false)
+    expect(needsCompaction([...chain, b('incr', 1)])).toBe(true)
   })
 })
 
