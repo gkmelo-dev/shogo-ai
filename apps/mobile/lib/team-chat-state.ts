@@ -364,7 +364,7 @@ export function mentionCandidates(
     { kind: 'special', display: 'here', token: '<!here>', subtitle: 'Notify everyone online' },
     { kind: 'special', display: 'channel', token: '<!channel>', subtitle: 'Notify everyone in this channel' },
   ]
-  return [...agents, ...people, ...groups, ...special]
+  return [...people, ...groups, ...special, ...agents]
 }
 
 /** The `@query` being typed at the cursor, if any. */
@@ -375,6 +375,20 @@ export function activeMentionQuery(text: string, cursor: number): { start: numbe
   return { start: before.length - match[2].length - 1, query: match[2] }
 }
 
+/** Primary sort: people first, then groups, then @here/@channel, then agents and bots. */
+function kindRank(c: MentionCandidate): number {
+  switch (c.kind) {
+    case 'user':
+      return 0
+    case 'group':
+      return 1
+    case 'special':
+      return 2
+    case 'agent':
+      return 3
+  }
+}
+
 /** Within equal relevance, a person not in the channel sorts after everyone else. */
 function notInChannelRank(c: MentionCandidate): number {
   return c.inChannel === false ? 1 : 0
@@ -382,7 +396,11 @@ function notInChannelRank(c: MentionCandidate): number {
 
 export function filterCandidates(candidates: MentionCandidate[], query: string, limit = 8): MentionCandidate[] {
   const q = query.toLowerCase()
-  if (!q) return [...candidates].sort((a, b) => notInChannelRank(a) - notInChannelRank(b)).slice(0, limit)
+  if (!q) {
+    return [...candidates]
+      .sort((a, b) => kindRank(a) - kindRank(b) || notInChannelRank(a) - notInChannelRank(b))
+      .slice(0, limit)
+  }
   const scored = candidates
     .map((c) => {
       const name = c.display.toLowerCase()
@@ -390,7 +408,10 @@ export function filterCandidates(candidates: MentionCandidate[], query: string, 
       return { c, score }
     })
     .filter((x) => x.score >= 0)
-    .sort((a, b) => a.score - b.score || notInChannelRank(a.c) - notInChannelRank(b.c))
+    .sort(
+      (a, b) =>
+        kindRank(a.c) - kindRank(b.c) || a.score - b.score || notInChannelRank(a.c) - notInChannelRank(b.c),
+    )
   return scored.slice(0, limit).map((x) => x.c)
 }
 
