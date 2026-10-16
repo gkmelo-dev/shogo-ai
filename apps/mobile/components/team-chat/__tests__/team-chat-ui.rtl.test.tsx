@@ -437,6 +437,9 @@ describe('MessageRow', () => {
     // Stop sits in the header beside the AGENT tag, not beside the streamed work.
     const stop = screen.getByLabelText('Stop agent')
     expect(stop.parentElement?.textContent).toContain('AGENT')
+    // Open session sits beside Stop; the live status itself is not pressable.
+    expect(screen.getByLabelText('Open the session this agent is working in').parentElement).toBe(stop.parentElement)
+    expect(shim('group')!.closest('[aria-label="Open the session this agent is working in"]')).toBeNull()
     fireEvent.click(stop)
     expect(h.onStopAgent).toHaveBeenCalled()
     expect(screen.queryByText('Open full session')).toBeNull()
@@ -448,7 +451,7 @@ describe('MessageRow', () => {
     expect(h.onOpenSession).toHaveBeenCalled()
   })
 
-  test('a grouped running reply has no header, so its Stop sits on a line of its own', () => {
+  test('a grouped running reply has no header, so Open session and Stop sit on a line of their own', () => {
     const h = handlers()
     const running = message({
       id: 'm5', authorType: 'agent', author: null, authorUserId: null,
@@ -459,9 +462,21 @@ describe('MessageRow', () => {
       <MessageRow message={running} grouped me="u-me" names={names} canManage={false} inThread streaming={{ text: '', tool: 'exec' }} {...h} />,
     )
     const stop = screen.getByLabelText('Stop agent')
-    expect(stop.parentElement?.textContent).toBe('Stop')
+    expect(stop.parentElement?.textContent).toBe('Open sessionStop')
     fireEvent.click(stop)
     expect(h.onStopAgent).toHaveBeenCalled()
+  })
+
+  test('a running reply without a session offers Stop but no Open session', () => {
+    const h = handlers()
+    const running = message({
+      id: 'm6', authorType: 'agent', author: null, authorUserId: null,
+      authorAgent: { projectId: 'proj-1', name: 'Billing Bot' },
+      text: '', agentStatus: 'running', agentSessionId: null, threadRootId: 'm1',
+    })
+    render(<MessageRow message={running} grouped={false} me="u-me" names={names} canManage={false} inThread {...h} />)
+    expect(screen.getByLabelText('Stop agent')).toBeTruthy()
+    expect(screen.queryByLabelText('Open the session this agent is working in')).toBeNull()
   })
 
   test('an agent reply uses the project chat markdown renderer', () => {
@@ -1163,7 +1178,7 @@ describe('agent work', () => {
     workLogResult = async () => ({ parts: [], startedAt: 0, completedAt: 1, toolCalls: 0 })
   })
 
-  test('the running status opens the session the agent is working in', () => {
+  test('Open session in the header opens the session the agent is working in', () => {
     const h = handlers()
     const running = { ...reply(), agentStatus: 'running', text: '' }
     render(<MessageRow message={running} grouped={false} me="u-me" names={names} canManage={false} {...h} />)
@@ -1171,7 +1186,7 @@ describe('agent work', () => {
     expect(h.onOpenSession).toHaveBeenCalledWith(expect.objectContaining({ id: 'm1', agentSessionId: 's1' }))
   })
 
-  test('the workspace agent (no project) opens its session from the running status too', () => {
+  test('the workspace agent (no project) opens its session from Open session too', () => {
     const h = handlers()
     const running = { ...reply(), authorAgent: { projectId: null, name: 'Workspace agent' }, agentStatus: 'running', text: '' }
     render(<MessageRow message={running} grouped={false} me="u-me" names={names} canManage={false} {...h} />)
