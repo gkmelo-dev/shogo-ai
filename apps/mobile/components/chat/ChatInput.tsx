@@ -153,6 +153,7 @@ import {
   MAX_FILES,
   useComposerAttachments,
 } from "../../lib/composer-attachments";
+import { formatClipDuration } from "../../lib/voice-note";
 import {
   ComposerPlusTrigger,
   ComposerSendButton,
@@ -208,6 +209,12 @@ export interface FileAttachment {
   dataUrl: string;
   name: string;
   type: string;
+  /** Voice notes recorded on a phone: a local file, uploaded without base64. */
+  uri?: string;
+  /** Voice notes: clip length in ms. */
+  durationMs?: number;
+  /** Voice notes: waveform levels 0-100, space separated. */
+  peaks?: string;
 }
 
 /**
@@ -296,6 +303,8 @@ export interface ChatInputHandle {
   submit: () => void;
   /** Stage files (web `File`s, e.g. dropped elsewhere on the screen). */
   addFiles: (files: File[]) => void;
+  /** Stage an attachment built by the caller, e.g. a recorded voice note. */
+  addAttachment: (attachment: FileAttachment & { size: number }) => void;
 }
 
 /** Lightweight sibling-project shape the composer needs for the "@" menu. */
@@ -587,6 +596,8 @@ export interface ChatInputProps {
   plusMenuExtras?: ReactNode;
   /** Replaces dictation on the empty-composer mic button. */
   onVoiceStart?: () => void | Promise<void>;
+  /** What the mic announces when `onVoiceStart` is set. */
+  voiceStartLabel?: string;
   /** Rotating "Ask Shogo to …" placeholder while the input is empty. */
   typingPlaceholder?: boolean;
   /** Shows a spinner on send and locks the input. */
@@ -648,6 +659,7 @@ const ChatInputImpl = forwardRef<ChatInputHandle, ChatInputProps>(function ChatI
   trailingControls,
   plusMenuExtras,
   onVoiceStart,
+  voiceStartLabel,
   typingPlaceholder = false,
   submitting = false,
   completions,
@@ -724,6 +736,7 @@ const ChatInputImpl = forwardRef<ChatInputHandle, ChatInputProps>(function ChatI
     handleRemovePastedText,
     handleUpdatePastedText,
     processFiles,
+    addAttachment,
     resetAttachments,
   } = useComposerAttachments({ maxFileSizeBytes });
   const fileSizeLimit = maxFileSizeBytes ?? MAX_FILE_SIZE;
@@ -1838,8 +1851,9 @@ const ChatInputImpl = forwardRef<ChatInputHandle, ChatInputProps>(function ChatI
       insertReference,
       submit: () => handleSubmitRef.current(),
       addFiles: (files: File[]) => processFiles(files),
+      addAttachment: (attachment: FileAttachment & { size: number }) => addAttachment(attachment),
     }),
-    [insertText, insertReference, processFiles]
+    [insertText, insertReference, processFiles, addAttachment]
   );
 
   const removeReference = useCallback((key: string) => {
@@ -2345,9 +2359,22 @@ const ChatInputImpl = forwardRef<ChatInputHandle, ChatInputProps>(function ChatI
                 {pendingFiles.map((file) => {
                   const isImage = file.type.startsWith("image/");
                   const isVideo = file.type.startsWith("video/");
+                  const isAudio = file.type.startsWith("audio/");
                   return (
                     <View key={file.id} className="relative">
-                      {isImage ? (
+                      {isAudio ? (
+                        <View
+                          className="flex-row items-center gap-1.5 rounded-lg border border-border/60 bg-muted/40 px-2"
+                          style={{ height: 36, maxWidth: 180 }}
+                        >
+                          <Mic size={14} className="text-muted-foreground flex-shrink-0" />
+                          <Text className="text-xs text-foreground" numberOfLines={1}>
+                            {file.durationMs
+                              ? formatClipDuration(file.durationMs)
+                              : file.name}
+                          </Text>
+                        </View>
+                      ) : isImage ? (
                         <Pressable
                           onPress={() =>
                             setPreviewImageFile({
@@ -2483,7 +2510,7 @@ const ChatInputImpl = forwardRef<ChatInputHandle, ChatInputProps>(function ChatI
                       <Text
                         key={idx}
                         className={cn(
-                          "rounded bg-primary/20",
+                          "rounded bg-yellow-300/70 dark:bg-yellow-400/35",
                           mobileChatText
                             ? "text-base leading-6"
                             : "text-sm leading-5"
@@ -3502,7 +3529,7 @@ const ChatInputImpl = forwardRef<ChatInputHandle, ChatInputProps>(function ChatI
                     role="button"
                     accessibilityLabel={
                       onVoiceStart
-                        ? "Start voice project creation"
+                        ? (voiceStartLabel ?? "Start voice project creation")
                         : "Start voice recording"
                     }
                     className={cn(

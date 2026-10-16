@@ -166,6 +166,71 @@ describe('messages', () => {
     expect(marked.unreadCount).toBe(2)
   })
 
+  test('advance:true never regresses the read marker, even if an older request arrives late', async () => {
+    const g = await general()
+    const m1 = await call(seed.member, 'POST', `/conversations/${g.id}/messages`, { text: 'first' })
+    const m2 = await call(seed.member, 'POST', `/conversations/${g.id}/messages`, { text: `second <@u:${seed.owner}>` })
+
+    // Two "I'm reading, keep my position current" requests race over the
+    // network. The one carrying the smaller seq (fired first, client-side)
+    // can still have its response land second -- ordinary HTTP reordering.
+    const newer = await call(seed.owner, 'POST', `/conversations/${g.id}/read`, { seq: m2.json.message.seq, advance: true })
+    expect(newer.json).toEqual({ lastReadSeq: m2.json.message.seq, unreadCount: 0 })
+
+    const stale = await call(seed.owner, 'POST', `/conversations/${g.id}/read`, { seq: m1.json.message.seq, advance: true })
+    expect(stale.json.lastReadSeq).toBe(m2.json.message.seq) // unchanged, not regressed
+    expect(stale.json.unreadCount).toBe(0) // still fully caught up
+
+    const row = (await call(seed.owner, 'GET', `/workspaces/${seed.workspaceId}/conversations`))
+      .json.conversations.find((c: any) => c.id === g.id)
+    expect(row.unreadCount).toBe(0) // the badge does not pop back
+    expect(row.mentionCount).toBe(0)
+  })
+
+  test('a mention in a thread-only reply never badges the channel, so reading can clear it', async () => {
+    const g = await general()
+    const rowOf = async (user: string) =>
+      (await call(user, 'GET', `/workspaces/${seed.workspaceId}/conversations`))
+        .json.conversations.find((c: any) => c.id === g.id)
+
+    const root = await call(seed.member, 'POST', `/conversations/${g.id}/messages`, { text: 'thread root' })
+    await call(seed.owner, 'POST', `/conversations/${g.id}/read`, {})
+
+    // In the channel view, so it badges -- and the reader can reach it.
+    const visible = await call(seed.member, 'POST', `/conversations/${g.id}/messages`, {
+      text: `also here <@u:${seed.owner}>`, threadRootId: root.json.message.id, alsoSentToChannel: true,
+    })
+    // Thread-only, with a higher seq than anything the channel view shows. The read marker can
+    // never advance past it from the channel, so counting it would strand the badge permanently.
+    await call(seed.member, 'POST', `/conversations/${g.id}/messages`, {
+      text: `thread only <@u:${seed.owner}>`, threadRootId: root.json.message.id,
+    })
+
+    const waiting = await rowOf(seed.owner)
+    expect(waiting.unreadCount).toBe(1)
+    expect(waiting.mentionCount).toBe(1) // the channel-visible one only
+
+    const read = await call(seed.owner, 'POST', `/conversations/${g.id}/read`, {
+      seq: visible.json.message.seq, advance: true,
+    })
+    expect(read.json).toEqual({ lastReadSeq: visible.json.message.seq, unreadCount: 0 })
+    expect((await rowOf(seed.owner)).mentionCount).toBe(0)
+
+    // Reading again must not resurrect it -- the badge would otherwise pop back on the next refresh.
+    await call(seed.owner, 'POST', `/conversations/${g.id}/read`, { seq: visible.json.message.seq, advance: true })
+    const after = await rowOf(seed.owner)
+    expect(after.unreadCount).toBe(0)
+    expect(after.mentionCount).toBe(0)
+  })
+
+  test('without advance, an explicit seq still sets the marker exactly -- "mark unread" keeps working', async () => {
+    const g = await general()
+    const m = await call(seed.member, 'POST', `/conversations/${g.id}/messages`, { text: 'x' })
+    await call(seed.owner, 'POST', `/conversations/${g.id}/read`, {})
+    const unread = await call(seed.owner, 'POST', `/conversations/${g.id}/read`, { seq: m.json.message.seq - 1 })
+    expect(unread.json).toEqual({ lastReadSeq: m.json.message.seq - 1, unreadCount: 1 })
+  })
+
   test('clientMsgId makes sends idempotent', async () => {
     const g = await general()
     const a = await call(seed.owner, 'POST', `/conversations/${g.id}/messages`, { text: 'once', clientMsgId: 'c-1' })

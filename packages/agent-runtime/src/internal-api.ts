@@ -16,9 +16,26 @@ export function deriveApiUrl(): string | null {
       return `${url.protocol}//${url.host}`
     } catch { /* invalid URL */ }
   }
+  // The cluster-DNS fallback only resolves inside Kubernetes. Elsewhere (a
+  // standalone/local runtime with no API configured) return null so callers
+  // fail fast with NO_API_URL_ERROR instead of an ENOTFOUND DNS lookup.
+  if (!isInKubernetes()) return null
   const systemNs = process.env.SYSTEM_NAMESPACE || 'shogo-system'
   return `http://api.${systemNs}.svc.cluster.local`
 }
+
+function isInKubernetes(): boolean {
+  if (process.env.KUBERNETES_SERVICE_HOST) return true
+  try {
+    return existsSync(SA_TOKEN_PATH)
+  } catch {
+    return false
+  }
+}
+
+/** Error returned by internal-API calls when `deriveApiUrl()` is null. */
+export const NO_API_URL_ERROR =
+  'Not available in this environment: no Shogo API is configured (SHOGO_API_URL is unset).'
 
 /**
  * Public-facing API URL for URLs that end up in browser-facing contexts
@@ -281,7 +298,7 @@ async function checkpointFetch<T>(
   init: RequestInit & { parse?: (json: any) => T },
 ): Promise<CheckpointCallResult<T>> {
   const apiUrl = deriveApiUrl()
-  if (!apiUrl) return { ok: false, status: 0, error: 'No API URL configured' }
+  if (!apiUrl) return { ok: false, status: 0, error: NO_API_URL_ERROR }
   try {
     const res = await fetch(`${apiUrl}${path}`, {
       headers: getInternalHeaders(),
@@ -568,7 +585,7 @@ async function publishFetch<T>(
   timeoutMs = 120_000,
 ): Promise<CheckpointCallResult<T>> {
   const apiUrl = deriveApiUrl()
-  if (!apiUrl) return { ok: false, status: 0, error: 'No API URL configured' }
+  if (!apiUrl) return { ok: false, status: 0, error: NO_API_URL_ERROR }
   try {
     const res = await fetch(`${apiUrl}${path}`, {
       headers: getInternalHeaders(),
@@ -634,26 +651,38 @@ export async function createSharedFileLink(
 // the "Project lifecycle" section. Same CheckpointCallResult envelope.
 // ---------------------------------------------------------------------------
 
+/** Proxy timeout statuses (Cloudflare 524, gateway 502/504) that arrive as HTML, not API JSON. */
+const PROXY_TIMEOUT_STATUSES = new Set([502, 504, 524])
+
 async function lifecycleFetch<T>(
   path: string,
-  init: RequestInit & { parse?: (json: any) => T; timeoutMs?: number },
+  init: RequestInit & {
+    parse?: (json: any) => T
+    timeoutMs?: number
+    /** Ask the API to pad a long wait with whitespace pings; the real status then arrives as `httpStatus` in the body. */
+    keepalive?: boolean
+  },
 ): Promise<CheckpointCallResult<T>> {
   const apiUrl = deriveApiUrl()
-  if (!apiUrl) return { ok: false, status: 0, error: 'No API URL configured' }
-  const { parse, timeoutMs, ...rest } = init
+  if (!apiUrl) return { ok: false, status: 0, error: NO_API_URL_ERROR }
+  const { parse, timeoutMs, keepalive, ...rest } = init
   try {
     const res = await fetch(`${apiUrl}${path}`, {
-      headers: getInternalHeaders(),
+      headers: { ...getInternalHeaders(), ...(keepalive ? { 'X-Shogo-Keepalive': '1' } : {}) },
       signal: AbortSignal.timeout(timeoutMs ?? 20_000),
       ...rest,
     })
     const json = (await res.json().catch(() => null)) as any
-    if (!res.ok) {
+    const status = typeof json?.httpStatus === 'number' ? json.httpStatus : res.status
+    if (status < 200 || status >= 300) {
+      if (json === null && PROXY_TIMEOUT_STATUSES.has(status)) {
+        return { ok: false, status, error: `The API gateway timed out (HTTP ${status})`, code: 'timeout' }
+      }
       const err = json?.error
       const message = typeof err === 'string' ? err : err?.message
-      return { ok: false, status: res.status, error: message ?? `HTTP ${res.status}`, code: err?.code }
+      return { ok: false, status, error: message ?? `HTTP ${status}`, code: err?.code }
     }
-    return { ok: true, status: res.status, data: parse ? parse(json) : (json as T) }
+    return { ok: true, status, data: parse ? parse(json) : (json as T) }
   } catch (err: any) {
     const timedOut = err?.name === 'TimeoutError' || err?.name === 'AbortError'
     return { ok: false, status: 0, error: err?.message ?? String(err), code: timedOut ? 'timeout' : undefined }
@@ -767,7 +796,7 @@ async function personalFetch<T>(
   init: RequestInit & { parse?: (json: any) => T } = {},
 ): Promise<CheckpointCallResult<T>> {
   const apiUrl = deriveApiUrl()
-  if (!apiUrl) return { ok: false, status: 0, error: 'No API URL configured' }
+  if (!apiUrl) return { ok: false, status: 0, error: NO_API_URL_ERROR }
   const { parse, ...rest } = init
   try {
     const res = await fetch(`${apiUrl}${path}`, {
@@ -993,6 +1022,17 @@ export interface AgentStatusCard {
   summary?: string
 }
 
+/** A question for the people an agent tags; see the API's `QuestionDraft`. */
+export interface AgentQuestion {
+  header: string
+  prompt: string
+  interaction?: string
+  options?: Array<{ label: string; description?: string }>
+  multiSelect?: boolean
+  hint?: string
+  secretName?: string
+}
+
 function channelsPath(workspaceId: string, suffix = ''): string {
   return `/api/internal/workspaces/${encodeURIComponent(workspaceId)}/agent-channels${suffix}`
 }
@@ -1032,8 +1072,14 @@ export async function postAgentChannelMessage(
     runId?: string
     kind?: AgentMessageKind
     card?: AgentStatusCard
+    questions?: AgentQuestion[]
+    /** Return a background task per agent this post hands work to. */
+    trackReplies?: boolean
   },
-): Promise<CheckpointCallResult<{ id: string; conversationId: string; threadId: string; runId: string | null; url: string | null }>> {
+): Promise<CheckpointCallResult<{
+  id: string; conversationId: string; threadId: string; runId: string | null; url: string | null
+  tasks?: Array<{ task_id: string; title: string; status: 'running' }>
+}>> {
   return personalFetch(channelsPath(workspaceId, `/${encodeURIComponent(channel)}/messages`), {
     method: 'POST',
     body: JSON.stringify({
@@ -1045,6 +1091,8 @@ export async function postAgentChannelMessage(
       runId: input.runId,
       kind: input.kind,
       card: input.card,
+      questions: input.questions,
+      trackReplies: input.trackReplies || undefined,
     }),
     parse: (j) => ({
       id: j?.message?.id,
@@ -1052,6 +1100,7 @@ export async function postAgentChannelMessage(
       threadId: j?.message?.threadRootId ?? j?.message?.id,
       runId: j?.message?.runId ?? null,
       url: j?.message?.url ?? null,
+      ...(Array.isArray(j?.message?.tasks) ? { tasks: j.message.tasks } : {}),
     }),
   })
 }
@@ -1060,13 +1109,48 @@ export async function postAgentChannelMessage(
 export async function updateAgentChannelMessage(
   workspaceId: string,
   messageId: string,
-  input: { identity: AgentChannelIdentity; text?: string; kind?: AgentMessageKind; card?: AgentStatusCard },
+  input: { identity: AgentChannelIdentity; text?: string; kind?: AgentMessageKind; card?: AgentStatusCard; questions?: AgentQuestion[] },
 ): Promise<CheckpointCallResult<{ id: string; conversationId: string }>> {
   return personalFetch(channelsPath(workspaceId, `/messages/${encodeURIComponent(messageId)}`), {
     method: 'PATCH',
-    body: JSON.stringify({ text: input.text, kind: input.kind, card: input.card, projectId: input.identity.projectId }),
+    body: JSON.stringify({ text: input.text, kind: input.kind, card: input.card, questions: input.questions, projectId: input.identity.projectId }),
     parse: (j) => ({ id: j?.message?.id, conversationId: j?.message?.conversationId }),
   })
+}
+
+/**
+ * Work boards on the internal API (`agent-boards` and `agent-work-items`).
+ * `path` starts at the workspace, e.g. `/agent-boards/pipeline/items`.
+ */
+export async function agentBoardsRequest<T = any>(
+  workspaceId: string,
+  method: 'GET' | 'POST' | 'PATCH' | 'PUT' | 'DELETE',
+  path: string,
+  options: { body?: Record<string, unknown>; query?: Record<string, string | number | boolean | undefined | null> } = {},
+): Promise<CheckpointCallResult<T>> {
+  const params = new URLSearchParams()
+  for (const [k, v] of Object.entries(options.query ?? {})) {
+    if (v !== undefined && v !== null && v !== '') params.set(k, String(v))
+  }
+  const qs = params.toString()
+  return personalFetch<T>(`/api/internal/workspaces/${encodeURIComponent(workspaceId)}${path}${qs ? `?${qs}` : ''}`, {
+    method,
+    ...(options.body ? { body: JSON.stringify(options.body) } : {}),
+  })
+}
+
+/** The value a person entered for one of this agent's `secret` questions. */
+export async function readAgentQuestionSecret(
+  workspaceId: string,
+  messageId: string,
+  questionId: string,
+  identity: AgentChannelIdentity,
+): Promise<CheckpointCallResult<{ name: string; value: string }>> {
+  const query = identity.projectId ? `?projectId=${encodeURIComponent(identity.projectId)}` : ''
+  return personalFetch(
+    channelsPath(workspaceId, `/messages/${encodeURIComponent(messageId)}/questions/${encodeURIComponent(questionId)}/secret${query}`),
+    { method: 'GET', parse: (j) => ({ name: j?.name, value: j?.value }) },
+  )
 }
 
 export async function sendAgentDirectMessage(
@@ -1189,12 +1273,35 @@ export async function upsertTeamChannel(
     removeAgentProjectIds?: string[]
     userEmails?: string[]
     groupHandles?: string[]
+    /** Project whose manifest declares the channel; it stays undeletable while declared. */
+    system?: string
+    /** The person this run works for; a newly created channel gets them as its owner. */
+    onBehalfOfUserId?: string
   },
 ): Promise<CheckpointCallResult<{ created: boolean; changes: string[]; channel: { id: string; name: string } }>> {
   return personalFetch(channelsPath(workspaceId, `/team-channels/${encodeURIComponent(name)}`), {
     method: 'PUT',
     body: JSON.stringify(input),
     parse: (j) => ({ created: !!j?.created, changes: j?.changes ?? [], channel: j?.channel }),
+  })
+}
+
+/**
+ * Tell the server every channel `system`'s manifest declares. Those can't be
+ * deleted by people; channels it declared before but no longer does can be.
+ */
+export async function syncTeamChannelOwnership(
+  workspaceId: string,
+  system: string,
+  declared: string[],
+): Promise<CheckpointCallResult<{ claimed: string[]; released: string[] }>> {
+  return personalFetch(channelsPath(workspaceId, '/team-channels/ownership'), {
+    method: 'POST',
+    body: JSON.stringify({ system, declared }),
+    parse: (j) => ({
+      claimed: Array.isArray(j?.claimed) ? j.claimed : [],
+      released: Array.isArray(j?.released) ? j.released : [],
+    }),
   })
 }
 
@@ -1242,6 +1349,140 @@ export async function searchAgentChannels(
     method: 'GET',
     parse: (j) => j?.results ?? [],
   })
+}
+
+// ─── Chat files ──────────────────────────────────────────────────────────────
+
+export interface AgentChatFile {
+  id: string
+  conversationId: string
+  messageId: string
+  name: string
+  mimeType: string
+  kind: 'image' | 'document' | 'other'
+  size: number
+  uploadedBy: string
+  createdAt: string
+  hasText: boolean
+  /** Folder under `chat-files/` that downloads from this conversation go to. */
+  folder: string
+}
+
+export interface AgentChatFileConversation {
+  id: string
+  kind: string
+  name: string
+  folder: string
+  fileCount: number
+  lastFileAt: string | null
+}
+
+export interface AgentChatFileHit {
+  fileId: string
+  name: string
+  mimeType: string
+  size: number
+  conversationId: string
+  messageId: string
+  charStart: number | null
+  snippet: string | null
+  score: number
+  match: 'semantic' | 'keyword' | 'name'
+  conversation: { id: string; kind: string; name: string } | null
+  folder: string
+}
+
+export interface AgentChatFileText {
+  fileId: string
+  name: string
+  mimeType: string
+  text: string | null
+  offset: number
+  totalChars: number
+  nextOffset: number | null
+}
+
+function fileParams(identity: AgentChannelIdentity, extra: Record<string, string | number | undefined>): URLSearchParams {
+  const params = new URLSearchParams()
+  if (identity.projectId) params.set('projectId', identity.projectId)
+  for (const [k, v] of Object.entries(extra)) if (v !== undefined && v !== '') params.set(k, String(v))
+  return params
+}
+
+export async function listAgentChatFiles(
+  workspaceId: string,
+  identity: AgentChannelIdentity,
+  options: { conversation?: string; query?: string; kind?: string; cursor?: string; limit?: number } = {},
+): Promise<CheckpointCallResult<{ conversations: AgentChatFileConversation[]; files: AgentChatFile[]; nextCursor: string | null }>> {
+  const params = fileParams(identity, {
+    conversation: options.conversation, q: options.query, kind: options.kind, cursor: options.cursor, limit: options.limit,
+  })
+  return personalFetch(channelsPath(workspaceId, `/files?${params}`), {
+    method: 'GET',
+    parse: (j) => ({ conversations: j?.conversations ?? [], files: j?.files ?? [], nextCursor: j?.nextCursor ?? null }),
+  })
+}
+
+export async function searchAgentChatFiles(
+  workspaceId: string,
+  identity: AgentChannelIdentity,
+  query: string,
+  options: { conversation?: string; limit?: number } = {},
+): Promise<CheckpointCallResult<{ results: AgentChatFileHit[]; semantic: boolean }>> {
+  const params = fileParams(identity, { q: query, conversation: options.conversation, limit: options.limit })
+  return personalFetch(channelsPath(workspaceId, `/files/search?${params}`), {
+    method: 'GET',
+    parse: (j) => ({ results: j?.results ?? [], semantic: !!j?.semantic }),
+  })
+}
+
+export async function readAgentChatFileText(
+  workspaceId: string,
+  identity: AgentChannelIdentity,
+  fileId: string,
+  options: { offset?: number; limit?: number } = {},
+): Promise<CheckpointCallResult<AgentChatFileText>> {
+  const params = fileParams(identity, { offset: options.offset, limit: options.limit })
+  return personalFetch(channelsPath(workspaceId, `/files/${encodeURIComponent(fileId)}/text?${params}`), { method: 'GET' })
+}
+
+export const MAX_CHAT_FILE_DOWNLOAD_BYTES = 50 * 1024 * 1024
+
+/** The raw file, with the name and folder the API chose for it. */
+export async function downloadAgentChatFile(
+  workspaceId: string,
+  identity: AgentChannelIdentity,
+  fileId: string,
+): Promise<CheckpointCallResult<{ bytes: Uint8Array; name: string; folder: string; mimeType: string }>> {
+  const apiUrl = deriveApiUrl()
+  if (!apiUrl) return { ok: false, status: 0, error: NO_API_URL_ERROR }
+  const params = fileParams(identity, {})
+  try {
+    const res = await fetch(`${apiUrl}${channelsPath(workspaceId, `/files/${encodeURIComponent(fileId)}/content?${params}`)}`, {
+      headers: getInternalHeaders(),
+      signal: AbortSignal.timeout(120_000),
+    })
+    if (!res.ok) {
+      const err = (await res.json().catch(() => null) as any)?.error
+      return { ok: false, status: res.status, error: err?.message ?? `HTTP ${res.status}`, code: err?.code }
+    }
+    const declared = Number(res.headers.get('content-length') ?? 0)
+    if (declared > MAX_CHAT_FILE_DOWNLOAD_BYTES) return { ok: false, status: 413, error: 'File is larger than 50 MB', code: 'too_large' }
+    const bytes = new Uint8Array(await res.arrayBuffer())
+    if (bytes.byteLength > MAX_CHAT_FILE_DOWNLOAD_BYTES) return { ok: false, status: 413, error: 'File is larger than 50 MB', code: 'too_large' }
+    return {
+      ok: true,
+      status: res.status,
+      data: {
+        bytes,
+        name: decodeURIComponent(res.headers.get('x-file-name') ?? 'file'),
+        folder: decodeURIComponent(res.headers.get('x-file-folder') ?? 'files'),
+        mimeType: res.headers.get('content-type') ?? 'application/octet-stream',
+      },
+    }
+  } catch (err: any) {
+    return { ok: false, status: 0, error: err?.message ?? String(err) }
+  }
 }
 
 export async function listSchedules(
@@ -1296,7 +1537,7 @@ export interface EventTrigger {
   filter: Record<string, unknown> | null
   ownerUserId: string | null
   source: string
-  target: 'agent' | 'project' | 'webhook'
+  target: 'agent' | 'project' | 'webhook' | 'work_item'
   targetProjectId: string | null
   targetMode: string | null
   prompt: string | null
@@ -1312,13 +1553,14 @@ export interface EventTriggerCreateRequest {
   name: string
   eventType: string
   filter?: Record<string, unknown> | null
-  target?: 'agent' | 'project' | 'webhook'
+  target?: 'agent' | 'project' | 'webhook' | 'work_item'
   targetProjectId?: string
   targetMode?: 'agent' | 'hook'
   prompt?: string
   notifyConversationId?: string | null
   notifyThreadRootId?: string | null
   webhookUrl?: string
+  workItemTarget?: Record<string, unknown>
   triggerConfig?: Record<string, unknown>
   enabled?: boolean
 }
@@ -1334,6 +1576,7 @@ export interface EventTriggerUpdateRequest {
   notifyThreadRootId?: string | null
   webhookUrl?: string
   rotateWebhookSecret?: boolean
+  workItemTarget?: Record<string, unknown>
 }
 
 function triggersPath(workspaceId: string, suffix = ''): string {
@@ -1413,7 +1656,7 @@ export async function uploadAgentAvatar(
   contentType = 'image/png',
 ): Promise<CheckpointCallResult<PersonalProfile>> {
   const apiUrl = deriveApiUrl()
-  if (!apiUrl) return { ok: false, status: 0, error: 'No API URL configured' }
+  if (!apiUrl) return { ok: false, status: 0, error: NO_API_URL_ERROR }
   try {
     const res = await fetch(
       `${apiUrl}/api/internal/workspaces/${encodeURIComponent(workspaceId)}/agent-avatar`,
@@ -1598,10 +1841,14 @@ export interface AgentCallRequest {
   /** Reply timeout in ms when waiting (default 5 min, max 20 min). */
   timeoutMs?: number
   callerProjectId?: string
+  /** With `wait: false`, record the outcome so it can be waited on as a background task. */
+  track?: boolean
 }
 
 export interface AgentCallResult {
   status: 'completed' | 'accepted'
+  /** The API records the outcome under `runId` (wait: false, track: true). */
+  tracked?: boolean
   reply?: string
   runId?: string
   sessionId?: string
@@ -1609,17 +1856,214 @@ export interface AgentCallResult {
   chatSessionId?: string
 }
 
+interface TrackedAgentCall {
+  status: 'running' | 'completed' | 'failed'
+  reply?: string | null
+  sessionId?: string
+  chatSessionId?: string
+  error?: { code?: string; message: string }
+}
+
+const AGENT_CALL_POLL_WAIT_MS = 60_000
+const AGENT_CALL_POLL_MAX_FAILURES = 3
+const TRACKED_CALL_UNSUPPORTED_RECHECK_MS = 5 * 60_000
+
+/** true once the API proved it serves `GET .../agent-call/:runId`; a timestamp while it doesn't. */
+let trackedCallSupport: true | { unsupportedUntil: number } | undefined
+
+async function apiSupportsTrackedCalls(callPath: string, runId: string): Promise<boolean> {
+  if (trackedCallSupport === true) return true
+  if (trackedCallSupport && Date.now() < trackedCallSupport.unsupportedUntil) return false
+  const probe = await lifecycleFetch(`${callPath}/${encodeURIComponent(runId)}?waitMs=0`, { method: 'GET', timeoutMs: 10_000 })
+  if (probe.ok || probe.code === 'agent_call_unknown') {
+    trackedCallSupport = true
+    return true
+  }
+  if (probe.status === 404) {
+    trackedCallSupport = { unsupportedUntil: Date.now() + TRACKED_CALL_UNSUPPORTED_RECHECK_MS }
+    return false
+  }
+  return true
+}
+
+/** Test seam: forget whether the API supports tracked calls. */
+export function resetTrackedCallSupport(): void {
+  trackedCallSupport = undefined
+}
+
+/**
+ * `wait: true` never holds one request open for the whole turn: metal runtimes
+ * reach the API through Cloudflare, which 524s any request silent for ~100s.
+ * Instead the call is started in the background (`wait: false, track: true`)
+ * and the outcome is long-polled in ≤60s windows, each padded with keep-alive
+ * pings. APIs that predate tracked calls get the old single blocking POST.
+ */
 export async function callProjectAgent(
   targetProjectId: string,
   req: AgentCallRequest,
 ): Promise<CheckpointCallResult<AgentCallResult>> {
   const timeoutMs = Math.min(Math.max(req.timeoutMs ?? 5 * 60_000, 10_000), 20 * 60_000)
-  return lifecycleFetch(`/api/internal/projects/${encodeURIComponent(targetProjectId)}/agent-call`, {
+  const callPath = `/api/internal/projects/${encodeURIComponent(targetProjectId)}/agent-call`
+  if (req.wait === false) {
+    return lifecycleFetch(callPath, {
+      method: 'POST',
+      body: JSON.stringify({ ...req, timeoutMs }),
+      parse: (j) => j as AgentCallResult,
+      timeoutMs: 20_000,
+    })
+  }
+
+  const runId = req.runId?.trim() || `run_${crypto.randomUUID().replace(/-/g, '').slice(0, 12)}`
+  if (!(await apiSupportsTrackedCalls(callPath, runId))) {
+    return lifecycleFetch(callPath, {
+      method: 'POST',
+      body: JSON.stringify({ ...req, runId, timeoutMs }),
+      parse: (j) => j as AgentCallResult,
+      // The API adds its own 5s grace on top of the runtime's wait budget.
+      timeoutMs: timeoutMs + 10_000,
+    })
+  }
+
+  const started = await lifecycleFetch<AgentCallResult & { tracked?: boolean }>(callPath, {
     method: 'POST',
-    body: JSON.stringify({ ...req, timeoutMs }),
-    parse: (j) => j as AgentCallResult,
-    // The API adds its own 5s grace on top of the runtime's wait budget.
-    timeoutMs: req.wait === false ? 20_000 : timeoutMs + 10_000,
+    body: JSON.stringify({ ...req, runId, timeoutMs, wait: false, track: true }),
+    timeoutMs: 20_000,
+  })
+  if (!started.ok || !started.data) return started
+  // An API without tracking already started the turn untracked; its reply lands in the project chat.
+  if (started.data.tracked !== true) return { ...started, data: { ...started.data, runId } }
+
+  const deadline = Date.now() + timeoutMs
+  let failures = 0
+  for (;;) {
+    const remaining = deadline - Date.now()
+    if (remaining <= 0) {
+      return {
+        ok: false,
+        status: 504,
+        code: 'agent_call_timeout',
+        error: `The target agent did not reply within ${Math.round(timeoutMs / 1000)}s.`,
+      }
+    }
+    const waitMs = Math.min(AGENT_CALL_POLL_WAIT_MS, remaining)
+    const poll = await lifecycleFetch<TrackedAgentCall>(`${callPath}/${encodeURIComponent(runId)}?waitMs=${waitMs}`, {
+      method: 'GET',
+      keepalive: true,
+      timeoutMs: waitMs + 20_000,
+    })
+    if (!poll.ok || !poll.data) {
+      const transient = poll.ok || poll.status === 0 || poll.status >= 500 || poll.code === 'timeout'
+      if (!transient || ++failures >= AGENT_CALL_POLL_MAX_FAILURES) return { ...poll, ok: false, data: undefined }
+      await new Promise((resolve) => setTimeout(resolve, Math.min(2_000, Math.max(0, deadline - Date.now()))))
+      continue
+    }
+    failures = 0
+    const record = poll.data
+    if (record.status === 'completed') {
+      return {
+        ok: true,
+        status: 200,
+        data: {
+          status: 'completed',
+          reply: record.reply ?? undefined,
+          runId,
+          sessionId: record.sessionId ?? started.data.sessionId,
+          chatSessionId: record.chatSessionId ?? started.data.chatSessionId,
+        },
+      }
+    }
+    if (record.status === 'failed') {
+      return { ok: false, status: 502, error: record.error?.message ?? 'Project agent call failed', code: record.error?.code }
+    }
+  }
+}
+
+// ─── Background tasks ────────────────────────────────────────────────────────
+
+export type BackgroundTaskSource = 'project_call' | 'agent_reply' | 'work_item'
+
+export interface BackgroundTaskState {
+  id: string
+  source: string
+  title: string
+  status: 'running' | 'completed' | 'failed' | 'cancelled'
+  output?: string
+  result?: { summary?: string; exitCode?: number } | null
+  matched?: boolean
+  startedAt?: string
+}
+
+/** A finished local task (shell, subagent) whose session is idle and should be woken. */
+export interface TaskNotificationPayload {
+  id: string
+  source: string
+  title: string
+  status: string
+  text: string
+}
+
+const tasksPath = '/api/internal/tasks'
+
+export async function createBackgroundTask(input: {
+  id: string
+  chatSessionId: string
+  source: BackgroundTaskSource
+  targetRef: string
+  title: string
+  until?: string
+}): Promise<CheckpointCallResult<BackgroundTaskState>> {
+  return lifecycleFetch(tasksPath, {
+    method: 'POST',
+    body: JSON.stringify(input),
+    parse: (j) => j.task as BackgroundTaskState,
+    timeoutMs: 10_000,
+  })
+}
+
+export async function getBackgroundTask(
+  id: string,
+  opts: { waitMs?: number; until?: string } = {},
+): Promise<CheckpointCallResult<BackgroundTaskState>> {
+  const waitMs = Math.max(0, Math.min(opts.waitMs ?? 0, 25_000))
+  const query = new URLSearchParams({ waitMs: String(waitMs) })
+  if (opts.until) query.set('until', opts.until)
+  return lifecycleFetch(`${tasksPath}/${encodeURIComponent(id)}?${query}`, {
+    method: 'GET',
+    parse: (j) => j.task as BackgroundTaskState,
+    keepalive: waitMs > 0,
+    timeoutMs: waitMs + 15_000,
+  })
+}
+
+export async function cancelBackgroundTask(id: string): Promise<CheckpointCallResult<BackgroundTaskState>> {
+  return lifecycleFetch(`${tasksPath}/${encodeURIComponent(id)}/cancel`, {
+    method: 'POST',
+    parse: (j) => j.task as BackgroundTaskState,
+    timeoutMs: 10_000,
+  })
+}
+
+export async function consumeBackgroundTasks(ids: string[]): Promise<CheckpointCallResult<{ consumed: number }>> {
+  return lifecycleFetch(`${tasksPath}/consume`, {
+    method: 'POST',
+    body: JSON.stringify({ ids }),
+    timeoutMs: 10_000,
+  })
+}
+
+export async function listBackgroundTasks(chatSessionId: string): Promise<CheckpointCallResult<{ tasks: BackgroundTaskState[] }>> {
+  return lifecycleFetch(`${tasksPath}?chatSessionId=${encodeURIComponent(chatSessionId)}`, { method: 'GET', timeoutMs: 10_000 })
+}
+
+/** Hand finished local tasks to the API so it wakes the (idle) session with one queued message. */
+export async function notifyTaskCompletions(
+  chatSessionId: string,
+  tasks: TaskNotificationPayload[],
+): Promise<CheckpointCallResult<{ queued: boolean }>> {
+  return lifecycleFetch(`${tasksPath}/notify`, {
+    method: 'POST',
+    body: JSON.stringify({ chatSessionId, tasks }),
+    timeoutMs: 10_000,
   })
 }
 

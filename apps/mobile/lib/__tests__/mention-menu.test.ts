@@ -103,7 +103,7 @@ describe('buildMentionMenu', () => {
   })
 
   test('private channels flag non-members and explain who is notified', () => {
-    const menu = buildMentionMenu(data({ memberIds: new Set(['u0', 'me']) }), DOC_CATEGORIES, 'sam', 'people')
+    const menu = buildMentionMenu(data({ memberIds: new Set(['u0', 'me']), membersOnly: true }), DOC_CATEGORIES, 'sam', 'people')
     expect(menu.rows.find((r) => r.label === 'Sam A')!.trailing).toBeNull()
     expect(menu.rows.find((r) => r.label === 'Sam B')!.trailing).toBe('Not in channel')
     expect(menu.footer).toBe('Only people in this channel will be notified')

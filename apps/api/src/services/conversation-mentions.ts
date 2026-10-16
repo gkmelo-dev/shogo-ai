@@ -204,11 +204,54 @@ export function resolveFriendlyMentionsWith(text: string, lookup: Map<string, st
   return result + resolveSegment(text.slice(last))
 }
 
+const COLLAPSIBLE_TOKEN = '<(?:@[uag]:[A-Za-z0-9_:-]+|@a:ws)>'
+const REPEATED_TOKEN_RE = new RegExp(`(${COLLAPSIBLE_TOKEN})\\s*\\(\\s*\\1\\s*\\)`, 'g')
+const TOKEN_THEN_NAME_RE = new RegExp(`(${COLLAPSIBLE_TOKEN})\\s*\\(([^()<>\\n]{1,80})\\)`, 'g')
+
+/**
+ * Agents read people as `Name (<@u:ID>)` and often write both back, which
+ * renders the name twice: `<@u:ID> (<@u:ID>)` or `<@u:ID> (Name)` become one
+ * mention. With a `lookup` (lowercased name → token), a name in parentheses
+ * only goes when it is that same person.
+ */
+export function collapseRepeatedMentions(text: string, lookup?: Map<string, string>): string {
+  let out = text.replace(REPEATED_TOKEN_RE, '$1')
+  if (lookup?.size) {
+    out = out.replace(TOKEN_THEN_NAME_RE, (whole, token: string, name: string) =>
+      lookup.get(name.trim().replace(/^@/, '').toLowerCase()) === token ? token : whole)
+  }
+  return out
+}
+
 /** `@handle` names for group tokens, scoped to one workspace. */
 export async function groupNames(db: any, workspaceId: string, groupIds: string[]): Promise<Map<string, string>> {
   if (!groupIds.length) return new Map()
   const rows = await db.userGroup.findMany({ where: { workspaceId, id: { in: groupIds } }, select: { id: true, handle: true } })
   return new Map(rows.map((g: any) => [g.id, g.handle]))
+}
+
+/**
+ * Names for every token in `texts`, in one lookup per kind regardless of how
+ * many texts are passed. Feed the result to `renderMentionsAsText`, or every
+ * token renders as its fallback (`@someone`, `#channel`).
+ *
+ * `workspaceAgentName` is left to the caller: the agent is a workspace setting
+ * rather than an id lookup, and callers already have their own way to read it.
+ */
+export async function loadNamesForTexts(db: any, workspaceId: string, texts: string[]): Promise<MentionNames> {
+  const ids = collectMentionIds(texts)
+  const [users, projects, conversations, groups] = await Promise.all([
+    ids.userIds.length ? db.user.findMany({ where: { id: { in: ids.userIds } }, select: { id: true, name: true, email: true } }) : [],
+    ids.projectIds.length ? db.project.findMany({ where: { id: { in: ids.projectIds } }, select: { id: true, name: true } }) : [],
+    ids.conversationIds.length ? db.conversation.findMany({ where: { id: { in: ids.conversationIds } }, select: { id: true, name: true } }) : [],
+    groupNames(db, workspaceId, ids.groupIds),
+  ])
+  return {
+    users: new Map<string, string>(users.map((u: any) => [u.id, u.name || u.email])),
+    projects: new Map<string, string>(projects.map((p: any) => [p.id, p.name])),
+    conversations: new Map<string, string>(conversations.map((c: any) => [c.id, c.name ?? 'channel'])),
+    groups,
+  }
 }
 
 /**

@@ -217,7 +217,7 @@ const HOME_REGION_PARTITIONED: HomeRegionPartitioned[] = [
     fn: 'runChannelIndexer',
     file: 'apps/api/src/jobs/run-channel-workers.ts',
     reason:
-      'conversation_message_embeddings replicates. indexPendingMessages only embeds messages in conversations whose workspace is homed here (homeRegionWorkspaceWhere), so a message is embedded by one region and the messageId unique never collides across regions. The per-region lock only de-duplicates pods within a region.',
+      'conversation_message_embeddings and conversation_attachment_chunks replicate. indexPendingMessages, chunkPendingAttachments and embedPendingChunks only touch conversations whose workspace is homed here (homeRegionWorkspaceWhere), so each message or file is indexed by one region and the messageId unique never collides across regions. The per-region lock only de-duplicates pods within a region.',
     partitionKeyColumn: 'Workspace.homeRegion',
   },
   {
@@ -364,7 +364,12 @@ const ACCEPTED_UNIQUE_KEYS: UniqueKeyRule[] = [
   {
     key: 'UserIntegrationGrant.(projectId,provider,userId)',
     category: 'single_tenant_upsert',
-    reason: 'integration-credentials/store.ts grantAccess upserts the user\'s own consent row from their consent POST or OAuth callback.',
+    reason: 'integration-credentials/store.ts grantAccess upserts the user\'s own consent row from their consent POST, OAuth callback, or per-agent settings PUT.',
+  },
+  {
+    key: 'UserIntegrationWorkspaceGrant.(provider,userId,workspaceId)',
+    category: 'single_tenant_upsert',
+    reason: 'integration-credentials/store.ts setWorkspaceGrant upserts the user\'s own workspace consent row from their consent POST or /api/workspaces/:workspaceId/integrations settings PUT.',
   },
   {
     key: 'StarredProject.(projectId,userId)',
@@ -722,6 +727,29 @@ const ACCEPTED_UNIQUE_KEYS: UniqueKeyRule[] = [
     category: 'request_scoped',
     reason:
       'Channel create (POST /api/workspaces/:workspaceId/conversations, path-resolved to the home region) picks a free slug; #general/#activity seeding is find-then-create with a raced-create fallback in the same region.',
+  },
+  {
+    key: 'Board.(slug,workspaceId)',
+    category: 'request_scoped',
+    reason:
+      'Board create (POST /api/workspaces/:workspaceId/boards or system_apply through the internal API, path-resolved to the home region) picks a free slug. No cron writer.',
+  },
+  {
+    key: 'WorkItem.(key,workspaceId)',
+    category: 'request_scoped',
+    reason:
+      'Card keys come from an atomic increment of Board.itemCounter inside the create transaction on the workspace home region. Trigger intake runs in the delivering region for workspaces homed there. No cron writer.',
+  },
+  {
+    key: 'WorkItemLink.(kind,refId,workItemId)',
+    category: 'request_scoped',
+    reason:
+      'Links are upserted by the request (message post, tool call, agent run end) that touches the card, on the workspace home region; a raced duplicate re-reads the existing row.',
+  },
+  {
+    key: 'WorkItemSubscription.(userId,workItemId)',
+    category: 'request_scoped',
+    reason: 'Follow/unfollow on a card is a user request upsert on the workspace home region. No cron writer.',
   },
   {
     key: 'Conversation.(dmKey,workspaceId)',

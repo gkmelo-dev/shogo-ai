@@ -73,3 +73,15 @@ export {
   type AvailableModelFilter,
   type CapabilityRating,
 } from './helpers'
+
+export { ADAPTIVE_THINKING_MODEL_MARKERS, supportsAdaptiveThinking } from './thinking'
+
+export {
+  registerDynamicModels,
+  rememberProviderHint,
+  getDynamicModel,
+  isAnthropicBacked,
+  parseDynamicModelsEnv,
+  clearDynamicModels,
+  type DynamicModelEntry,
+} from './dynamic-models'

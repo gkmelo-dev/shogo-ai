@@ -16,6 +16,10 @@ import {
   MAX_CONVERSATION_FILE_BYTES,
   buildConversationFileKey,
   conversationFileUrl,
+  loadConversationFileBytes,
+  parseAttachmentDurationMs,
+  parseAttachmentPeaks,
+  parseByteRange,
   putConversationFile,
   readConversationFile,
   verifyAttachmentToken,
@@ -28,6 +32,7 @@ import {
   agentDisplayName,
   addUserMembers,
   createChannel,
+  deleteConversation,
   deleteMessage,
   editMessage,
   getConversationForUser,
@@ -54,24 +59,38 @@ import {
 import { getDocForAgent, updateDocAsAgent } from '../services/conversation-doc.service'
 import { afterMessagePosted } from '../services/conversation-pipeline'
 import { AgentMessageError, postAgentMessage, updateAgentMessage } from '../services/chat-providers/outbound'
-import { blocksForKind, cardToMarkdown, normalizeCard, normalizeKind } from '../services/conversation-message-kind'
+import { blocksForKind, cardToMarkdown, normalizeCard, normalizeKind, normalizeQuestionDrafts, questionsOf, questionsToMarkdown } from '../services/conversation-message-kind'
+import { answerQuestion, attachQuestions, dismissQuestion, listQuestions, readQuestionSecret } from '../services/conversation-questions'
+import { registerQuestionDesigner } from '../services/conversation-question-designer'
 import { listInstallations } from '../services/chat-providers/installations'
 import { CHAT_RATE_LIMITS, takeRateLimit } from '../lib/chat-limits'
 import { getFrontendUrl } from '../lib/cloud-urls'
 import { adoptSlackRouting } from '../services/chat-providers/slack-adopt'
 import { catchUp, registerConversationActivity } from '../services/conversation-activity'
-import { respondToPermission, stopAgentReply } from '../services/conversation-agent-dispatcher'
+import { agentPostTargets, respondToPermission, stopAgentReply } from '../services/conversation-agent-dispatcher'
+import { createReplyTasks } from '../services/background-tasks.service'
 import { decideApproval, listPendingApprovals } from '../services/conversation-approvals'
 import { liveActivityApprovalAnswered } from '../services/approval-live-activity'
 import { loadWorkLog } from '../services/agent-work-log'
 import { chainForAgentPost, rootChain, setThreadOwner } from '../services/conversation-agent-chain'
 import { loadAgentCard, loadTeamDirectory, resolveFriendlyMentions, setAgentBuddyLook } from '../services/conversation-directory'
-import { listTeamChannels, TeamChannelError, upsertTeamChannel } from '../services/conversation-team-channels'
+import { listTeamChannels, syncTeamChannelOwnership, TeamChannelError, upsertTeamChannel } from '../services/conversation-team-channels'
+import { huddleUserIds } from '../services/huddle.service'
 import { getPresence } from '../services/conversation-presence'
 import { getChannelMetrics } from '../services/conversation-metrics'
 import { searchMessages } from '../services/conversation-search'
 import { askWorkspace, semanticSearch } from '../services/conversation-semantic'
 import { canExtract, extractAndStoreAttachmentText } from '../services/conversation-file-text'
+import { publicPreview } from '../services/conversation-file-preview'
+import { loadVisibleFile, type FilePrincipal } from '../services/conversation-file-access'
+import { readFileText, searchFiles } from '../services/conversation-file-index'
+import {
+  listFileConversations,
+  listFiles,
+  parseFileKind,
+  serializeFileForAgent,
+  serializeFileForUser,
+} from '../services/conversation-files.service'
 import { registerConversationNotifications } from '../services/conversation-notifications'
 import { registerConversationUnfurls } from '../services/conversation-unfurl'
 import { listStatuses } from '../services/chat-settings'
@@ -130,6 +149,7 @@ export function conversationRoutes(config: ConversationRoutesConfig): Hono {
   registerConversationNotifications()
   registerConversationUnfurls()
   registerConversationActivity()
+  registerQuestionDesigner()
 
   async function requireUser(c: any): Promise<string | Response> {
     const userId = await config.resolveUserId(c)
@@ -216,6 +236,32 @@ export function conversationRoutes(config: ConversationRoutesConfig): Hono {
     }
   })
 
+  /**
+   * Questions agents asked in channels this person can read. `scope=mine` (default) is the ones for
+   * them; `status` is open (default), answered, or all. Open lists also carry pending approvals, so the
+   * inbox shows everything waiting on this person in one place.
+   */
+  router.get('/workspaces/:workspaceId/questions', async (c) => {
+    const auth = await requireWorkspace(c)
+    if (auth instanceof Response) return auth
+    const status = c.req.query('status')
+    const scope = c.req.query('scope') === 'all' ? 'all' : 'mine'
+    try {
+      const result = await listQuestions(auth.workspaceId, auth.userId, {
+        status: status === 'answered' || status === 'all' ? status : 'open',
+        scope,
+      })
+      const role = await getWorkspaceRole(auth.workspaceId, auth.userId)
+      // Approvals are best-effort here so a failure never hides the questions.
+      const approvals = status === 'answered' || role === 'viewer'
+        ? []
+        : await listPendingApprovals(auth.workspaceId, auth.userId).catch(() => [])
+      return c.json({ questions: result.items, openCount: result.openCount, approvals })
+    } catch (err) {
+      return errorResponse(c, err)
+    }
+  })
+
   router.post('/workspaces/:workspaceId/conversations', async (c) => {
     const auth = await requireWorkspace(c)
     if (auth instanceof Response) return auth
@@ -296,7 +342,11 @@ export function conversationRoutes(config: ConversationRoutesConfig): Hono {
     const auth = await requireWorkspace(c)
     if (auth instanceof Response) return auth
     const ids = (c.req.query('userIds') ?? '').split(',').map((s) => s.trim()).filter(Boolean).slice(0, 500)
-    return c.json({ presence: await getPresence(auth.workspaceId, ids) })
+    const [presence, inHuddle] = await Promise.all([
+      getPresence(auth.workspaceId, ids),
+      huddleUserIds(auth.workspaceId, ids),
+    ])
+    return c.json({ presence, huddle: [...inHuddle] })
   })
 
   router.get('/workspaces/:workspaceId/conversations/search', async (c) => {
@@ -423,6 +473,17 @@ export function conversationRoutes(config: ConversationRoutesConfig): Hono {
         kind: body.kind === 'public' || body.kind === 'private' ? body.kind : undefined,
       })
       return c.json({ conversation: serializeConversation(updated) })
+    } catch (err) {
+      return errorResponse(c, err)
+    }
+  })
+
+  router.delete('/conversations/:conversationId', async (c) => {
+    const userId = await requireUser(c)
+    if (userId instanceof Response) return userId
+    try {
+      await deleteConversation(c.req.param('conversationId'), userId)
+      return c.json({ ok: true })
     } catch (err) {
       return errorResponse(c, err)
     }
@@ -563,7 +624,12 @@ export function conversationRoutes(config: ConversationRoutesConfig): Hono {
     if (userId instanceof Response) return userId
     const body = await readJson(c)
     try {
-      return c.json(await markRead(c.req.param('conversationId'), userId, typeof body.seq === 'number' ? body.seq : undefined))
+      return c.json(await markRead(
+        c.req.param('conversationId'),
+        userId,
+        typeof body.seq === 'number' ? body.seq : undefined,
+        { advance: body.advance === true },
+      ))
     } catch (err) {
       return errorResponse(c, err)
     }
@@ -609,6 +675,8 @@ export function conversationRoutes(config: ConversationRoutesConfig): Hono {
           size: file.size,
           width: width ?? null,
           height: height ?? null,
+          durationMs: parseAttachmentDurationMs(form?.get('durationMs')),
+          peaks: parseAttachmentPeaks(form?.get('peaks')),
         },
       })
       if (canExtract(mimeType, name, file.size)) {
@@ -618,8 +686,30 @@ export function conversationRoutes(config: ConversationRoutesConfig): Hono {
         attachment: {
           id: row.id, name: row.name, mimeType: row.mimeType, size: row.size,
           width: row.width, height: row.height, url: conversationFileUrl(row),
+          durationMs: row.durationMs, peaks: row.peaks,
+          // Extraction has not run yet, so this is null on a fresh upload; the
+          // message (or a later `message.updated`) carries the real preview.
+          preview: publicPreview(row.previewData),
         },
       }, 201)
+    } catch (err) {
+      return errorResponse(c, err)
+    }
+  })
+
+  router.get('/conversations/:conversationId/files', async (c) => {
+    const userId = await requireUser(c)
+    if (userId instanceof Response) return userId
+    try {
+      const access = await loadAccess(c.req.param('conversationId'), userId)
+      const { files, nextCursor } = await listFiles({ kind: 'user', userId }, access.conversation.workspaceId, {
+        conversationId: access.conversation.id,
+        q: c.req.query('q') || undefined,
+        kind: parseFileKind(c.req.query('kind')),
+        cursor: c.req.query('cursor') || undefined,
+        limit: numberParam(c.req.query('limit')),
+      })
+      return c.json({ files: files.map(serializeFileForUser), nextCursor })
     } catch (err) {
       return errorResponse(c, err)
     }
@@ -722,6 +812,42 @@ export function conversationRoutes(config: ConversationRoutesConfig): Hono {
     }
   })
 
+  /** Answer a question an agent asked; the answer is posted in the thread as this person. */
+  router.post('/conversation-messages/:messageId/questions/:questionId/answer', async (c) => {
+    const userId = await requireUser(c)
+    if (userId instanceof Response) return userId
+    const limited = await rateLimited(c, `msg:${userId}`, CHAT_RATE_LIMITS.message)
+    if (limited) return limited
+    const body = await readJson(c)
+    try {
+      const result = await answerQuestion({
+        messageId: c.req.param('messageId'),
+        questionId: c.req.param('questionId'),
+        userId,
+        answer: typeof body.answer === 'string' ? body.answer : undefined,
+        secret: typeof body.secret === 'string' ? body.secret : undefined,
+      })
+      const { secretCipher: _secret, ...question } = result.question
+      return c.json({ message: result.message, question, reply: result.reply.message })
+    } catch (err) {
+      if (err instanceof AgentMessageError) return c.json({ error: { code: err.code, message: err.message } }, err.status)
+      return errorResponse(c, err)
+    }
+  })
+
+  router.post('/conversation-messages/:messageId/questions/:questionId/dismiss', async (c) => {
+    const userId = await requireUser(c)
+    if (userId instanceof Response) return userId
+    try {
+      const result = await dismissQuestion({ messageId: c.req.param('messageId'), questionId: c.req.param('questionId'), userId })
+      const { secretCipher: _secret, ...question } = result.question
+      return c.json({ message: result.message, question })
+    } catch (err) {
+      if (err instanceof AgentMessageError) return c.json({ error: { code: err.code, message: err.message } }, err.status)
+      return errorResponse(c, err)
+    }
+  })
+
   /** What an agent did before its final message, trimmed for the channel (see agent-work-log). */
   router.get('/conversation-messages/:messageId/work', async (c) => {
     const userId = await requireUser(c)
@@ -757,15 +883,45 @@ export function conversationRoutes(config: ConversationRoutesConfig): Hono {
     }
     if (!allowed) return c.json({ error: { code: 'forbidden', message: 'No access to this file' } }, 403)
     try {
-      const file = await readConversationFile(row.storageKey)
+      // `?dl=1` is the download action on an attachment card. Pictures, video,
+      // audio and PDFs are served `inline` so they can be previewed in place,
+      // so following one of those links would open the file rather than save
+      // it — this is what makes the card's download actually download.
+      const download = c.req.query('dl') === '1'
+      const file = await readConversationFile(row.storageKey, download ? { downloadName: row.name } : undefined)
       if (file.kind === 'redirect') return c.redirect(file.url, 302)
-      const inline = /^(image|video|audio)\//.test(row.mimeType) || row.mimeType === 'application/pdf'
-      return new Response(file.bytes as any, {
+      const inline = !download && (/^(image|video|audio)\//.test(row.mimeType) || row.mimeType === 'application/pdf')
+      const disposition = `${inline ? 'inline' : 'attachment'}; filename*=UTF-8''${encodeURIComponent(row.name)}`
+      const baseHeaders = {
+        'Content-Type': row.mimeType,
+        'Content-Disposition': disposition,
+        'Cache-Control': 'private, max-age=300',
+        'Accept-Ranges': 'bytes',
+      }
+      // Served locally the whole file is in memory, so a range is a slice of
+      // it. Cloud mode redirects to S3 above, which handles ranges itself.
+      const bytes = file.bytes as Uint8Array
+      const range = parseByteRange(c.req.header('range'), bytes.byteLength)
+      if (range.kind === 'unsatisfiable') {
+        return new Response(null, {
+          status: 416,
+          headers: { ...baseHeaders, 'Content-Range': `bytes */${bytes.byteLength}` },
+        })
+      }
+      if (range.kind === 'range') {
+        return new Response(bytes.slice(range.start, range.end + 1) as any, {
+          status: 206,
+          headers: {
+            ...baseHeaders,
+            'Content-Length': String(range.end - range.start + 1),
+            'Content-Range': `bytes ${range.start}-${range.end}/${bytes.byteLength}`,
+          },
+        })
+      }
+      return new Response(bytes as any, {
         headers: {
-          'Content-Type': row.mimeType,
-          'Content-Length': String(file.bytes.byteLength),
-          'Content-Disposition': `${inline ? 'inline' : 'attachment'}; filename*=UTF-8''${encodeURIComponent(row.name)}`,
-          'Cache-Control': 'private, max-age=300',
+          ...baseHeaders,
+          'Content-Length': String(bytes.byteLength),
         },
       })
     } catch {
@@ -794,7 +950,23 @@ export function textContains(q: string) {
   return isLocalMode() ? { contains: q } : { contains: q, mode: 'insensitive' as const }
 }
 
+/**
+ * The conversation an agent names: a channel name (with or without `#`), a
+ * conversation id, or `@person` (an email or user id) for its DM with them.
+ * Null when it doesn't exist or the agent can't see it.
+ */
 export async function resolveAgentConversation(workspaceId: string, channel: string, projectId: string | null) {
+  if (channel.startsWith('@')) {
+    const who = channel.slice(1).trim()
+    if (!who) return null
+    const member = await db.member.findFirst({
+      where: { workspaceId, projectId: null, OR: [{ userId: who }, { user: { email: who.toLowerCase() } }] },
+      select: { userId: true },
+    })
+    if (!member) return null
+    return db.conversation.findFirst({ where: { workspaceId, dmKey: `a:${member.userId}:${projectId ?? 'ws'}` } })
+  }
+  channel = channel.replace(/^#/, '')
   const byId = await db.conversation.findUnique({ where: { id: channel } }).catch(() => null)
   const conversation = byId && byId.workspaceId === workspaceId
     ? byId
@@ -806,6 +978,11 @@ export async function resolveAgentConversation(workspaceId: string, channel: str
     select: { id: true },
   })
   return member ? conversation : null
+}
+
+const AGENT_MESSAGE_INCLUDE = {
+  authorUser: { select: { name: true, email: true } },
+  attachments: { select: { id: true, name: true, mimeType: true, size: true } },
 }
 
 async function renderForAgent(rows: any[]) {
@@ -826,9 +1003,10 @@ async function renderForAgent(rows: any[]) {
       ? `${r.authorUser?.name || r.authorUser?.email || 'Someone'} (<@u:${r.authorUserId}>)`
       : r.authorType === 'agent' ? `${r.authorAgentRef?.name ?? 'Agent'} (agent)` : r.authorType,
     authorType: r.authorType,
-    text: renderMentionsAsText(r.text, names),
+    text: [renderMentionsAsText(r.text, names), questionsToMarkdown(questionsOf(r.blocks), names)].filter(Boolean).join('\n\n'),
     threadRootId: r.threadRootId ?? null,
     replyCount: r.replyCount ?? 0,
+    files: (r.attachments ?? []).map((a: any) => ({ id: a.id, name: a.name, mimeType: a.mimeType, size: a.size })),
     createdAt: r.createdAt,
   }))
 }
@@ -881,17 +1059,38 @@ export function agentChannelRoutes(routeConfig: AgentChannelRoutesConfig): Hono 
     return c.json(await listTeamChannels(auth.workspaceId))
   })
 
+  /**
+   * The project whose manifest a team-channel write comes from (`system`,
+   * sent by `system_apply`). Runtimes that predate it send none, and their
+   * channels stay unmarked rather than marked under a key nothing releases.
+   */
+  const systemKey = (raw: unknown) => (typeof raw === 'string' && raw.trim() ? raw.trim().slice(0, 200) : undefined)
+
   router.put(`${base}/team-channels/:name`, async (c) => {
     const auth = await config.authorize(c)
     if (auth instanceof Response) return auth
     const body = await readJson(c)
     try {
-      const result = await upsertTeamChannel(auth.workspaceId, { ...body, name: c.req.param('name') })
+      const onBehalfOfUserId = typeof body.onBehalfOfUserId === 'string' && body.onBehalfOfUserId.trim() ? body.onBehalfOfUserId.trim() : undefined
+      const result = await upsertTeamChannel(auth.workspaceId, { ...body, name: c.req.param('name'), onBehalfOfUserId }, systemKey(body.system))
       return c.json(result, result.created ? 201 : 200)
     } catch (err) {
       if (err instanceof TeamChannelError) return c.json({ error: { code: err.code, message: err.message } }, err.status)
       return errorResponse(c, err)
     }
+  })
+
+  /** `system_apply` sends every channel its manifest declares: those are protected, the rest it had declared are released. */
+  router.post(`${base}/team-channels/ownership`, async (c) => {
+    const auth = await config.authorize(c)
+    if (auth instanceof Response) return auth
+    const body = await readJson(c)
+    const system = systemKey(body.system)
+    const declared = Array.isArray(body.declared) ? body.declared.filter((n: unknown): n is string => typeof n === 'string') : null
+    if (!system || !declared) {
+      return c.json({ error: { code: 'invalid', message: 'system and a declared list of channel names are required' } }, 400)
+    }
+    return c.json(await syncTeamChannelOwnership(auth.workspaceId, system, declared))
   })
 
   /** Chain for an agent's tool post: joins the reply it's running in, and inherits the thread's run id. */
@@ -954,6 +1153,101 @@ export function agentChannelRoutes(routeConfig: AgentChannelRoutesConfig): Hono 
     return c.json({ results: rendered.map((r, i) => ({ ...r, channel: rows[i].conversation?.name ?? null })) })
   })
 
+  // ─── Files ───────────────────────────────────────────────────────────────
+  // Visibility is decided by conversation-file-access, the same rules the Files pane uses.
+
+  const FILE_NOT_VISIBLE = { error: { code: 'not_found', message: 'Conversation not found or not visible to this agent' } }
+
+  /** The agent principal, and the conversation id it named (null when none was named, undefined when it can't see it). */
+  async function fileScope(c: any, auth: AgentChannelAuthContext) {
+    const projectId = await agentIdentity(auth, c.req.query('projectId'))
+    const principal: FilePrincipal = { kind: 'agent', projectId }
+    const ref = c.req.query('conversation')?.trim()
+    if (!ref) return { principal, conversationId: null as string | null }
+    const conversation = await resolveAgentConversation(auth.workspaceId, ref, projectId)
+    return { principal, conversationId: conversation?.id as string | undefined }
+  }
+
+  router.get(`${base}/files`, async (c) => {
+    const auth = await config.authorize(c)
+    if (auth instanceof Response) return auth
+    const { principal, conversationId } = await fileScope(c, auth)
+    if (conversationId === undefined) return c.json(FILE_NOT_VISIBLE, 404)
+    const conversations = await listFileConversations(principal, auth.workspaceId)
+    const folders = new Map<string, string>(conversations.map((conv: any) => [conv.id, conv.folder]))
+    const { files, nextCursor } = await listFiles(principal, auth.workspaceId, {
+      conversationId: conversationId ?? undefined,
+      q: c.req.query('q') || undefined,
+      kind: parseFileKind(c.req.query('kind')),
+      cursor: c.req.query('cursor') || undefined,
+      limit: numberParam(c.req.query('limit')),
+    })
+    return c.json({ conversations, files: files.map((f: any) => serializeFileForAgent(f, folders)), nextCursor })
+  })
+
+  router.get(`${base}/files/search`, async (c) => {
+    const auth = await config.authorize(c)
+    if (auth instanceof Response) return auth
+    const { principal, conversationId } = await fileScope(c, auth)
+    if (conversationId === undefined) return c.json(FILE_NOT_VISIBLE, 404)
+    const q = (c.req.query('q') ?? '').trim()
+    if (!q) return c.json({ results: [], semantic: false })
+    const [{ results, semantic }, conversations] = await Promise.all([
+      searchFiles(principal, auth.workspaceId, q, { conversationId: conversationId ?? undefined, limit: numberParam(c.req.query('limit')) }),
+      listFileConversations(principal, auth.workspaceId),
+    ])
+    const byId = new Map(conversations.map((conv: any) => [conv.id, conv]))
+    return c.json({
+      semantic,
+      results: results.map((r) => {
+        const conv: any = byId.get(r.conversationId)
+        return { ...r, conversation: conv ? { id: conv.id, kind: conv.kind, name: conv.name } : null, folder: conv?.folder ?? r.conversationId }
+      }),
+    })
+  })
+
+  router.get(`${base}/files/:fileId/text`, async (c) => {
+    const auth = await config.authorize(c)
+    if (auth instanceof Response) return auth
+    const { principal } = await fileScope(c, auth)
+    try {
+      const text = await readFileText(principal, auth.workspaceId, c.req.param('fileId'), {
+        offset: numberParam(c.req.query('offset')),
+        limit: numberParam(c.req.query('limit')),
+      })
+      return c.json(text)
+    } catch (err) {
+      return errorResponse(c, err)
+    }
+  })
+
+  router.get(`${base}/files/:fileId/content`, async (c) => {
+    const auth = await config.authorize(c)
+    if (auth instanceof Response) return auth
+    const { principal } = await fileScope(c, auth)
+    try {
+      const { attachment, conversation } = await loadVisibleFile(principal, auth.workspaceId, c.req.param('fileId'))
+      const [bytes, conversations] = await Promise.all([
+        loadConversationFileBytes(attachment.storageKey),
+        listFileConversations(principal, auth.workspaceId),
+      ])
+      const folder = conversations.find((conv: any) => conv.id === conversation.id)?.folder
+      return new Response(bytes as any, {
+        headers: {
+          'Content-Type': attachment.mimeType,
+          'Content-Length': String(bytes.byteLength),
+          'Content-Disposition': `attachment; filename*=UTF-8''${encodeURIComponent(attachment.name)}`,
+          'X-File-Name': encodeURIComponent(attachment.name),
+          'X-File-Folder': encodeURIComponent(folder ?? conversation.id),
+          'Cache-Control': 'private, no-store',
+        },
+      })
+    } catch (err) {
+      if (err instanceof ConversationError) return errorResponse(c, err)
+      return c.json({ error: { code: 'not_found', message: 'File not found' } }, 404)
+    }
+  })
+
   router.get(`${base}/:channel/messages`, async (c) => {
     const auth = await config.authorize(c)
     if (auth instanceof Response) return auth
@@ -966,13 +1260,13 @@ export function agentChannelRoutes(routeConfig: AgentChannelRoutesConfig): Hono 
     const rows = threadRootId
       ? await db.conversationMessage.findMany({
           where: { conversationId: conversation.id, OR: [{ id: threadRootId }, { threadRootId }], deletedAt: null },
-          include: { authorUser: { select: { name: true, email: true } } },
+          include: AGENT_MESSAGE_INCLUDE,
           orderBy: { seq: 'asc' },
           take: limit,
         })
       : (await db.conversationMessage.findMany({
           where: { conversationId: conversation.id, threadRootId: null, deletedAt: null },
-          include: { authorUser: { select: { name: true, email: true } } },
+          include: AGENT_MESSAGE_INCLUDE,
           orderBy: { seq: 'desc' },
           take: limit,
         })).reverse()
@@ -1040,21 +1334,32 @@ export function agentChannelRoutes(routeConfig: AgentChannelRoutesConfig): Hono 
       if (body.card !== undefined && body.card !== null && !card) {
         return c.json({ error: { code: 'invalid_card', message: 'A status card needs a title' } }, 400)
       }
+      const questions = normalizeQuestionDrafts(body.questions)
       // A card is routine by default; agents mark it a decision or alert when it needs a person.
-      const kind = normalizeKind(body.kind) ?? (card ? 'status' : null)
+      const kind = normalizeKind(body.kind) ?? (questions.length ? 'decision' : card ? 'status' : null)
       const note = String(body.text ?? '')
+      const blocks = blocksForKind({ kind, card })
       const result = await postAgentMessage({
         conversationId: conversation.id,
         text: await resolveFriendlyMentions(auth.workspaceId, card ? [cardToMarkdown(card), note.trim()].filter(Boolean).join('\n\n') : note, projectId),
         agent: { projectId, name: await agentDisplayName(auth.workspaceId, projectId) },
         threadRootId,
         agentChain,
-        blocks: blocksForKind({ kind, card }),
+        // The designer leaves alone a message whose agent asked its own questions.
+        blocks: questions.length ? { ...blocks, questionScan: 'explicit' } : blocks,
       })
       const rootId = result.row.threadRootId ?? result.row.id
       if (!result.duplicate && (body.owner === true || (!result.row.threadRootId && body.owner !== false))) {
         await setThreadOwner(rootId, { projectId }, agentChain?.runId)
       }
+      if (!result.duplicate && questions.length) {
+        await attachQuestions({ messageId: result.row.id, drafts: questions, source: 'agent' })
+          .catch((err) => console.warn('[AgentChannels] questions failed:', (err as Error).message))
+      }
+      // Created before dispatch, so a fast reply cannot finish ahead of its task.
+      const tasks = body.trackReplies === true && typeof body.sessionId === 'string' && !result.duplicate
+        ? await trackedReplies(auth.workspaceId, body.sessionId, result)
+        : []
       void afterMessagePosted(result, { actorUserId: null, origin: 'agent' })
       return c.json({
         message: {
@@ -1063,12 +1368,26 @@ export function agentChannelRoutes(routeConfig: AgentChannelRoutesConfig): Hono 
           threadRootId: rootId,
           runId: agentChain?.runId ?? null,
           url: `${getFrontendUrl()}/c/${encodeURIComponent(conversation.id)}?thread=${encodeURIComponent(rootId)}`,
+          ...(tasks.length ? { tasks } : {}),
         },
       }, 201)
     } catch (err) {
       return errorResponse(c, err)
     }
   })
+
+  /** Background tasks for the agents a post hands work to, so the poster can wait for their replies. */
+  async function trackedReplies(workspaceId: string, chatSessionId: string, result: any) {
+    try {
+      const targets = await agentPostTargets(result)
+      if (!targets.length) return []
+      const agents = await Promise.all(targets.map(async (t) => ({ projectId: t.projectId, name: await agentDisplayName(workspaceId, t.projectId) })))
+      return await createReplyTasks(chatSessionId, result.row.id, agents)
+    } catch (err) {
+      console.warn('[AgentChannels] reply tracking failed:', (err as Error).message)
+      return []
+    }
+  }
 
   /** An agent edits one of its own messages in place: its text, kind, or status card. */
   router.patch(`${base}/messages/:messageId`, async (c) => {
@@ -1082,16 +1401,48 @@ export function agentChannelRoutes(routeConfig: AgentChannelRoutesConfig): Hono 
     if (body.card !== undefined && body.card !== null && !card) {
       return c.json({ error: { code: 'invalid_card', message: 'A status card needs a title' } }, 400)
     }
+    const questions = normalizeQuestionDrafts(body.questions)
     try {
-      const { message } = await updateAgentMessage({
-        messageId: c.req.param('messageId'),
-        workspaceId: auth.workspaceId,
-        projectId,
-        text: typeof body.text === 'string' ? await resolveFriendlyMentions(auth.workspaceId, body.text, projectId) : undefined,
-        kind: normalizeKind(body.kind),
-        card,
-      })
+      const text = typeof body.text === 'string' ? await resolveFriendlyMentions(auth.workspaceId, body.text, projectId) : undefined
+      let message: any
+      if (text !== undefined || card || normalizeKind(body.kind)) {
+        ;({ message } = await updateAgentMessage({
+          messageId: c.req.param('messageId'),
+          workspaceId: auth.workspaceId,
+          projectId,
+          text,
+          kind: normalizeKind(body.kind),
+          card,
+        }))
+      }
+      if (questions.length) {
+        const row = await db.conversationMessage.findUnique({ where: { id: c.req.param('messageId') } })
+        const own = row && row.workspaceId === auth.workspaceId && row.authorType === 'agent' && (row.authorAgentRef?.projectId ?? null) === projectId
+        if (!own) return c.json({ error: { code: 'forbidden', message: 'Agents can only add questions to their own messages' } }, 403)
+        await attachQuestions({ messageId: row.id, drafts: questions, source: 'agent' })
+        message ??= row
+      }
+      if (!message) return c.json({ error: { code: 'empty', message: 'Pass text, card, kind or questions to change' } }, 400)
       return c.json({ message: { id: message.id, conversationId: message.conversationId } })
+    } catch (err) {
+      if (err instanceof AgentMessageError) return c.json({ error: { code: err.code, message: err.message } }, err.status)
+      return errorResponse(c, err)
+    }
+  })
+
+  /** The value a person entered for one of this agent's `secret` questions. */
+  router.get(`${base}/messages/:messageId/questions/:questionId/secret`, async (c) => {
+    const auth = await config.authorize(c)
+    if (auth instanceof Response) return auth
+    const projectId = await agentIdentity(auth, c.req.query('projectId'))
+    try {
+      const secret = await readQuestionSecret({
+        workspaceId: auth.workspaceId,
+        messageId: c.req.param('messageId'),
+        questionId: c.req.param('questionId'),
+        projectId,
+      })
+      return c.json(secret)
     } catch (err) {
       if (err instanceof AgentMessageError) return c.json({ error: { code: err.code, message: err.message } }, err.status)
       return errorResponse(c, err)

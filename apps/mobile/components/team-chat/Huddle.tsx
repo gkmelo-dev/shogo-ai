@@ -8,6 +8,8 @@
 import { ActivityIndicator, Image, Pressable, Text, View } from 'react-native'
 import { Headphones, Mic, MicOff, MonitorOff, MonitorUp, PhoneOff, Video, VideoOff, Volume2, X } from 'lucide-react-native'
 import { cn } from '@shogo/shared-ui/primitives'
+import { WebTooltip } from '../chat/WebTooltip'
+import { resolveAvatarUrl } from '../../lib/chat-attachment-url'
 import { useConversationHuddle } from '../../hooks/useHuddles'
 import {
   clearHuddleError,
@@ -49,7 +51,7 @@ export function Face({ person, speaking, size = 28 }: { person: HuddleParticipan
       accessibilityLabel={speaking ? `${person.name}, speaking` : person.name}
     >
       {person.image ? (
-        <Image source={{ uri: person.image }} style={{ width: size, height: size, borderRadius: size / 2 }} accessibilityIgnoresInvertColors />
+        <Image source={{ uri: resolveAvatarUrl(person.image) ?? undefined }} style={{ width: size, height: size, borderRadius: size / 2 }} accessibilityIgnoresInvertColors />
       ) : (
         <View className="items-center justify-center rounded-full bg-secondary" style={{ width: size, height: size }}>
           <Text className="text-[10px] font-semibold text-secondary-foreground">{initials(person.name)}</Text>
@@ -103,8 +105,10 @@ export function HuddleButton({ conversation, me, label, floating }: { conversati
       accessibilityLabel={action}
       className={cn('flex-row items-center gap-1 rounded-md p-1.5 active:bg-muted hover:bg-muted', huddle && !inThis && 'bg-emerald-500/10')}
     >
-      <Headphones size={16} className={iconClass} />
-      {huddle && !inThis ? <Text className="text-xs font-medium text-emerald-600">{huddle.participants.length}</Text> : null}
+      <WebTooltip label={action}>
+        <Headphones size={16} className={iconClass} />
+        {huddle && !inThis ? <Text className="text-xs font-medium text-emerald-600">{huddle.participants.length}</Text> : null}
+      </WebTooltip>
     </Pressable>
   )
 }

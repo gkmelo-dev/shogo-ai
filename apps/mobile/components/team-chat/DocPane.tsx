@@ -20,7 +20,7 @@ import { localTimeZone, parseDocToken } from '../../lib/doc-tokens'
 import { privateMemberIds } from '../../lib/mention-menu'
 import { teamChatApi, type ChannelDocRevision, type ConversationDetail, type Mentionables } from '../../lib/team-chat-api'
 import { docLink } from '../../lib/team-chat-links'
-import { mentionNames, renderMentions } from '../../lib/team-chat-state'
+import { mentionNames, renderMentionsMarkdown } from '../../lib/team-chat-state'
 import { relativeTime } from '../../lib/activity-feed'
 import DocEditor from './doc-editor/DocEditor'
 import type { DocChipPress, DocEditorData, DocEditorHandle } from './doc-editor/types'
@@ -72,6 +72,7 @@ export function DocPane({ conversation, workspaceId, mentionables, me = null, on
       statuses: mentionables?.statuses,
       meId: me,
       memberIds: privateMemberIds(conversation),
+      membersOnly: conversation.kind === 'private',
       timeZone: localTimeZone(),
     }),
     [mentionables, me, conversation],
@@ -367,7 +368,7 @@ function HistoryModal({
           {selected ? (
             <>
               <ScrollView className="max-h-[60vh] rounded-md border border-border p-3">
-                <MarkdownText>{selected.content ? renderMentions(selected.content, names) : '_Empty_'}</MarkdownText>
+                <MarkdownText>{selected.content ? renderMentionsMarkdown(selected.content, names) : '_Empty_'}</MarkdownText>
               </ScrollView>
               {canRestore ? (
                 <View className="mt-3 flex-row justify-end">

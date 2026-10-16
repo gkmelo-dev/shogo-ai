@@ -24,10 +24,16 @@ import { runtimeRoutes } from './routes/runtime'
 import { filesRoutes } from './routes/files'
 import { projectChatRoutes, trackUsageFromStream } from './routes/project-chat'
 import { pinChatToHomeRegion, pinProjectRoutesToHomeRegion } from './lib/chat-region-pin'
+import { RuntimeNotInHomeRegionError, runtimeNotInHomeRegionResponse } from './lib/runtime-home-region-guard'
 import { workspaceChatRoutes } from './routes/workspace-chat'
 import { workspaceAgentRoutes, sessionAuthorize } from './routes/workspace-agent'
 import { workspaceMeetingRoutes, sharedMeetingRoutes } from './routes/workspace-meetings'
 import { conversationRoutes } from './routes/conversations'
+import { workBoardRoutes } from './routes/work-boards'
+// Analytics routes are plain in-repo modules (Prisma only), so they mount in
+// local mode too. Loading them via server-cloud-deps left local 404ing.
+import { scopedAnalyticsRoutes } from './routes/scoped-analytics'
+import { costAnalyticsRoutes } from './routes/cost-analytics'
 import { AGENT_REPLY_TIMEOUT_MS, configureConversationAgentDispatcher, settleOrphanedAgentReplies } from './services/conversation-agent-dispatcher'
 import { registerBuiltInChatProviders } from './services/chat-providers'
 import { chatProviderRoutes } from './routes/chat-providers'
@@ -227,8 +233,6 @@ const licenseKeyAdminRoutes: any = cloud.licenseKeyAdminRoutes ?? emptyRouter
 const licenseKeyRoutes: any = cloud.licenseKeyRoutes ?? emptyRouter
 const affiliateRoutes: any = cloud.affiliateRoutes ?? emptyRouter
 const marketplaceRoutes: any = cloud.marketplaceRoutes ?? emptyRouter
-const scopedAnalyticsRoutes: any = cloud.scopedAnalyticsRoutes ?? emptyRouter
-const costAnalyticsRoutes: any = cloud.costAnalyticsRoutes ?? emptyRouter
 const integrationRoutes: any = cloud.integrationRoutes ?? emptyRouter
 const evalOutputRoutes: any = cloud.evalOutputRoutes ?? emptyRouter
 const projectExportImportRoutes: any = cloud.projectExportImportRoutes ?? emptyRouter
@@ -646,6 +650,10 @@ app.onError((err, c) => {
   if (err instanceof HTTPException) {
     return err.getResponse()
   }
+  if (err instanceof RuntimeNotInHomeRegionError) {
+    console.warn(`[API] ${c.req.method} ${c.req.path}: ${err.message}`)
+    return runtimeNotInHomeRegionResponse(c, err)
+  }
   console.error(`[API] Unhandled route error on ${c.req.method} ${c.req.path}:`, err.message)
   // Don't expose internal error details in production
   const isProduction = process.env.NODE_ENV === 'production'
@@ -968,6 +976,8 @@ app.get('/api/config', async (c) => {
     // have been explicitly enabled; local design work stays opt-in by default.
     agentShell: localMode,
     mobileAgentShell: localMode,
+    // Kill switch: a super-admin can turn boards off instance-wide without a deploy.
+    workBoards: true,
   }
 
   // Super-admin overrides from PlatformSetting (absence = use default).
@@ -985,6 +995,7 @@ app.get('/api/config', async (c) => {
             'feature.personal_shell',
             'feature.agent_shell',
             'feature.mobile_agent_shell',
+            'feature.work_boards',
           ],
         },
       },
@@ -1003,6 +1014,7 @@ app.get('/api/config', async (c) => {
       if (row.key === 'feature.personal_shell') overrides.personalShell = bool
       if (row.key === 'feature.agent_shell') overrides.agentShell = bool
       if (row.key === 'feature.mobile_agent_shell') overrides.mobileAgentShell = bool
+      if (row.key === 'feature.work_boards') overrides.workBoards = bool
     }
   } catch (err) {
     console.error('[config] Failed to load feature flag overrides:', err)
@@ -1595,6 +1607,7 @@ configureConversationAgentDispatcher({ runtimeManager: getRuntimeManager() })
 void settleOrphanedAgentReplies(AGENT_REPLY_TIMEOUT_MS + 60_000).catch((err) => console.warn('[Channels] could not settle interrupted replies:', err?.message ?? err))
 registerBuiltInChatProviders()
 app.route('/api', conversationRoutes({ resolveUserId: getAuthUserId }))
+app.route('/api', workBoardRoutes({ resolveUserId: getAuthUserId }))
 app.route('/api', chatProviderRoutes({ resolveUserId: getAuthUserId }))
 app.route('/api', createAgentTaskRoutes({ runtimeManager: getRuntimeManager() }))
 // Resume queued agent tasks after API restarts and keep dueAt-backed work
@@ -6141,8 +6154,17 @@ app.post('/api/admin/metal/rewarm', async (c) => {
 
 app.get('/api/admin/metal/rewarm', async (c) => {
   try {
-    const { getRewarmStatus } = await import('./lib/metal-rewarm')
-    return c.json({ ok: true, data: await getRewarmStatus() })
+    const { getRewarmStatus, getSwitchoverStatus, getRefreshStatus } = await import('./lib/metal-rewarm')
+    const { getMetalWarmPoolController } = await import('./lib/metal-warm-pool-controller')
+    const hosts = (await getMetalWarmPoolController().getFleetStatus().catch(() => null))?.hosts ?? []
+    const regions = [...new Set(hosts.map((h) => h.region))]
+    return c.json({
+      ok: true,
+      data: await getRewarmStatus(),
+      switchover: await getSwitchoverStatus(undefined, regions),
+      refresh: await getRefreshStatus(),
+      staged: hosts.map((h) => ({ hostId: h.hostId, region: h.region, rootfsSha: h.rootfsSha, stagedRootfs: h.stagedRootfs ?? null, restarting: h.restarting ?? false })),
+    })
   } catch (err: any) {
     return c.json({ ok: false, error: err?.message ?? 'unavailable' }, 500)
   }
@@ -6169,6 +6191,20 @@ app.post('/api/admin/metal/rewarm/:action', async (c) => {
     return c.json({ ok: true, control: action === 'pause' ? 'pause' : null })
   } catch (err: any) {
     return c.json({ ok: false, error: err?.message ?? `${action} failed` }, 500)
+  }
+})
+
+// POST /api/admin/metal/drain-foreign-members — unmount every project that is
+// mounted into a runtime other than its own `ws:proj:<id>`, on every live host.
+// Returns { ok, hosts: [{ hostId, ok, results?, error? }] }.
+app.post('/api/admin/metal/drain-foreign-members', async (c) => {
+  try {
+    const { getMetalWarmPoolController } = await import('./lib/metal-warm-pool-controller')
+    const hosts = await getMetalWarmPoolController().drainForeignMembers()
+    console.log(`[admin-audit] ${JSON.stringify({ event: 'admin.metal.drain_foreign_members', actorId: rewarmActor(c).id, actorEmail: rewarmActor(c).email, hosts: hosts.length })}`)
+    return c.json({ ok: hosts.every((h) => h.ok), hosts })
+  } catch (err: any) {
+    return c.json({ ok: false, error: err?.message ?? 'drain failed' }, 500)
   }
 })
 
@@ -6725,6 +6761,7 @@ const FEATURE_FLAG_KEYS = {
   personalShell: 'feature.personal_shell',
   agentShell: 'feature.agent_shell',
   mobileAgentShell: 'feature.mobile_agent_shell',
+  workBoards: 'feature.work_boards',
 } as const
 
 type FeatureFlagName = keyof typeof FEATURE_FLAG_KEYS
@@ -6743,6 +6780,7 @@ app.get('/api/admin/settings/features', async (c) => {
       personalShell: null,
       agentShell: null,
       mobileAgentShell: null,
+      workBoards: null,
     }
     for (const row of rows) {
       const bool = row.value === 'true'
@@ -6789,6 +6827,7 @@ app.put('/api/admin/settings/features', async (c) => {
       personalShell: null,
       agentShell: null,
       mobileAgentShell: null,
+      workBoards: null,
     }
     for (const row of rows) {
       const bool = row.value === 'true'

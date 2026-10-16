@@ -35,6 +35,8 @@ import {
 } from '../services/workspace-session.service'
 import { memberCallFailure, resolveWhileStarting } from '../lib/workspace-member-call'
 import { resolveWorkspaceRuntimeUrl } from '../lib/resolve-workspace-runtime-url'
+import { isMetalEnabled } from '../lib/metal-eligibility'
+import { remoteToolPermission } from '../lib/remote-tool-policy'
 import { deriveWorkspaceRuntimeToken } from '../lib/workspace-runtime-token'
 import { getRuntimeManager } from '../lib/runtime/manager'
 import { resolve as resolvePath } from 'path'
@@ -46,6 +48,7 @@ import {
 } from './workspace-agent'
 import { workspaceMeetingRoutes } from './workspace-meetings'
 import { agentChannelRoutes, type AgentChannelAuthContext } from './conversations'
+import { agentBoardRoutes } from './work-boards'
 import {
   createInternalAuthorizers,
   logAuthReject,
@@ -57,8 +60,16 @@ import { signSharedFileToken } from '../lib/shared-file-token'
 import { withShogoPrFooter } from '@shogo/shared-runtime/agent-attribution'
 import { resolveConnectionAuth } from '../services/github-auth'
 import { CREDENTIAL_APPROVAL_HEADER } from '../services/integration-credentials/approvals'
-import { handOffRequesterTicket, REQUESTER_TICKET_HEADER, verifyRequesterTicket, type RequesterTicket } from '../lib/requester-ticket'
+import {
+  handOffRequesterTicket,
+  REQUESTER_TICKET_HEADER,
+  verifyRequesterTicket,
+  verifyRequesterTicketInWorkspace,
+  type RequesterTicket,
+} from '../lib/requester-ticket'
 import { signResumeToken } from '../services/integration-credentials/resume'
+import { waitForAgentCall } from '../lib/agent-call-store'
+import { keepAliveJson, KEEPALIVE_HEADER, wantsKeepAlive } from '../lib/keepalive-json'
 
 /** Where a connect link handed out in this turn should pick the conversation back up. */
 type CredentialUseSource = 'shared' | 'personal' | 'delegate' | 'approved'
@@ -172,6 +183,24 @@ function hideInaccessibleEdges<T extends { id: string; attachments?: Array<{ att
     ...p,
     attachments: (p.attachments ?? []).filter((edge) => ids.has(edge.attachedProjectId)),
   }))
+}
+
+/** Metal never mounts a project into a runtime other than its own `ws:proj:<id>`. */
+function metalMountingRemoved(): boolean {
+  return process.env.SHOGO_LOCAL_MODE !== 'true' && isMetalEnabled()
+}
+
+function mountingRemovedResponse(c: Context, extra: Record<string, unknown> = {}) {
+  return c.json(
+    {
+      error: {
+        code: 'mounting_removed',
+        message: 'Projects are no longer mounted into other runtimes; use the project parameter / connect_project to reach them.',
+      },
+      ...extra,
+    },
+    410,
+  )
 }
 
 function unavailable(c: Context, capability: string) {
@@ -659,6 +688,21 @@ export function runtimeInternalRoutes(opts: RuntimeInternalRoutesOptions): Hono 
     }),
   )
 
+  app.route(
+    '/',
+    agentBoardRoutes({
+      authorize: async (c) => {
+        const workspaceId = c.req.param('workspaceId')
+        if (!(await authorizeWorkspaceScope(c, workspaceId))) {
+          return c.json({ error: 'Unauthorized' }, 401)
+        }
+        const identity = await authenticate(c)
+        const projectId = identity?.kind === 'project' ? identity.projectId : undefined
+        return { workspaceId, projectId }
+      },
+    }),
+  )
+
   // ---------------------------------------------------------------------------
   // Workspace meta-agent membership
   // ---------------------------------------------------------------------------
@@ -899,6 +943,7 @@ export function runtimeInternalRoutes(opts: RuntimeInternalRoutesOptions): Hono 
         projectId,
         body?.attachMode === 'readonly' ? 'readonly' : 'readwrite',
       )
+      if (metalMountingRemoved()) return mountingRemovedResponse(c, { attached: attachedRow, project })
       const attached = await getAttachedProjects(sessionId)
       const attachedIds = attached.map((row) => row.projectId)
       const readonlyIds = attached.filter((row) => row.attachMode === 'readonly').map((row) => row.projectId)
@@ -947,6 +992,7 @@ export function runtimeInternalRoutes(opts: RuntimeInternalRoutesOptions): Hono 
     }
     try {
       const removed = await detachProject(sessionId, projectId)
+      if (metalMountingRemoved()) return mountingRemovedResponse(c, { removed })
       const attached = await getAttachedProjects(sessionId)
       const attachedIds = attached.map((row) => row.projectId)
       const readonlyIds = attached.filter((row) => row.attachMode === 'readonly').map((row) => row.projectId)
@@ -1192,16 +1238,19 @@ export function runtimeInternalRoutes(opts: RuntimeInternalRoutesOptions): Hono 
   /**
    * GET /api/internal/projects/:projectId/integrations/policies
    *
-   * The project's saved "acts as" policies. The runtime only consults the
-   * resolver for providers listed here; everything else keeps its default
-   * behavior.
+   * The project's "acts as" policies: what it saved, plus GitHub's default
+   * when it saved none and GitHub is available here. The runtime only
+   * consults the resolver for providers listed here; everything else keeps
+   * its default behavior.
    */
   app.get('/projects/:projectId/integrations/policies', async (c) => {
     const projectId = c.req.param('projectId')
     if (!projectId) return c.json({ error: 'Missing projectId' }, 400)
     if (!(await validateAuth(c, projectId))) return c.json({ error: 'Unauthorized' }, 401)
-    const { listPolicies } = await import('../services/integration-credentials')
-    return c.json({ ok: true, policies: await listPolicies(projectId) })
+    const { getPolicy, listPolicies } = await import('../services/integration-credentials')
+    const policies = await listPolicies(projectId)
+    if (loadGitHub && !policies.some((p) => p.provider === 'github')) policies.unshift(await getPolicy(projectId, 'github'))
+    return c.json({ ok: true, policies })
   })
 
   /**
@@ -1884,6 +1933,7 @@ export function runtimeInternalRoutes(opts: RuntimeInternalRoutesOptions): Hono 
     try {
       const svc = await import('../services/project-attachment.service')
       const attachment = await svc.attachProjectToProject(projectId, body.attachedProjectId, attachMode)
+      if (metalMountingRemoved()) return mountingRemovedResponse(c, { attachment, mounted: false })
 
       let mounted = false
       try {
@@ -2025,6 +2075,10 @@ export function runtimeInternalRoutes(opts: RuntimeInternalRoutesOptions): Hono 
    * given a `WEBHOOK_TOKEN`, so the external `/agent/hooks/*` path can't be
    * reused here. `wait=true` blocks for the reply (bounded by `timeoutMs`,
    * default 5 min, max 20 min); otherwise the runtime acks with 202.
+   * `wait=false, track=true` records the outcome for
+   * `GET .../agent-call/:runId`. Callers behind Cloudflare send
+   * `X-Shogo-Keepalive: 1` to get whitespace pings while a `wait=true` call
+   * is pending (see `keepAliveJson`).
    */
   app.post('/projects/:projectId/agent-call', async (c) => {
     const projectId = c.req.param('projectId')
@@ -2057,16 +2111,245 @@ export function runtimeInternalRoutes(opts: RuntimeInternalRoutesOptions): Hono 
     const agentCallSvc = await loadAgentCall?.()
     if (!agentCallSvc) return unavailable(c, 'Cross-project agent calls')
     const { callProjectAgentAsChat } = agentCallSvc
-    const outcome = await callProjectAgentAsChat(c, projectId, authz.workspaceId, {
+    const wait = body.wait !== false
+    const work = callProjectAgentAsChat(c, projectId, authz.workspaceId, {
       message: body.message,
       runId: typeof body.runId === 'string' ? body.runId : undefined,
       sessionId: typeof body.sessionId === 'string' ? body.sessionId : undefined,
-      wait: body.wait !== false,
+      wait,
       timeoutMs: typeof body.timeoutMs === 'number' ? body.timeoutMs : undefined,
+      track: body.track === true,
       callerProjectId,
       ...(requesterTicket ? { requesterTicket } : {}),
     })
+    if (wait && wantsKeepAlive(c.req.header(KEEPALIVE_HEADER))) return keepAliveJson(work)
+    const outcome = await work
     return c.json(outcome.body, outcome.status as any)
   })
+
+  /**
+   * POST /api/internal/projects/:projectId/remote-tool
+   *   body: { tool, args?, callerProjectId?, timeoutMs? }
+   *
+   * Run one tool against another project in the caller's workspace. The
+   * target is woken in its own runtime and the call is forwarded to its
+   * `/agent/remote/tool`; status and JSON body pass through. Read-only tools
+   * need `project:read` on the target, everything else `project:update`.
+   */
+  app.post('/projects/:projectId/remote-tool', async (c) => {
+    const projectId = c.req.param('projectId')
+    const authz = await authorizeLifecycleProject(c, projectId)
+    if (!authz) {
+      const identity = await authenticate(c)
+      const target = identity
+        ? ((await prisma.project.findUnique({ where: { id: projectId }, select: { workspaceId: true } })) as { workspaceId: string } | null)
+        : null
+      if (target) {
+        return c.json(
+          { error: { code: 'cross_workspace', message: 'The target project is in a different workspace.' } },
+          403,
+        )
+      }
+      return c.json({ error: 'Unauthorized' }, 401)
+    }
+
+    const ticketHeader = c.req.header(REQUESTER_TICKET_HEADER)
+    if (ticketHeader && !(await verifyRequesterTicketInWorkspace(ticketHeader, authz.workspaceId))) {
+      return c.json({ error: { code: 'invalid_requester_ticket', message: 'The requester ticket is invalid or expired.' } }, 401)
+    }
+
+    const body = (await c.req.json().catch(() => null)) as Record<string, unknown> | null
+    if (!body || typeof body.tool !== 'string' || !body.tool.trim()) {
+      return c.json({ error: { code: 'bad_request', message: 'tool is required' } }, 400)
+    }
+    if (body.args !== undefined && (typeof body.args !== 'object' || body.args === null || Array.isArray(body.args))) {
+      return c.json({ error: { code: 'bad_request', message: 'args must be an object' } }, 400)
+    }
+    const tool = body.tool.trim()
+    const denied = await enforceProjectPermission(
+      c, authz.identity, authz.workspaceId, projectId, remoteToolPermission(tool),
+    )
+    if (denied) return denied
+
+    const callerProjectId =
+      authz.identity.kind === 'project'
+        ? authz.identity.projectId
+        : typeof body.callerProjectId === 'string' ? body.callerProjectId : undefined
+
+    let requesterTicket: string | undefined
+    const callerTicket = callerProjectId ? verifyRequesterTicket(ticketHeader, callerProjectId) : null
+    if (callerTicket && callerProjectId !== projectId) {
+      requesterTicket = handOffRequesterTicket(callerTicket, projectId) ?? undefined
+    }
+
+    const agentCallSvc = await loadAgentCall?.()
+    if (!agentCallSvc) return unavailable(c, 'Remote project tools')
+    const work = agentCallSvc.callProjectRemoteTool(c, projectId, authz.workspaceId, {
+      tool,
+      args: (body.args as Record<string, unknown> | undefined) ?? {},
+      callerProjectId,
+      timeoutMs: typeof body.timeoutMs === 'number' ? body.timeoutMs : undefined,
+      ...(requesterTicket ? { requesterTicket } : {}),
+    })
+    if (wantsKeepAlive(c.req.header(KEEPALIVE_HEADER))) return keepAliveJson(work)
+    const outcome = await work
+    return c.json(outcome.body, outcome.status as any)
+  })
+
+  /**
+   * GET /api/internal/projects/:projectId/agent-call/:runId?waitMs=
+   *
+   * Long-poll a call started with `wait=false, track=true`. Returns as soon as
+   * the call is `completed` / `failed`, or the `running` record after
+   * `waitMs` (default 60s, max 90s). With `X-Shogo-Keepalive: 1` the wait is
+   * padded with whitespace pings so Cloudflare does not cut it off.
+   */
+  app.get('/projects/:projectId/agent-call/:runId', async (c) => {
+    const projectId = c.req.param('projectId')
+    const runId = c.req.param('runId')
+    const authz = await authorizeLifecycleProject(c, projectId)
+    if (!authz) return c.json({ error: 'Unauthorized' }, 401)
+    const denied = await enforceProjectPermission(c, authz.identity, authz.workspaceId, projectId, 'project:update')
+    if (denied) return denied
+
+    const requested = Number(c.req.query('waitMs'))
+    const waitMs = Number.isFinite(requested) ? Math.min(Math.max(requested, 0), 90_000) : 60_000
+    const work = waitForAgentCall(projectId, runId, waitMs, { signal: c.req.raw.signal }).then((record) =>
+      record
+        ? { status: 200, body: record }
+        : { status: 404, body: { error: { code: 'agent_call_unknown', message: `No tracked call ${runId} for this project.` } } },
+    )
+    if (wantsKeepAlive(c.req.header(KEEPALIVE_HEADER))) return keepAliveJson(work)
+    const outcome = await work
+    return c.json(outcome.body, outcome.status as any)
+  })
+
+  // ─── Background tasks ──────────────────────────────────────────────────────
+  //
+  // Tasks a runtime's agent waits on or is woken by (see
+  // background-tasks.service). Every route is scoped to the chat session the
+  // task belongs to, authorized like that session's runtime.
+
+  async function authorizeChatSession(c: Context, chatSessionId: string): Promise<boolean> {
+    const session = (await prisma.chatSession.findUnique({
+      where: { id: chatSessionId },
+      select: { contextType: true, contextId: true, workspaceId: true },
+    })) as { contextType: string; contextId: string | null; workspaceId: string | null } | null
+    if (!session) return false
+    const projectId = session.contextType === 'project' ? session.contextId ?? undefined : undefined
+    let workspaceId = session.workspaceId
+    if (!workspaceId && projectId) {
+      const project = (await prisma.project.findUnique({ where: { id: projectId }, select: { workspaceId: true } })) as { workspaceId: string } | null
+      workspaceId = project?.workspaceId ?? null
+    }
+    const identity = await authenticate(c)
+    if (!identity) return false
+    if (identity.kind === 'sa') return true
+    if (identity.kind === 'workspace') return !!workspaceId && identity.workspaceId === workspaceId
+    return !!projectId && identity.projectId === projectId
+  }
+
+  const tasksSvc = () => import('../services/background-tasks.service')
+
+  async function taskOr404(c: Context, id: string) {
+    const { getTask } = await tasksSvc()
+    const row = await getTask(id)
+    if (!row || !(await authorizeChatSession(c, row.chatSessionId))) return null
+    return row
+  }
+
+  function taskError(c: Context, err: unknown) {
+    const e = err as { status?: number; code?: string; message?: string }
+    if (e?.status === 400 || e?.status === 404) return c.json({ error: { code: e.code, message: e.message } }, e.status)
+    throw err
+  }
+
+  /** POST /api/internal/tasks  body: { id, chatSessionId, source, targetRef, title, until? } */
+  app.post('/tasks', async (c) => {
+    const body = (await c.req.json().catch(() => null)) as Record<string, unknown> | null
+    const chatSessionId = typeof body?.chatSessionId === 'string' ? body.chatSessionId : ''
+    if (!chatSessionId) return c.json({ error: { code: 'bad_request', message: 'chatSessionId is required' } }, 400)
+    if (!(await authorizeChatSession(c, chatSessionId))) return c.json({ error: 'Unauthorized' }, 401)
+    const { createTask, viewOf } = await tasksSvc()
+    try {
+      const row = await createTask({
+        id: String(body!.id ?? ''),
+        chatSessionId,
+        source: String(body!.source ?? ''),
+        targetRef: String(body!.targetRef ?? ''),
+        title: String(body!.title ?? ''),
+        until: typeof body!.until === 'string' ? body!.until : null,
+      })
+      return c.json({ task: viewOf(row) }, 201)
+    } catch (err) {
+      return taskError(c, err)
+    }
+  })
+
+  /** GET /api/internal/tasks?chatSessionId= — running tasks for a session (the dock). */
+  app.get('/tasks', async (c) => {
+    const chatSessionId = c.req.query('chatSessionId') ?? ''
+    if (!chatSessionId || !(await authorizeChatSession(c, chatSessionId))) return c.json({ error: 'Unauthorized' }, 401)
+    const { listTasks, viewOf } = await tasksSvc()
+    return c.json({ tasks: (await listTasks(chatSessionId)).map((row) => viewOf(row)) })
+  })
+
+  /** POST /api/internal/tasks/consume  body: { ids } — the agent saw these results. */
+  app.post('/tasks/consume', async (c) => {
+    const body = (await c.req.json().catch(() => null)) as { ids?: unknown } | null
+    const ids = Array.isArray(body?.ids) ? body!.ids.filter((id): id is string => typeof id === 'string') : []
+    const { getTask, consumeTasks } = await tasksSvc()
+    const allowed: string[] = []
+    const checked = new Map<string, boolean>()
+    for (const id of ids.slice(0, 200)) {
+      const row = await getTask(id)
+      if (!row) continue
+      if (!checked.has(row.chatSessionId)) checked.set(row.chatSessionId, await authorizeChatSession(c, row.chatSessionId))
+      if (checked.get(row.chatSessionId)) allowed.push(id)
+    }
+    return c.json({ consumed: await consumeTasks(allowed) })
+  })
+
+  /** POST /api/internal/tasks/notify  body: { chatSessionId, tasks: [{ id, source, title, status, text }] } */
+  app.post('/tasks/notify', async (c) => {
+    const body = (await c.req.json().catch(() => null)) as { chatSessionId?: unknown; tasks?: unknown } | null
+    const chatSessionId = typeof body?.chatSessionId === 'string' ? body.chatSessionId : ''
+    if (!chatSessionId || !(await authorizeChatSession(c, chatSessionId))) return c.json({ error: 'Unauthorized' }, 401)
+    const { notifyLocalTasks } = await tasksSvc()
+    const tasks = Array.isArray(body?.tasks) ? (body!.tasks as any[]) : []
+    const n = await notifyLocalTasks(chatSessionId, tasks)
+    return c.json({ queued: n > 0 })
+  })
+
+  /** GET /api/internal/tasks/:id?waitMs=&until= — long-poll one task. */
+  app.get('/tasks/:id', async (c) => {
+    const row = await taskOr404(c, c.req.param('id'))
+    if (!row) return c.json({ error: { code: 'task_unknown', message: 'No such task.' } }, 404)
+    const { waitForTask, viewOf, MAX_WAIT_MS } = await tasksSvc()
+    const requested = Number(c.req.query('waitMs'))
+    const waitMs = Number.isFinite(requested) ? Math.min(Math.max(requested, 0), MAX_WAIT_MS) : 0
+    const work = waitForTask(row.id, { waitMs, until: c.req.query('until') || null, signal: c.req.raw.signal })
+      .then((outcome) => outcome
+        ? { status: 200, body: { task: viewOf(outcome.row, outcome.matched) } }
+        : { status: 404, body: { error: { code: 'task_unknown', message: 'No such task.' } } })
+      .catch((err) => {
+        const e = err as { status?: number; code?: string; message?: string }
+        if (e?.status === 400) return { status: 400, body: { error: { code: e.code, message: e.message } } }
+        throw err
+      })
+    if (waitMs > 0 && wantsKeepAlive(c.req.header(KEEPALIVE_HEADER))) return keepAliveJson(work)
+    const outcome = await work
+    return c.json(outcome.body, outcome.status as any)
+  })
+
+  /** POST /api/internal/tasks/:id/cancel — stop tracking (and notifying about) a task. */
+  app.post('/tasks/:id/cancel', async (c) => {
+    const row = await taskOr404(c, c.req.param('id'))
+    if (!row) return c.json({ error: { code: 'task_unknown', message: 'No such task.' } }, 404)
+    const { cancelTask, viewOf } = await tasksSvc()
+    const updated = await cancelTask(row.id)
+    return c.json({ task: updated ? viewOf(updated) : null })
+  })
+
   return app
 }

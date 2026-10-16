@@ -47,6 +47,10 @@ export type EvalCategory =
   | 'teammate-coordination'
   | 'plan'
   | 'workspace-attachments'
+  | 'company-sim'
+  | 'company-ops'
+  | 'orchestration'
+  | 'reactive'
 
 export type ValidationPhase = 'intention' | 'execution' | 'interaction'
 
@@ -97,6 +101,13 @@ export interface AgentEval {
    *  the runner sends the next response as a follow-up user message.
    *  Responses are consumed in order; if exhausted, subsequent ask_user calls get no response. */
   askUserResponses?: string[]
+  /** Company simulation seed: board, chat and system tools answer from one stateful world (see company-sim/). */
+  sim?: import('./company-sim/world').WorldSeed
+  /**
+   * Simulated hours to let pass before each user turn (history user turns in
+   * order, then the final turn). Scripted teammates act while time passes.
+   */
+  simAdvanceHours?: number[]
 }
 
 export interface ConversationTurn {
@@ -257,6 +268,11 @@ export interface EvalResult {
    * per-phase from cumulative state.
    */
   pipelineToolCalls?: ToolCallRecord[]
+  /**
+   * This phase's calls only, even in intention criteria (whose `toolCalls`
+   * is the pipeline view). For ordering checks like "the first spawn".
+   */
+  phaseToolCalls?: ToolCallRecord[]
   criteriaResults: CriterionResult[]
   triggeredAntiPatterns: string[]
   timing: {
@@ -282,6 +298,8 @@ export interface EvalResult {
    * frame. Captured by the runner so evals can assert on loop/iteration/empty
    * outcomes that are otherwise invisible (the runner used to drop these).
    */
+  /** Final state of the company simulation, when the eval ran one. */
+  sim?: import('./company-sim/world').WorldSnapshot
   loopDetected?: boolean
   hitMaxTurns?: boolean
   responseEmpty?: boolean

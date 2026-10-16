@@ -14,7 +14,7 @@ import { prisma } from '../../lib/prisma'
 import { renderMentionsAsText } from '../conversation-mentions'
 import { agentIconUrl, conversationAudience, type PostMessageResult } from '../conversation.service'
 import type { AgentChain } from '../conversation-agent-chain'
-import { blocksForKind, cardToMarkdown, normalizeKind, type AgentWork, type MessageBlocks, type MessageKind, type StatusCard } from '../conversation-message-kind'
+import { blocksForKind, cardToMarkdown, normalizeKind, type AgentWork, type IntegrationConnectRequest, type MessageBlocks, type MessageKind, type StatusCard } from '../conversation-message-kind'
 import { getChatProvider } from './registry'
 import { installationForWorkspace } from './installations'
 import { shogoProvider } from './shogo'
@@ -226,6 +226,13 @@ export function workedForLabel(work: { startedAt: number; completedAt: number })
   return `Worked for ${Math.floor(minutes / 60)}h ${minutes % 60}m`
 }
 
+/** "github" / "github_app" -> "GitHub", "composio:google_calendar" -> "Google Calendar". Mirrors the app's `integrationLabel`. */
+function connectLabel(provider: string): string {
+  if (provider === 'github' || provider === 'github_app') return 'GitHub'
+  const name = provider.includes(':') ? provider.slice(provider.indexOf(':') + 1) : provider
+  return name.split(/[_\-\s]+/).filter(Boolean).map((w) => w[0]!.toUpperCase() + w.slice(1)).join(' ')
+}
+
 /**
  * Settle a streaming reply with its final text and status. A reply that finished after other
  * messages landed moves to the end of the conversation, so the timeline reads in the order things
@@ -233,18 +240,26 @@ export function workedForLabel(work: { startedAt: number; completedAt: number })
  */
 export async function finishAgentReply(
   handle: AgentReplyHandle,
-  final: { text: string; agentStatus: string; work?: AgentWork | null },
+  final: { text: string; agentStatus: string; work?: AgentWork | null; connect?: IntegrationConnectRequest[] },
 ): Promise<void> {
+  const connect = final.connect?.length ? final.connect : null
+  const blocks = final.work || connect
+    ? { ...(final.work ? { work: final.work } : {}), ...(connect ? { connect } : {}) }
+    : null
   await shogoProvider.updateMessage(
     handle.messageId,
-    { text: final.text, agentStatus: final.agentStatus, ...(final.work ? { blocks: { work: final.work } } : {}) },
+    { text: final.text, agentStatus: final.agentStatus, ...(blocks ? { blocks } : {}) },
     { moveToEnd: true },
   )
   const ext = handle.external
   if (!ext) return
   try {
     const footer = final.work ? `_${workedForLabel(final.work)}_` : ''
-    const body = [final.text, footer].filter(Boolean).join('\n\n')
+    // External surfaces have no connect card, so the link goes in the text unless the agent already wrote it.
+    const links = (connect ?? [])
+      .filter((c) => !final.text.includes(c.connectUrl))
+      .map((c) => `Connect ${connectLabel(c.provider)}: ${c.connectUrl}`)
+    const body = [final.text, ...links, footer].filter(Boolean).join('\n\n')
     const msg = { text: await providerText(ext.conv.workspaceId, body), author: handle.author }
     if (ext.provider.updateMessage && ext.provider.capabilities.edits) {
       await ext.provider.updateMessage(ext.conv, ext.ref, msg)
@@ -354,13 +369,16 @@ export async function updateAgentMessage(input: {
  */
 export async function rewriteMessage(input: {
   messageId: string
-  text: string
+  /** New stored text; omitted to change only the blocks. */
+  text?: string
   blocks: MessageBlocks
   actions?: OutboundAction[]
+  /** What the mirrored copy shows, when it differs from the stored text. */
+  providerText?: string
 }): Promise<{ message: any; row: any }> {
   const row = await db.conversationMessage.findUnique({ where: { id: input.messageId } })
   if (!row || row.deletedAt) throw new AgentMessageError(404, 'not_found', 'Message not found')
-  const message = await shogoProvider.updateMessage(row.id, { text: input.text, blocks: input.blocks })
+  const message = await shogoProvider.updateMessage(row.id, input.text === undefined ? { blocks: input.blocks } : { text: input.text, blocks: input.blocks })
   const conversation = await db.conversation.findUnique({ where: { id: row.conversationId } })
   const target = conversation ? await conversationRef(conversation, row.threadRootId ?? null) : null
   const ref = parseExternalRef(row.externalRef)
@@ -370,7 +388,7 @@ export async function rewriteMessage(input: {
       .updateMessage?.(
         target.conv,
         { provider: ref.provider as ExternalChatProvider, channelId: ref.channelId, id: ref.id, threadId: target.conv.threadExternalId },
-        { text: await providerText(row.workspaceId, input.text), author, actions: input.actions },
+        { text: await providerText(row.workspaceId, input.providerText ?? input.text ?? row.text), author, actions: input.actions },
       )
       .catch((err: Error) => console.warn(`[ChatOutbound] ${target.provider.kind} message update failed:`, err.message))
   }

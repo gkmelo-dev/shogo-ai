@@ -16,11 +16,25 @@ import { join, resolve, extname, dirname, relative, sep } from 'path'
 import { execSync } from '@shogo/shared-runtime/child-process'
 import { fileURLToPath } from 'node:url'
 import { isProtectedFile, PROTECTED_FILE_REJECTION } from './protected-files'
-import { createProjectTools } from './project-tools'
+import { createProjectTools, resolveProjectRef } from './project-tools'
+import {
+  REMOTE_READONLY_TOOLS,
+  REMOTE_TOOL_ALLOWLIST,
+  RemoteToolError,
+  callRemoteTool,
+  currentRuntimeProjectId,
+  isMetalRuntime,
+  isRemotableTool,
+  remoteProjectsGuidance,
+} from './remote-tools'
+import { availableModelsHint, isAvailableModel } from './available-models'
 import { createWorkspaceAgentTools } from './workspace-agent-tools'
 import { createTriggerTools } from './trigger-tools'
 import { createMeetingTools } from './meeting-tools'
 import { createChannelTools } from './channel-tools'
+import { createBoardTools } from './board-tools'
+import { BOARD_ADMIN_TOOL_NAMES, BOARD_TOOL_NAMES, CHANNEL_TOOL_NAMES, PROBLEM_TOOL_NAMES } from './work-tool-names'
+import { resolveRuntimeCapabilities } from './capability-status-prompt'
 import { isWorkspaceRuntimeMode, resolveRuntimeIdentity, workspaceAttachedProjectIds } from './workspace-runtime-mode'
 import { isSearchEnabled } from './search-flag'
 import { isInQuietHours } from './quiet-hours'
@@ -29,7 +43,10 @@ import { Type, type Static } from '@sinclair/typebox'
 import type { AgentTool, AgentToolResult } from '@mariozechner/pi-agent-core'
 import { sandboxExec, sandboxExecAsync, shouldSandbox, type CommandHandle } from './sandbox-exec'
 import { commandTargetsGateway, gatewayKillRefusal } from './gateway-self-protect'
+import { checkSelfDetach, selfDetachRefusal } from './exec-detach'
 import { CommandRegistry, type CommandEntry } from './command-registry'
+import type { TaskEntry } from './task-registry'
+import { tailLines } from './task-output'
 import {
   resolveRunDir as resolveScreenshotRunDir,
   nextScreenshotPath as nextScreenshotFilePath,
@@ -247,8 +264,8 @@ export interface ToolContext {
     setCwd: (cwd: string) => void
     initialCwd?: string
   }
-  /** Tracks backgrounded shell commands that soft-timed-out so exec_wait can retrieve them */
-  commandRegistry?: import('./command-registry').CommandRegistry
+  /** Background tasks of this session (shell, subagents, remote tasks) — backs `wait` / `task_list` / `task_cancel`. */
+  commandRegistry?: import('./task-registry').TaskRegistry
   /** On-demand guide registry populated by buildGuideRegistry() */
   guideRegistry?: Map<string, string>
   /** Eval mock functions — propagated to subagents so mocked tools work in delegated calls */
@@ -508,6 +525,14 @@ function resolveWorkspaceId(ctx: ToolContext): string | undefined {
   return resolveRuntimeIdentity().workspaceId || ctx.workspaceId
 }
 
+/**
+ * Whether the workspace profile/goal/schedule tools (`schedule_create`, …)
+ * are registered. Prompts that mention them must use the same check.
+ */
+export function workspaceAgentToolsRegistered(ctx: Pick<ToolContext, 'workspaceId'>): boolean {
+  return Boolean(resolveWorkspaceId(ctx as ToolContext))
+}
+
 function workspaceMetaToolEnabled(ctx: ToolContext): boolean {
   return resolveRuntimeIdentity().mode === 'workspace' && Boolean(resolveWorkspaceId(ctx))
 }
@@ -604,12 +629,16 @@ async function mountWorkspaceProject(
 }
 
 function createListProjectsTool(ctx: ToolContext): AgentTool {
+  const metal = isMetalRuntime()
   return {
     name: 'list_projects',
     label: 'List Projects',
-    description:
-      'List the projects you can access in this Shogo workspace and show which ones are currently mounted. ' +
-      'Use this before mounting when the request names a project ambiguously or asks about project availability.',
+    description: metal
+      ? 'List the projects you can access in this Shogo workspace. Other projects are not mounted here; ' +
+        'reach one with `connect_project` and the `project` parameter of the file and shell tools. ' +
+        'Use this when the request names a project ambiguously or asks about project availability.'
+      : 'List the projects you can access in this Shogo workspace and show which ones are currently mounted. ' +
+        'Use this before mounting when the request names a project ambiguously or asks about project availability.',
     parameters: Type.Object({}),
     execute: async () => {
       if (!workspaceMetaToolEnabled(ctx))
@@ -621,17 +650,22 @@ function createListProjectsTool(ctx: ToolContext): AgentTool {
         ...(ctx.userId ? { userId: ctx.userId } : {}),
         ...(ctx.sessionId ? { sessionId: ctx.sessionId } : {}),
       })
-      return textResult(await workspaceMetaFetch(ctx, `/api/internal/workspaces/${encodeURIComponent(workspaceId!)}/projects?${qs}`))
+      const result = await workspaceMetaFetch(ctx, `/api/internal/workspaces/${encodeURIComponent(workspaceId!)}/projects?${qs}`)
+      if (!metal || !result || typeof result !== 'object' || Array.isArray(result)) return textResult(result)
+      return textResult({ ...result, remoteAccess: remoteProjectsGuidance() })
     },
   }
 }
 
 function createMountProjectTool(ctx: ToolContext): AgentTool {
+  const metal = isMetalRuntime()
   return {
     name: 'mount_project',
     label: 'Mount Project',
-    description:
-      'Mount one available Shogo project into the workspace runtime. Mount read-only when you only need to inspect it; use readwrite when the user asks for edits or commands.',
+    description: metal
+      ? 'Connect to another Shogo project of this workspace (same as connect_project). Projects are not mounted on this runtime; ' +
+        'after connecting, pass `project` to the file and shell tools to work inside it.'
+      : 'Mount one available Shogo project into the workspace runtime. Mount read-only when you only need to inspect it; use readwrite when the user asks for edits or commands.',
     parameters: Type.Object({
       projectId: Type.String({
         description: 'The exact project id returned by list_projects.',
@@ -639,6 +673,7 @@ function createMountProjectTool(ctx: ToolContext): AgentTool {
       mode: Type.Optional(Type.Union([Type.Literal('readwrite'), Type.Literal('readonly')])),
     }),
     execute: async (_toolCallId, params: any) => {
+      if (metal) return connectRemoteProject(ctx, String(params?.projectId ?? ''))
       if (!workspaceMetaToolEnabled(ctx))
         return textResult({
           error: 'This tool is only available in a workspace runtime.',
@@ -651,15 +686,24 @@ function createMountProjectTool(ctx: ToolContext): AgentTool {
 }
 
 function createUnmountProjectTool(ctx: ToolContext): AgentTool {
+  const metal = isMetalRuntime()
   return {
     name: 'unmount_project',
     label: 'Unmount Project',
-    description:
-      'Unmount a project from the workspace runtime after work is complete or when switching away. Never unmount a project that is needed for the current follow-up.',
+    description: metal
+      ? 'No-op on this runtime: other projects are reached remotely with the `project` parameter, never mounted, so there is nothing to unmount.'
+      : 'Unmount a project from the workspace runtime after work is complete or when switching away. Never unmount a project that is needed for the current follow-up.',
     parameters: Type.Object({
       projectId: Type.String({ description: 'The exact mounted project id.' }),
     }),
     execute: async (_toolCallId, params: any) => {
+      if (metal) {
+        return textResult({
+          ok: true,
+          projectId: params?.projectId,
+          message: 'Nothing to unmount: other projects are reached remotely with the `project` parameter, not mounted here.',
+        })
+      }
       if (!workspaceMetaToolEnabled(ctx))
         return textResult({
           error: 'This tool is only available in a workspace runtime.',
@@ -680,6 +724,200 @@ function createUnmountProjectTool(ctx: ToolContext): AgentTool {
         ),
       )
     },
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Remote tool channel (remote-tools.ts): `project` on the remotable tools
+// ---------------------------------------------------------------------------
+
+const REMOTE_PROJECT_PARAM_DESCRIPTION =
+  'Run this tool in another project of this workspace (project id or name). Omit for the current project.'
+
+type RemoteTarget = { local: true } | { local: false; id: string; name: string } | { error: string; code: string }
+
+const REMOTE_TARGET_TTL_MS = 60_000
+const remoteTargetCache = new Map<string, { target: RemoteTarget; expiresAt: number }>()
+
+/** Test seam: forget resolved project references. */
+export function resetRemoteTargetCache(): void {
+  remoteTargetCache.clear()
+}
+
+/**
+ * Where a `project` argument points: the current project (by id, or by name
+ * once resolved through the workspace graph, the same lookup project_call
+ * uses) runs locally; any other project goes over the remote channel.
+ */
+async function resolveRemoteTarget(ctx: ToolContext, ref: string): Promise<RemoteTarget> {
+  const trimmed = ref.trim()
+  const self = currentRuntimeProjectId(ctx.projectId)
+  const isSelf = (id: string) => id === self || id === ctx.projectId
+  if (!trimmed || isSelf(trimmed)) return { local: true }
+  const key = `${resolveWorkspaceId(ctx) ?? ''}:${trimmed}`
+  const hit = remoteTargetCache.get(key)
+  if (hit && hit.expiresAt > Date.now()) return hit.target
+  const resolved = await resolveProjectRef(ctx, trimmed)
+  if ('error' in resolved) return resolved
+  const target: RemoteTarget = isSelf(resolved.id) ? { local: true } : { local: false, id: resolved.id, name: resolved.name }
+  remoteTargetCache.set(key, { target, expiresAt: Date.now() + REMOTE_TARGET_TTL_MS })
+  return target
+}
+
+function remoteFailure(err: unknown, project: { id: string; name: string }): AgentToolResult<any> {
+  const message = err instanceof Error ? err.message : String(err)
+  const code = err instanceof RemoteToolError ? err.code : undefined
+  const status = err instanceof RemoteToolError ? err.status : undefined
+  return textResult({
+    error: message,
+    ...(code ? { code } : {}),
+    ...(status ? { status } : {}),
+    project,
+    ...(code === 'tool_not_remotable' || status === 403
+      ? { hint: 'The requester may only have read access to that project, or the tool cannot run remotely.' }
+      : {}),
+  })
+}
+
+/**
+ * Add the optional `project` parameter to a remotable tool. Without it the
+ * tool runs exactly as before; with another project it runs in that
+ * project's own runtime and returns that runtime's result.
+ */
+export function withRemoteProject(tool: AgentTool, ctx: ToolContext): AgentTool {
+  if (!isRemotableTool(tool.name)) return tool
+  const base = tool.parameters as unknown as { properties?: Record<string, any> }
+  return {
+    ...tool,
+    parameters: Type.Object({
+      ...(base.properties ?? {}),
+      project: Type.Optional(Type.String({ description: REMOTE_PROJECT_PARAM_DESCRIPTION })),
+    }),
+    execute: async (toolCallId, params, signal, onUpdate) => {
+      const project = (params as Record<string, unknown> | undefined)?.project
+      if (project === undefined || project === null) return tool.execute(toolCallId, params, signal, onUpdate)
+      const { project: _project, ...args } = params as Record<string, unknown>
+      if (typeof project !== 'string') return textResult({ error: '`project` must be a project id or name.' })
+      const target = await resolveRemoteTarget(ctx, project)
+      if ('error' in target) return textResult({ error: target.error, code: target.code })
+      if (target.local) return tool.execute(toolCallId, args as any, signal, onUpdate)
+      try {
+        const result = await callRemoteTool(target.id, tool.name, args, signal)
+        return tool.name === 'exec' ? mirrorRemoteExecTask(ctx, target, args, result) : result
+      } catch (err) {
+        return remoteFailure(err, { id: target.id, name: target.name })
+      }
+    },
+  }
+}
+
+/**
+ * A remote `exec` that is still running becomes a local task whose status is
+ * polled from the other project's runtime, so `wait`, `task_list`, the dock
+ * and wake-ups treat it like any other background task.
+ */
+function mirrorRemoteExecTask(
+  ctx: ToolContext,
+  target: { id: string; name: string },
+  args: Record<string, unknown>,
+  result: AgentToolResult<any>,
+): AgentToolResult<any> {
+  const details = result.details as Record<string, any> | undefined
+  const registry = ctx.commandRegistry
+  const taskId = details?.task_id ?? details?.run_id
+  if (!registry || details?.status !== 'running' || typeof taskId !== 'string') return result
+  const pid = typeof details.pid === 'number' ? details.pid : undefined
+  const client: import('./task-registry').RemoteTaskClient = {
+    get: async (id, opts = {}) => {
+      const res = await callRemoteTool(target.id, 'exec_wait', {
+        run_id: id,
+        timeout_ms: Math.max(0, opts.waitMs ?? 0),
+        ...(opts.until ? { pattern: opts.until } : {}),
+      })
+      const d = (res.details ?? {}) as Record<string, any>
+      const output = [d.stdout, d.stderr].filter((v) => typeof v === 'string' && v).join('\n')
+      if (d.status === 'running') return { id, status: 'running', output }
+      if (d.status === 'pattern_matched') return { id, status: 'running', output, matched: true }
+      if (d.status === 'stale' || (d.error && d.exitCode === undefined)) {
+        return { id, status: 'failed', output, result: { summary: String(d.error ?? 'remote task lost') } }
+      }
+      const exitCode = typeof d.exitCode === 'number' ? d.exitCode : 1
+      return { id, status: exitCode === 0 ? 'completed' : 'failed', output, result: { exitCode, summary: `exit code ${exitCode}` } }
+    },
+    cancel: async () => {
+      if (pid) await callRemoteTool(target.id, 'exec', { command: `kill ${pid}` })
+    },
+    consume: async () => {},
+  }
+  const entry = registry.registerRemote({
+    id: taskId,
+    source: 'shell',
+    title: `[${target.name}] ${String(args.command ?? '')}`,
+    client,
+  })
+  return textResult({
+    ...details,
+    task_id: entry.id,
+    output_file: taskOutputPath(ctx, entry),
+    hint: BACKGROUND_TASK_HINT,
+  })
+}
+
+const REMOTE_WAKE_COMMAND = 'pwd && ls -la'
+
+async function connectRemoteProject(ctx: ToolContext, ref: string, signal?: AbortSignal): Promise<AgentToolResult<any>> {
+  if (!ref.trim()) return textResult({ error: 'project is required' })
+  const target = await resolveRemoteTarget(ctx, ref)
+  if ('error' in target) return textResult({ error: target.error, code: target.code })
+  const toolList = REMOTE_TOOL_ALLOWLIST.join(', ')
+  if (target.local) {
+    return textResult({
+      ok: true,
+      current: true,
+      message: 'That is the current project; its tools already run here, so omit `project`.',
+    })
+  }
+  const project = { id: target.id, name: target.name }
+  let readOnly = false
+  let listing: string | undefined
+  try {
+    const result = await callRemoteTool(target.id, 'exec', { command: REMOTE_WAKE_COMMAND }, signal)
+    const details = result.details as { stdout?: string } | undefined
+    listing = typeof details?.stdout === 'string' ? details.stdout : undefined
+  } catch (err) {
+    if (!(err instanceof RemoteToolError) || err.status !== 403) return remoteFailure(err, project)
+    // Read-only access: exec is refused, but a read-only tool still wakes it.
+    try {
+      await callRemoteTool(target.id, 'exec_list', {}, signal)
+      readOnly = true
+    } catch (inner) {
+      return remoteFailure(inner, project)
+    }
+  }
+  const tools = readOnly ? REMOTE_READONLY_TOOLS.join(', ') : toolList
+  const text = [
+    `Connected to project "${target.name}" (${target.id}); it is reachable${readOnly ? ' (read-only)' : ''}.`,
+    `Pass \`project: "${target.id}"\` to ${tools} to run them inside it. Paths are relative to its root, and each remote exec starts at that root.`,
+    ...(listing ? ['', listing] : []),
+  ].join('\n')
+  return {
+    content: [{ type: 'text', text }],
+    details: { ok: true, project, reachable: true, readOnly, tools: readOnly ? [...REMOTE_READONLY_TOOLS] : [...REMOTE_TOOL_ALLOWLIST] },
+  }
+}
+
+function createConnectProjectTool(ctx: ToolContext): AgentTool {
+  return {
+    name: 'connect_project',
+    label: 'Connect Project',
+    description:
+      'Connect to another project of this workspace so you can work in it. Wakes its runtime, checks that it is reachable, ' +
+      `and lists the tools that accept a \`project\` parameter (${REMOTE_TOOL_ALLOWLIST.join(', ')}). ` +
+      "Use project_call instead to hand a task to that project's agent.",
+    parameters: Type.Object({
+      project: Type.String({ description: 'Project id or exact name (see project_list / list_projects).' }),
+    }),
+    execute: async (_toolCallId, params: any, signal) => connectRemoteProject(ctx, String(params?.project ?? ''), signal),
   }
 }
 
@@ -759,7 +997,7 @@ function createPreviewProjectTool(ctx: ToolContext): AgentTool {
   }
 }
 
-const MAX_EXEC_OUTPUT_CHARS = 16000
+const MAX_EXEC_OUTPUT_CHARS = 8000
 
 function truncateExecOutput(text: string): string {
   if (!text || text.length <= MAX_EXEC_OUTPUT_CHARS) return text
@@ -795,6 +1033,18 @@ export function containerToHost(containerPath: string, workspaceDir: string): st
 /** Default soft timeout for exec / exec_wait — after this we hand control back. */
 const DEFAULT_EXEC_SOFT_TIMEOUT_MS = 30_000
 
+/** Resolves with `value` once `signal` aborts (never, without one). */
+function onAbort<T>(signal: AbortSignal | undefined, value: T): { promise: Promise<T>; dispose: () => void } {
+  if (!signal) return { promise: new Promise<T>(() => {}), dispose: () => {} }
+  if (signal.aborted) return { promise: Promise.resolve(value), dispose: () => {} }
+  let listener: () => void = () => {}
+  const promise = new Promise<T>((resolve) => {
+    listener = () => resolve(value)
+    signal.addEventListener('abort', listener, { once: true })
+  })
+  return { promise, dispose: () => signal.removeEventListener('abort', listener) }
+}
+
 interface ExecRunMetadata {
   cwdFileHost: string
   isSandboxed: boolean
@@ -828,6 +1078,7 @@ interface BuildExecResultOpts {
     stdout: string
     stderr: string
     killed: boolean
+    killReason?: string
   }
 }
 
@@ -842,6 +1093,7 @@ function buildCompletedExecResult({ ctx, entry, finalResult }: BuildExecResultOp
   // The command may have rewritten files the agent already read (formatters,
   // generators). Re-stat them so the next edit is not rejected as stale.
   ctx.fileStateCache?.resyncMtimes()
+  if (entry.backgrounded) ctx.commandRegistry?.markConsumed([entry.id])
   return textResult({
     cwd: newCwd,
     exitCode: finalResult.exitCode,
@@ -851,21 +1103,24 @@ function buildCompletedExecResult({ ctx, entry, finalResult }: BuildExecResultOp
     sandboxed: entry.handle.sandboxed || undefined,
     cwdReset: meta?.cwdReset || undefined,
     killed: finalResult.killed || undefined,
+    killedReason: finalResult.killReason,
     run_id: entry.runId,
+    ...(entry.backgrounded ? { task_id: entry.id, output_file: taskOutputPath(ctx, entry) } : {}),
   })
 }
 
-function buildSoftTimeoutResult(entry: CommandEntry, softTimeoutMs: number): AgentToolResult<any> {
+/** Workspace-relative output file of a task, as shown to the model. */
+function taskOutputPath(ctx: ToolContext, entry: { outputFile?: string }): string | undefined {
+  return ctx.commandRegistry?.displayPath(entry.outputFile) ?? entry.outputFile
+}
+
+function buildSoftTimeoutResult(ctx: ToolContext, entry: CommandEntry, softTimeoutMs: number | null): AgentToolResult<any> {
   const elapsedMs = Date.now() - entry.handle.startedAt
-  const killTarget =
-    entry.handle.sandboxed && entry.handle.containerName
-      ? `docker kill ${entry.handle.containerName}`
-      : process.platform === 'win32'
-        ? `taskkill /F /PID ${entry.handle.pid}`
-        : `kill ${entry.handle.pid}`
   return textResult({
     status: 'running',
+    task_id: entry.id,
     run_id: entry.runId,
+    output_file: taskOutputPath(ctx, entry),
     pid: entry.handle.pid,
     sandboxed: entry.handle.sandboxed || undefined,
     container_name: entry.handle.containerName,
@@ -873,15 +1128,21 @@ function buildSoftTimeoutResult(entry: CommandEntry, softTimeoutMs: number): Age
     stdout: truncateExecOutput(entry.handle.stdout().trim()),
     stderr: truncateExecOutput(entry.handle.stderr().trim()),
     hint:
-      `Command still running after ${Math.round(softTimeoutMs / 1000)}s. ` +
-      `Call exec_wait('${entry.runId}') to wait more, or run \`exec("${killTarget}")\` to terminate and move on.`,
+      (softTimeoutMs === null
+        ? 'Started in the background. '
+        : `Still running after ${Math.round(softTimeoutMs / 1000)}s; it keeps running in the background. `) +
+      BACKGROUND_TASK_HINT,
   })
 }
+
+/** One rule for every async tool result. */
+export const BACKGROUND_TASK_HINT =
+  'Call wait({ task_ids: [task_id] }) to block on it, or end your turn and you will get a [Task update] when it finishes.'
 
 function createExecTool(ctx: ToolContext): AgentTool {
   return {
     name: 'exec',
-    description: `Run a shell command. The shell remembers your working directory across calls — do NOT prepend cd to commands, the cwd from your last exec call is preserved automatically. The result includes the current cwd. Destructive commands are blocked. Quote file paths containing spaces. Use && to chain dependent commands, ; for independent ones. Never use interactive flags (-i). Prefer read_file over cat/head/tail, and the \`search\` tool over grep/rg for finding code. Tokens saved to .env are auto-loaded. Soft timeout: if the command does not finish within \`timeout\` ms (default ${DEFAULT_EXEC_SOFT_TIMEOUT_MS}), this tool returns \`{ status: "running", run_id, pid, ... }\` while the command keeps running in the background. You can then call \`exec_wait(run_id)\` to keep waiting, or \`exec("kill <pid>")\` to terminate it and move on.`,
+    description: `Run a shell command. The shell remembers your working directory across calls — do NOT prepend cd to commands, the cwd from your last exec call is preserved automatically. The result includes the current cwd. Destructive commands are blocked. Quote file paths containing spaces. Use && to chain dependent commands, ; for independent ones. Never use interactive flags (-i). Prefer read_file over cat/head/tail${isSearchEnabled() ? ', and the \`search\` tool over grep/rg for finding code' : '; use rg (ripgrep) to find code'}. Tokens saved to .env are auto-loaded. Long-running commands become background tasks: set \`background: true\` to start one immediately (never detach it yourself with \`&\` or \`nohup\`; those are refused), and any command still running after \`timeout\` ms (default ${DEFAULT_EXEC_SOFT_TIMEOUT_MS}) is handed back as \`{ status: "running", task_id, output_file }\` while it keeps running.`,
     label: 'Execute Command',
     parameters: Type.Object({
       command: Type.String({ description: 'Shell command to execute' }),
@@ -889,14 +1150,20 @@ function createExecTool(ctx: ToolContext): AgentTool {
         Type.Number({
           description:
             `Soft timeout in milliseconds (default: ${DEFAULT_EXEC_SOFT_TIMEOUT_MS}). ` +
-            'If exceeded, the command keeps running in the background and you receive a run_id to wait on or kill.',
+            'If exceeded, the command keeps running as a background task.',
+        }),
+      ),
+      background: Type.Optional(
+        Type.Boolean({
+          description: 'Start as a background task and return immediately with a task_id (servers, watchers, long builds/tests).',
         }),
       ),
     }),
-    execute: async (_toolCallId, params) => {
-      const { command, timeout = DEFAULT_EXEC_SOFT_TIMEOUT_MS } = params as {
+    execute: async (_toolCallId, params, signal) => {
+      const { command, timeout = DEFAULT_EXEC_SOFT_TIMEOUT_MS, background = false } = params as {
         command: string
         timeout?: number
+        background?: boolean
       }
       const attributedCommand = injectCommitTrailer(command, {
         ...process.env,
@@ -931,6 +1198,9 @@ function createExecTool(ctx: ToolContext): AgentTool {
           error: gatewayKillRefusal(gatewayGuard.reason ?? 'kill targets the runtime'),
         })
       }
+
+      const detach = checkSelfDetach(command)
+      if (detach.detached) return textResult({ error: selfDetachRefusal(detach) })
 
       // Desktop auto-redirect: when the user asks the agent to run a
       // dev server / long-lived process, route through terminalExec
@@ -1017,7 +1287,11 @@ function createExecTool(ctx: ToolContext): AgentTool {
       // a soft timeout and hand the agent a run_id if it overruns.
       // GH_TOKEN is the App installation token when the project is connected,
       // so `gh` comments and git commits are the bot rather than a user PAT.
-      const githubEnv = await githubCliEnvForProject(ctx.projectId)
+      const STOPPED = Symbol('stopped')
+      const stoppedBeforeSpawn = onAbort(signal, STOPPED)
+      const githubEnv = await Promise.race([githubCliEnvForProject(ctx.projectId), stoppedBeforeSpawn.promise])
+      stoppedBeforeSpawn.dispose()
+      if (githubEnv === STOPPED) return textResult({ error: 'Stopped before the command started.' })
       const handle = sandboxExecAsync({
         command: wrappedCommand,
         workspaceDir: ctx.workspaceDir,
@@ -1039,7 +1313,12 @@ function createExecTool(ctx: ToolContext): AgentTool {
       // completes within the soft timeout (defensive against races where the
       // model decided to wait while we were already returning).
       const registry = ctx.commandRegistry ?? new CommandRegistry()
-      const entry = registry.register(attributedCommand, handle)
+      const entry = registry.register(attributedCommand, handle, { cwd: currentCwd })
+
+      if (background) {
+        registry.markBackgrounded(entry.id)
+        return buildSoftTimeoutResult(ctx, entry, null)
+      }
 
       const softTimeoutMs = Math.max(0, timeout)
       const SOFT_TIMEOUT = Symbol('soft-timeout')
@@ -1049,12 +1328,14 @@ function createExecTool(ctx: ToolContext): AgentTool {
         ;(timer as any)?.unref?.()
       })
 
-      const winner = await Promise.race([handle.done, timeoutPromise])
+      const stopped = onAbort(signal, STOPPED)
+      const winner = await Promise.race([handle.done, timeoutPromise, stopped.promise])
       if (timer) clearTimeout(timer)
+      stopped.dispose()
 
-      if (winner === SOFT_TIMEOUT) {
+      if (winner === SOFT_TIMEOUT || winner === STOPPED) {
         registry.markBackgrounded(entry.runId)
-        return buildSoftTimeoutResult(entry, softTimeoutMs)
+        return buildSoftTimeoutResult(ctx, entry, winner === STOPPED ? null : softTimeoutMs)
       }
 
       return buildCompletedExecResult({ ctx, entry, finalResult: winner })
@@ -1284,7 +1565,10 @@ export function createGitHubConnectTool(ctx: ToolContext): AgentTool {
       'Pass `branch` to work on a branch other than the default ("clone X and switch to branch Y" is one call); on a project ' +
       'that is already connected, calling it with `branch` and no token just switches branches. ' +
       'The project\'s tech stack is detected from the repository and its preview restarts on it. ' +
-      'This replaces cloning by hand: do not `git clone` a repository into a project or write the token to `.env`.',
+      'This replaces cloning by hand: do not `git clone` a repository into a project. A token passed here is stored on the ' +
+      'project\'s connection, so do not also write it to `.env`. `repo` is required: if the user pasted a token without naming ' +
+      'a repository, ask which one (owner/name). A token for one-off `gh` work outside a project\'s repository goes in workspace ' +
+      '`.env` as GITHUB_TOKEN instead.',
     parameters: Type.Object({
       repo: Type.String({ description: 'Repository as owner/name or a github.com URL' }),
       token: Type.Optional(Type.String({ description: 'GitHub access token the user shared, to connect with it' })),
@@ -1364,6 +1648,14 @@ export function createGitHubConnectTool(ctx: ToolContext): AgentTool {
         `Share a GitHub access token for ${repoFullName} (fine-grained: Contents and Pull requests read/write; ` +
         'classic: repo scope). It is stored encrypted on the project connection.'
       if (link.ok && link.data?.available && link.data.url) {
+        ctx.uiWriter?.write({
+          type: 'data-integration-auth-required',
+          data: {
+            provider: 'github_app',
+            connectUrl: link.data.url,
+            message: `Authorize the Shogo GitHub App so this project can use ${repoFullName}.`,
+          },
+        })
         return textResult({
           ok: true,
           connected: false,
@@ -1503,7 +1795,7 @@ function createExecWaitTool(ctx: ToolContext): AgentTool {
         }),
       ),
     }),
-    execute: async (_toolCallId, params) => {
+    execute: async (_toolCallId, params, signal) => {
       const {
         run_id,
         timeout_ms = DEFAULT_EXEC_SOFT_TIMEOUT_MS,
@@ -1521,12 +1813,16 @@ function createExecWaitTool(ctx: ToolContext): AgentTool {
         })
       }
 
-      const entry = registry.get(run_id)
-      if (!entry) {
+      const found = registry.get(run_id)
+      if (!found) {
         return textResult({
           error: `Unknown run_id: ${run_id}. The run may have been cleaned up (entries are kept ~10 min after completion).`,
         })
       }
+      if (!found.handle) {
+        return createWaitTool(ctx).execute(_toolCallId, { task_ids: [found.id], timeout_ms, until: pattern }, signal)
+      }
+      const entry = found as CommandEntry
 
       // Stale entries were restored from a persisted snapshot after a runtime
       // restart — the underlying OS child is gone and cannot be polled.
@@ -1598,11 +1894,13 @@ function createExecWaitTool(ctx: ToolContext): AgentTool {
         : new Promise<never>(() => {}) // never resolves
 
       const endWait = registry.beginWait(run_id)
+      const stopped = onAbort(signal, SOFT_TIMEOUT)
       let winner: { exitCode: number; stdout: string; stderr: string; killed: boolean } | typeof SOFT_TIMEOUT | typeof PATTERN_HIT
       try {
-        winner = await Promise.race([entry.handle.done, timeoutPromise, patternPromise])
+        winner = await Promise.race([entry.handle.done, timeoutPromise, patternPromise, stopped.promise])
       } finally {
         endWait()
+        stopped.dispose()
       }
       if (timer) clearTimeout(timer)
       if (patternTimer) clearTimeout(patternTimer)
@@ -1633,7 +1931,7 @@ function createExecWaitTool(ctx: ToolContext): AgentTool {
             finalResult: entry.finalResult,
           })
         }
-        return buildSoftTimeoutResult(entry, softTimeoutMs)
+        return buildSoftTimeoutResult(ctx, entry, softTimeoutMs)
       }
 
       return buildCompletedExecResult({ ctx, entry, finalResult: winner })
@@ -1661,6 +1959,197 @@ function createExecListTool(ctx: ToolContext): AgentTool {
         })
       }
       return textResult({ processes: registry.listRunning() })
+    },
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Background tasks: wait / task_list / task_cancel
+// ---------------------------------------------------------------------------
+
+const DEFAULT_WAIT_TIMEOUT_MS = 30_000
+const MAX_WAIT_TIMEOUT_MS = 10 * 60 * 1000
+
+function taskView(ctx: ToolContext, entry: TaskEntry) {
+  return {
+    task_id: entry.id,
+    source: entry.source,
+    title: entry.title,
+    status: entry.status,
+    elapsed_ms: (entry.finishedAt ?? Date.now()) - entry.startedAt,
+    output_file: taskOutputPath(ctx, entry),
+  }
+}
+
+/** Final result of a finished task, the same shape for every source. */
+function finishedTaskResult(ctx: ToolContext, entry: TaskEntry): Record<string, unknown> {
+  const registry = ctx.commandRegistry!
+  const base: Record<string, unknown> = {
+    ...taskView(ctx, entry),
+    exit_code: entry.result?.exitCode,
+  }
+  if (entry.handle && entry.finalResult) {
+    const meta = execRunMetadata.get(entry.handle)
+    if (meta) finalizeCwdAfterExec(ctx, meta)
+    ctx.fileStateCache?.resyncMtimes()
+    base.stdout = truncateExecOutput(entry.finalResult.stdout.trim())
+    const stderr = entry.finalResult.stderr.trim()
+    if (stderr) base.stderr = truncateExecOutput(stderr)
+    if (entry.finalResult.killReason) base.killed_reason = entry.finalResult.killReason
+  } else {
+    base.output = truncateExecOutput(stripAnsiForPattern(registry.readOutput(entry)).trim())
+  }
+  return base
+}
+
+function createWaitTool(ctx: ToolContext): AgentTool {
+  return {
+    name: 'wait',
+    description:
+      'Wait for background tasks. Returns as soon as any task in `task_ids` finishes, `until` (a regex) matches its output, ' +
+      `or \`timeout_ms\` elapses (default ${DEFAULT_WAIT_TIMEOUT_MS}). With no task_ids it waits on every running task in this conversation ` +
+      '(returning at once with any that finished since you last heard), and only sleeps for timeout_ms when there are none. ' +
+      'Every task writes its full output to output_file, which you can read_file or search.',
+    label: 'Wait',
+    parameters: Type.Object({
+      task_ids: Type.Optional(Type.Array(Type.String(), { description: 'Task ids to wait on (default: every running task)' })),
+      timeout_ms: Type.Optional(
+        Type.Number({ description: `Max milliseconds to wait (default ${DEFAULT_WAIT_TIMEOUT_MS}, max ${MAX_WAIT_TIMEOUT_MS}). 0 = check without blocking.` }),
+      ),
+      until: Type.Optional(Type.String({ description: 'Regex; return early once a task\'s output matches (e.g. "ready on port")' })),
+    }),
+    execute: async (toolCallId, params, signal) => {
+      const { timeout_ms = DEFAULT_WAIT_TIMEOUT_MS, until } = params as {
+        task_ids?: string[]
+        timeout_ms?: number
+        until?: string
+      }
+      let task_ids = (params as { task_ids?: string[] }).task_ids ?? []
+      if (task_ids.length === 0 && ctx.commandRegistry) {
+        task_ids = [
+          ...ctx.commandRegistry.peekNotifications().map((n) => n.taskId),
+          ...ctx.commandRegistry.listRunning().map((t) => t.id),
+        ]
+      }
+      const timeoutMs = Math.min(Math.max(0, timeout_ms), MAX_WAIT_TIMEOUT_MS)
+      const startedAt = Date.now()
+
+      let regex: RegExp | undefined
+      if (until) {
+        try {
+          regex = new RegExp(until, 'm')
+        } catch (err: any) {
+          return textResult({ error: `Invalid until regex: ${err?.message || String(err)}` })
+        }
+      }
+
+      if (task_ids.length === 0) {
+        await new Promise<void>((resolve) => {
+          if (timeoutMs === 0 || signal?.aborted) return resolve()
+          const t = setTimeout(resolve, timeoutMs)
+          signal?.addEventListener('abort', () => { clearTimeout(t); resolve() }, { once: true })
+        })
+        return textResult({ status: 'slept', elapsed_ms: Date.now() - startedAt })
+      }
+
+      const registry = ctx.commandRegistry
+      if (!registry) return textResult({ error: 'Background tasks are not available in this context.' })
+
+      const unknown = task_ids.filter((id) => !registry.get(id))
+      if (unknown.length === task_ids.length) {
+        return textResult({
+          error: `Unknown task id${unknown.length > 1 ? 's' : ''}: ${unknown.join(', ')}. Finished tasks are kept ~10 min; call task_list to see current tasks.`,
+        })
+      }
+
+      const ids = task_ids.filter((id) => registry.get(id))
+      const emitWait = (active: boolean) => {
+        try {
+          ctx.uiWriter?.write({
+            type: 'data-task-wait',
+            data: { toolCallId, taskIds: ids.map((id) => registry.get(id)!.id), until, timeoutMs, startedAt, active },
+            transient: true,
+          } as any)
+        } catch { /* writer closed */ }
+      }
+
+      if (timeoutMs > 0) emitWait(true)
+      let outcome: Awaited<ReturnType<typeof registry.wait>>
+      try {
+        outcome = await registry.wait(ids, { timeoutMs, until: regex, signal })
+      } finally {
+        if (timeoutMs > 0) emitWait(false)
+      }
+
+      if (outcome.kind === 'finished' && outcome.task) {
+        return textResult({
+          ...finishedTaskResult(ctx, outcome.task),
+          ...(unknown.length ? { unknown_task_ids: unknown } : {}),
+          still_running: ids
+            .map((id) => registry.get(id)!)
+            .filter((e) => e.id !== outcome.task!.id && e.status === 'running')
+            .map((e) => e.id),
+        })
+      }
+
+      if (outcome.kind === 'matched' && outcome.task) {
+        return textResult({
+          ...taskView(ctx, outcome.task),
+          matched: outcome.matched,
+          output: truncateExecOutput(tailLines(stripAnsiForPattern(registry.readOutput(outcome.task)), 60, 8000)),
+        })
+      }
+
+      return textResult({
+        status: 'timeout',
+        waited_ms: Date.now() - startedAt,
+        tasks: ids.map((id) => taskView(ctx, registry.get(id)!)),
+        ...(unknown.length ? { unknown_task_ids: unknown } : {}),
+        hint: 'Still running. Wait again, or end your turn and you will get a [Task update] when it finishes.',
+      })
+    },
+  }
+}
+
+function createTaskListTool(ctx: ToolContext): AgentTool {
+  return {
+    name: 'task_list',
+    description: 'List the background tasks of this conversation (running and recently finished) with their status and output_file.',
+    label: 'List Tasks',
+    parameters: Type.Object({}),
+    execute: async () => {
+      const registry = ctx.commandRegistry
+      if (!registry) return textResult({ tasks: [] })
+      await registry.refreshRemote()
+      return textResult({
+        tasks: registry.listAll().map((t) => ({
+          task_id: t.id,
+          source: t.source,
+          title: t.title,
+          status: t.stale ? 'unknown (runtime restarted)' : t.status,
+          elapsed_ms: t.elapsedMs,
+          output_file: t.outputFile,
+        })),
+      })
+    },
+  }
+}
+
+function createTaskCancelTool(ctx: ToolContext): AgentTool {
+  return {
+    name: 'task_cancel',
+    description: 'Cancel a background task you started (stops the command, subagent, or tracking).',
+    label: 'Cancel Task',
+    parameters: Type.Object({
+      task_id: Type.String({ description: 'Task id to cancel' }),
+    }),
+    execute: async (_id, params) => {
+      const { task_id } = params as { task_id: string }
+      const registry = ctx.commandRegistry
+      const entry = registry?.get(task_id)
+      if (!registry || !entry) return textResult({ error: `Unknown task id: ${task_id}` })
+      registry.kill(entry.id)
+      return textResult({ ok: true, task_id: entry.id, status: registry.get(entry.id)?.status ?? 'cancelled' })
     },
   }
 }
@@ -1772,11 +2261,15 @@ function detectBinaryContent(buf: Buffer, absolutePath: string): { label: string
   return null
 }
 
+/** A read without offset/limit stops at whichever of these comes first. */
+const MAX_FULL_READ_LINES = 2000
+const MAX_FULL_READ_CHARS = 60_000
+
 function createReadFileTool(ctx: ToolContext): AgentTool {
   return {
     name: 'read_file',
     description:
-      'Read a file from the agent workspace. Prefer this over `exec` with `cat`/`head`/`tail`. Supports partial reads via offset and limit to handle large files without consuming the full context window. `offset` is a 1-based line number (e.g. offset: 380) or a [start, end] tuple (e.g. offset: [380, 420]); `limit` is a line count (e.g. limit: 40). When using offset/limit, output includes line numbers in N|content format. For large files (500+ lines), prefer offset/limit, or use the `search` tool to find the relevant section first. When called on an image file (.png, .jpg, .jpeg, .gif, .webp, .bmp, .avif, .heic, .ico), the image is returned as multimodal image content for vision-capable models to view or describe; offset/limit are ignored for images, and images larger than 20 MB are rejected.',
+      `Read a file from the agent workspace. Prefer this over \`exec\` with \`cat\`/\`head\`/\`tail\`. Supports partial reads via offset and limit to handle large files without consuming the full context window. \`offset\` is a 1-based line number (e.g. offset: 380) or a [start, end] tuple (e.g. offset: [380, 420]); \`limit\` is a line count (e.g. limit: 40). When using offset/limit, output includes line numbers in N|content format. For large files (500+ lines), prefer offset/limit, or ${isSearchEnabled() ? 'use the `search` tool' : 'run `rg -n` via `exec`'} to find the relevant section first. When called on an image file (.png, .jpg, .jpeg, .gif, .webp, .bmp, .avif, .heic, .ico), the image is returned as multimodal image content for vision-capable models to view or describe; offset/limit are ignored for images, and images larger than 20 MB are rejected.`,
     label: 'Read File',
     parameters: Type.Object({
       path: Type.String({ description: 'File path relative to workspace' }),
@@ -2001,6 +2494,30 @@ function createReadFileTool(ctx: ToolContext): AgentTool {
         })
       }
 
+      if (totalLineCount > MAX_FULL_READ_LINES || fullContent.length > MAX_FULL_READ_CHARS) {
+        const lines = fullContent.split('\n')
+        const kept: string[] = []
+        let chars = 0
+        for (const line of lines) {
+          const numbered = `${kept.length + 1}|${line}`
+          if (kept.length >= MAX_FULL_READ_LINES || chars + numbered.length + 1 > MAX_FULL_READ_CHARS) break
+          kept.push(numbered)
+          chars += numbered.length + 1
+        }
+        if (kept.length === 0) kept.push(`1|${lines[0].slice(0, MAX_FULL_READ_CHARS - 2)}`)
+        ctx.fileStateCache?.recordRead(filePath, mtime, totalLineCount, { offset: 1, limit: kept.length }, undefined)
+        return textResult({
+          content: kept.join('\n'),
+          totalLines: totalLineCount,
+          startLine: 1,
+          endLine: kept.length,
+          truncated: true,
+          note:
+            `File too large to read whole (${totalLineCount} lines, ${fullContent.length} chars); showing lines 1-${kept.length}. ` +
+            `Continue with offset: ${kept.length + 1}, or use the \`search\` tool to find the section you need.`,
+        })
+      }
+
       ctx.fileStateCache?.recordRead(filePath, mtime, totalLineCount, undefined, fullContent)
       const result: Record<string, any> = {
         content: fullContent,
@@ -2008,7 +2525,7 @@ function createReadFileTool(ctx: ToolContext): AgentTool {
       }
       if (totalLineCount > 500) {
         result.totalLines = totalLineCount
-        result.note = `Large file (${totalLineCount} lines). Use offset/limit to read specific sections (e.g. offset: 380, limit: 40), or the \`search\` tool to find the code you need. Reading the whole file wastes context.`
+        result.note = `Large file (${totalLineCount} lines). Use offset/limit to read specific sections (e.g. offset: 380, limit: 40), or ${isSearchEnabled() ? 'the `search` tool' : '`rg -n` via `exec`'} to find the code you need. Reading the whole file wastes context.`
       }
       return textResult(result)
     },
@@ -2030,7 +2547,7 @@ function appendImpactHint(ctx: ToolContext, filePath: string, result: Record<str
         `This file is referenced by ${impact.impactedFiles.length} other file(s): ${impact.impactedFiles
           .slice(0, 5)
           .join(', ')}${impact.impactedFiles.length > 5 ? ` and ${impact.impactedFiles.length - 5} more` : ''}. ` +
-        'Use impact_radius for full analysis.'
+        'For a full blast-radius analysis, delegate to the explore or code-reviewer subagent (they have impact_radius).'
     }
   } catch {
     /* best-effort — do not fail the write */
@@ -2287,6 +2804,29 @@ function findOrphanedFetchesInContent(content: string, activeRoutes: string[]): 
 }
 
 /**
+ * First path segments of the routes registered in the project's
+ * `custom-routes.ts` (mounted under `/api/`), so fetches to custom routes
+ * aren't reported as orphaned. Comments are stripped first: the template
+ * file documents example routes in comments that aren't actually mounted.
+ */
+function customRouteSegments(workspaceDir: string): string[] {
+  const file = ['custom-routes.ts', 'custom-routes.tsx'].map((f) => join(workspaceDir, f)).find((f) => existsSync(f))
+  if (!file) return []
+  let source: string
+  try {
+    source = readFileSync(file, 'utf-8')
+  } catch {
+    return []
+  }
+  const code = source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1')
+  const segments = new Set<string>()
+  for (const m of code.matchAll(/\.(?:get|post|put|patch|delete|all|route|use)\(\s*[`"']\/([^`"'/\s?:*$]+)/g)) {
+    segments.add(m[1])
+  }
+  return [...segments]
+}
+
+/**
  * Path filter: should this file be checked for canvas-API contract
  * violations? Only `.ts(x)` / `.js(x)` files inside `src/` or `canvas/`
  * (not the generated CRUD output, which by definition matches the routes
@@ -2331,7 +2871,7 @@ function appendCanvasApiContractHint(ctx: ToolContext, filePath: string, content
     return
   }
 
-  const orphaned = findOrphanedFetchesInContent(content, activeRoutes)
+  const orphaned = findOrphanedFetchesInContent(content, [...activeRoutes, ...customRouteSegments(ctx.workspaceDir)])
   if (orphaned.length === 0) return
 
   base.canvasApiContract = {
@@ -2340,13 +2880,14 @@ function appendCanvasApiContractHint(ctx: ToolContext, filePath: string, content
     warning:
       `This file fetches ${orphaned.length} route(s) that don't exist on the server: ${orphaned.join(', ')}. ` +
       `Either add a matching Prisma model in prisma/schema.prisma (which gives you /api/{model-plural} CRUD ` +
-      `automatically after \`shogo generate\`), or register a custom Hono route in server.tsx (e.g. ` +
-      `\`app.get('${orphaned[0]}', async (c) => ...)\`). Otherwise the fetch will return a 404 at runtime.`,
+      `automatically after \`shogo generate\`), or register a custom Hono route in custom-routes.ts, which is ` +
+      `mounted under /api (e.g. \`app.get('${orphaned[0].replace(/^\/api/, '')}', async (c) => ...)\`). Do not add ` +
+      `routes to server.tsx — it is regenerated. Otherwise the fetch will return a 404 at runtime.`,
   }
 }
 
 function findOrphanedFetches(workspaceDir: string, activeRoutes: string[]): { route: string; file: string }[] {
-  const routeSet = new Set(activeRoutes.map((r) => r.toLowerCase()))
+  const routeSet = new Set([...activeRoutes, ...customRouteSegments(workspaceDir)].map((r) => r.toLowerCase()))
   // Each call site needs its own RegExp instance because the global flag
   // makes the regex stateful (`lastIndex`) — sharing the constant across
   // concurrent scans would skip matches.
@@ -6124,7 +6665,7 @@ function createConnectTool(ctx: ToolContext): AgentTool {
     description:
       'Install (connect) an integration so its tools become available. Auto-routes by name: tries Composio managed OAuth first (Google, Slack, GitHub, etc. — no credentials needed), falls back to the MCP catalog (postgres, etc.), then to a remote URL if provided. Files and shell commands are built in (read_file, write_file, edit_file, exec) — do not connect filesystem or computer-use. Use `source: "mcp"` to skip Composio. Use `skill:<name>` to install a bundled skill. Pair with search_integrations to discover names.\n\n' +
       'When to call connect vs. when not to: only call connect when the user has asked for an ACTION you can\'t perform without that integration (send a calendar invite, post to Slack, query a Postgres database, etc.). Do NOT call connect when the user is asking to "show", "list", "compare", "describe", or "preview" data you can already produce with `web`, `read_file`, or in-context information — installing an integration the user did not ask for forces them through an OAuth dance for no reason and is one of the most disliked agent behaviors. If you\'re unsure whether the user wants the action or just an explanation, ask one clarifying question via `ask_user` before calling connect.\n\n' +
-      'GitHub issues, pull requests, Actions, releases, and repo metadata: do NOT call connect. Use the pre-installed `gh` CLI via exec for listing and issue operations (`gh issue list`, `gh issue create`, `gh pr list`, `gh run list`). Use the `github_create_pr` tool to create a PR so Shogo can add attribution and use the GitHub App when connected. To bring a repository into a project, use `github_connect`. If gh is not authenticated, save a PAT to `.env` as GITHUB_TOKEN and retry. Only connect({ name: "github" }) if the user explicitly asks for the Composio GitHub OAuth integration.',
+      'GitHub issues, pull requests, Actions, releases, and repo metadata: do NOT call connect. Use the pre-installed `gh` CLI via exec for listing and issue operations (`gh issue list`, `gh issue create`, `gh pr list`, `gh run list`). Use the `github_create_pr` tool to create a PR so Shogo can add attribution and use the GitHub App when connected. To bring a repository into a project, use `github_connect`. If gh is not authenticated: for a project\'s repository, use `github_connect` (pass the user\'s token if they shared one); only for one-off work outside a project\'s repository, save the PAT to workspace `.env` as GITHUB_TOKEN and retry. Only connect({ name: "github" }) if the user explicitly asks for the Composio GitHub OAuth integration.',
     label: 'Connect Integration',
     parameters: Type.Object({
       name: Type.String({
@@ -6349,7 +6890,7 @@ function createAgentSpawnTool(ctx: ToolContext, allToolsGetter: () => AgentTool[
   return {
     name: 'agent_spawn',
     description:
-      'Launch an instance of a registered or built-in agent type. Returns an instance_id. Use background: true for async execution, then check with agent_status/agent_result. Built-in types: explore, general-purpose, code-reviewer, integration, channel, media, devops, browser, browser_qa. IMPORTANT: `integration` is for discovery / install / uninstall ONLY. Once a tool is installed, it is bound to YOU — call it directly by name (e.g. JIRA_LIST_BOARDS({})). Do NOT spawn the integration subagent to execute installed tools; it does not have them bound. Omit type to use fork mode (inherits your full context — ideal for context-heavy tasks).',
+      'Launch an instance of a registered or built-in agent type. Waits for its report, or with background: true runs it as a background task. Built-in types: explore, general-purpose, code-reviewer, integration, channel, media, devops, browser, browser_qa. IMPORTANT: `integration` is for discovery / install / uninstall ONLY. Once a tool is installed, it is bound to YOU — call it directly by name (e.g. JIRA_LIST_BOARDS({})). Do NOT spawn the integration subagent to execute installed tools; it does not have them bound. Omit type to use fork mode (inherits your full context — ideal for context-heavy tasks).',
     label: 'Spawn Agent',
     parameters: Type.Object({
       type: Type.Optional(
@@ -6380,13 +6921,12 @@ function createAgentSpawnTool(ctx: ToolContext, allToolsGetter: () => AgentTool[
       ),
       resume: Type.Optional(
         Type.String({
-          description: 'Instance ID to resume (sends follow-up to existing agent)',
+          description: 'Instance ID to resume (sends follow-up to existing agent). type may be omitted; the instance keeps its own type.',
         }),
       ),
     }),
     execute: async (toolCallId, params) => {
       const {
-        type,
         prompt,
         model_tier,
         max_turns,
@@ -6401,6 +6941,19 @@ function createAgentSpawnTool(ctx: ToolContext, allToolsGetter: () => AgentTool[
         readonly?: boolean
         background?: boolean
         resume?: string
+      }
+      let type = (params as { type?: string }).type
+
+      // Resuming an instance without restating its type continues that
+      // instance; it must not fall through to fork mode.
+      if (!type && resume) {
+        const existing = ctx.agentManager?.getInstance(resume)
+        if (!existing) {
+          return textResult({
+            error: `Cannot resume "${resume}": no agent instance with that ID exists in this session. Pass the instance_id returned by a previous agent_spawn call, or omit resume to start a new agent.`,
+          })
+        }
+        type = existing.type
       }
 
       // --- Fork mode: type is omitted ---
@@ -6465,7 +7018,7 @@ function createAgentSpawnTool(ctx: ToolContext, allToolsGetter: () => AgentTool[
         }
 
         const accumulated = spawn?.getAccumulatedOutput()
-        return textResult({
+        return subagentToolResult({
           mode: 'fork',
           agent_id: result.agentId,
           toolCalls: result.toolCalls,
@@ -6473,7 +7026,7 @@ function createAgentSpawnTool(ctx: ToolContext, allToolsGetter: () => AgentTool[
           tokens: { input: result.inputTokens, output: result.outputTokens },
           parts: accumulated?.parts,
           model: accumulated?.model || subModel,
-        })
+        }, result.responseText)
       }
 
       // --- Normal mode: type is specified ---
@@ -6497,18 +7050,49 @@ function createAgentSpawnTool(ctx: ToolContext, allToolsGetter: () => AgentTool[
       const w = ctx.uiWriter
       const spawn = buildSpawnCallbacks(w, toolCallId)
 
-      const spawnResult = am.spawn(type, prompt, ctx, allToolsGetter(), spawn?.callbacks, { history })
-      if (!spawnResult.ok) return textResult({ error: spawnResult.error })
+      let instanceRef: string | undefined
+      const task = background && ctx.commandRegistry
+        ? ctx.commandRegistry.registerTask({
+            source: 'subagent',
+            title: `${type}: ${prompt.replace(/\s+/g, ' ').trim().slice(0, 80)}`,
+            backgrounded: true,
+            cancel: () => { if (instanceRef) am.cancel(instanceRef) },
+          })
+        : undefined
+      const callbacks = task ? withTaskOutput(spawn?.callbacks, task) : spawn?.callbacks
+
+      const spawnResult = am.spawn(type, prompt, ctx, allToolsGetter(), callbacks, { history })
+      if (!spawnResult.ok) {
+        if (task) {
+          task.entry.consumed = true
+          task.finish('failed', { summary: spawnResult.error })
+        }
+        return textResult({ error: spawnResult.error })
+      }
 
       const instanceId = spawnResult.instanceId
+      instanceRef = instanceId
       scLog(`[screencast] agent_spawn -> instanceId=${instanceId} type=${type}`)
       spawn?.setInstanceId(instanceId)
 
       if (background) {
+        const inst = am.getInstance(instanceId)
+        if (task && inst) {
+          ctx.commandRegistry!.addAlias(instanceId, task.entry.id)
+          void inst.promise.then((result) => {
+            const report = result.responseText?.trim() || '(Subagent returned no output.)'
+            task.append(`\n\n=== Final report ===\n${report}\n`)
+            const status = inst.status === 'cancelled'
+              ? 'cancelled'
+              : inst.status === 'failed' || result.responseEmpty ? 'failed' : 'completed'
+            task.finish(status, { summary: report.slice(0, 200) })
+          })
+        }
         return textResult({
-          instance_id: instanceId,
           status: 'running',
-          hint: 'Use agent_status or agent_result to check progress',
+          ...(task ? { task_id: task.entry.id, output_file: taskOutputPath(ctx, task.entry) } : {}),
+          instance_id: instanceId,
+          hint: task ? `Started in the background. ${BACKGROUND_TASK_HINT}` : 'Running in the background.',
         })
       }
 
@@ -6542,7 +7126,7 @@ function createAgentSpawnTool(ctx: ToolContext, allToolsGetter: () => AgentTool[
       }
 
       const accumulated = spawn?.getAccumulatedOutput()
-      return textResult({
+      return subagentToolResult({
         instance_id: instanceId,
         agent_id: result.agentId,
         status: inst.status,
@@ -6551,8 +7135,66 @@ function createAgentSpawnTool(ctx: ToolContext, allToolsGetter: () => AgentTool[
         tokens: { input: result.inputTokens, output: result.outputTokens },
         parts: accumulated?.parts,
         model: accumulated?.model || result.effectiveModelId || inst.model,
-      })
+      }, result.responseText)
     },
+  }
+}
+
+/** Mirror a background subagent's text and tool calls into its task output file. */
+function withTaskOutput(
+  callbacks: SubagentStreamCallbacks | undefined,
+  task: import('./task-registry').TaskHandle,
+): SubagentStreamCallbacks {
+  return {
+    ...callbacks,
+    onTextDelta: (delta: string) => {
+      task.append(delta)
+      callbacks?.onTextDelta?.(delta)
+    },
+    onBeforeToolCall: async (toolName: string, args: any, toolCallId: string) => {
+      let input = ''
+      try { input = JSON.stringify(args).slice(0, 200) } catch { /* non-serializable */ }
+      task.append(`\n[tool] ${toolName} ${input}\n`)
+      await callbacks?.onBeforeToolCall?.(toolName, args, toolCallId)
+    },
+  }
+}
+
+const MAX_SUBAGENT_RESPONSE_CHARS = 8000
+
+export function capSubagentResponse(text: string): string {
+  if (text.length <= MAX_SUBAGENT_RESPONSE_CHARS) return text
+  const headSize = Math.floor(MAX_SUBAGENT_RESPONSE_CHARS * 0.75)
+  const tailSize = MAX_SUBAGENT_RESPONSE_CHARS - headSize
+  return (
+    `${text.substring(0, headSize)}\n\n... [${text.length - MAX_SUBAGENT_RESPONSE_CHARS} chars of the subagent report truncated] ...\n\n` +
+    text.substring(text.length - tailSize)
+  )
+}
+
+/**
+ * Result of a completed subagent: `details` (the UI payload, including the
+ * streamed `parts` transcript) is kept whole, but the model only sees the
+ * capped final report and a per-tool call count. Re-sending the subagent's
+ * full transcript to the parent defeats the point of delegating.
+ */
+export function subagentToolResult(
+  details: Record<string, any>,
+  responseText: string | undefined,
+): AgentToolResult<any> {
+  const { parts, ...rest } = details
+  const toolCounts: Record<string, number> = {}
+  for (const p of (parts ?? []) as any[]) {
+    if (p?.type === 'tool' && p.tool?.toolName) toolCounts[p.tool.toolName] = (toolCounts[p.tool.toolName] ?? 0) + 1
+  }
+  const modelFacing = {
+    ...rest,
+    response: capSubagentResponse(responseText?.trim() || '(Subagent completed but returned no output.)'),
+    ...(Object.keys(toolCounts).length > 0 ? { tools_used: toolCounts } : {}),
+  }
+  return {
+    content: [{ type: 'text', text: JSON.stringify(modelFacing, null, 2) }],
+    details,
   }
 }
 
@@ -6843,6 +7485,7 @@ function createAgentResultTool(ctx: ToolContext): AgentTool {
       }
 
       const r = inst.result
+      ctx.commandRegistry?.markConsumed([inst.id])
 
       const w = ctx.uiWriter
       if (w && r && (r.inputTokens > 0 || r.outputTokens > 0)) {
@@ -6868,7 +7511,7 @@ function createAgentResultTool(ctx: ToolContext): AgentTool {
         instance_id: inst.id,
         type: inst.type,
         status: inst.status,
-        response: responseText,
+        response: capSubagentResponse(responseText),
         toolCalls: r?.toolCalls ?? 0,
         // Rolling window (see MAX_RECENT_ACTIVITY) of the tools this
         // instance actually called, in order — lets the caller (and eval
@@ -7021,9 +7664,9 @@ function createTeamDeleteTool(ctx: ToolContext): AgentTool {
   }
 }
 
-function createTaskCreateTool(ctx: ToolContext): AgentTool {
+function createTeamTaskCreateTool(ctx: ToolContext): AgentTool {
   return {
-    name: 'task_create',
+    name: 'team_task_create',
     description: "Create a task in the team's shared task queue. Teammates will automatically claim available tasks when idle.",
     label: 'Create Task',
     parameters: Type.Object({
@@ -7084,9 +7727,9 @@ function createTaskCreateTool(ctx: ToolContext): AgentTool {
   }
 }
 
-function createTaskGetTool(ctx: ToolContext): AgentTool {
+function createTeamTaskGetTool(ctx: ToolContext): AgentTool {
   return {
-    name: 'task_get',
+    name: 'team_task_get',
     description: 'Get detailed information about a specific task including its dependencies.',
     label: 'Get Task',
     parameters: Type.Object({
@@ -7103,9 +7746,9 @@ function createTaskGetTool(ctx: ToolContext): AgentTool {
   }
 }
 
-function createTaskListTool(ctx: ToolContext): AgentTool {
+function createTeamTaskListTool(ctx: ToolContext): AgentTool {
   return {
-    name: 'task_list',
+    name: 'team_task_list',
     description: "List all tasks in the team's queue with their status, owner, and dependencies.",
     label: 'List Tasks',
     parameters: Type.Object({}),
@@ -7127,9 +7770,9 @@ function createTaskListTool(ctx: ToolContext): AgentTool {
   }
 }
 
-function createTaskUpdateTool(ctx: ToolContext): AgentTool {
+function createTeamTaskUpdateTool(ctx: ToolContext): AgentTool {
   return {
-    name: 'task_update',
+    name: 'team_task_update',
     description: "Update a task's status, description, owner, or dependencies. Use to mark tasks in_progress or completed.",
     label: 'Update Task',
     parameters: Type.Object({
@@ -7802,24 +8445,30 @@ function createSocialMediaTool(ctx: ToolContext): AgentTool {
 export function createTools(ctx: ToolContext, extraTools?: AgentTool[]): AgentTool[] {
   const pe = ctx.permissionEngine
   const g = (tool: AgentTool, cat: import('./types').PermissionCategory) => applyPermissionGate(tool, cat, pe)
+  // Inside the gate, so this runtime's permission rules also cover calls it
+  // sends to another project.
+  const r = (tool: AgentTool) => withRemoteProject(tool, ctx)
 
   const tools: AgentTool[] = [
-    g(createExecTool(ctx), 'shell'),
-    g(createExecWaitTool(ctx), 'shell'),
-    g(createExecListTool(ctx), 'shell'),
+    g(r(createExecTool(ctx)), 'shell'),
+    g(r(createExecWaitTool(ctx)), 'shell'),
+    g(r(createExecListTool(ctx)), 'shell'),
+    createWaitTool(ctx),
+    createTaskListTool(ctx),
+    createTaskCancelTool(ctx),
     g(createGitHubPullRequestTool(ctx), 'network'),
     g(createGitHubMergePullRequestTool(ctx), 'network'),
     g(createGitHubConnectTool(ctx), 'network'),
     createExposePortTool(ctx),
-    g(createReadFileTool(ctx), 'file_read'),
-    g(createWriteFileTool(ctx), 'file_write'),
-    g(createEditFileTool(ctx), 'file_write'),
-    g(createDeleteFileTool(ctx), 'file_delete'),
+    g(r(createReadFileTool(ctx)), 'file_read'),
+    g(r(createWriteFileTool(ctx)), 'file_write'),
+    g(r(createEditFileTool(ctx)), 'file_write'),
+    g(r(createDeleteFileTool(ctx)), 'file_delete'),
     // search is disabled while local indexing is off (reindex-on-query hangs).
     // Re-enable with SHOGO_SEARCH_ENABLED=1 (also pre-warms the index — see gateway.ts start()).
     // isSearchEnabled() is the same gate every prompt/guide uses to decide
     // whether to advertise `search`, so the prompt surface matches registration.
-    ...(isSearchEnabled() ? [g(createSearchTool(ctx), 'file_read')] : []),
+    ...(isSearchEnabled() ? [g(r(createSearchTool(ctx)), 'file_read')] : []),
     g(createImpactRadiusTool(ctx), 'file_read'),
     g(createDetectChangesTool(ctx), 'file_read'),
     g(createReviewContextTool(ctx), 'file_read'),
@@ -7851,7 +8500,9 @@ export function createTools(ctx: ToolContext, extraTools?: AgentTool[]): AgentTo
     createCreatePlanTool(ctx),
     createUpdatePlanTool(ctx),
     createQuickActionTool(ctx),
-    g(createTerminalExecTool(ctx), 'shell'),
+    // terminal_exec drives the desktop app's visible terminal; it can only
+    // work when the desktop bridge is wired (TERMINAL_EXEC_URL → ctx.terminalExec).
+    ...(ctx.terminalExec ? [g(createTerminalExecTool(ctx), 'shell')] : []),
     createTerminalReadTool(ctx),
     createReadGuideTool(ctx),
   ]
@@ -7874,10 +8525,10 @@ export function createTools(ctx: ToolContext, extraTools?: AgentTool[]): AgentTo
   // Team coordination tools
   tools.push(createTeamCreateTool(ctx))
   tools.push(createTeamDeleteTool(ctx))
-  tools.push(createTaskCreateTool(ctx))
-  tools.push(createTaskGetTool(ctx))
-  tools.push(createTaskListTool(ctx))
-  tools.push(createTaskUpdateTool(ctx))
+  tools.push(createTeamTaskCreateTool(ctx))
+  tools.push(createTeamTaskGetTool(ctx))
+  tools.push(createTeamTaskListTool(ctx))
+  tools.push(createTeamTaskUpdateTool(ctx))
   tools.push(createSendTeamMessageTool(ctx))
 
   // BETA: per-chat git worktrees — cross-chat awareness tool
@@ -7892,16 +8543,20 @@ export function createTools(ctx: ToolContext, extraTools?: AgentTool[]): AgentTo
     const projectTools = createProjectTools(ctx)
     tools.push(...projectTools.readonly)
     for (const t of projectTools.mutating) tools.push(g(t, 'project'))
+    tools.push(createConnectProjectTool(ctx))
   }
 
   // Workspace runtimes expose universal profile/goal primitives. Project
   // runtimes omit them so the existing builder tool contract is unchanged.
-  if (resolveWorkspaceId(ctx)) {
+  if (workspaceAgentToolsRegistered(ctx)) {
     tools.push(...createWorkspaceAgentTools(ctx))
     tools.push(...createTriggerTools(ctx))
     // Meetings are private to the personal workspace; the API rejects team workspaces.
     if (ctx.config.capabilityProfile === 'personal') tools.push(...createMeetingTools(ctx))
-    else tools.push(...createChannelTools(ctx))
+    else {
+      tools.push(...createChannelTools(ctx))
+      tools.push(...createBoardTools(ctx))
+    }
   }
 
   if (process.env.WORKSPACE_RUNTIME === 'true') {
@@ -7929,7 +8584,23 @@ export function createTools(ctx: ToolContext, extraTools?: AgentTool[]): AgentTo
     for (let i = 0; i < tools.length; i++) tools[i] = withActionRules(tools[i], pe)
   }
 
+  for (const tool of tools) {
+    if (HIDDEN_LEGACY_TOOLS.has(tool.name)) markHiddenTool(tool)
+  }
+
   return tools
+}
+
+/**
+ * Superseded by `wait` / `task_list` / `task_cancel`. Still executable so old
+ * transcripts and remote callers keep working, but never advertised to the model.
+ */
+export const HIDDEN_LEGACY_TOOLS: ReadonlySet<string> = new Set(['exec_wait', 'exec_list', 'agent_status', 'agent_result'])
+
+/** Keep a tool executable but leave it out of the tool list sent to the model. */
+export function markHiddenTool<T extends AgentTool>(tool: T): T {
+  ;(tool as T & { hidden?: boolean }).hidden = true
+  return tool
 }
 
 // ---------------------------------------------------------------------------
@@ -8398,7 +9069,7 @@ export function createModeUnavailableTool(name: string, mode: RestrictedMode): A
  * individually resolvable via a skill's declared tool list.
  */
 export const TOOL_GROUP_MAP: Record<string, string[]> = {
-  shell: ['exec', 'exec_wait', 'terminal_exec', 'terminal_read'],
+  shell: ['exec', 'exec_wait', 'wait', 'task_list', 'task_cancel', 'terminal_exec', 'terminal_read'],
   filesystem: ['read_file', 'write_file', 'edit_file', 'read_lints'],
   files: ['delete_file', 'search', 'read_file', 'write_file', 'edit_file', 'read_lints', 'share_file'],
   search: ['search', 'impact_radius'],
@@ -8416,9 +9087,24 @@ export const TOOL_GROUP_MAP: Record<string, string[]> = {
   audio: ['transcribe_audio'],
 }
 
+/**
+ * Tools behind the work capabilities. Kept out of `TOOL_GROUP_MAP` so a
+ * skill's declared tool list cannot pull them in by group name.
+ */
+export const WORK_TOOL_GROUPS = {
+  team_chat: [...CHANNEL_TOOL_NAMES],
+  boards: [...BOARD_TOOL_NAMES],
+  board_admin: [...BOARD_ADMIN_TOOL_NAMES],
+  triggers: ['trigger_create', 'trigger_update', 'trigger_delete', 'trigger_test'],
+  problems: [...PROBLEM_TOOL_NAMES],
+} as const
+
 export const ALL_TOOL_NAMES = [
   'exec',
   'exec_wait',
+  'wait',
+  'task_list',
+  'task_cancel',
   'read_file',
   'write_file',
   'edit_file',
@@ -8505,6 +9191,12 @@ export function filterDisabledCapabilityTools(tools: AgentTool[], config: import
   if (config.quickActionsEnabled === false) disabled.add('quick_action')
   if (config.channelsEnabled === false) for (const n of TOOL_GROUP_MAP.messaging) disabled.add(n)
   if (config.integrationsEnabled === false) for (const n of TOOL_GROUP_MAP.integrations) disabled.add(n)
+  const work = resolveRuntimeCapabilities(config as unknown as Record<string, unknown>)
+  if (!work.teamChatEnabled) for (const n of WORK_TOOL_GROUPS.team_chat) disabled.add(n)
+  if (!work.boardsEnabled) for (const n of [...WORK_TOOL_GROUPS.boards, ...WORK_TOOL_GROUPS.board_admin, ...WORK_TOOL_GROUPS.problems]) disabled.add(n)
+  if (!work.boardAdminEnabled) for (const n of WORK_TOOL_GROUPS.board_admin) disabled.add(n)
+  if (!work.workTriggersEnabled) for (const n of WORK_TOOL_GROUPS.triggers) disabled.add(n)
+  if (!work.problemsEnabled) for (const n of WORK_TOOL_GROUPS.problems) disabled.add(n)
   // BETA: worktree awareness tool only exists when per-chat worktrees are on (off by default).
   if (config.gitWorktreesEnabled !== true) disabled.add('worktree_list')
   // Social lookups are opt-in, and a platform that is off must not be callable.
@@ -8512,11 +9204,12 @@ export function filterDisabledCapabilityTools(tools: AgentTool[], config: import
 
   const memoryOff = config.memoryEnabled === false
   if (disabled.size === 0 && !memoryOff) return tools
-  return tools.filter((t) => {
+  const kept = tools.filter((t) => {
     if (disabled.has(t.name)) return false
     if (memoryOff && t.name.startsWith('memory_')) return false
     return true
   })
+  return kept.length === tools.length ? tools : kept
 }
 
 /**
@@ -9276,8 +9969,7 @@ function createChannelConnectTool(ctx: ToolContext): AgentTool {
       }),
       model: Type.Optional(
         Type.String({
-          description:
-            'AI model ID for this channel (e.g. "claude-sonnet-4-6", "claude-haiku-4-5-20251001"). Economy-tier models work on all plans; standard/premium require Pro. Defaults to "claude-haiku-4-5-20251001".',
+          description: `AI model for this channel. Defaults to "auto". ${availableModelsHint()} Economy-tier models work on all plans; standard/premium require Pro.`,
         }),
       ),
     }),
@@ -9292,7 +9984,10 @@ function createChannelConnectTool(ctx: ToolContext): AgentTool {
         model?: string
       }
 
-      const channelModel = model || 'claude-haiku-4-5-20251001'
+      if (model && !isAvailableModel(model)) {
+        return textResult({ error: `Model "${model}" is not available in this workspace. ${availableModelsHint()}` })
+      }
+      const channelModel = model || 'auto'
       const resolvedChannelModel = resolveModelId(channelModel)
       const channelTier = getModelTier(resolvedChannelModel)
 
@@ -9804,11 +10499,11 @@ function resolveHeartbeatProjectId(ctx: ToolContext, requested?: string): string
   )
 }
 
-function createHeartbeatConfigureTool(ctx: ToolContext): AgentTool {
+export function createHeartbeatConfigureTool(ctx: ToolContext): AgentTool {
   return {
     name: 'heartbeat_configure',
     description:
-      'Configure the heartbeat system: enable/disable, set interval, and quiet hours. The schedule is stored in the central scheduler database (not config.json). Heartbeats require a paid plan; on a free plan this returns a paywall error. Defaults to the current project.',
+      'Configure the heartbeat system: enable/disable, set interval, and quiet hours. The heartbeat is a periodic sweep (HEARTBEAT.md) for things nothing else reports, such as inboxes and stale cards; work an agent hands off or starts reports back through [Task update], so never shorten the interval to follow it. The schedule is stored in the central scheduler database (not config.json). Heartbeats require a paid plan; on a free plan this returns a paywall error. Defaults to the current project.',
     label: 'Configure Heartbeat',
     parameters: Type.Object({
       enabled: Type.Optional(Type.Boolean({ description: 'Enable or disable heartbeat' })),
@@ -9894,7 +10589,7 @@ function createHeartbeatConfigureTool(ctx: ToolContext): AgentTool {
   }
 }
 
-function createHeartbeatStatusTool(ctx: ToolContext): AgentTool {
+export function createHeartbeatStatusTool(ctx: ToolContext): AgentTool {
   return {
     name: 'heartbeat_status',
     description:

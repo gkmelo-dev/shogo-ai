@@ -9,6 +9,7 @@ import type { BuddyLook } from '@shogo/shared-app/buddy-look'
 import { Platform } from 'react-native'
 import { API_URL, createHttpClient } from './api'
 import { authClient } from './auth-client'
+import type { Question } from './team-chat-kinds'
 import type { UploadPart } from './upload-part'
 import { routeUrl } from './workspace-route'
 
@@ -32,7 +33,7 @@ export function nativeChatVisible(mode: ChatModeValue | null | undefined): boole
 export type AgentStatus = 'running' | 'done' | 'error' | 'stopped'
 
 export type Participant =
-  | { type: 'user'; id: string; name: string; image: string | null }
+  | { type: 'user'; id: string; name: string; image: string | null; /** Your own row, in the note-to-self conversation. */ self?: boolean }
   | { type: 'agent'; projectId: string | null; name: string | null }
 
 export interface ConversationSummary {
@@ -75,6 +76,10 @@ export interface ConversationDetail extends Omit<ConversationSummary, 'unreadCou
   /** Can reply in threads (true in #activity even though top-level posts are system-only). */
   canReply: boolean
   canManage: boolean
+  /** This user may permanently delete the channel (older servers omit it). */
+  canDelete?: boolean
+  /** An agent system's manifest declares this channel, so it can't be deleted until it stops. */
+  systemManaged?: boolean
   members: ConversationMember[]
 }
 
@@ -92,6 +97,49 @@ export interface MessageAttachment {
   width: number | null
   height: number | null
   url: string
+  /** Voice notes only: clip length in ms, so a player can show the total up front. */
+  durationMs?: number | null
+  /** Voice notes only: waveform levels 0-100, space separated. */
+  peaks?: string | null
+  /** A small sample of the file's content, if the server could read it. Built
+   *  during the upload's background extraction, so it may arrive later than the
+   *  message itself (as a `message.updated`). */
+  preview?: AttachmentPreview | null
+}
+
+/**
+ * Mirrors `AttachmentPreview` in `apps/api/src/services/conversation-file-preview.ts`.
+ * `v` is the shape version: a preview from a different version is dropped by the
+ * server, and anything unrecognised here renders as no preview.
+ */
+export type AttachmentPreview =
+  | { v: 1; kind: 'text'; lines: string[]; pages?: number }
+  | { v: 1; kind: 'code'; lines: string[]; lang?: string }
+  | { v: 1; kind: 'slides'; title: string; bullets: string[]; count: number }
+  | { v: 1; kind: 'table'; rows: string[][]; sheet?: string; truncated: boolean }
+
+export type ConversationFileKind = 'image' | 'document' | 'other'
+
+/** A file shared in a conversation, as the Files pane lists it. */
+export interface ConversationFile {
+  id: string
+  conversationId: string
+  messageId: string
+  threadRootId: string | null
+  name: string
+  mimeType: string
+  kind: ConversationFileKind
+  size: number
+  width: number | null
+  height: number | null
+  uploadedBy: { id: string | null; name: string }
+  createdAt: string
+  url: string
+}
+
+export interface ConversationFilePage {
+  files: ConversationFile[]
+  nextCursor: string | null
 }
 
 export interface ChatMessage {
@@ -165,7 +213,8 @@ export type PresenceStatus = 'active' | 'away' | 'offline'
 
 export interface Mentionables {
   people: Array<{ id: string; name: string; email: string; image: string | null; role: string; title?: string | null; timezone?: string | null }>
-  agents: Array<{ key: string; projectId: string | null; name: string; description: string | null; image: string | null; buddyLook?: BuddyLook | null }>
+  /** `boards` is false for agents with the Boards capability off; they can't be given cards. */
+  agents: Array<{ key: string; projectId: string | null; name: string; description: string | null; image: string | null; buddyLook?: BuddyLook | null; boards?: boolean }>
   statuses?: Record<string, UserStatus>
   groups?: UserGroup[]
   /** Public channels and private ones you're in. */
@@ -242,7 +291,28 @@ export interface ChatSettings {
   emailDigest: 'off' | 'daily'
 }
 
-export type InboxKind = 'mention' | 'dm' | 'thread' | 'reaction' | 'reminder' | 'keyword' | 'broadcast' | 'message'
+export type InboxKind = 'mention' | 'dm' | 'thread' | 'reaction' | 'reminder' | 'keyword' | 'broadcast' | 'message' | 'question'
+
+/** A question an agent asked, across channels the viewer can read. */
+export interface QuestionListItem {
+  messageId: string
+  conversationId: string
+  threadRootId: string | null
+  conversation: { id: string; kind: string; name: string | null; slug: string | null }
+  agent: { projectId: string | null; name: string; iconUrl: string | null }
+  question: Question
+  askedAt: string
+  /** For the viewer, or open to anyone. */
+  mine: boolean
+  canAnswer: boolean
+}
+
+export interface QuestionInbox {
+  questions: QuestionListItem[]
+  /** Open questions for the viewer, for the badge. */
+  openCount: number
+  approvals: PendingApproval[]
+}
 
 export interface InboxItem {
   id: string
@@ -336,10 +406,12 @@ export type TeamChatEvent =
   | { type: 'agent.delta'; conversationId: string; messageId: string; text: string; tool: string | null; tools?: Array<{ name: string; done: boolean }> }
   | { type: 'conversation.created'; conversationId: string; conversation: ConversationSummary }
   | { type: 'conversation.updated'; conversationId: string; conversation: ConversationSummary }
+  | { type: 'conversation.deleted'; conversationId: string }
   | { type: 'member.joined' | 'member.left'; conversationId: string; userId?: string; userIds?: string[] }
   | { type: 'read'; conversationId: string; userId: string; seq: number; unreadCount?: number }
   | { type: 'typing'; conversationId: string; threadRootId: string | null; userId: string; name: string }
-  | { type: 'presence'; userId: string; status: PresenceStatus }
+  | { type: 'presence'; userId: string; status: PresenceStatus }  | { type: 'huddle.presence'; userId: string; inHuddle: boolean }
+
   | {
       type: 'notification'
       conversationId: string | null
@@ -360,6 +432,7 @@ export type TeamChatEvent =
   | { type: 'groups.changed' }
   | { type: 'agent.updated'; projectId: string | null }
   | { type: 'emoji.changed' }
+  | { type: 'board.changed'; boardId: string; conversationId?: string; action: string; itemId?: string }
   | { type: 'huddle.updated'; conversationId: string; huddle: Huddle | null }
   | {
       type: 'huddle.ring'
@@ -466,7 +539,13 @@ export const mentionToken = {
 
 export function conversationTitle(c: Pick<ConversationSummary, 'kind' | 'name' | 'participants'>): string {
   if (c.kind === 'dm' || c.kind === 'group_dm') {
-    const names = (c.participants ?? []).map((p) => p.name ?? 'Agent').filter(Boolean)
+    const names = (c.participants ?? [])
+      .map((p) => {
+        const name = p.name ?? 'Agent'
+        // A note-to-self lists you, so say which row is you.
+        return p.type === 'user' && p.self ? `${name} (you)` : name
+      })
+      .filter(Boolean)
     return names.length ? names.join(', ') : 'Direct message'
   }
   return c.name ?? 'channel'
@@ -474,6 +553,11 @@ export function conversationTitle(c: Pick<ConversationSummary, 'kind' | 'name' |
 
 export function isAgentDm(c: Pick<ConversationSummary, 'kind' | 'participants'>): boolean {
   return c.kind === 'dm' && (c.participants ?? []).some((p) => p.type === 'agent')
+}
+
+/** The note-to-self conversation: a direct message whose only member is you. */
+export function isSelfDm(c: Pick<ConversationSummary, 'kind' | 'participants'>): boolean {
+  return c.kind === 'dm' && (c.participants ?? []).some((p) => p.type === 'user' && p.self === true)
 }
 
 export function teamChatApi() {
@@ -497,6 +581,11 @@ export function teamChatApi() {
     async openAgentDm(workspaceId: string, projectId: string | null) {
       return (await http.post<{ conversation: ConversationSummary }>(`${ws(workspaceId)}/dms`, { agent: { projectId } }))
         .data.conversation
+    },
+    /** The note-to-self conversation. Same endpoint: you are the only member. */
+    async openSelfDm(workspaceId: string, userId: string) {
+      return (await http.post<{ conversation: ConversationSummary }>(`${ws(workspaceId)}/dms`, { userIds: [userId] })).data
+        .conversation
     },
     async search(
       workspaceId: string,
@@ -666,20 +755,30 @@ export function teamChatApi() {
     async pendingApprovals(workspaceId: string): Promise<PendingApproval[]> {
       return (await http.get<{ approvals: PendingApproval[] }>(`${ws(workspaceId)}/approvals/pending`)).data.approvals
     },
-    /** Batched: ~400 ids would push the URL past the server's header limit. */
-    async presence(workspaceId: string, userIds: string[]): Promise<Record<string, PresenceStatus>> {
+    /**
+     * Batched: ~400 ids would push the URL past the server's header limit.
+     * `huddle` is the subset of these ids currently in a huddle.
+     */
+    async presence(workspaceId: string, userIds: string[]): Promise<{ presence: Record<string, PresenceStatus>; huddle: string[] }> {
       const out: Record<string, PresenceStatus> = {}
+      const huddle = new Set<string>()
       for (let i = 0; i < userIds.length; i += 200) {
         const ids = userIds.slice(i, i + 200).map(encodeURIComponent).join(',')
-        Object.assign(out, (await http.get<{ presence: Record<string, PresenceStatus> }>(`${ws(workspaceId)}/presence?userIds=${ids}`)).data.presence)
+        const res = (await http.get<{ presence: Record<string, PresenceStatus>; huddle?: string[] }>(`${ws(workspaceId)}/presence?userIds=${ids}`)).data
+        Object.assign(out, res.presence)
+        for (const id of res.huddle ?? []) huddle.add(id)
       }
-      return out
+      return { presence: out, huddle: [...huddle] }
     },
     async get(id: string): Promise<ConversationDetail> {
       return (await http.get<{ conversation: ConversationDetail }>(conv(id))).data.conversation
     },
     async update(id: string, patch: { name?: string; topic?: string | null; archived?: boolean }) {
       return (await http.patch<{ conversation: ConversationDetail }>(conv(id), patch)).data.conversation
+    },
+    /** Permanently delete a channel with all its messages and files. */
+    async delete(id: string) {
+      await http.delete(conv(id))
     },
     async join(id: string) {
       await http.post(`${conv(id)}/join`, {})
@@ -719,8 +818,23 @@ export function teamChatApi() {
     ): Promise<ChatMessage> {
       return (await http.post<{ message: ChatMessage }>(`${conv(id)}/messages`, input)).data.message
     },
-    async markRead(id: string, seq?: number): Promise<{ lastReadSeq: number; unreadCount?: number }> {
-      return (await http.post<{ lastReadSeq: number; unreadCount?: number }>(`${conv(id)}/read`, seq === undefined ? {} : { seq })).data
+    /** Files shared in a conversation, newest first. */
+    async files(
+      id: string,
+      opts: { q?: string; kind?: ConversationFileKind; cursor?: string; limit?: number } = {},
+    ): Promise<ConversationFilePage> {
+      const q = new URLSearchParams()
+      if (opts.q) q.set('q', opts.q)
+      if (opts.kind) q.set('kind', opts.kind)
+      if (opts.cursor) q.set('cursor', opts.cursor)
+      if (opts.limit) q.set('limit', String(opts.limit))
+      return (await http.get<ConversationFilePage>(`${conv(id)}/files?${q}`)).data
+    },
+    async markRead(id: string, seq?: number, opts?: { advance?: boolean }): Promise<{ lastReadSeq: number; unreadCount?: number }> {
+      const body: Record<string, unknown> = {}
+      if (seq !== undefined) body.seq = seq
+      if (opts?.advance) body.advance = true
+      return (await http.post<{ lastReadSeq: number; unreadCount?: number }>(`${conv(id)}/read`, body)).data
     },
     async message(messageId: string): Promise<ChatMessage> {
       return (await http.get<{ message: ChatMessage }>(msg(messageId))).data.message
@@ -748,6 +862,20 @@ export function teamChatApi() {
     async decideApproval(messageId: string, decision: 'approve' | 'deny'): Promise<ChatMessage> {
       return (await http.post<{ message: ChatMessage }>(`${msg(messageId)}/approval`, { decision })).data.message
     },
+    /** Agent questions the viewer can see, plus approvals waiting on them. */
+    async questions(workspaceId: string, opts: { status?: 'open' | 'answered' | 'all'; scope?: 'mine' | 'all' } = {}): Promise<QuestionInbox> {
+      const q = new URLSearchParams()
+      if (opts.status) q.set('status', opts.status)
+      if (opts.scope) q.set('scope', opts.scope)
+      return (await http.get<QuestionInbox>(`${ws(workspaceId)}/questions?${q}`)).data
+    },
+    /** Answer an agent's question; posts the answer in its thread. The first answer wins; later ones throw. */
+    async answerQuestion(messageId: string, questionId: string, input: { answer?: string; secret?: string }): Promise<{ message: ChatMessage; question: Question; reply: ChatMessage }> {
+      return (await http.post<{ message: ChatMessage; question: Question; reply: ChatMessage }>(`${msg(messageId)}/questions/${encodeURIComponent(questionId)}/answer`, input)).data
+    },
+    async dismissQuestion(messageId: string, questionId: string): Promise<{ message: ChatMessage; question: Question }> {
+      return (await http.post<{ message: ChatMessage; question: Question }>(`${msg(messageId)}/questions/${encodeURIComponent(questionId)}/dismiss`, {})).data
+    },
     async huddles(workspaceId: string): Promise<{ enabled: boolean; huddles: ActiveHuddle[] }> {
       return (await http.get<{ enabled: boolean; huddles: ActiveHuddle[] }>(`${ws(workspaceId)}/huddles`)).data
     },
@@ -772,9 +900,16 @@ export function teamChatApi() {
         }).catch(() => {})
       } catch {}
     },
-    async upload(id: string, file: UploadPart | File): Promise<MessageAttachment> {
+    async upload(
+      id: string,
+      file: UploadPart | File,
+      /** Voice-note metadata: the server can't decode audio, so it comes from the recorder. */
+      audio?: { durationMs?: number | null; peaks?: string | null },
+    ): Promise<MessageAttachment> {
       const form = new FormData()
       form.append('file', file as any)
+      if (audio?.durationMs) form.append('durationMs', String(Math.round(audio.durationMs)))
+      if (audio?.peaks) form.append('peaks', audio.peaks)
       const res = await fetch(`${API_URL}${conv(id)}/attachments`, {
         method: 'POST',
         body: form,
@@ -790,9 +925,13 @@ export function teamChatApi() {
   }
 }
 
-/** Server file links are root-relative; resolve them against the API origin. */
+/**
+ * Server file links are root-relative; resolve them against the API origin.
+ * `<img>` loads bypass the fetch router, so a cloud workspace's links are
+ * routed here or they'd hit the desktop's local API.
+ */
 export function absoluteApiUrl(url: string): string {
-  return url.startsWith('/') && API_URL ? `${API_URL}${url}` : url
+  return url.startsWith('/') && API_URL ? routeUrl(`${API_URL}${url}`, API_URL) : url
 }
 
 export function nativeCookieHeader(): Record<string, string> {

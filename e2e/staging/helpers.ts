@@ -34,11 +34,22 @@ export const STRIPE_CARDS = {
  * Signs up a new account at /sign-in, then walks through the cloud onboarding
  * flow into the Team workspace:
  *
- *   destination (Team workspace) → team setup → agent picker (skip) → home
+ *   team setup → build prompt (skip) → home
  *
  * Leaves the browser on the home screen with "What are we building" visible.
  */
 export async function signUpAndOnboard(page: Page, user: TestUser): Promise<void> {
+  await signUp(page, user)
+  if (await onboardToBuildPrompt(page)) {
+    await page.getByText("I'll explore first", { exact: true }).click()
+  }
+
+  // ── Home screen ────────────────────────────────────────────────────────────
+  await page.waitForSelector("text=What are we building", { timeout: 30_000 })
+}
+
+/** Signs up a new account at /sign-in and waits to leave the sign-in page. */
+export async function signUp(page: Page, user: TestUser): Promise<void> {
   watchChatHealth(page)
   // ── Sign up ────────────────────────────────────────────────────────────────
   await page.goto("/sign-in")
@@ -61,31 +72,31 @@ export async function signUpAndOnboard(page: Page, user: TestUser): Promise<void
   await page.waitForURL((url) => !url.pathname.startsWith("/sign-in"), {
     timeout: 30_000,
   })
+}
 
-  // ── Onboarding (destination-first, CloudOnboarding) ───────────────────────
-  // Cloud onboarding asks where to start: Personal space or Team workspace.
-  // Projects live in the Team workspace, so pick it, keep the prefilled team
-  // name, and open the workspace without installing an agent. The CTAs are
-  // Pressables rather than <button>s, so they are matched by visible text.
-  const teamDestination = page.getByRole("radio", { name: "My Team workspace" })
+/**
+ * Walks cloud onboarding (CloudOnboarding) to its last team step, "What do you
+ * want to build?". There is no personal-vs-team choice: a new account goes
+ * straight to team setup. The team name stays prefilled. The CTAs are
+ * Pressables rather than <button>s, so they are matched by visible text.
+ *
+ * Returns false when the account is already onboarded.
+ */
+export async function onboardToBuildPrompt(page: Page): Promise<boolean> {
   try {
-    await teamDestination.waitFor({ timeout: 20_000 })
-  } catch {
-    // Account is already onboarded.
-  }
-  if (await teamDestination.isVisible()) {
-    await teamDestination.click()
-    await page.getByText("Continue", { exact: true }).click()
-
     await page.getByText("Set up your team workspace").waitFor({ timeout: 20_000 })
-    await page.getByText("Continue", { exact: true }).click()
-
-    await page.getByText("Start with an agent").waitFor({ timeout: 20_000 })
-    await page.getByText(/^Open /).last().click()
+  } catch {
+    return false
   }
+  await page.getByText("Continue", { exact: true }).click()
 
-  // ── Home screen ────────────────────────────────────────────────────────────
-  await page.waitForSelector("text=What are we building", { timeout: 30_000 })
+  await page.getByText("What do you want to build?", { exact: true }).first().waitFor({ timeout: 20_000 })
+  return true
+}
+
+/** The onboarding "What do you want to build?" input. */
+export function buildPromptInput(page: Page) {
+  return page.getByTestId("onboarding-build-prompt-input")
 }
 
 /**
@@ -352,6 +363,19 @@ export async function assertChatHealthy(page: Page): Promise<void> {
   }
 }
 
+/**
+ * First prompt for specs that only need a project to exist. A vague prompt
+ * ("Simple test agent for file uploads") reads as a feature request: the agent
+ * builds a whole app and runs browser QA on it, outlasting the turn budget.
+ */
+export const NO_BUILD_PROJECT_PROMPT =
+  "Do not build or change anything. Just reply with the single word OK."
+
+/** First prompt for specs that need a real (but trivial) app to preview or publish. */
+export const MINIMAL_APP_PROMPT =
+  "Create the simplest possible starter app: a single page that shows the word Hello. " +
+  "Do not add any extra pages, components, features, or backend, and do not run browser QA."
+
 export async function createProjectAndWait(page: Page, prompt: string) {
   extendTestTimeout(90_000)
   watchChatHealth(page)
@@ -460,7 +484,16 @@ export async function bootstrapProSubscriptionViaApi(
     // not set). Caller should fall back.
     return false
   }
-  if (!res.ok()) return false
+  if (res.status() === 401) {
+    throw new Error(
+      "SHOGO_E2E_BOOTSTRAP_SECRET is set but the API rejected it — it must match the " +
+        "target environment's e2e-bootstrap secret",
+    )
+  }
+  if (!res.ok()) {
+    console.warn(`[e2e] Pro bootstrap failed (HTTP ${res.status()}): ${await res.text().catch(() => "")}`)
+    return false
+  }
   const body = await res.json().catch(() => ({ ok: false }))
   return body?.ok === true
 }
@@ -508,6 +541,36 @@ export async function runtimeFaultViaApi(
   if (!res || [401, 404, 503].includes(res.status())) return null
   const body = await res.json().catch(() => ({}))
   return { ok: res.ok() && body?.ok === true, body }
+}
+
+export interface RuntimeHolder {
+  hostId: string
+  runtimeKey: string
+}
+
+/**
+ * Every runtime across the fleet that currently holds `projectId`
+ * (`GET /api/internal/e2e/runtime-holders`). On metal a project is online only
+ * in its own runtime, so a healthy answer is exactly `ws:proj:<projectId>`.
+ * Returns null when the backdoor is unavailable (no secret, or the endpoint is
+ * disabled / not deployed) — callers should `test.skip` in that case.
+ */
+export async function runtimeHoldersViaApi(
+  page: Page,
+  projectId: string,
+): Promise<{ projectId: string; holders: RuntimeHolder[] } | null> {
+  const secret = process.env.SHOGO_E2E_BOOTSTRAP_SECRET
+  if (!secret) return null
+  const res = await page.request
+    .get(`${bootstrapApiBase()}/api/internal/e2e/runtime-holders`, {
+      headers: { "x-e2e-bootstrap-secret": secret },
+      params: { projectId },
+      timeout: 30_000,
+    })
+    .catch(() => null)
+  if (!res || [401, 404, 503].includes(res.status())) return null
+  if (!res.ok()) throw new Error(`runtime-holders failed: HTTP ${res.status()} ${await res.text().catch(() => "")}`)
+  return (await res.json()) as { projectId: string; holders: RuntimeHolder[] }
 }
 
 export async function suspendRuntimeViaApi(page: Page, projectId: string): Promise<boolean> {
@@ -620,7 +683,14 @@ export async function recycleRuntimeViaApi(
   }
 }
 
-export async function signUpAndUpgradeToPro(page: Page, user: TestUser): Promise<void> {
+/**
+ * `"bootstrap"` subscriptions have a synthetic Stripe customer
+ * (`e2e_bootstrap_cus_*`), so anything that calls Stripe for that customer
+ * (e.g. the customer portal) only works after a real `"checkout"`.
+ */
+export type ProUpgradeMethod = "bootstrap" | "checkout"
+
+export async function signUpAndUpgradeToPro(page: Page, user: TestUser): Promise<ProUpgradeMethod> {
   await signUpAndOnboard(page, user)
 
   // Try the API bootstrap first — this works against any environment
@@ -629,7 +699,7 @@ export async function signUpAndUpgradeToPro(page: Page, user: TestUser): Promise
     // Give the client a moment to revalidate billing state on the next
     // navigation; most callers go to /billing or / right after.
     await page.waitForTimeout(500)
-    return
+    return "bootstrap"
   }
 
   // Fall back to the UI-driven Stripe Checkout flow. Against live keys
@@ -677,4 +747,5 @@ export async function signUpAndUpgradeToPro(page: Page, user: TestUser): Promise
 
   await page.getByTestId("hosted-payment-submit-button").click()
   await page.waitForURL((url) => !url.toString().includes("stripe.com"), { timeout: 30_000 })
+  return "checkout"
 }

@@ -709,7 +709,7 @@ Old instructions.
       expect(config).toBeNull()
     })
 
-    test('explore agent is read-only with haiku model', () => {
+    test('explore agent is read-only with auto model', () => {
       // `search` only joins the explore toolset when the flag is on — the
       // prod-side (flag off) shape is asserted in
       // search-advertisement-contract.test.ts.
@@ -719,8 +719,8 @@ Old instructions.
         const tools = createTools(ctx)
         const config = getBuiltinSubagentConfig('explore', ctx, tools)
         expect(config).not.toBeNull()
-        expect(config!.model).toBe('claude-haiku-4-5')
-        expect(config!.maxTurns).toBe(5)
+        expect(config!.model).toBe('auto')
+        expect(config!.maxTurns).toBe(100)
         expect(config!.toolNames).toContain('read_file')
         expect(config!.toolNames).toContain('search')
         expect(config!.toolNames).not.toContain('write_file')
@@ -745,14 +745,13 @@ Old instructions.
       expect(config).toBeNull()
     })
 
-    test('browser_qa agent is canvas-first with browser + web + file tools and gpt-6-luna model', () => {
+    test('browser_qa agent is canvas-first with browser + web + file tools and auto model', () => {
       const ctx = createCtx()
       const tools = createTools(ctx)
       const config = getBuiltinSubagentConfig('browser_qa', ctx, tools)
       expect(config).not.toBeNull()
       expect(config!.name).toBe('browser_qa')
-      expect(config!.model).toBe('gpt-6-luna')
-      expect(config!.provider).toBe('openai')
+      expect(config!.model).toBe('auto')
       expect(config!.maxTurns).toBe(200)
       expect(config!.toolNames).toEqual(['browser', 'web', 'read_file', 'write_file', 'edit_file'])
       expect(config!.disallowedTools).toContain('task')

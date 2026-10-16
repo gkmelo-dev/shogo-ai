@@ -11,11 +11,12 @@
  * - Automatic container cleanup (--rm)
  */
 
-import { execSync, spawn, type ChildProcess } from '@shogo/shared-runtime/child-process'
+import { execSync, spawn, spawnSync, type ChildProcess } from '@shogo/shared-runtime/child-process'
 import { readFileSync, existsSync } from 'fs'
 import { join, isAbsolute, resolve, sep } from 'path'
 import { randomBytes } from 'crypto'
 import type { SandboxConfig } from './types'
+import { trackExecProcess } from './exec-memory-guard'
 
 // ---------------------------------------------------------------------------
 // Windows shell resolution — use Git Bash when available so Unix commands
@@ -289,6 +290,10 @@ export function buildExecEnv(
   const workspaceEnv = loadWorkspaceEnv(workspaceDir)
   const merged: NodeJS.ProcessEnv = { ...base, ...workspaceEnv }
   delete merged.PROJECTS_DATABASE_URL
+  // PORT is stripped above, but commands still need the runtime's own port
+  // to curl the preview API (`localhost:$RUNTIME_PORT/api/...`). Same value
+  // project processes get (see resolveProjectProcessEnv in preview-manager).
+  merged.RUNTIME_PORT = runtimePort()
   merged.DATABASE_URL = projectScopedDatabaseUrl(
     workspaceDir,
     workspaceEnv.DATABASE_URL,
@@ -300,6 +305,11 @@ export function buildExecEnv(
     }
   }
   return merged
+}
+
+/** The agent runtime's HTTP port (server.ts binds `PORT`, default 8080). */
+export function runtimePort(env: NodeJS.ProcessEnv = process.env): string {
+  return env.PORT || env.RUNTIME_PORT || '8080'
 }
 
 function appendDockerEnv(dockerArgs: string[], env: Record<string, string> | undefined): void {
@@ -613,13 +623,18 @@ export interface CommandHandle {
    * observable by exec_wait.
    */
   recentOutput: () => string
-  /** Resolves once the child process has exited (cleanly or killed). */
-  done: Promise<{ exitCode: number; stdout: string; stderr: string; killed: boolean }>
+  /**
+   * Resolves once the child process has exited (cleanly or killed).
+   * `killReason` is set when Shogo stopped it (e.g. out of memory).
+   */
+  done: Promise<{ exitCode: number; stdout: string; stderr: string; killed: boolean; killReason?: string }>
   /** Send a termination signal. SIGTERM is graceful, SIGKILL is forceful. */
   kill: (signal?: 'SIGTERM' | 'SIGKILL') => void
   /** True once the child has exited. */
   exited: () => boolean
   startedAt: number
+  /** Subscribe to raw output chunks as they arrive. Returns an unsubscribe function. */
+  onData?: (listener: (chunk: string, stream: 'stdout' | 'stderr') => void) => () => void
 }
 
 export type SandboxExecAsyncOptions = SandboxExecOptions
@@ -640,6 +655,7 @@ export function sandboxExecAsync(opts: SandboxExecAsyncOptions): CommandHandle {
   const recentOutputBuf = new RecentOutputBuffer()
 
   let child: ChildProcess
+  let ownGroup = false
   let containerName: string | undefined
 
   if (useSandbox) {
@@ -682,11 +698,13 @@ export function sandboxExecAsync(opts: SandboxExecAsyncOptions): CommandHandle {
     const env = buildExecEnv(opts.workspaceDir, { extraEnv: opts.extraEnv })
     const finalCommand = rewriteBunxOnWindows(opts.command)
 
+    ownGroup = process.platform !== 'win32'
     if (shell) {
       child = spawn(shell, ['-c', finalCommand], {
         cwd: opts.workspaceDir,
         env,
         stdio: ['ignore', 'pipe', 'pipe'],
+        detached: ownGroup,
       })
     } else {
       child = spawn(finalCommand, {
@@ -694,35 +712,78 @@ export function sandboxExecAsync(opts: SandboxExecAsyncOptions): CommandHandle {
         env,
         shell: true,
         stdio: ['ignore', 'pipe', 'pipe'],
+        detached: ownGroup,
       })
     }
   }
 
   let killed = false
+  let killReason: string | undefined
   let exited = false
+
+  const dataListeners = new Set<(chunk: string, stream: 'stdout' | 'stderr') => void>()
+  const emitData = (chunk: string, stream: 'stdout' | 'stderr') => {
+    for (const listener of dataListeners) {
+      try { listener(chunk, stream) } catch { /* listener errors never affect the child */ }
+    }
+  }
 
   child.stdout?.setEncoding('utf-8')
   child.stderr?.setEncoding('utf-8')
   child.stdout?.on('data', (chunk: string) => {
     stdoutBuf.push(chunk)
     recentOutputBuf.push(chunk)
+    emitData(chunk, 'stdout')
   })
   child.stderr?.on('data', (chunk: string) => {
     stderrBuf.push(chunk)
     recentOutputBuf.push(chunk)
+    emitData(chunk, 'stderr')
   })
+
+  const untrack = !useSandbox && child.pid
+    ? trackExecProcess({
+        pid: child.pid,
+        killForMemory: (note) => {
+          if (exited) return
+          killReason = note
+          const text = `\n${note}\n`
+          stderrBuf.push(text)
+          recentOutputBuf.push(text)
+          emitData(text, 'stderr')
+          sendKill('SIGKILL')
+        },
+      })
+    : () => {}
 
   // Suppress unhandled-error events; we surface failures via the `done`
   // promise's exitCode field instead of throwing.
   child.on('error', (err) => {
+    untrack()
     stderrBuf.push(`\n[shogo] spawn error: ${err.message}\n`)
   })
 
   function sendKill(signal: 'SIGTERM' | 'SIGKILL'): void {
     killed = true
+    // Windows has no process groups and TerminateProcess stops only the shell,
+    // leaving what it launched running. Walk the tree while the shell is alive.
+    if (!useSandbox && !ownGroup && process.platform === 'win32' && child.pid && !exited) {
+      try {
+        spawnSync('taskkill', ['/F', '/T', '/PID', String(child.pid)], {
+          stdio: 'ignore',
+          windowsHide: true,
+          timeout: 10_000,
+        })
+      } catch { /* fall through to child.kill */ }
+    }
     try {
-      child.kill(signal)
-    } catch { /* already gone */ }
+      // The shell's children (`bun run dev` → `bun server.ts`) share its
+      // process group; signalling only the shell would orphan them.
+      if (ownGroup && child.pid) process.kill(-child.pid, signal)
+      else child.kill(signal)
+    } catch {
+      try { child.kill(signal) } catch { /* already gone */ }
+    }
 
     // For sandboxed runs the SIGTERM to the docker CLI may not always
     // propagate to the container — issue an explicit `docker kill` as
@@ -747,9 +808,10 @@ export function sandboxExecAsync(opts: SandboxExecAsyncOptions): CommandHandle {
     ;(escalate as any)?.unref?.()
   }
 
-  const done = new Promise<{ exitCode: number; stdout: string; stderr: string; killed: boolean }>((resolve) => {
+  const done = new Promise<{ exitCode: number; stdout: string; stderr: string; killed: boolean; killReason?: string }>((resolve) => {
     child.on('exit', (code, signal) => {
       exited = true
+      untrack()
       const exitCode = typeof code === 'number'
         ? code
         : (signal ? 128 + (signalNumber(signal) ?? 0) : 1)
@@ -758,6 +820,7 @@ export function sandboxExecAsync(opts: SandboxExecAsyncOptions): CommandHandle {
         stdout: stdoutBuf.toString(),
         stderr: stderrBuf.toString(),
         killed,
+        ...(killReason ? { killReason } : {}),
       })
     })
   })
@@ -779,6 +842,10 @@ export function sandboxExecAsync(opts: SandboxExecAsyncOptions): CommandHandle {
     },
     exited: () => exited,
     startedAt,
+    onData: (listener) => {
+      dataListeners.add(listener)
+      return () => { dataListeners.delete(listener) }
+    },
   }
 }
 

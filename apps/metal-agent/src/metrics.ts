@@ -63,6 +63,10 @@ export const M = {
   tapCapacity: 'metal_tap_capacity',
   tapUsedPct: 'metal_tap_used_pct',
   gcStaleReclaimed: 'metal_gc_stale_reclaimed_total',
+  // Rootfs switch-over: pre-warmed snapshots made current at activation, and
+  // idle VMs on a superseded rootfs backed up and stopped instead of snapshotted.
+  stagedSnapshotsPromoted: 'metal_staged_snapshots_promoted_total',
+  suspendRetiredStale: 'metal_suspend_retired_stale_total',
   resumeLocalHits: 'metal_resume_local_hits_total',
   resumeStoreHits: 'metal_resume_store_hits_total',
   resumeColdMiss: 'metal_resume_cold_miss_total',
@@ -88,9 +92,20 @@ export const M = {
   // has mounted. Backups follow the guest; before that, a member missing from
   // the host's list was never backed up at all.
   workspaceMemberDrift: 'metal_workspace_member_drift_total',
-  // A project was exported from one live VM so another runtime opening it
-  // started from those files instead of an older backup (or the starter).
-  memberFlushedForOpen: 'metal_member_flushed_for_open_total',
+  // Single-runtime rule: a project is online only in its own runtime
+  // (pool.ownMemberIds). Each of these should read zero once the API and every
+  // VM from before the rule are gone.
+  //   `foreignMembersStripped`    — member ids dropped from an assign/resume env
+  //                                 (an API replica still sending the old lists).
+  //   `foreignMemberMountRefused` — a live mount of a foreign member (409).
+  //   `foreignMemberBackupSkipped`— a backup found a foreign member in a legacy
+  //                                 VM and left it to the drain.
+  //   `foreignMemberDrained`      — `{outcome="exported"|"conflict"|"empty"|"failed"}`
+  //                                 per member pool.drainForeignMembers took off.
+  foreignMembersStripped: 'metal_foreign_members_stripped_total',
+  foreignMemberMountRefused: 'metal_foreign_member_mount_refused_total',
+  foreignMemberBackupSkipped: 'metal_foreign_member_backup_skipped_total',
+  foreignMemberDrained: 'metal_foreign_member_drained_total',
   // Writable-state durability (database + uploads; see
   // pool.saveProjectDataToStore).
   //   `dataConflict`  — a conditional write's precondition failed, so the
@@ -188,11 +203,31 @@ export const M = {
   rescueDisk: 'metal_rescue_disk_extract_total',
   rescueFailed: 'metal_rescue_failed_quarantined_total',
   staleSnapshotSkipped: 'metal_stale_snapshot_skipped_total',
+  // Same events labelled `{reason="repo"|"member_data"|...}` (see StaleReason).
+  staleSnapshotSkippedByReason: 'metal_stale_snapshot_skipped_by_reason_total',
+  // Resumes that kept a snapshot whose writable-state archives had moved on,
+  // re-applying just those archives instead of cold-booting.
+  snapshotDriftRepaired: 'metal_snapshot_drift_repaired_total',
+  // Idle suspends labelled `{tier="relaxed"|"aggressive"|"static"}`, and VMs
+  // past the window left for a later pass by METAL_REAP_MAX_PER_PASS.
+  idleSuspendedByTier: 'metal_idle_suspended_by_tier_total',
+  idleReapDeferred: 'metal_idle_reap_deferred_total',
+  idleWindowMs: 'metal_idle_window_ms',
+  // Source backups taken mid-residency (pool.exportAllSource), separate from
+  // the one every suspend takes.
+  sourceBackupPeriodic: 'metal_source_backup_periodic_total',
+  sourceBackupPeriodicFailed: 'metal_source_backup_periodic_failed_total',
   // Host-mediated `.git` durability (see pool.saveRepoToStore).
   repoConflict: 'metal_repo_conflict_total',
   repoPromoted: 'metal_repo_unlinked_promoted_total',
   repoRefused: 'metal_repo_refused_untrusted_total',
   repoTooLarge: 'metal_repo_too_large_total',
+  repoBundleBytes: 'metal_repo_bundle_bytes_total',
+  repoBundleFull: 'metal_repo_bundle_full_total',
+  repoManifestConflict: 'metal_repo_manifest_conflict_total',
+  repoBundleCompactions: 'metal_repo_bundle_compactions_total',
+  repoBundlesGced: 'metal_repo_bundle_gc_deleted_total',
+  repoExportUnchanged: 'metal_repo_export_unchanged_total',
   // Guest-side failures scraped from the per-VM serial console by serial-watcher.
   // These are the ONLY fleet-wide signal for in-guest breakage that survives a
   // guest too broken to ship its own telemetry (e.g. TLS failing on clock skew).

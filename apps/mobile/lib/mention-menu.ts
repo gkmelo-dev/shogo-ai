@@ -36,8 +36,10 @@ export interface MentionMenuData {
   projects?: Array<{ id: string; name: string; description?: string | null }>
   statuses?: Record<string, { emoji?: string | null; text?: string | null } | null | undefined>
   meId?: string | null
-  /** Who is in the conversation when only members can be notified (private channels); null otherwise. */
+  /** Who is in the channel, to flag everyone else; null outside channels. */
   memberIds?: ReadonlySet<string> | null
+  /** Only members get notified (private channels). */
+  membersOnly?: boolean
   /** Tokens picked recently, newest first. */
   recent?: string[]
   now?: Date
@@ -183,7 +185,7 @@ function matches(data: MentionMenuData, category: MentionCategory, query: string
  * category, or null at the top level), limited to `categories`.
  */
 export function buildMentionMenu(data: MentionMenuData, categories: MentionCategory[], query: string, drill: MentionCategory | null): MentionMenu {
-  const footer = data.memberIds && categories.includes('people') ? 'Only people in this channel will be notified' : null
+  const footer = data.membersOnly && categories.includes('people') ? 'Only people in this channel will be notified' : null
   const q = query.trim()
 
   if (drill) {
@@ -258,7 +260,7 @@ export function privateMemberIds(conversation: { kind: string; members: Array<{ 
 export function mentionMenuData(
   mentionables: Mentionables | null,
   meId: string | null,
-  extra: Pick<MentionMenuData, 'memberIds' | 'recent' | 'now' | 'timeZone'> = {},
+  extra: Pick<MentionMenuData, 'memberIds' | 'membersOnly' | 'recent' | 'now' | 'timeZone'> = {},
 ): MentionMenuData {
   return {
     people: mentionables?.people ?? [],

@@ -79,6 +79,24 @@ describe('recipients', () => {
     expect(await notified(result)).toEqual([])
   })
 
+  test('mentioning a workspace member who is not in this channel never notifies them, public or private', async () => {
+    for (const kind of ['public', 'private'] as const) {
+      const channel = await service.createChannel({ workspaceId: seed.workspaceId, userId: seed.owner, name: `no-${kind}-${kind}`, kind })
+      const result = await service.postMessage({
+        conversationId: channel.id, authorType: 'user', authorUserId: seed.owner,
+        text: `${userMentionToken(seed.member)} can you look?`,
+      })
+      expect(await notified(result)).toEqual([])
+
+      await service.addUserMembers(channel.id, seed.owner, [seed.member])
+      const afterJoining = await service.postMessage({
+        conversationId: channel.id, authorType: 'user', authorUserId: seed.owner,
+        text: `${userMentionToken(seed.member)} thanks for joining`,
+      })
+      expect(await notified(afterJoining)).toEqual([`${seed.member}:mention`])
+    }
+  })
+
   test('muted channels still deliver direct mentions but not @channel; notify level none silences both', async () => {
     await db.conversationMember.updateMany({ where: { conversationId: generalId, userId: seed.member }, data: { muted: true } })
     expect(await notified(await post({ authorUserId: seed.owner, text: '<!channel> standup' }))).toEqual([`${seed.viewer}:broadcast`])
@@ -121,6 +139,13 @@ describe('delivery', () => {
     expect(events).toHaveLength(1)
     expect(events[0].audience).toEqual([seed.member])
     expect(events[0].event.reason).toBe('mention')
+  })
+
+  test('users who are not active get both a push and a socket alert for any open client', async () => {
+    await notified(await post({ authorUserId: seed.owner, text: `${userMentionToken(seed.member)} when you're back` }))
+    expect(pushes.filter((p) => p.userId === seed.member)).toHaveLength(1)
+    expect(events).toHaveLength(1)
+    expect(events[0].audience).toEqual([seed.member])
   })
 
   test('rapid messages in one conversation coalesce into a single push', async () => {

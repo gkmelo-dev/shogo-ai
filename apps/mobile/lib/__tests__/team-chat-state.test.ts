@@ -27,7 +27,9 @@ import {
   mentionCandidates,
   mentionNames,
   mergePage,
+  newestReadableSeq,
   renderMentions,
+  renderMentionsMarkdown,
   startsGroup,
   stepConversation,
   trimToNewest,
@@ -123,6 +125,28 @@ describe('timeline', () => {
     expect(state.messages.map((m) => m.id)).toEqual(['m1', 'r1'])
   })
 
+  test('newestReadableSeq ignores thread-only replies but counts ones also sent to the channel', () => {
+    expect(newestReadableSeq([])).toBe(0)
+    expect(newestReadableSeq([msg({ id: 'm1', seq: 5 })])).toBe(5)
+    // A thread reply that never reached the channel doesn't count: marking the
+    // channel read shouldn't silently also advance past something unseen.
+    expect(newestReadableSeq([
+      msg({ id: 'm1', seq: 5 }),
+      msg({ id: 'r1', seq: 6, threadRootId: 'm1' }),
+    ])).toBe(5)
+    // ...but one marked "also send to channel" *does* render in the channel
+    // feed, so reading the channel has to count it too.
+    expect(newestReadableSeq([
+      msg({ id: 'm1', seq: 5 }),
+      msg({ id: 'r1', seq: 6, threadRootId: 'm1', alsoSentToChannel: true }),
+    ])).toBe(6)
+    // A pending (not yet confirmed) send is never "read" yet.
+    expect(newestReadableSeq([
+      msg({ id: 'm1', seq: 5 }),
+      { ...msg({ id: 'tmp', seq: 0 }), pending: true },
+    ])).toBe(5)
+  })
+
   test('optimistic sends are replaced by the server copy and failures are marked', () => {
     let state = addOptimistic(emptyTimeline, msg({ id: 'tmp-1', seq: 0, clientMsgId: 'c-1' }))
     state = addOptimistic(state, msg({ id: 'tmp-2', seq: 0, clientMsgId: 'c-2' }))
@@ -159,6 +183,13 @@ describe('timeline', () => {
 })
 
 describe('conversation list', () => {
+  test('a deleted channel drops out of the list without a refetch', () => {
+    const list = [conv({ id: 'keep', kind: 'public' }), conv({ id: 'gone', kind: 'public' })]
+    const update = applyListEvent(list, { type: 'conversation.deleted', conversationId: 'gone' }, 'me', 'gone')
+    expect(update.list.map((c) => c.id)).toEqual(['keep'])
+    expect(update.refetch).toBe(false)
+  })
+
   test('a doc update marks the channel as having a doc', () => {
     const list = [conv({ id: 'ch', kind: 'public' })]
     const event = { type: 'doc.updated' as const, conversationId: 'ch', version: 1, title: '', locked: false, updatedBy: null }
@@ -176,6 +207,32 @@ describe('conversation list', () => {
     expect(update.list[1]!.lastMessage).toBeUndefined()
     update = applyListEvent(update.list, { type: 'message.created', conversationId: 'dm', message: msg({ id: 'c', seq: 7, conversationId: 'dm', authorUserId: 'u2', text: 'in thread', threadRootId: 'a' }) }, 'me', null)
     expect(update.list[0]!.lastMessage?.preview).toBe('ship it @someone')
+  })
+
+  test('a voice note with no text previews as a voice note, not as blank', () => {
+    const list = [conv({ id: 'dm', kind: 'dm' })]
+    const voiceNote = {
+      id: 'att-1',
+      name: 'Voice note.m4a',
+      mimeType: 'audio/mp4',
+      size: 12_000,
+      width: null,
+      height: null,
+      url: '/api/conversation-files/att-1',
+      durationMs: 12_000,
+      peaks: '20 40 60',
+    }
+    const update = applyListEvent(
+      list,
+      {
+        type: 'message.created',
+        conversationId: 'dm',
+        message: msg({ id: 'v', seq: 6, conversationId: 'dm', authorUserId: 'u2', text: '', attachments: [voiceNote] }),
+      },
+      'me',
+      null,
+    )
+    expect(update.list[0]!.lastMessage).toMatchObject({ preview: '🎤 Voice note · 0:12', authorId: 'u2' })
   })
 
   test('messages from others bump unread and mentions; my own and the open conversation stay read', () => {
@@ -260,6 +317,27 @@ describe('mentions', () => {
     expect(insertMention('ask @bil', { start: 4, query: 'bil' }, billing)).toEqual({ text: 'ask @Billing Bot ', cursor: 17 })
   })
 
+  test('flags users who are not in the channel, and lists them after everyone else', () => {
+    const inChannel = new Set(['me', 'u3'])
+    const candidates = mentionCandidates(mentionables, 'me', inChannel)
+    const ana = candidates.find((c) => c.display === 'Ana')!
+    const anaLopez = candidates.find((c) => c.display === 'Ana Lopez')!
+    const billing = candidates.find((c) => c.display === 'Billing Bot')!
+    expect(ana.inChannel).toBe(true)
+    expect(anaLopez.inChannel).toBe(false)
+    expect(billing.inChannel).toBeUndefined() // not a user candidate: the flag doesn't apply
+
+    // Tie-broken by membership: Ana (member) before Ana Lopez (not a member).
+    expect(filterCandidates(candidates, 'ana').map((c) => c.display)).toEqual(['Ana', 'Ana Lopez'])
+    // With no query, every non-member user sorts after the rest, in their original order.
+    expect(filterCandidates(candidates, '').map((c) => c.display)).toEqual(['Shogo', 'Billing Bot', 'Ana', 'here', 'channel', 'Ana Lopez'])
+  })
+
+  test('omitting channel membership leaves every candidate unflagged', () => {
+    const candidates = mentionCandidates(mentionables, 'me')
+    expect(candidates.every((c) => c.inChannel === undefined)).toBe(true)
+  })
+
   test('encodes picked names to tokens (longest names first) and renders them back', () => {
     const candidates = mentionCandidates(mentionables, 'me')
     const picked = candidates.filter((c) => ['Ana', 'Ana Lopez', 'Billing Bot'].includes(c.display))
@@ -267,6 +345,10 @@ describe('mentions', () => {
     expect(wire).toBe('<@u:u2> and <@u:u3>, ask <@a:p:p1>. email@Ana stays')
     expect(renderMentions(`${wire} <!here> <@a:ws> <@u:gone>`, mentionNames(mentionables))).toBe(
       '**@Ana Lopez** and **@Ana**, ask **@Billing Bot**. email@Ana stays **@here** **@Shogo** **@someone**',
+    )
+    expect(renderMentionsMarkdown(`${wire} <!here> <@a:ws> <@u:gone>`, mentionNames(mentionables))).toBe(
+      '[@Ana Lopez](/shogo-mention) and [@Ana](/shogo-mention), ask [@Billing Bot](/shogo-mention). email@Ana stays ' +
+        '[@here](/shogo-mention) [@Shogo](/shogo-mention) [@someone](/shogo-mention)',
     )
   })
 })
@@ -383,6 +465,9 @@ describe('group mentions', () => {
     const group = mentionCandidates(m, null).find((c) => c.kind === 'group')!
     expect(group).toMatchObject({ display: 'design', token: '<@g:g1>', subtitle: 'Design · 2 people' })
     expect(renderMentions('<@g:g1> and <@g:gone>', mentionNames(m))).toBe('**@design** and **@group**')
+    expect(renderMentionsMarkdown('<@g:g1> and <@g:gone>', mentionNames(m))).toBe(
+      '[@design](/shogo-mention) and [@group](/shogo-mention)',
+    )
   })
 })
 
@@ -414,5 +499,18 @@ describe('stepConversation', () => {
     expect(stepConversation(list, 'b', 1, true)?.id).toBe('e')
     expect(stepConversation(list, 'e', 1, true)?.id).toBe('b')
     expect(stepConversation([conv('a'), conv('b')], 'a', 1, true)).toBeNull()
+  })
+})
+
+describe('renderMentionsMarkdown', () => {
+  test('renders channel mentions and escapes brackets in names', () => {
+    const names = {
+      users: new Map([['u1', 'Ana [ops]']]),
+      agents: new Map(),
+      conversations: new Map([['c1', 'general']]),
+    }
+    expect(renderMentionsMarkdown('<@u:u1> in <#c:c1> and <#c:gone>', names)).toBe(
+      '[@Ana \\[ops\\]](/shogo-mention) in [#general](/shogo-mention) and [#channel](/shogo-mention)',
+    )
   })
 })

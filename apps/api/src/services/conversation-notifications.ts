@@ -3,14 +3,15 @@
 /**
  * Mention, DM, and thread-reply notifications for channel messages.
  *
- * People active in the workspace on any device get an in-app/desktop alert
- * over the realtime socket instead of a phone push; everyone else gets a push.
+ * Every open client gets an alert over the realtime socket; people not active
+ * in the workspace on any device also get a phone push.
  */
 
 import { prisma } from '../lib/prisma'
 import { publishConversationEvent } from '../lib/conversation-bus'
 import { sendPushToUser } from '../lib/push-notifications'
-import { collectMentionIds, groupNames, markdownToPlainText, renderMentionsAsText } from './conversation-mentions'
+import { markdownToPlainText, renderMentionsAsText } from './conversation-mentions'
+import { loadMentionNames } from './conversation-agent-dispatcher'
 import { registerAfterPostHook } from './conversation-pipeline'
 import {
   agentDisplayName, getWorkspaceRole, isOpenKind, onReactionAdded,
@@ -99,8 +100,10 @@ export async function resolveRecipients(result: PostMessageResult): Promise<Noti
     if (m.targetType !== 'user') continue
     const member = byUser.get(m.userId)
     if (member?.level === 'none') continue
-    if (!member && !isOpenKind(conversation.kind)) continue
-    if (!member && !(await getWorkspaceRole(conversation.workspaceId, m.userId))) continue
+    // Mentioning someone who isn't in this channel never notifies them, public or
+    // private: channel notifications are scoped to members, same as Slack. The
+    // composer instead offers to add them (see team-chat-mention-nudge.ts).
+    if (!member) continue
     add(m.userId, 'mention')
   }
 
@@ -152,22 +155,24 @@ export async function resolveRecipients(result: PostMessageResult): Promise<Noti
     .map(([userId, reason]) => ({ userId, reason, silenced: isSilenced(settings.get(userId), now) }))
 }
 
+/**
+ * Preview text for a notification: mention tokens resolved to names, then
+ * flattened to plain text.
+ *
+ * `renderMentionsAsText` falls back to `@someone` / `@group` / `@agent` /
+ * `#channel` for every token whose id it was not handed, so a preview built
+ * without the name lookup shows placeholders instead of the people tagged.
+ */
+async function notificationText(text: string, workspaceId: string): Promise<string> {
+  return markdownToPlainText(renderMentionsAsText(text, await loadMentionNames(workspaceId, [text])))
+}
+
 async function describe(result: PostMessageResult) {
   const { row, conversation } = result
   const author = row.authorType === 'agent'
     ? row.authorAgentRef?.name ?? (await agentDisplayName(conversation.workspaceId, row.authorAgentRef?.projectId ?? null))
     : row.authorUser?.name || row.authorUser?.email || row.blocks?.externalAuthor?.name || 'Someone'
-  const ids = collectMentionIds([row.text])
-  const [users, projects] = await Promise.all([
-    ids.userIds.length ? db.user.findMany({ where: { id: { in: ids.userIds } }, select: { id: true, name: true, email: true } }) : [],
-    ids.projectIds.length ? db.project.findMany({ where: { id: { in: ids.projectIds } }, select: { id: true, name: true } }) : [],
-  ])
-  const text = markdownToPlainText(renderMentionsAsText(row.text ?? '', {
-    users: new Map(users.map((u: any) => [u.id, u.name || u.email])),
-    projects: new Map(projects.map((p: any) => [p.id, p.name])),
-    groups: await groupNames(db, conversation.workspaceId, ids.groupIds),
-    workspaceAgentName: await agentDisplayName(conversation.workspaceId, null),
-  }))
+  const text = await notificationText(row.text ?? '', conversation.workspaceId)
   const attachments = row.attachments?.length ? `📎 ${row.attachments.length} file${row.attachments.length > 1 ? 's' : ''}` : ''
   const body = (text || attachments || 'New message').slice(0, BODY_CHARS)
   const where = isDirect(conversation.kind) ? null : `#${conversation.slug ?? conversation.name ?? 'channel'}`
@@ -205,14 +210,15 @@ export async function notifyForMessage(result: PostMessageResult): Promise<Notif
 
   for (const { userId, reason, silenced } of recipients) {
     if (silenced) continue
-    if (presence[userId] === 'active') {
-      publishConversationEvent(
-        conversation.workspaceId,
-        { type: 'notification', ...data, reason, title, body },
-        [userId],
-      )
-      continue
-    }
+    // Every open client gets the alert and decides locally whether to show it
+    // (a backgrounded tab with permission still can). The push is only for
+    // when no device is in active use.
+    publishConversationEvent(
+      conversation.workspaceId,
+      { type: 'notification', ...data, reason, title, body },
+      [userId],
+    )
+    if (presence[userId] === 'active') continue
     // An approval waits on a person, so it is never folded into the last push
     // for the channel, and its notification carries Approve and Deny buttons.
     if (approval) {
@@ -250,7 +256,7 @@ export async function notifyForReaction({ message, conversation, reactorId, emoj
   if (existing) return
   const reactor = await db.user.findUnique({ where: { id: reactorId }, select: { name: true, email: true } })
   const who = reactor?.name || reactor?.email || 'Someone'
-  const preview = markdownToPlainText(renderMentionsAsText(message.text ?? '')) || 'your message'
+  const preview = (await notificationText(message.text ?? '', conversation.workspaceId)) || 'your message'
   await createInboxItems([{
     workspaceId: conversation.workspaceId,
     userId: authorId,
@@ -273,17 +279,7 @@ function mentionedUserIds(text: string): Set<string> {
 async function docMentionPreview(workspaceId: string, content: string, userId: string): Promise<string> {
   const token = `<@u:${userId}>`
   const lines = content.split('\n').filter((l) => l.includes(token)).slice(0, 3).join('\n')
-  const ids = collectMentionIds([lines])
-  const [users, projects] = await Promise.all([
-    ids.userIds.length ? db.user.findMany({ where: { id: { in: ids.userIds } }, select: { id: true, name: true, email: true } }) : [],
-    ids.projectIds.length ? db.project.findMany({ where: { id: { in: ids.projectIds } }, select: { id: true, name: true } }) : [],
-  ])
-  return markdownToPlainText(renderMentionsAsText(lines, {
-    users: new Map(users.map((u: any) => [u.id, u.name || u.email])),
-    projects: new Map(projects.map((p: any) => [p.id, p.name])),
-    groups: await groupNames(db, workspaceId, ids.groupIds),
-    workspaceAgentName: await agentDisplayName(workspaceId, null),
-  })).slice(0, BODY_CHARS)
+  return markdownToPlainText(renderMentionsAsText(lines, await loadMentionNames(workspaceId, [lines]))).slice(0, BODY_CHARS)
 }
 
 /**
@@ -347,6 +343,38 @@ export async function notifyForDocMentions(input: {
     }
   }
   return recipients
+}
+
+/**
+ * An agent asked these people something they weren't tagged in (or the post
+ * that asked it was too quiet to notify). Never folded into a channel's last
+ * push, since someone is waiting on the answer.
+ */
+export async function notifyQuestion(input: {
+  conversation: any
+  row: any
+  userIds: string[]
+  title: string
+  body: string
+}): Promise<void> {
+  const { conversation, row } = input
+  const settings = await getSettingsRows(conversation.workspaceId, input.userIds)
+  const presence = await getPresence(conversation.workspaceId, input.userIds)
+  const now = new Date()
+  const body = (await notificationText(input.body, conversation.workspaceId)).slice(0, BODY_CHARS)
+  const data = {
+    conversationId: conversation.id,
+    messageId: row.id,
+    threadRootId: row.threadRootId ?? null,
+    workspaceId: conversation.workspaceId,
+    reason: 'question',
+  }
+  for (const userId of input.userIds) {
+    if (isSilenced(settings.get(userId), now)) continue
+    publishConversationEvent(conversation.workspaceId, { type: 'notification', ...data, title: input.title, body }, [userId])
+    if (presence[userId] === 'active') continue
+    void sendPush(userId, { title: input.title, body, type: 'agent-question', channelId: 'messages', audience: 'chat', data })
+  }
 }
 
 let registered = false

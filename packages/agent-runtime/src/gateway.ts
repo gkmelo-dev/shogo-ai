@@ -22,7 +22,7 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, statSy
 import { join, dirname, resolve } from 'path'
 import { fileURLToPath } from 'url'
 import type { Message, ImageContent } from '@mariozechner/pi-ai'
-import type { StreamFn, AgentTool } from '@mariozechner/pi-agent-core'
+import type { StreamFn, AgentTool, AgentToolResult } from '@mariozechner/pi-agent-core'
 import { Type } from '@sinclair/typebox'
 import type { ChannelAdapter, IncomingMessage, AgentStatus, ChannelStatus, StreamChunkConfig, SandboxConfig } from './types'
 import { loadAllSkills, migrateFromLegacySkills, matchSkill, buildSkillsPromptSection, type Skill } from './skills'
@@ -34,7 +34,7 @@ import { TRIGGERS_GUIDE, triggerToolsAvailable } from './trigger-tools'
 import { runAgentLoop, classifyRetryability, RetryWaker, type LoopDetectorConfig } from './agent-loop'
 import { LONG_RETRY_MS, recordRetryEpisode, recordRetryLong, recordRetryNoProgress, recordRetryNow } from './retry-telemetry'
 import type { ToolContext } from './gateway-tools'
-import { createTools, textResult, filterDisabledCapabilityTools, filterSubagentOnlyTools, expectedCoreToolsForAgentMode, createModeUnavailableTool, type RestrictedMode } from './gateway-tools'
+import { createTools, textResult, filterDisabledCapabilityTools, filterSubagentOnlyTools, expectedCoreToolsForAgentMode, createModeUnavailableTool, workspaceAgentToolsRegistered, type RestrictedMode } from './gateway-tools'
 import { DEFAULT_CLOUD_SECURITY_PREFERENCE, PermissionEngine, parseSecurityPolicy } from './permission-engine'
 import { buildExposedPortsPrompt } from './exposed-ports-prompt'
 import { HookEmitter, loadAllHooks, workspaceHooksSignature } from './hooks'
@@ -44,6 +44,7 @@ import { microcompact } from './microcompact'
 import {
   type ContentReplacementState,
   createContentReplacementState,
+  resolveInLoopContextBudgetTokens,
   stableTransformContext,
 } from './stable-compaction'
 import { scrubOversizedImages } from './image-size-guard'
@@ -56,7 +57,8 @@ import {
 import { SqliteSessionPersistence } from './sqlite-session-persistence'
 import { BlockChunker } from './block-chunker'
 import { canvasModeStableGuides } from './canvas-v2-prompt'
-import { buildCapabilityStatusSection } from './capability-status-prompt'
+import { buildCapabilityStatusSection, resolveRuntimeCapabilities } from './capability-status-prompt'
+import { BOARDS_GUIDE, COMPANY_OPS_GUIDE } from './board-tools'
 import { buildViewerContextPrompt, parseCanvasViewer } from './viewer-context'
 import { buildAccountContextPrompt, type AccountContext } from './account-context'
 import { CanvasFileWatcher } from './canvas-file-watcher'
@@ -69,6 +71,9 @@ import {
   setAgentModeOverrides,
   isAutoModel,
   AUTO_MODEL_ID,
+  parseDynamicModelsEnv,
+  registerDynamicModels,
+  rememberProviderHint,
 } from '@shogo/model-catalog'
 import {
   selectModelForSpawn,
@@ -79,8 +84,11 @@ import {
   type SpawnClassificationInput,
   type AutoTierOverride,
 } from './model-router'
-import { CODE_AGENT_GENERAL_GUIDE, OUTPUT_CONTRACT_GUIDE } from './code-agent-prompt'
-import { SHOGO_SDK_GUIDE } from './shogo-sdk-prompt'
+import { buildCodeAgentGeneralGuide, OUTPUT_CONTRACT_GUIDE } from './code-agent-prompt'
+import { isSearchEnabled } from './search-flag'
+import { smartTruncateJson } from './response-transforms'
+import { getShogoSdkGuide } from './shogo-sdk-prompt'
+import { refreshAvailableModels } from './available-models'
 import { UI_UX_DESIGN_GUIDE } from './ui-ux-guide-prompt'
 import { MCPClientManager, type MCPServerConfig, type RemoteMCPServerConfig } from './mcp-client'
 import { WorkspaceLSPManager, resolveBin, WorktreeManager } from '@shogo/shared-runtime'
@@ -93,7 +101,7 @@ import {
 } from './workspace-runtime-mode'
 import { initComposioSession, resetComposioSession, isComposioEnabled, isComposioInitialized } from './composio'
 import { createIntegrationCredentialWrapper } from './integration-credentials'
-import { deriveApiUrl, getInternalHeaders, getProjectConfig, hasInternalApiCredentials, postCostMetric, projectScopedId } from './internal-api'
+import { deriveApiUrl, getInternalHeaders, getProjectConfig, hasInternalApiCredentials, notifyTaskCompletions, postCostMetric, projectScopedId } from './internal-api'
 import { mergeCapabilitySettingsIntoConfig } from '@shogo/shared-runtime/capability-settings'
 import { getRuntimeTrust } from './runtime-trust'
 import { refreshTrust } from './trust-resolver'
@@ -108,10 +116,13 @@ import { defaultShellCwd, workspaceKind } from './workspace-runtime-mode'
 import { applyCapabilityProfile, CAPABILITY_PROFILES, type CapabilityProfileName } from './capability-profiles'
 import { FileStateCache } from './file-state-cache'
 import { SUBAGENT_GUIDE, WORKTREE_GUIDE } from './subagent-prompts'
+import { BACKGROUND_TASKS_GUIDE } from './background-tasks-guide'
 import { buildGuideRegistry, buildCapabilitiesIndex } from './guide-registry'
 import { AgentManager } from './agent-manager'
 import { loadWorkspaceCustomAgents } from './subagent'
-import { CommandRegistry } from './command-registry'
+import { TaskRegistry, formatTaskNotification } from './task-registry'
+import { cleanupTaskOutputs, taskOutputDir, taskOutputRoot } from './task-output'
+import { createApiTaskClient } from './remote-tasks'
 import { releaseSessionBrowsers, reapOrphanChromium } from './browser-pool'
 import { TeamManager } from './team-manager'
 import {
@@ -247,6 +258,12 @@ const AUTO_TIER_ORDER: AutoTierCeiling[] = ['economy', 'standard', 'premium']
 // transient cloud configuration error can recover without requiring a new
 // chat session.
 const AUTO_TIER_CEILING_TTL_MS = 5 * 60 * 1000
+/** Finished tasks arriving this close together wake an idle session once. */
+const TASK_WAKE_COALESCE_MS = 2_000
+/** How often an idle session polls tasks mirrored from another project's runtime. */
+const REMOTE_TASK_POLL_MS = 10_000
+/** How often a running turn refreshes remote tasks so their results can be injected mid-turn. */
+const TURN_REMOTE_REFRESH_MS = 10_000
 
 function lowerAutoTier(tier: AutoTierCeiling): AutoTierCeiling | null {
   const index = AUTO_TIER_ORDER.indexOf(tier)
@@ -433,7 +450,7 @@ export interface GatewayConfig {
    */
   heartbeatToolsEnabled?: boolean
   channels: Array<{ type: string; config: Record<string, string>; model?: string }>
-  /** Model configuration: provider + name (e.g. { provider: 'anthropic', name: 'claude-sonnet-4-5' }).
+  /** Model configuration: provider + name (e.g. { provider: 'anthropic', name: 'auto' }).
    *  `thinkingLevel` is the admin-configured reasoning effort for the selected
    *  model (set by the client when picking a model); it overrides the env
    *  default in `resolveThinkingLevel`. */
@@ -500,6 +517,18 @@ export interface GatewayConfig {
   socialInstagramEnabled?: boolean
   /** When the master switch is on, TikTok lookups stay available unless this is `false`. */
   socialTiktokEnabled?: boolean
+  /** Team chat tools (`team_chat_*`, `team_directory`, `member_activity`, `fetch_chat_files`). Default on. */
+  teamChatEnabled?: boolean
+  /** Working cards on boards (`board_list/summary/health`, `work_item_*`). Default on. */
+  boardsEnabled?: boolean
+  /** Board structure (`board_create/update/archive/reorder`, `column_*`). Opt-in. */
+  boardAdminEnabled?: boolean
+  /** Creating and changing triggers (`trigger_create/update/delete/test`). Default on. */
+  workTriggersEnabled?: boolean
+  /** Board sweeps, digests and escalation on heartbeat (company-ops skill). Opt-in. */
+  companyOpsEnabled?: boolean
+  /** Problem tools (`problem_occurrences`, `problem_report`). Opt-in. */
+  problemsEnabled?: boolean
 }
 
 /**
@@ -520,6 +549,7 @@ export interface GatewayConfig {
 async function runMockAndUnwrap(
   mockFn: (params: Record<string, any>) => any | Promise<any>,
   params: Record<string, any>,
+  integrationToolName?: string,
 ): Promise<any> {
   const result = await mockFn(params)
   if (result === '__passthrough') return result
@@ -527,7 +557,30 @@ async function runMockAndUnwrap(
     const { __multipart: _m, ...rest } = result as any
     return rest
   }
+  if (integrationToolName) return capIntegrationMockResult(integrationToolName, result)
   return textResult(result)
+}
+
+/** Composio action slugs, e.g. `GMAIL_SEND_EMAIL`. */
+const COMPOSIO_SLUG_RE = /^[A-Z][A-Z0-9]*_[A-Z0-9_]+$/
+
+/**
+ * Apply the real Composio result-size cap (see the execute path in
+ * composio.ts) to a mocked integration result, so eval mocks can't hand the
+ * model a payload the production path would never return. Keep the limit and
+ * annotation in sync with composio.ts.
+ */
+export function capIntegrationMockResult(toolName: string, data: unknown): AgentToolResult<any> {
+  const maxChars = Math.max(4000, Number(process.env.COMPOSIO_MAX_RESULT_CHARS) || 25000)
+  const { result: raw, truncated } = smartTruncateJson(data, maxChars)
+  if (!truncated) return textResult(data)
+  const slug = toolName.toUpperCase()
+  const isGoogleDoc = slug.includes('GOOGLEDOCS') || slug.includes('GOOGLE_DOCS')
+  const docHint = isGoogleDoc
+    ? ` This is a Google Doc: to read the COMPLETE document (including its ending/conclusion), export it via GOOGLEDRIVE_DOWNLOAD_FILE or GOOGLEDRIVE_EXPORT_FILE using the same document id — that returns the full body. Do NOT summarize the document's decision or conclusion from this truncated copy.`
+    : ''
+  const annotation = `\n\n[⚠️ TRUNCATED — this response was cut from ${JSON.stringify(data).length} to ${raw.length} chars and is INCOMPLETE. Do not treat it as the whole result or answer as if you have seen the end. To get the full value, re-fetch the source directly: page through with a smaller range, or export/download the underlying file.${docHint} For large datasets, use the skill server pattern: create a Prisma schema in .shogo/server/schema.prisma, ingest the data via a script, then query and display with canvas code.]`
+  return textResult(raw + annotation)
 }
 
 export class AgentGateway {
@@ -566,7 +619,7 @@ export class AgentGateway {
   /** Tool execute overrides for eval mocking (tool name -> mock fn) */
   private toolMocks = new Map<string, (params: Record<string, any>) => any>()
   /** Synthetic tool definitions for mocked MCP tools that don't exist in the base tool set */
-  private syntheticTools = new Map<string, { description: string; paramKeys: string[] }>()
+  private syntheticTools = new Map<string, { description: string; paramKeys: string[]; parameters?: unknown }>()
   /** Tools that have mock responses but should not appear until promoted via connect */
   private hiddenMockTools = new Set<string>()
   /** Hidden mocks promoted to visible after connect is called during a turn */
@@ -691,7 +744,7 @@ export class AgentGateway {
   /** Per-session shell cwd tracking — persists cd across exec calls */
   private shellCwd = new Map<string, string>()
   /** Per-session backgrounded command registry — soft-timed-out exec runs */
-  private commandRegistries = new Map<string, import('./command-registry').CommandRegistry>()
+  private commandRegistries = new Map<string, TaskRegistry>()
   /**
    * Admin-configured Auto-mode tier overrides, parsed once from the injected
    * `AGENT_AUTO_TIER_MAP` env var. Undefined keeps the hardcoded defaults.
@@ -759,6 +812,18 @@ export class AgentGateway {
     this.autoTierOverride = parseAutoTierOverride(process.env.AGENT_AUTO_TIER_MAP)
     if (this.autoTierOverride) {
       console.log(`[AgentGateway] Auto tier override active: ${JSON.stringify(this.autoTierOverride)}`)
+    }
+
+    // DB-defined models (UUID ids) the API resolved for us. Every provider
+    // inference path (subagents, forks, channels, heartbeats, fallbacks)
+    // consults this, so Anthropic-backed ones keep native prompt caching.
+    const dynamicModels = parseDynamicModelsEnv(process.env.AGENT_MODEL_REGISTRY)
+    for (const entry of Object.values(this.autoTierOverride ?? {})) {
+      if (entry?.provider) dynamicModels.push({ id: entry.id, provider: entry.provider })
+    }
+    registerDynamicModels(dynamicModels)
+    if (dynamicModels.length > 0) {
+      console.log(`[AgentGateway] Registered ${dynamicModels.length} dynamic model entries`)
     }
 
     // Initialize permission engine. Local mode enforces the full mode-based
@@ -870,7 +935,7 @@ export class AgentGateway {
    */
   setToolMocks(
     mocks: Record<string, (params: Record<string, any>) => any | Promise<any>>,
-    syntheticDefs?: Record<string, { description: string; paramKeys: string[] }>,
+    syntheticDefs?: Record<string, { description: string; paramKeys: string[]; parameters?: unknown }>,
     hiddenTools?: Set<string>,
   ): void {
     this.toolMocks.clear()
@@ -923,7 +988,7 @@ export class AgentGateway {
         description: synDef?.description || `External integration tool: ${toolName}`,
         label: toolName.replace(/__/g, ' > ').replace(/_/g, ' '),
         parameters: Type.Object(paramProps),
-        execute: async (_id: string, params: any) => runMockAndUnwrap(mockFn, params),
+        execute: async (_id: string, params: any) => runMockAndUnwrap(mockFn, params, toolName),
       })
       this.hiddenMockTools.delete(toolName)
     }
@@ -958,7 +1023,7 @@ export class AgentGateway {
         capabilityProfile: undefined,
         heartbeatToolsEnabled: undefined,
         channels: [],
-        model: { provider: 'anthropic', name: 'claude-haiku-4-5' },
+        model: { provider: 'anthropic', name: 'auto' },
         maxSessionMessages: 30,
         activeMode: teamDefaults.activeMode,
         allowedModes: teamDefaults.allowedModes,
@@ -1048,6 +1113,10 @@ export class AgentGateway {
     } catch (err: any) {
       console.warn(`[AgentGateway] capability sync failed: ${err?.message ?? err}`)
     }
+
+    try {
+      cleanupTaskOutputs(taskOutputRoot(this.workspaceDir))
+    } catch { /* best effort */ }
 
     migrateFromLegacySkills(this.workspaceDir)
     this.skills = loadAllSkills(this.workspaceDir)
@@ -1485,6 +1554,10 @@ export class AgentGateway {
       try { reg.killAll() } catch { /* already gone */ }
     }
     this.commandRegistries.clear()
+    for (const timer of this.taskWakeTimers.values()) clearTimeout(timer)
+    this.taskWakeTimers.clear()
+    for (const poller of this.remoteTaskPollers.values()) clearInterval(poller)
+    this.remoteTaskPollers.clear()
 
     this.sessionManager.destroy()
     this.sessionPersistence?.close()
@@ -1827,7 +1900,7 @@ export class AgentGateway {
   }
 
   private buildSetupPrompt(userText: string): string {
-    return `[Agent Setup — First Message]\nThis is a brand new agent that has not been configured yet. The user's message below describes what they want the agent to do. Use your tools to set up the agent:\n\n1. Write AGENTS.md with all sections: # Identity (name, emoji, tagline), # Personality (tone, boundaries), # User (preferences), and # Operating Instructions (specific to this use case — IMPORTANT: replace the default content)\n2. Write HEARTBEAT.md with a relevant checklist if the agent should run autonomously\n3. Create any relevant skills in the skills/ directory\n4. Update config.json if heartbeat should be enabled\n\nAfter setting up, give the user a brief summary of what you configured.\n\n[User Message]\n${userText}`
+    return `[Agent Setup — First Message]\nThis is a brand new agent that has not been configured yet. The user's message below describes what they want the agent to do. Use your tools to set up the agent:\n\n1. Write AGENTS.md with all sections: # Identity (name, emoji, tagline), # Personality (tone, boundaries), # User (preferences), and # Operating Instructions (specific to this use case — IMPORTANT: replace the default content)\n2. Write HEARTBEAT.md with a relevant checklist only if the agent has wall-clock work (daily digests, inbox sweeps) or needs a stall safety net\n3. Create any relevant skills in the skills/ directory\n4. Update config.json if heartbeat should be enabled. Work the agent starts or hands off reports back through task updates, so it never needs a heartbeat to follow it\n\nAfter setting up, give the user a brief summary of what you configured.\n\n[User Message]\n${userText}`
   }
 
   private buildChatPrompt(text: string): { prompt: string; activeSkill?: { name: string } } {
@@ -1914,6 +1987,9 @@ export class AgentGateway {
       // undefined so a previously-hinted model can't leave a stale provider
       // behind once the selection changes.
       session.modelProvider = options.modelProvider
+      // Remember the hint beyond this session so subagents, forks and
+      // channel turns that run the same model infer the same provider.
+      rememberProviderHint(resolveModelId(options.modelOverride), options.modelProvider)
     }
 
     if (options?.userId) {
@@ -2031,6 +2107,8 @@ export class AgentGateway {
     callerProjectId?: string
     /** The calling turn's person, handed off by the API for this project. */
     requesterTicket?: string
+    /** Streams the turn so a chat open on this session can watch it live. */
+    writer?: { write(chunk: Record<string, any>): void }
   }): Promise<{ reply: string; sessionId: string; runId?: string }> {
     const runId = opts.runId?.trim() || undefined
     const sessionId = opts.sessionId?.trim() || (runId ? `run:${runId}` : 'pipeline')
@@ -2041,30 +2119,31 @@ export class AgentGateway {
     const prompt = header ? `${header}\n${opts.message}` : opts.message
 
     if (runId) this.activePipelineRuns.set(sessionId, runId)
+    this.unattendedSessions.add(sessionId)
     try {
       const reply = await this.agentTurn(
-        prompt, sessionId, false, undefined, undefined, undefined, undefined, 'agent', false, opts.requesterTicket,
+        prompt, sessionId, false, undefined, opts.writer, undefined, undefined, 'agent', false, opts.requesterTicket,
       )
       return { reply, sessionId, runId }
     } finally {
       this.activePipelineRuns.delete(sessionId)
+      this.unattendedSessions.delete(sessionId)
     }
   }
+
+  /**
+   * Sessions whose turn nobody started from a chat (pipeline calls). Their
+   * turn may stream to a watcher, but permission asks still fail closed:
+   * no one is there to answer them.
+   */
+  private unattendedSessions = new Set<string>()
 
   private buildSlashContext(sessionId: string): SlashCommandContext {
     const session = this.sessionManager.getOrCreate(sessionId)
     return {
       sessionKey: sessionId,
       workspaceDir: this.workspaceDir,
-      clearHistory: () => {
-        this.sessionManager.clearHistory(sessionId)
-        // History wipe = prefix rewrite. Drop per-session compaction state
-        // so fresh decisions are taken against the new (empty) history.
-        this.contentReplacementStates.delete(sessionId)
-        this.turnCounters.delete(sessionId)
-        // Kill any backgrounded shell commands; they belong to the wiped session.
-        this.disposeSessionState(sessionId)
-      },
+      clearHistory: () => this.clearSessionHistory(sessionId),
       getMessages: () => [...session.messages],
       reloadConfig: () => this.reloadConfig(),
       setModelOverride: (model: string) => {
@@ -2081,43 +2160,140 @@ export class AgentGateway {
   // Backgrounded shell command bookkeeping (per-session)
   // ---------------------------------------------------------------------------
 
-  private getOrCreateCommandRegistry(sessionId: string): CommandRegistry {
+  private getOrCreateCommandRegistry(sessionId: string): TaskRegistry {
     let reg = this.commandRegistries.get(sessionId)
     if (!reg) {
-      reg = new CommandRegistry()
+      const registry = new TaskRegistry({
+        outputDir: taskOutputDir(this.workspaceDir, sessionId),
+        workspaceDir: this.workspaceDir,
+        remote: hasInternalApiCredentials() ? createApiTaskClient() : undefined,
+      })
+      reg = registry
 
       // Re-seed from the persisted snapshot so a thread reopened after a
-      // runtime restart still shows the processes it started. These are stale
-      // (the OS children belonged to the dead gateway) and are flagged as such.
+      // runtime restart still shows its tasks. Local ones are stale (the OS
+      // children belonged to the dead gateway); API-tracked ones stay live.
       const persisted = this.sessionManager.get(sessionId)?.metadata?.runningProcesses
       if (Array.isArray(persisted) && persisted.length > 0) {
-        reg.restoreStale(persisted)
+        registry.restoreStale(persisted)
       }
 
       // Persist the running list on every change so it survives reconnect and
-      // restart via .shogo/sessions.db (synced to S3). Process start/exit is
+      // restart via .shogo/sessions.db (synced to S3). Task start/exit is
       // rare relative to message volume, so this write is cheap.
-      reg.onChange((running) => {
-        this.sessionManager.setSessionMetadata(sessionId, {
-          runningProcesses: running.map((p) => ({
-            runId: p.runId,
-            command: p.command,
-            pid: p.pid,
-            sandboxed: p.sandboxed,
-            containerName: p.containerName,
-            startedAt: p.startedAt,
-          })),
-        })
+      registry.onChange(() => {
+        this.sessionManager.setSessionMetadata(sessionId, { runningProcesses: registry.snapshot() })
       })
+      registry.onNotification(() => this.scheduleTaskWake(sessionId))
 
-      this.commandRegistries.set(sessionId, reg)
+      this.commandRegistries.set(sessionId, registry)
     }
     return reg
   }
 
-  /** List the background shell processes still running for a chat thread. */
+  // ---------------------------------------------------------------------------
+  // Idle wake: a task finished while no turn is running
+  // ---------------------------------------------------------------------------
+
+  private taskWakeTimers = new Map<string, ReturnType<typeof setTimeout>>()
+  private remoteTaskPollers = new Map<string, ReturnType<typeof setInterval>>()
+
+  /**
+   * Coalesce finished-task notes for an idle session and hand them to the API,
+   * which queues one wake message. While a turn runs, notes are injected into
+   * it instead (takeInjectedMessages) and the turn's end re-schedules this.
+   * API-tracked tasks are skipped: the API wakes the session for those itself.
+   */
+  private scheduleTaskWake(sessionId: string): void {
+    if (this.turnAbortControllers.has(sessionId) || this.taskWakeTimers.has(sessionId)) return
+    const timer = setTimeout(() => {
+      this.taskWakeTimers.delete(sessionId)
+      void this.flushTaskWake(sessionId)
+    }, TASK_WAKE_COALESCE_MS)
+    ;(timer as any).unref?.()
+    this.taskWakeTimers.set(sessionId, timer)
+  }
+
+  private async flushTaskWake(sessionId: string): Promise<void> {
+    const reg = this.commandRegistries.get(sessionId)
+    if (!reg || this.turnAbortControllers.has(sessionId)) return
+    const notes = reg.peekNotifications().filter((n) => !reg.get(n.taskId)?.apiTracked && !reg.get(n.taskId)?.reported)
+    if (notes.length === 0) return
+    if (!hasInternalApiCredentials()) return
+    const res = await notifyTaskCompletions(sessionId, notes.map((n) => ({
+      id: n.taskId,
+      source: n.source,
+      title: n.title,
+      status: n.status,
+      text: formatTaskNotification(n),
+    })))
+    if (res.ok) reg.markReported(notes.map((n) => n.taskId))
+    else console.warn(`${this.logPrefix} Task wake for ${sessionId} failed: ${res.error ?? res.status}`)
+  }
+
+  /**
+   * Tasks mirrored from another project's runtime have no API row to wake the
+   * session, so while idle the gateway polls them itself.
+   */
+  private ensureRemoteTaskPoller(sessionId: string): void {
+    const reg = this.commandRegistries.get(sessionId)
+    const needsPolling = (e: { apiTracked?: boolean }) => !e.apiTracked
+    if (!reg || this.remoteTaskPollers.has(sessionId) || !reg.hasRunningRemote(needsPolling)) return
+    const poller = setInterval(() => {
+      if (!reg.hasRunningRemote(needsPolling)) {
+        clearInterval(poller)
+        this.remoteTaskPollers.delete(sessionId)
+        return
+      }
+      if (this.turnAbortControllers.has(sessionId)) return
+      void reg.refreshWhere(needsPolling)
+    }, REMOTE_TASK_POLL_MS)
+    ;(poller as any).unref?.()
+    this.remoteTaskPollers.set(sessionId, poller)
+  }
+
+  /**
+   * A queued wake message is starting a turn: its text already carries these
+   * tasks' results, so they must not be injected again.
+   */
+  acknowledgeTaskNotification(sessionId: string, taskIds: string[]): void {
+    const reg = this.commandRegistries.get(sessionId)
+    if (reg && taskIds.length > 0) reg.markConsumed(taskIds)
+  }
+
+  /** List the tasks still running for a chat thread. */
   listSessionProcesses(sessionId: string): import('./command-registry').RunningProcess[] {
     return this.getOrCreateCommandRegistry(sessionId).listVisible()
+  }
+
+  /** Running tasks for the dock, with API-tracked ones refreshed first. */
+  async listSessionTasks(sessionId: string): Promise<import('./task-registry').RunningProcess[]> {
+    const reg = this.getOrCreateCommandRegistry(sessionId)
+    if (reg.hasRunningRemote()) await reg.refreshRemote()
+    return reg.listVisible()
+  }
+
+  /** Last part of a task's output, for the dock's output viewer. */
+  readSessionTaskOutput(sessionId: string, taskId: string): { taskId: string; outputFile?: string; output: string } | null {
+    const reg = this.commandRegistries.get(sessionId)
+    const entry = reg?.get(taskId)
+    if (!reg || !entry) return null
+    const output = reg.readOutput(entry)
+    return {
+      taskId: entry.id,
+      outputFile: reg.displayPath(entry.outputFile),
+      output: output.length > 64_000 ? output.slice(-64_000) : output,
+    }
+  }
+
+  /** Stop: running tasks keep going but no longer wake the agent. */
+  muteSessionTasks(sessionId: string): void {
+    this.commandRegistries.get(sessionId)?.muteRunning()
+    const timer = this.taskWakeTimers.get(sessionId)
+    if (timer) {
+      clearTimeout(timer)
+      this.taskWakeTimers.delete(sessionId)
+    }
   }
 
   /**
@@ -2128,6 +2304,17 @@ export class AgentGateway {
     return this.getOrCreateCommandRegistry(sessionId).kill(runId)
   }
 
+  /** Wipe a session's history and everything tied to it, including its background tasks. */
+  clearSessionHistory(sessionId: string): void {
+    this.sessionManager.clearHistory(sessionId)
+    // History wipe = prefix rewrite. Drop per-session compaction state
+    // so fresh decisions are taken against the new (empty) history.
+    this.contentReplacementStates.delete(sessionId)
+    this.turnCounters.delete(sessionId)
+    this.shellCwd.delete(sessionId)
+    this.disposeSessionState(sessionId)
+  }
+
   /** Tear down per-session bookkeeping. Kills any backgrounded shell runs and releases browsers. */
   private disposeSessionState(sessionId: string): void {
     const reg = this.commandRegistries.get(sessionId)
@@ -2135,6 +2322,12 @@ export class AgentGateway {
       reg.killAll()
       this.commandRegistries.delete(sessionId)
     }
+    const wake = this.taskWakeTimers.get(sessionId)
+    if (wake) clearTimeout(wake)
+    this.taskWakeTimers.delete(sessionId)
+    const poller = this.remoteTaskPollers.get(sessionId)
+    if (poller) clearInterval(poller)
+    this.remoteTaskPollers.delete(sessionId)
     void releaseSessionBrowsers(sessionId)
   }
 
@@ -2232,7 +2425,7 @@ export class AgentGateway {
         'Exception: you may create or update the plan artifact using create_plan/update_plan; those tools only write under .shogo/plans/ for user review.',
         '',
         'Your job:',
-        '1. Research the user\'s request using read-only tools (read_file, search, web, etc.)',
+        `1. Research the user's request using read-only tools (read_file, ${isSearchEnabled() ? 'search, ' : ''}web, etc.)`,
         '2. If you need more information, ask clarifying questions using ask_user',
         '3. If the request is too broad, ask 1-2 narrowing questions using ask_user',
         '4. If there are multiple valid approaches, ask the user which they prefer',
@@ -2330,7 +2523,7 @@ export class AgentGateway {
     if (this.permissionEngine) {
       this.permissionEngine.resetTurn()
       this.permissionEngine.setSseCallback(
-        uiWriter ? (event) => uiWriter.write(event) : undefined
+        uiWriter && !this.unattendedSessions.has(sessionId) ? (event) => uiWriter.write(event) : undefined
       )
     }
 
@@ -2475,6 +2668,9 @@ export class AgentGateway {
     }
 
 
+    // Tool descriptions list the workspace's models, so refresh the list first
+    // (cached for a few minutes; a no-op without AI_PROXY_URL).
+    await refreshAvailableModels()
     const baseTools = createTools(toolContext)
 
     const mcpTools = this.mcpClientManager.getTools()
@@ -2514,7 +2710,7 @@ export class AgentGateway {
     } else if (interactionMode === 'plan') {
       restrictedMode = 'plan'
       const PLAN_MODE_ALLOWED = new Set([
-        'read_file', 'search',
+        'read_file', ...(isSearchEnabled() ? ['search'] : []),
         'web',
         'memory_read', 'memory_search', 'search_history', 'read_history',
         'ask_user', 'todo_write', 'create_plan', 'update_plan',
@@ -2602,6 +2798,7 @@ export class AgentGateway {
               const { __multipart: _m, ...rest } = result as any
               return rest
             }
+            if (COMPOSIO_SLUG_RE.test(tool.name)) return capIntegrationMockResult(tool.name, result)
             return textResult(result)
           },
         }
@@ -2624,8 +2821,8 @@ export class AgentGateway {
           name,
           description: synDef?.description || `External integration tool: ${name}`,
           label: name.replace(/__/g, ' > ').replace(/_/g, ' '),
-          parameters: Type.Object(paramProps),
-          execute: async (_id: string, params: any) => runMockAndUnwrap(mockFn, params),
+          parameters: (synDef?.parameters as any) ?? Type.Object(paramProps),
+          execute: async (_id: string, params: any) => runMockAndUnwrap(mockFn, params, name),
         }
         staticTools.push(syntheticTool)
       }
@@ -2676,6 +2873,7 @@ export class AgentGateway {
 
     // Multi-layer context compaction pipeline (Layers 1-4)
     const contextBudgetChars = (this.sessionManager.autocompactThreshold) * 4
+    const inLoopBudgetTokens = resolveInLoopContextBudgetTokens(this.sessionManager.autocompactThreshold)
     let history = this.sessionManager.buildHistory(sessionId)
     history = applyToolResultBudget(history, contextBudgetChars)
     const mc = microcompact(history)
@@ -2863,23 +3061,43 @@ export class AgentGateway {
     // tool progress) are `transient`: the client consumes them in `onData`,
     // and the AI SDK would otherwise append each one to `message.parts`.
     let unsubscribeProcesses: (() => void) | undefined
+    let remoteRefreshTimer: ReturnType<typeof setInterval> | undefined
+    if (sessionId) {
+      const wake = this.taskWakeTimers.get(sessionId)
+      if (wake) {
+        clearTimeout(wake)
+        this.taskWakeTimers.delete(sessionId)
+      }
+      const reg = this.getOrCreateCommandRegistry(sessionId)
+      // Remote tasks finish on the API's side; refresh them so the loop can
+      // inject their results mid-turn like any local task.
+      if (reg.hasRunningRemote()) void reg.refreshRemote()
+      remoteRefreshTimer = setInterval(() => {
+        if (reg.hasRunningRemote()) void reg.refreshRemote()
+      }, TURN_REMOTE_REFRESH_MS)
+      ;(remoteRefreshTimer as any).unref?.()
+    }
     if (uiWriter && sessionId) {
       const reg = this.getOrCreateCommandRegistry(sessionId)
-      const visibleRunIds = (processes: readonly { runId: string }[]) =>
-        processes.map((process) => process.runId).join('\0')
+      const visibleKey = (tasks: readonly { runId: string; status: string }[]) =>
+        tasks.map((task) => `${task.runId}:${task.status}`).join('\0')
+      const writeTasks = (tasks: ReturnType<typeof reg.listVisible>) => {
+        uiWriter.write({ type: 'data-task-update', data: { tasks }, transient: true } as any)
+        uiWriter.write({ type: 'data-process-update', data: { processes: tasks }, transient: true } as any)
+      }
       // Push the current list immediately so a reconnecting client re-syncs.
-      const initialProcesses = reg.listVisible()
-      let lastVisibleRunIds = visibleRunIds(initialProcesses)
+      const initialTasks = reg.listVisible()
+      let lastVisibleKey = visibleKey(initialTasks)
       try {
-        uiWriter.write({ type: 'data-process-update', data: { processes: initialProcesses }, transient: true } as any)
+        writeTasks(initialTasks)
       } catch { /* writer may already be closed */ }
       unsubscribeProcesses = reg.onChange(() => {
-        const processes = reg.listVisible()
-        const nextVisibleRunIds = visibleRunIds(processes)
-        if (nextVisibleRunIds === lastVisibleRunIds) return
-        lastVisibleRunIds = nextVisibleRunIds
+        const tasks = reg.listVisible()
+        const nextKey = visibleKey(tasks)
+        if (nextKey === lastVisibleKey) return
+        lastVisibleKey = nextKey
         try {
-          uiWriter.write({ type: 'data-process-update', data: { processes }, transient: true } as any)
+          writeTasks(tasks)
         } catch { /* writer closed — onChange teardown happens in finally */ }
       })
     }
@@ -3317,7 +3535,15 @@ export class AgentGateway {
             state = createContentReplacementState()
             this.contentReplacementStates.set(sessionId, state)
           }
-          const result = stableTransformContext(messages, state, contextBudgetChars)
+          const result = stableTransformContext(messages, state, contextBudgetChars, {
+            budgetTokens: inLoopBudgetTokens,
+          })
+          if (result.stats.checkpointCleared > 0) {
+            console.log(
+              `${this.logPrefix} In-loop checkpoint: cleared ${result.stats.checkpointCleared} older tool results ` +
+              `(budget ${inLoopBudgetTokens} tokens) for session ${sessionId}`,
+            )
+          }
           // Final guard: self-heal any oversized image blocks that may have
           // landed in history before this guard shipped (or that slipped past
           // emission-time checks). Deterministic, so it does not disturb the
@@ -3327,16 +3553,15 @@ export class AgentGateway {
         onToolCall: (name, input) => {
           console.log(`${this.logPrefix} Tool call: ${name}`, JSON.stringify(input).substring(0, 20))
         },
-        onIterationMessages: (liveMessages) => {
+        takeInjectedMessages: () => {
           const notes = commandRegistry?.consumeCompletionNotes() ?? []
-          if (notes.length === 0) return
-          const note = {
+          if (notes.length === 0) return []
+          return [{
             role: 'user',
-            content: `[Shogo process update]\n${notes.join('\n')}\nContinue the current task using this result.`,
+            content: notes.join('\n\n'),
             timestamp: Date.now(),
             __shogoBackgroundNote: true,
-          } as unknown as Message & { __shogoBackgroundNote: boolean }
-          liveMessages.push(note)
+          } as unknown as Message]
         },
         onProgress: (progressMessages) => {
           const durableMessages = progressMessages.filter((message) => {
@@ -3931,6 +4156,12 @@ export class AgentGateway {
       }
       toolHeartbeatTimers.clear()
       unsubscribeProcesses?.()
+      if (remoteRefreshTimer) clearInterval(remoteRefreshTimer)
+      if (sessionId && this.commandRegistries.has(sessionId)) {
+        // Notes that arrived after the loop's last iteration wake the session instead.
+        if (this.commandRegistries.get(sessionId)!.hasPendingNotifications()) this.scheduleTaskWake(sessionId)
+        this.ensureRemoteTaskPoller(sessionId)
+      }
     }
   }
 
@@ -4008,13 +4239,14 @@ export class AgentGateway {
       parts.push(workspaceTree)
     }
 
-    parts.push(CODE_AGENT_GENERAL_GUIDE)
+    parts.push(buildCodeAgentGeneralGuide())
     if (this.config.capabilityProfile === 'personal') parts.push(PERSONAL_COMPANION_GUIDE)
     parts.push(buildCapabilityStatusSection(this.config))
     parts.push(OUTPUT_CONTRACT_GUIDE)
     if (this.config.browserEnabled !== false) {
       parts.push(BROWSER_TOOL_GUIDE)
     }
+    parts.push(BACKGROUND_TASKS_GUIDE)
     parts.push(SUBAGENT_GUIDE)
     if (this.config.gitWorktreesEnabled) parts.push(WORKTREE_GUIDE)
 
@@ -4051,7 +4283,7 @@ export class AgentGateway {
       parts.push(workspaceTree)
     }
 
-    parts.push(CODE_AGENT_GENERAL_GUIDE)
+    parts.push(buildCodeAgentGeneralGuide())
     if (this.config.capabilityProfile === 'personal') parts.push(PERSONAL_COMPANION_GUIDE)
     parts.push(buildCapabilityStatusSection(this.config))
     if (this.config.browserEnabled !== false) {
@@ -4074,6 +4306,7 @@ export class AgentGateway {
       }
     }
 
+    parts.push(BACKGROUND_TASKS_GUIDE)
     parts.push(SUBAGENT_GUIDE)
     if (this.config.gitWorktreesEnabled) parts.push(WORKTREE_GUIDE)
 
@@ -4168,7 +4401,8 @@ export class AgentGateway {
     }
 
     // 2. General coding guide (always the same)
-    pushStable('code-agent-guide', CODE_AGENT_GENERAL_GUIDE)
+    pushStable('code-agent-guide', buildCodeAgentGeneralGuide())
+    pushStable('background-tasks-guide', BACKGROUND_TASKS_GUIDE)
     if (this.config.capabilityProfile === 'personal') {
       pushStable('personal-companion-mode', PERSONAL_COMPANION_GUIDE)
     }
@@ -4177,7 +4411,7 @@ export class AgentGateway {
     // Toggleable so projects that don't ship a Shogo app (pure-chat agents,
     // SWE benches, etc.) can drop ~2k tokens from the cached prefix.
     if (this.config.sdkGuideEnabled !== false) {
-      pushStable('shogo-sdk-guide', SHOGO_SDK_GUIDE)
+      pushStable('shogo-sdk-guide', getShogoSdkGuide())
     }
 
     // 3. Capabilities Index — compact pointers to on-demand guides served by read_guide tool.
@@ -4228,7 +4462,14 @@ export class AgentGateway {
         actionLines.push('- For managed integrations (Google, Slack, GitHub, etc.) and MCP servers alike, call `search_integrations` then `connect`. The result\'s `source` tag (`managed` | `mcp` | `skill`) tells you which path was taken.')
       }
       if (devopsGuideOn) {
-        actionLines.push('- For recurring reminders, digests, check-ins, or autonomous routines in a workspace, create a named goal schedule with `schedule_create`; use `heartbeat_configure` only for the general heartbeat sweep.')
+        if (workspaceAgentToolsRegistered({ workspaceId: process.env.WORKSPACE_ID })) {
+          actionLines.push(
+            '- For work tied to the clock (a reminder at 9am, a Monday digest, a daily inbox sweep), create a named goal schedule with `schedule_create`; use `heartbeat_configure` only for the general heartbeat sweep.',
+            '- To follow work that is already running (a card you handed to an agent, a background command or agent, a project call), do not schedule check-ins: watch its task and act on the `[Task update]` the moment it finishes, as in Background Tasks. When the user asks you to "loop", "keep an eye on it" or "check back at each phase", that is what they mean; tell them you will react as soon as each piece finishes. If a schedule you made earlier follows such work (an hourly loop over handed-off cards), turn it off and say so; do not keep it as a backstop.',
+          )
+        } else {
+          actionLines.push('- For recurring reminders, digests, check-ins, or autonomous routines, use `heartbeat_configure`.')
+        }
       }
       actionLines.push(
         '- If you need a missing detail such as timezone or channel name, call `ask_user` instead of asking only in prose.',
@@ -4251,8 +4492,13 @@ export class AgentGateway {
       pushStable('quick-action-guide', QUICK_ACTION_GUIDE)
     }
 
+    const workCaps = resolveRuntimeCapabilities(this.config as unknown as Record<string, unknown>)
     if (teamChatToolsAvailable(this.config.capabilityProfile)) {
-      pushStable('team-chat-guide', TEAM_CHAT_GUIDE)
+      if (workCaps.teamChatEnabled) pushStable('team-chat-guide', TEAM_CHAT_GUIDE)
+      if (workCaps.boardsEnabled) pushStable('boards-guide', BOARDS_GUIDE)
+      if (workCaps.companyOpsEnabled && workCaps.boardsEnabled && workCaps.heartbeatToolsEnabled) {
+        pushStable('company-ops-guide', COMPANY_OPS_GUIDE)
+      }
     }
 
     if (triggerToolsAvailable()) {
@@ -4626,7 +4872,7 @@ export class AgentGateway {
 
     sections.push(
       '',
-      'Use `send_team_message`, `task_create`, `task_update`, `task_list`, `team_delete` and other team tools to interact with this team.',
+      'Use `send_team_message`, `team_task_create`, `team_task_update`, `team_task_list`, `team_delete` and other team tools to interact with this team.',
     )
 
     return sections.join('\n')
@@ -4667,11 +4913,11 @@ export class AgentGateway {
       'Saving that file triggers a fast restart (no regenerate, no db push)',
       'so changes are live in under a second.',
       '',
-      'If you ever see a route 404 or need to force a refresh, use the `server_sync` tool:',
+      'If you ever see a route 404 or need to force a refresh, delegate to the `devops` subagent, which has the `server_sync` tool:',
       '```',
-      'server_sync({})',
+      'agent_spawn({ type: "devops", prompt: "Run server_sync and report the phase, active routes, and schema models" })',
       '```',
-      'It returns the current phase, active routes, and schema models.',
+      'It reports the current phase, active routes, and schema models.',
       '',
       '**Do NOT** manually run `prisma generate`, `shogo generate`, or `npm run db:generate` — it is all automatic.',
     ].join('\n')
@@ -4857,7 +5103,9 @@ export class AgentGateway {
     if (fileEntries.length > 0) {
       lines.push(
         'The user has uploaded the following files to the workspace `files/` directory.',
-        'Use `search` to search content, or `read_file` with path `files/<name>` to read them.',
+        isSearchEnabled()
+          ? 'Use `search` to search content, or `read_file` with path `files/<name>` to read them.'
+          : 'Use `read_file` with path `files/<name>` to read them, or `exec` with `rg -n "<text>" files` to search their content.',
         '',
       )
       for (const entry of fileEntries.slice(0, 50)) {
@@ -5100,6 +5348,34 @@ export class AgentGateway {
 
   getMcpClientManager(): MCPClientManager {
     return this.mcpClientManager
+  }
+
+  private remoteTools: { config: GatewayConfig; tools: ReturnType<typeof createTools> } | null = null
+  private remoteCommandRegistry = new TaskRegistry()
+
+  /**
+   * Tools for `/agent/remote/tool`: another project's runtime running one of
+   * this project's tools. Rooted at this project's own folder (the anchor in
+   * a workspace runtime), with no session, UI stream or file-read cache. One
+   * command registry spans all remote calls so exec_wait finds earlier runs.
+   */
+  getRemoteTools(): ReturnType<typeof createTools> {
+    if (this.remoteTools?.config === this.config) return this.remoteTools.tools
+    const ctx: ToolContext = {
+      workspaceDir: defaultShellCwd(this.workspaceDir),
+      channels: this.channels,
+      config: this.config,
+      projectId: process.env.WORKSPACE_ANCHOR_PROJECT_ID || this.projectId,
+      workspaceId: process.env.WORKSPACE_ID,
+      sandbox: this.config.sandbox,
+      mainSessionIds: this.config.mainSessionIds,
+      permissionEngine: this.permissionEngine ?? undefined,
+      indexEngine: this.indexEngine ?? undefined,
+      commandRegistry: this.remoteCommandRegistry,
+    }
+    const tools = filterDisabledCapabilityTools(createTools(ctx), this.config)
+    this.remoteTools = { config: this.config, tools }
+    return tools
   }
 
   async disconnectChannel(type: string): Promise<void> {
@@ -5647,6 +5923,17 @@ export class AgentGateway {
     waker?.wake()
     recordRetryNow({ sessionId, model: this.config.model.name }, !!waker)
     return !!waker
+  }
+
+  /**
+   * Work that means this runtime is not idle: agent turns running now (chat,
+   * schedule, heartbeat, channel) and background tasks that will wake the
+   * agent when they finish. Hosts check this before evicting the runtime.
+   */
+  getActiveWork(): { turns: number; tasks: number } {
+    let tasks = 0
+    for (const reg of this.commandRegistries.values()) tasks += reg.pendingNotifyCount()
+    return { turns: this.turnLocks.size, tasks }
   }
 
   abortCurrentTurn(sessionId: string): boolean {

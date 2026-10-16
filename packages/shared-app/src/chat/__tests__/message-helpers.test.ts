@@ -9,6 +9,9 @@ import {
   formatToolName,
   getToolCategory,
   ERROR_CODE_MESSAGES,
+  parseTaskUpdates,
+  projectCallOf,
+  taskNotificationOf,
 } from '../message-helpers'
 
 describe('extractTextContent', () => {
@@ -181,5 +184,71 @@ describe('getToolCategory', () => {
   it('returns other for unknown tools', () => {
     expect(getToolCategory('CustomTool')).toBe('other')
     expect(getToolCategory('something')).toBe('other')
+  })
+})
+
+describe('parseTaskUpdates', () => {
+  it('splits a wake message into one entry per task with its detail', () => {
+    const text = [
+      '[Task update] bun test (watch) (t_1a2b3c4d) failed (exit code 1).',
+      'Output: .shogo/tasks/s/t_1a2b3c4d.log',
+      'Last output:',
+      '1 fail',
+      '',
+      '[Task update] @Ops reply (t_99) was cancelled.',
+    ].join('\n')
+    expect(parseTaskUpdates(text)).toEqual([
+      {
+        taskId: 't_1a2b3c4d',
+        title: 'bun test (watch)',
+        outcome: 'failed (exit code 1)',
+        detail: 'Output: .shogo/tasks/s/t_1a2b3c4d.log\nLast output:\n1 fail',
+      },
+      { taskId: 't_99', title: '@Ops reply', outcome: 'was cancelled', detail: '' },
+    ])
+  })
+
+  it('ignores text without task updates', () => {
+    expect(parseTaskUpdates('just a message')).toEqual([])
+  })
+})
+
+describe('taskNotificationOf', () => {
+  it('reads the task ids and updates of a wake message', () => {
+    const message = {
+      parts: [
+        { type: 'text', text: '[Task update] explore (t_abc) completed.' },
+        { type: 'data-task-notification', data: { taskIds: ['t_abc', 42] } },
+      ],
+    }
+    const n = taskNotificationOf(message)
+    expect(n?.taskIds).toEqual(['t_abc'])
+    expect(n?.updates.map((u) => u.taskId)).toEqual(['t_abc'])
+  })
+
+  it('accepts parts stored as a JSON string', () => {
+    const parts = JSON.stringify([{ type: 'data-task-notification', data: { taskIds: ['t_x'] } }])
+    expect(taskNotificationOf({ parts })?.taskIds).toEqual(['t_x'])
+  })
+
+  it('is null for ordinary messages', () => {
+    expect(taskNotificationOf({ parts: [{ type: 'text', text: 'hi' }] })).toBeNull()
+    expect(taskNotificationOf(null)).toBeNull()
+  })
+})
+
+describe('projectCallOf', () => {
+  it('reads the run and caller of a project-call request', () => {
+    const parts = JSON.stringify([
+      { type: 'text', text: 'do it' },
+      { type: 'data-project-call', data: { runId: 'run_1', callerName: 'Planner' } },
+    ])
+    expect(projectCallOf({ parts })).toEqual({ runId: 'run_1', callerName: 'Planner' })
+  })
+
+  it('is null without a run id or marker', () => {
+    expect(projectCallOf({ parts: [{ type: 'data-project-call', data: { callerName: 'Planner' } }] })).toBeNull()
+    expect(projectCallOf({ parts: [{ type: 'text', text: 'hi' }] })).toBeNull()
+    expect(projectCallOf(null)).toBeNull()
   })
 })

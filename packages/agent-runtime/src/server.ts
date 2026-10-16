@@ -13,12 +13,11 @@
  * with an Agent Gateway that makes the configured agent "alive."
  */
 
-import { createUIMessageStream, createUIMessageStreamResponse } from 'ai'
 import { resolve, dirname, join, extname, basename } from 'path'
 import { tmpdir } from 'os'
 import { emitLogToSink } from '@shogo-ai/sdk/logger'
 import { sanitizeRuntimeLineForSignoz } from './signoz-safe-log'
-import { getStreamFinishReason } from './stream-finish'
+import { createBufferedTurns, type PipelineCallOptions, type PipelineCallResult } from './buffered-turn'
 import { shouldFlushGitBeforeExport } from './git-export-policy'
 import {
   existsSync,
@@ -55,6 +54,7 @@ import {
   removePoolTemplateDist,
   writePoolPreseedManifest,
 } from './workspace-pool-adopt'
+import { LiveTurnGate } from './live-turn-wait'
 import {
   createRuntimeApp, traceOperation,
   initializeS3Sync,
@@ -64,7 +64,6 @@ import {
   initializePostgresBackup,
   configureAIProxy,
   StreamBufferStore,
-  encodeTurnCompleteFrame,
   isMacOSJunkName,
   isBinaryBuffer,
   isBinaryFilePath,
@@ -100,7 +99,15 @@ import {
   type CloudSyncMode,
   wrapSseStreamWithKeepalive,
 } from '@shogo/shared-runtime'
-import { createStreamTrace, traceStream } from '@shogo/shared-runtime/stream-trace'
+import { traceStream } from '@shogo/shared-runtime/stream-trace'
+import {
+  buildRepoBundle,
+  materializeRepoFromBundles,
+  parseRepoManifest,
+  readRepoSnapshotFields,
+  type RepoManifest,
+  type RepoSnapshotFields,
+} from '@shogo/shared-runtime/repo-bundles'
 import { getModelTier, resolveModelId, calculateDollarCost } from '@shogo/model-catalog'
 import {
   seedWorkspaceDefaults,
@@ -159,6 +166,7 @@ import {
   type GitHubWorkspaceOpInput,
 } from './github-workspace-git'
 import { isHostMediatedDurability } from './host-durability'
+import { executeRemoteTool } from './remote-tools'
 import { clearGitHubCliEnvCache } from './github-cli-credentials'
 import { HistoryIndex } from './history-index'
 import { WORKTREE_BRANCH_PREFIX } from '@shogo/shared-runtime'
@@ -873,10 +881,13 @@ const { app, state, logTiming } = await createRuntimeApp({
       (max: number, s: any) => Math.max(max, now - (s.idleSeconds ?? 0) * 1000),
       state.poolAssignedAt ?? state.serverStartTime
     )
+    const work = agentGateway?.getActiveWork?.() ?? { turns: 0, tasks: 0 }
     return {
       activeSessions: stats.length,
       lastActivityAt: lastSessionActivity,
       activeStreams,
+      activeTurns: work.turns,
+      activeTasks: work.tasks,
       repoHeadSha: cachedRepoHeadSha,
       previewHealth: safePreviewHealth(),
     }
@@ -1282,6 +1293,13 @@ function startWorkspaceDepsInstall(opts: { afterS3Restore?: boolean } = {}): Pro
 // =============================================================================
 
 const streamBufferStore = new StreamBufferStore()
+const liveTurnGate = new LiveTurnGate(streamBufferStore)
+const bufferedTurns = createBufferedTurns({
+  store: streamBufferStore,
+  gate: liveTurnGate,
+  onStreamStart: () => trackStreamStart(),
+  onStreamEnd: () => trackStreamEnd(),
+})
 
 // Hono app, CORS, auth middleware, /health, /pool/activity, /pool/assign are
 // provided by createRuntimeApp(). Agent-specific routes follow below.
@@ -1392,6 +1410,31 @@ app.post('/agent/chat/:chatSessionId/processes/:runId/kill', (c) => {
   )
   if (!killed) return c.json({ error: 'unknown run_id' }, 404)
   return c.json({ ok: true, processes: agentGateway.listSessionProcesses(c.req.param('chatSessionId')) })
+})
+
+// Every task still running for a chat thread (shell, subagents, project calls,
+// tagged agents, cards). Seeds the dock and backs its idle polling; live
+// updates arrive via `data-task-update` frames during a turn.
+app.get('/agent/chat/:chatSessionId/tasks', async (c) => {
+  if (!agentGateway) return c.json({ error: 'Agent gateway not running' }, 503)
+  const tasks = await agentGateway.listSessionTasks(c.req.param('chatSessionId'))
+  return c.json({ tasks })
+})
+
+app.post('/agent/chat/:chatSessionId/tasks/:taskId/cancel', async (c) => {
+  if (!agentGateway) return c.json({ error: 'Agent gateway not running' }, 503)
+  const sessionId = c.req.param('chatSessionId')
+  if (!agentGateway.killSessionProcess(sessionId, c.req.param('taskId'))) {
+    return c.json({ error: 'unknown task_id' }, 404)
+  }
+  return c.json({ ok: true, tasks: await agentGateway.listSessionTasks(sessionId) })
+})
+
+app.get('/agent/chat/:chatSessionId/tasks/:taskId/output', (c) => {
+  if (!agentGateway) return c.json({ error: 'Agent gateway not running' }, 503)
+  const output = agentGateway.readSessionTaskOutput(c.req.param('chatSessionId'), c.req.param('taskId'))
+  if (!output) return c.json({ error: 'unknown task_id' }, 404)
+  return c.json(output)
 })
 
 // Read agent config
@@ -1695,8 +1738,12 @@ app.post('/agent/channels/disconnect', async (c) => {
 // Accepts AI SDK v3 format: { messages: [{ role, parts: [{ type: 'text', text }] }] }
 // Returns an AI SDK UI message stream so the frontend can use useChat().
 app.post('/agent/chat', async (c) => {
+  // Reported to the API as x-shogo-gateway-wait-ms: the part of a slow first
+  // message spent here, after the VM was up, waiting for the agent to start.
+  let gatewayWaitMs = 0
   if (!agentGateway || gatewayReadyPromise) {
     if (gatewayReadyPromise) {
+      const waitStartedAt = performance.now()
       const timeout = new Promise<never>((_, reject) =>
         setTimeout(() => reject(new Error('Gateway startup timeout')), 30_000)
       )
@@ -1704,7 +1751,10 @@ app.post('/agent/chat', async (c) => {
         await Promise.race([gatewayReadyPromise, timeout])
       } catch {
         return c.json({ error: 'Agent gateway still starting, please retry' }, 503)
+      } finally {
+        gatewayWaitMs = Math.round(performance.now() - waitStartedAt)
       }
+      if (gatewayWaitMs > 1000) console.log(`[AgentChat] waited ${gatewayWaitMs}ms for the agent gateway to start`)
     }
     if (!agentGateway) {
       return c.json({ error: 'Agent gateway not running' }, 503)
@@ -1838,6 +1888,10 @@ app.post('/agent/chat', async (c) => {
   const chatSessionKey = rawChatSessionKey
   const sessionManager = agentGateway!.getSessionManager()
   sessionManager.getOrCreate(chatSessionKey)
+  const wokenByTasks: unknown = body.taskNotification?.taskIds
+  if (Array.isArray(wokenByTasks)) {
+    agentGateway!.acknowledgeTaskNotification(chatSessionKey, wokenByTasks.filter((id): id is string => typeof id === 'string'))
+  }
   if (typeof body.chatSessionName === 'string' && body.chatSessionName.trim()) {
     sessionManager.setSessionMetadata(chatSessionKey, { title: body.chatSessionName.trim().slice(0, 200) })
   }
@@ -1913,237 +1967,103 @@ app.post('/agent/chat', async (c) => {
   const chatUserId = c.req.header('X-User-Id') || body.userId || undefined
   const requesterTicket = c.req.header('X-Requester-Ticket') || undefined
 
-  // Create a buffer that lives independently of the HTTP connection.
-  // The agent writes into this buffer via a background consumer so that
-  // a client disconnect (e.g. page refresh) does NOT cancel the agent.
-  console.log(`[AgentChat] Creating stream buffer for session: ${chatSessionKey}`)
-  const bufWriter = streamBufferStore.create(chatSessionKey)
-  const turnId = bufWriter.turnId
+  // A busy chat finishes its live turn first; see live-turn-wait.ts.
+  if (liveTurnGate.isBusy(chatSessionKey)) {
+    console.log(`[AgentChat] Session ${chatSessionKey} has a live turn; waiting for it before starting the next`)
+    const { waitedMs, stopped } = await liveTurnGate.waitUntilFree(chatSessionKey)
+    if (stopped) {
+      console.log(`[AgentChat] Session ${chatSessionKey} was stopped after ${waitedMs}ms; not starting the waiting turn`)
+      return c.json({ error: 'The chat was stopped before this message started', code: 'turn_stopped' }, 409)
+    }
+    console.log(`[AgentChat] Session ${chatSessionKey} free after ${waitedMs}ms`)
+  }
+  const turn = bufferedTurns.start(chatSessionKey, async (writer) => {
+    await agentGateway!.processChatMessageStream(userText || '', writer, {
+      modelOverride,
+      modelProvider,
+      fileParts: userFileParts.length > 0 ? userFileParts : undefined,
+      userId: chatUserId,
+      requesterTicket,
+      interactionMode,
+      confirmedPlan,
+      dualPlan,
+      chatSessionId: chatSessionKey,
+    })
 
-  trackStreamStart()
-  // Tracks whether an explicit `data-turn-complete` terminal frame has been
-  // emitted for this turn. The client's auto-resuming fetch keeps reconnecting
-  // to `/stream?fromSeq=N` until it parses this frame; if the turn ends
-  // abnormally (bg-reader transport error, process abort race) before the
-  // try/catch below writes one, the buffer would be marked `completed` with NO
-  // terminal frame and the client would replay the tail forever — pinning
-  // `useChat().status` at `streaming` and wedging the composer on Stop/Queue.
-  // The bgReader `finally` synthesizes one when this stays false.
-  let terminalFrameWritten = false
-  const stream = createUIMessageStream({
-    execute: async ({ writer }) => {
-      let turnSucceeded = false
-      // Periodic seq heartbeat. The client uses this to know how many
-      // buffered chunks it has already received so it can resume with
-      // `?fromSeq=N` on a premature disconnect without re-rendering text
-      // it has already seen. Transient: the AI SDK would otherwise append
-      // a message part every 250ms for the whole turn.
-      const seqHeartbeat = setInterval(() => {
-        const seq = bufWriter.lastSeq
-        if (seq <= 0) return
+    const usage = agentGateway!.consumeLastTurnUsage()
+    if (usage) {
+      const dollarCost = calculateDollarCost(
+        usage.model,
+        usage.inputTokens,
+        usage.outputTokens,
+        usage.cacheReadTokens,
+        usage.cacheWriteTokens,
+      )
+      writer.write({
+        type: 'data-usage',
+        data: { ...usage, dollarCost },
+      } as any)
+    }
+    return { aborted: !!usage?.wasAborted }
+  }, {
+    afterSuccess: () => {
+      // Per-turn git sync: in `dual_shadow` / `git_only` modes, sync
+      // the workspace once the agent finishes its turn. This is the
+      // natural ProjectCheckpoint granularity — one row per assistant
+      // turn. In `git_only` (pod-owned) the commit is local and the
+      // sync's afterCommit persists `.git` to object storage and records
+      // the ProjectCheckpoint row via the internal API endpoint (see
+      // persistAndRecordCheckpoint above). In `dual_shadow` it pushes to
+      // the API origin, whose post-receive hook writes the row.
+      //
+      // We deliberately do NOT hook the S3Sync filesystem watcher
+      // for git: that fires per file event and would commit 5–50
+      // times per turn (every tool call, every edit). The
+      // turn-complete site is the same boundary the checkpoints
+      // system has always used.
+      //
+      // `triggerSync(false)` is debounced internally (~1.5s) and
+      // returns immediately, so this is a fire-and-forget that
+      // doesn't add latency to the turn-complete response.
+      // `gitLayerReady` is already settled except right after a deferred
+      // local bootstrap (desktop), where it lands within ~1s of assign.
+      void gitLayerReady.then(() => {
+        if (!gitSyncInstance) return
         try {
-          writer.write({
-            type: 'data-turn-seq',
-            data: { turnId, seq },
-            transient: true,
-          } as any)
-        } catch {
-          clearInterval(seqHeartbeat)
+          // Offload large/binary assets first (updates .git/info/exclude
+          // synchronously so the debounced push below stays source-only).
+          triggerLargeFileSync()
+          gitSyncInstance.triggerSync(false)
+        } catch (err: any) {
+          console.warn('[agent-runtime] gitSync triggerSync at turn-complete threw:', err?.message ?? err)
         }
-      }, 250)
-      try {
-        // Mark the start of this durable turn so a reconnecting client
-        // can correlate replay frames against the right turn id.
-        writer.write({
-          type: 'data-turn-start',
-          data: {
-            turnId,
-            chatSessionId: chatSessionKey,
-            startedAt: Date.now(),
-          },
-        } as any)
-        writer.write({ type: 'start-step' })
-        await agentGateway!.processChatMessageStream(userText || '', writer, {
-          modelOverride,
-          modelProvider,
-          fileParts: userFileParts.length > 0 ? userFileParts : undefined,
-          userId: chatUserId,
-          requesterTicket,
-          interactionMode,
-          confirmedPlan,
-          dualPlan,
-          chatSessionId: chatSessionKey,
-        })
+      })
 
-        const usage = agentGateway!.consumeLastTurnUsage()
-        if (usage) {
-          const dollarCost = calculateDollarCost(
-            usage.model,
-            usage.inputTokens,
-            usage.outputTokens,
-            usage.cacheReadTokens,
-            usage.cacheWriteTokens,
-          )
-          writer.write({
-            type: 'data-usage',
-            data: { ...usage, dollarCost },
-          } as any)
-        }
-
-        writer.write({ type: 'finish-step' })
-        // Explicit terminal marker the client uses to differentiate "really
-        // done" from "stream EOF mid-turn". Anything past this point on the
-        // wire is purely framing noise and should be ignored by clients.
-        //
-        // When the user clicked Stop, the agent loop unwinds with
-        // `result.abortReason === 'external'` and the gateway sets
-        // `usage.wasAborted`. We tag the terminal frame `status: 'aborted'`
-        // so project-chat (and other consumers) can distinguish a
-        // user-initiated stop from a clean turn end and bill the partial
-        // usage that was just emitted.
-        writer.write({
-          type: 'data-turn-complete',
-          data: {
-            turnId,
-            chatSessionId: chatSessionKey,
-            status: usage?.wasAborted ? 'aborted' : 'completed',
-            lastSeq: bufWriter.lastSeq,
-            completedAt: Date.now(),
-          },
-        } as any)
-        terminalFrameWritten = true
-        writer.write({ type: 'finish', finishReason: getStreamFinishReason(!!usage?.wasAborted) })
-        turnSucceeded = true
-
-        // Per-turn git sync: in `dual_shadow` / `git_only` modes, sync
-        // the workspace once the agent finishes its turn. This is the
-        // natural ProjectCheckpoint granularity — one row per assistant
-        // turn. In `git_only` (pod-owned) the commit is local and the
-        // sync's afterCommit persists `.git` to object storage and records
-        // the ProjectCheckpoint row via the internal API endpoint (see
-        // persistAndRecordCheckpoint above). In `dual_shadow` it pushes to
-        // the API origin, whose post-receive hook writes the row.
-        //
-        // We deliberately do NOT hook the S3Sync filesystem watcher
-        // for git: that fires per file event and would commit 5–50
-        // times per turn (every tool call, every edit). The
-        // turn-complete site is the same boundary the checkpoints
-        // system has always used.
-        //
-        // `triggerSync(false)` is debounced internally (~1.5s) and
-        // returns immediately, so this is a fire-and-forget that
-        // doesn't add latency to the turn-complete response.
-        // `gitLayerReady` is already settled except right after a deferred
-        // local bootstrap (desktop), where it lands within ~1s of assign.
-        void gitLayerReady.then(() => {
-          if (!gitSyncInstance) return
-          try {
-            // Offload large/binary assets first (updates .git/info/exclude
-            // synchronously so the debounced push below stays source-only).
-            triggerLargeFileSync()
-            gitSyncInstance.triggerSync(false)
-          } catch (err: any) {
-            console.warn('[agent-runtime] gitSync triggerSync at turn-complete threw:', err?.message ?? err)
-          }
-        })
-
-        // BETA: per-chat git worktrees. When this session runs in an isolated
-        // worktree, the agent's edits live on its branch (not the main tree),
-        // so the main gitSync above no-ops. Commit the worktree (and, for a
-        // conflict-resolution turn, finish the merge) here.
-        if (agentGateway?.isWorktreeSession(chatSessionKey)) {
-          void finalizeWorktreeTurn(chatSessionKey).catch((err: any) =>
-            console.warn('[agent-runtime] finalizeWorktreeTurn at turn-complete threw:', err?.message ?? err),
-          )
-        }
-      } catch (error: any) {
-        writer.write({
-          type: 'data-turn-complete',
-          data: {
-            turnId,
-            chatSessionId: chatSessionKey,
-            status: 'failed',
-            error: error?.message || 'Agent chat error',
-            lastSeq: bufWriter.lastSeq,
-            completedAt: Date.now(),
-          },
-        } as any)
-        terminalFrameWritten = true
-        writer.write({ type: 'error', errorText: error.message || 'Agent chat error' } as any)
-      } finally {
-        clearInterval(seqHeartbeat)
-        trackStreamEnd()
-        if (!turnSucceeded) {
-          // Best-effort marker so the snapshot reflects the failure state
-          // for the grace window.
-        }
+      // BETA: per-chat git worktrees. When this session runs in an isolated
+      // worktree, the agent's edits live on its branch (not the main tree),
+      // so the main gitSync above no-ops. Commit the worktree (and, for a
+      // conflict-resolution turn, finish the merge) here.
+      if (agentGateway?.isWorktreeSession(chatSessionKey)) {
+        void finalizeWorktreeTurn(chatSessionKey).catch((err: any) =>
+          console.warn('[agent-runtime] finalizeWorktreeTurn at turn-complete threw:', err?.message ?? err),
+        )
       }
     },
   })
 
-  const response = createUIMessageStreamResponse({ stream })
-  if (response.body) {
-    // Consume the agent's stream in the background, feeding chunks into
-    // the buffer. This reader is NOT tied to the HTTP response — the agent
-    // keeps running even if the client disconnects.
-    const bgReader = response.body.getReader()
-    const streamTrace = createStreamTrace(`runtime-chat:${chatSessionKey.slice(0, 8)}`, ['buffered', 'replay', 'keepalive'])
-    ;(async () => {
-      try {
-        while (true) {
-          const { done, value } = await bgReader.read()
-          if (done) break
-          bufWriter.append(value)
-          streamTrace.mark('buffered', value.byteLength)
-        }
-        console.log(`[AgentChat] Background stream completed for session: ${chatSessionKey} (turn ${turnId}, seq=${bufWriter.lastSeq})`)
-      } catch (err: any) {
-        console.log(`[AgentChat] Background stream error for session: ${chatSessionKey}:`, err?.message || err)
-      } finally {
-        // Guarantee a terminal frame in the buffer. If the turn ended without
-        // the try/catch above writing one (bg-reader transport error, abort
-        // race, or any path that tore the agent stream before the terminal
-        // marker), synthesize one now — WHILE the buffer is still `active`, so
-        // `append` assigns it a seq and it reaches both live subscribers and
-        // future `?fromSeq=N` replays. Without this, the client's
-        // auto-resuming fetch never sees `data-turn-complete`, replays the
-        // tail forever, and the composer stays wedged in `streaming`.
-        if (!terminalFrameWritten) {
-          try {
-            bufWriter.append(
-              encodeTurnCompleteFrame({
-                turnId,
-                chatSessionId: chatSessionKey,
-                status: 'failed',
-                error: 'stream ended without terminal frame',
-                lastSeq: bufWriter.lastSeq,
-                completedAt: Date.now(),
-              }),
-            )
-            terminalFrameWritten = true
-            console.log(`[AgentChat] Synthesized terminal frame for session: ${chatSessionKey} (turn ${turnId})`)
-          } catch (sErr: any) {
-            console.warn(`[AgentChat] Failed to synthesize terminal frame for ${chatSessionKey}:`, sErr?.message || sErr)
-          }
-        }
-        bufWriter.complete()
-      }
-    })()
-
-    // The client reads from a replay stream backed by the buffer.
-    // If this client disconnects, only the replay subscriber is removed;
-    // the background reader + agent keep running.
-    const replayStream = traceStream(streamTrace, 'replay', streamBufferStore.createReplayStream(chatSessionKey)!)
-    const wrappedStream = traceStream(streamTrace, 'keepalive', wrapSseStreamWithKeepalive(replayStream, 15_000), true)
-    const responseHeaders = new Headers(response.headers)
-    responseHeaders.set('X-Turn-Id', turnId)
-    responseHeaders.set('X-Chat-Session-Id', chatSessionKey)
-    return new Response(wrappedStream, {
-      status: response.status,
-      headers: responseHeaders,
-    })
-  }
-  return response
+  // The client reads from a replay stream backed by the buffer.
+  // If this client disconnects, only the replay subscriber is removed;
+  // the background reader + agent keep running.
+  const replayStream = traceStream(turn.streamTrace, 'replay', streamBufferStore.createReplayStream(chatSessionKey)!)
+  const wrappedStream = traceStream(turn.streamTrace, 'keepalive', wrapSseStreamWithKeepalive(replayStream, 15_000), true)
+  const responseHeaders = new Headers(turn.headers)
+  responseHeaders.set('X-Turn-Id', turn.turnId)
+  responseHeaders.set('X-Chat-Session-Id', chatSessionKey)
+  responseHeaders.set('x-shogo-gateway-wait-ms', String(gatewayWaitMs))
+  return new Response(wrappedStream, {
+    status: turn.status,
+    headers: responseHeaders,
+  })
 })
 
 // Reconnect to an active (or recently completed) stream.
@@ -2561,7 +2481,10 @@ app.post('/agent/stop', async (c) => {
     )
   }
   const stopSessionKey = rawStopSessionKey
+  liveTurnGate.markStopped(stopSessionKey)
   const aborted = agentGateway.abortCurrentTurn(stopSessionKey)
+  // Background tasks keep running after Stop but must not restart the agent.
+  agentGateway.muteSessionTasks(stopSessionKey)
 
   // The main turn signal does not reach subagents because each has its own
   // AbortController. Scope their cancellation to this chat: a project runtime
@@ -3276,7 +3199,10 @@ app.post('/pool/repo-hydrated', async (c) => {
   // ends up with a stray `.git` inside its working tree.
   // `deadline` tells the host this guest honours `timeoutMs` and `keepPaths`;
   // an older one resets the whole tree whenever it gets round to it.
-  if (body?.probe === true) return c.json({ ok: true, supported: true, deadline: true })
+  // `bundles` means this guest can restore the incremental repo format
+  // (`/pool/repo-bundles-hydrate`). The host must not fall back to the legacy
+  // tarball when a manifest exists, so it refuses instead of guessing.
+  if (body?.probe === true) return c.json({ ok: true, supported: true, deadline: true, bundles: true })
   let stagingDir: string
   try {
     stagingDir = resolvePoolWorkspaceDir(body?.stagingDir)
@@ -3329,6 +3255,132 @@ app.post('/pool/repo-hydrated', async (c) => {
     return c.json({ error: err?.message ?? 'repo adopt failed' }, 500)
   } finally {
     sync?.resume()
+  }
+})
+
+// Incremental durable repo (packages/shared-runtime/src/repo-bundles.ts).
+//
+// The host drives both directions and stores the manifest itself; the guest
+// never holds store credentials. Export builds the next bundle relative to the
+// tips the host last recorded, and serves it by digest. Restore downloads each
+// bundle from a host-presigned URL and rebuilds the staging `.git`, which the
+// existing `/pool/repo-hydrated` adoption then swaps in unchanged.
+
+function sameRepoSnapshot(a: RepoSnapshotFields, b: RepoSnapshotFields): boolean {
+  return JSON.stringify(a) === JSON.stringify(b)
+}
+
+app.post('/pool/export-repo-bundle', async (c) => {
+  sweepSpool()
+  let body: { dir?: unknown; since?: unknown; full?: unknown }
+  try {
+    body = (await c.req.json().catch(() => ({}))) as typeof body
+    const destinationDir = resolvePoolWorkspaceDir(body?.dir)
+    const full = body?.full === true
+    const since: string[] | null = full || body?.since == null ? null : (body.since as unknown[]).map((s) => {
+      if (typeof s !== 'string' || !/^[0-9a-f]{40}([0-9a-f]{24})?$/.test(s)) throw new Error('since must be object ids')
+      return s
+    })
+    await flushGitBeforeExport(destinationDir)
+    if (isLfsActive()) {
+      const lfsCfg = lfsRemoteConfigFromEnv(WORKSPACE_DIR)
+      // Bundles never carry LFS objects. Falling back to a tar that does
+      // would not be an option, so a failed push fails the export.
+      if (lfsCfg && !(await lfsPushAll(lfsCfg))) {
+        return c.json({ error: 'lfs push failed; repo bundle not exported' }, 503)
+      }
+    }
+
+    // Snapshot refs before and after building. Refs that moved in between
+    // could leave the manifest pointing at objects the bundle lacks, so
+    // retry against the newer state.
+    let built: Awaited<ReturnType<typeof buildRepoBundle>> = null
+    let snapshot = await readRepoSnapshotFields(destinationDir)
+    for (let attempt = 0; ; attempt++) {
+      built = await buildRepoBundle(destinationDir, { previous: since, workDir: spoolDir() })
+      const after = await readRepoSnapshotFields(destinationDir)
+      if (sameRepoSnapshot(snapshot, after)) {
+        snapshot = after
+        break
+      }
+      if (built) rmSync(built.path, { force: true })
+      built = null
+      snapshot = after
+      if (attempt >= 2) return c.json({ error: 'repo refs kept moving during export; retry' }, 409)
+    }
+
+    return c.json({
+      bundle: built?.entry ?? null,
+      head: snapshot.head,
+      refs: snapshot.refs,
+      config: snapshot.config,
+      rootCommitAt: repoRootCommitAt(destinationDir),
+    })
+  } catch (err: any) {
+    console.error('[pool/export-repo-bundle] failed:', err?.message ?? err)
+    return c.json({ error: err?.message ?? 'export-repo-bundle failed' }, 500)
+  }
+})
+
+app.get('/pool/export-repo-bundle/:sha256', async (c) => {
+  const sha = c.req.param('sha256')
+  if (!/^[0-9a-f]{64}$/.test(sha)) return c.json({ error: 'sha256 must be 64 hex digits' }, 400)
+  const path = join(spoolDir(), `${sha}.bundle`)
+  if (!existsSync(path)) return c.json({ error: 'bundle not built for this export' }, 404)
+  return spooledFileResponse(path, { 'Content-Type': 'application/octet-stream' })
+})
+
+app.post('/pool/repo-bundles-hydrate', async (c) => {
+  sweepSpool()
+  const body = (await c.req.json().catch(() => null)) as Record<string, unknown> | null
+  if (!body || typeof body !== 'object') return c.json({ error: 'expected a JSON body' }, 400)
+  let stagingDir: string
+  try {
+    stagingDir = resolvePoolWorkspaceDir(body.stagingDir)
+  } catch (error: any) {
+    return c.json({ error: error?.message ?? 'invalid staging dir' }, 400)
+  }
+  if (stagingDir === WORKSPACE_DIR) return c.json({ error: 'stagingDir is required' }, 400)
+
+  let manifest: RepoManifest
+  try {
+    manifest = parseRepoManifest(body.manifest)
+  } catch (error: any) {
+    return c.json({ error: error?.message ?? 'invalid manifest' }, 400)
+  }
+
+  // The host's URL list must match the manifest chain exactly, in order.
+  const items = Array.isArray(body.bundles) ? (body.bundles as Array<{ sha256?: unknown; url?: unknown }>) : null
+  if (!items || items.length !== manifest.bundles.length) {
+    return c.json({ error: 'bundles must list every manifest bundle, in order' }, 400)
+  }
+  for (const [i, item] of items.entries()) {
+    if (item?.sha256 !== manifest.bundles[i].sha256 || typeof item.url !== 'string' || !/^https?:\/\//.test(item.url)) {
+      return c.json({ error: `bundle ${i} does not match the manifest` }, 400)
+    }
+  }
+
+  const timeoutMs = Number(body.timeoutMs)
+  const downloadMs = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 15 * 60_000
+  const downloaded: string[] = []
+  try {
+    rmSync(stagingDir, { recursive: true, force: true })
+    await materializeRepoFromBundles(stagingDir, manifest, async (entry) => {
+      const item = items[manifest.bundles.indexOf(entry)]
+      const res = await fetch(item.url as string, { signal: AbortSignal.timeout(downloadMs) })
+      if (!res.ok) throw new Error(`bundle ${entry.sha256} download failed (${res.status})`)
+      const path = spoolPath(`repo-bundle-${entry.sha256}.bundle`)
+      await Bun.write(path, res)
+      downloaded.push(path)
+      return path
+    })
+    return c.json({ ok: true, bundles: manifest.bundles.length })
+  } catch (err: any) {
+    rmSync(stagingDir, { recursive: true, force: true })
+    console.error('[pool/repo-bundles-hydrate] failed:', redactUrls(String(err?.message ?? err)))
+    return c.json({ error: redactUrls(String(err?.message ?? 'repo bundle restore failed')) }, 500)
+  } finally {
+    for (const path of downloaded) rmSync(path, { force: true })
   }
 })
 
@@ -3812,7 +3864,7 @@ app.post('/agent/pipeline/call', async (c) => {
   }
 
   if (body.wait === false) {
-    agentGateway.processPipelineCall(opts).then(
+    runPipelineCall(opts).then(
       (r: { reply: string; sessionId: string; runId?: string }) =>
         console.log(`[agent-runtime] pipeline call complete (run=${r.runId ?? '-'}):`, r.reply.substring(0, 200)),
       (err: any) => console.error('[agent-runtime] pipeline call failed:', err?.message ?? err),
@@ -3821,12 +3873,16 @@ app.post('/agent/pipeline/call', async (c) => {
   }
 
   try {
-    const result = await agentGateway.processPipelineCall(opts)
+    const result = await runPipelineCall(opts)
     return c.json({ status: 'completed', ...result })
   } catch (err: any) {
     return c.json({ error: { code: 'agent_turn_failed', message: err?.message ?? String(err) } }, 500)
   }
 })
+
+function runPipelineCall(opts: PipelineCallOptions): Promise<PipelineCallResult> {
+  return bufferedTurns.runPipelineCall((call) => agentGateway!.processPipelineCall(call), opts)
+}
 
 /**
  * POST /agent/events
@@ -3930,8 +3986,7 @@ app.post('/agent/session/reset', async (c) => {
     return c.json({ error: 'Agent gateway not running' }, 503)
   }
   const body = await c.req.json().catch(() => ({})) as { evalLabel?: string }
-  const sm = agentGateway.getSessionManager()
-  sm.clearHistory('chat')
+  agentGateway.clearSessionHistory('chat')
   agentGateway.reloadConfig()
   agentGateway.setActiveMode('canvas')
   agentGateway.setEvalLabel(body.evalLabel ?? null)
@@ -3941,15 +3996,18 @@ app.post('/agent/session/reset', async (c) => {
 })
 
 // Tool mocks — used by eval runner to install deterministic tool responses
+let simWorld: import('./evals/company-sim/world').CompanyWorld | null = null
 app.post('/agent/tool-mocks', async (c) => {
   if (!agentGateway) {
     return c.json({ error: 'Agent gateway not running' }, 503)
   }
   const raw = await c.req.json()
   const { compileInstallBody } = await import('./evals/tool-mocks-runtime')
-  const compiled = compileInstallBody(raw)
+  const simSchemas = raw?.sim ? (await import('./evals/company-sim/tool-defs')).simToolSchemas() : undefined
+  const compiled = compileInstallBody(raw, { simSchemas, workspaceDir: WORKSPACE_DIR })
   agentGateway.setToolMocks(compiled.fns, compiled.syntheticDefs, compiled.hiddenTools)
-  return c.json({ ok: true, mockedTools: Object.keys(compiled.fns), defaults: compiled.defaults })
+  simWorld = compiled.world
+  return c.json({ ok: true, mockedTools: Object.keys(compiled.fns), defaults: compiled.defaults, sim: !!compiled.world })
 })
 
 app.delete('/agent/tool-mocks', (c) => {
@@ -3957,7 +4015,29 @@ app.delete('/agent/tool-mocks', (c) => {
     return c.json({ error: 'Agent gateway not running' }, 503)
   }
   agentGateway.clearToolMocks()
+  simWorld = null
   return c.json({ ok: true })
+})
+
+// Final state of the company simulation installed with the mocks, for graders.
+app.get('/agent/tool-mocks/sim-state', (c) => {
+  if (!simWorld) return c.json({ error: 'No simulation installed' }, 404)
+  return c.json(simWorld.snapshot())
+})
+
+// Let simulated time pass between eval turns; scripted teammates act on the way.
+app.post('/agent/tool-mocks/sim-advance', async (c) => {
+  if (!simWorld) return c.json({ error: 'No simulation installed' }, 404)
+  const { hours } = await c.req.json().catch(() => ({})) as { hours?: number }
+  if (typeof hours !== 'number' || !(hours > 0)) return c.json({ error: 'hours must be a positive number' }, 400)
+  simWorld.advance(hours)
+  return c.json({ ok: true, now: simWorld.snapshot().now })
+})
+
+// Let simulated time pass until the agent would next be woken; returns that wake's message, or wake: null.
+app.post('/agent/tool-mocks/sim-next-wake', (c) => {
+  if (!simWorld) return c.json({ error: 'No simulation installed' }, 404)
+  return c.json({ ok: true, wake: simWorld.nextWake() })
 })
 
 app.post('/agent/workspace/seed', async (c) => {
@@ -4690,6 +4770,18 @@ app.post('/agent/tools/execute', async (c) => {
   const mcpMgr = agentGateway.getMcpClientManager()
   const result = await mcpMgr.callTool(tool, args || {})
   return c.json(result, result.ok ? 200 : 404)
+})
+
+// Remote tool channel (remote-tools.ts): another project of this workspace runs
+// one allow-listed tool against THIS project's root. Reached only through the
+// API (RBAC + wake); auth is the `/agent` runtime-token guard.
+app.post('/agent/remote/tool', async (c) => {
+  if (!agentGateway) {
+    return c.json({ ok: false, error: 'Agent gateway not running' }, 503)
+  }
+  const body = await c.req.json().catch(() => null)
+  const outcome = await executeRemoteTool(agentGateway.getRemoteTools(), body)
+  return c.json(outcome.body, outcome.status)
 })
 
 app.get('/agent/tools/schemas', (c) => {
@@ -6573,7 +6665,7 @@ async function initializeEssentials(): Promise<void> {
         beforeStage: isLfsActive()
           ? async () => { await autoTrackLargeFiles(WORKSPACE_DIR) }
           : undefined,
-        stageExcludes: ['.shogo/local'],
+        stageExcludes: ['.shogo/local', 'chat-files'],
         onDegrade: (reason) => {
           console.warn(
             `[agent-runtime] cloud-sync degraded (mode=${cloudSyncMode}): ${reason}`,

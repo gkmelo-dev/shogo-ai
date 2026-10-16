@@ -378,12 +378,23 @@ async function parseSSEStream(
  * and append them to the flat toolCalls array with viaSubagent=true.
  * This lets eval assertions check tools used inside subagents.
  */
-function flattenSubagentToolCalls(toolCalls: ToolCallRecord[]): ToolCallRecord[] {
+export function flattenSubagentToolCalls(toolCalls: ToolCallRecord[]): ToolCallRecord[] {
   const nested: ToolCallRecord[] = []
+  const seenTasks = new Set<string>()
   for (const tc of toolCalls) {
-    if (tc.name !== 'agent_spawn' && tc.name !== 'agent_result') continue
     const output = tc.output as any
     if (!output || typeof output !== 'object') continue
+
+    // Background subagents are collected with `wait`, whose result carries
+    // the subagent's task log: one `[tool] <name> <input>` line per call.
+    if (tc.name === 'wait' && output.source === 'subagent' && typeof output.output === 'string') {
+      if (output.task_id && seenTasks.has(output.task_id)) continue
+      if (output.task_id) seenTasks.add(output.task_id)
+      nested.push(...subagentCallsFromTaskLog(output.output))
+      continue
+    }
+
+    if (tc.name !== 'agent_spawn' && tc.name !== 'agent_result') continue
 
     // Legacy/hypothetical shape: a full `parts` transcript. Nothing in the
     // live agent-runtime actually returns this today (agent_result's real
@@ -427,22 +438,60 @@ function flattenSubagentToolCalls(toolCalls: ToolCallRecord[]): ToolCallRecord[]
   return nested
 }
 
+/** Parse the `[tool] <name> <input>` lines a subagent task writes to its log. */
+export function subagentCallsFromTaskLog(log: string): ToolCallRecord[] {
+  const calls: ToolCallRecord[] = []
+  for (const line of log.split('\n')) {
+    const m = line.match(/^\[tool\] (\S+)(?: (.*))?$/)
+    if (!m) continue
+    const raw = m[2] ?? ''
+    let input: Record<string, unknown>
+    try {
+      const parsed = JSON.parse(raw)
+      input = parsed && typeof parsed === 'object' ? parsed : { raw }
+    } catch {
+      input = { raw }
+    }
+    calls.push({ name: m[1]!, input, output: undefined, error: false, viaSubagent: true })
+  }
+  return calls
+}
+
 // ---------------------------------------------------------------------------
 // Anti-pattern checks
 // ---------------------------------------------------------------------------
 
-function checkAntiPattern(
+/** Three consecutive calls with the same tool and the same input. */
+export function hasRepeatedIdenticalCalls(toolCalls: ToolCallRecord[]): boolean {
+  const keys = toolCalls.map(t => `${t.name} ${JSON.stringify(t.input ?? {})}`)
+  for (let i = 2; i < keys.length; i++) {
+    if (keys[i] === keys[i - 1] && keys[i] === keys[i - 2]) return true
+  }
+  return false
+}
+
+function prismaModelsWritten(toolCalls: ToolCallRecord[]): number {
+  let most = 0
+  for (const t of toolCalls) {
+    if (t.name !== 'write_file' && t.name !== 'edit_file') continue
+    const input = t.input as Record<string, unknown>
+    if (!String(input.path ?? '').endsWith('.prisma')) continue
+    const text = String(input.content ?? input.new_string ?? '')
+    most = Math.max(most, (text.match(/^\s*model\s+\w+/gm) ?? []).length)
+  }
+  return most
+}
+
+export function checkAntiPattern(
   pattern: string,
   responseText: string,
   toolCalls: ToolCallRecord[],
+  loopDetected = false,
 ): boolean {
   const p = pattern.toLowerCase()
 
   if (p.includes('loop') || p.includes('repeat')) {
-    const names = toolCalls.map(t => t.name)
-    for (let i = 2; i < names.length; i++) {
-      if (names[i] === names[i - 1] && names[i] === names[i - 2]) return true
-    }
+    if (loopDetected || hasRepeatedIdenticalCalls(toolCalls)) return true
   }
 
   if (p === 'unnecessary-clarification' || p === 'unnecessary-questions') {
@@ -459,8 +508,7 @@ function checkAntiPattern(
   }
 
   if (p.includes('homework') && p.includes('prisma') && p.includes('over-engineer')) {
-    const json = JSON.stringify(toolCalls).toLowerCase()
-    return json.includes('prisma') && (json.includes('schema.prisma') || json.includes('model '))
+    return prismaModelsWritten(toolCalls) >= 3
   }
 
   return false
@@ -551,6 +599,38 @@ export async function runEval(
     return lastExecResp
   }
 
+  let userTurn = 0
+  /** Let simulated time pass before the next user turn, when the eval asks for it. */
+  async function advanceSim(): Promise<void> {
+    const hours = eval_.simAdvanceHours?.[userTurn++]
+    if (!eval_.sim || !hours) return
+    try {
+      const res = await fetch(cfg.agentEndpoint.replace(/\/agent\/chat\/?$/, '/agent/tool-mocks/sim-advance'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ hours }),
+        signal: AbortSignal.timeout(15_000),
+      })
+      if (!res.ok) errors.push(`sim-advance: HTTP ${res.status}`)
+    } catch (e: any) {
+      errors.push(`sim-advance: ${e.message}`)
+    }
+  }
+
+  async function nextSimWake(): Promise<import('./company-sim/world').SimWake | null> {
+    try {
+      const res = await fetch(cfg.agentEndpoint.replace(/\/agent\/chat\/?$/, '/agent/tool-mocks/sim-next-wake'), {
+        method: 'POST',
+        signal: AbortSignal.timeout(15_000),
+      })
+      if (!res.ok) { errors.push(`sim-next-wake: HTTP ${res.status}`); return null }
+      return ((await res.json()) as { wake: import('./company-sim/world').SimWake | null }).wake
+    } catch (e: any) {
+      errors.push(`sim-next-wake: ${e.message}`)
+      return null
+    }
+  }
+
   try {
     const messages: Array<{ role: string; parts: Array<{ type: string; text: string }> }> = []
 
@@ -567,6 +647,7 @@ export async function runEval(
       for (let i = 0; i < history.length; i++) {
         const turn = history[i]
         if (turn.role === 'user') {
+          await advanceSim()
           messages.push({ role: 'user', parts: [{ type: 'text', text: turn.content }] })
           const nextTurn = history[i + 1]
           if (nextTurn?.role === 'assistant') {
@@ -596,6 +677,7 @@ export async function runEval(
     }
 
     // Final eval turn
+    await advanceSim()
     messages.push({ role: 'user', parts: [{ type: 'text', text: eval_.input }] })
     const response = await sendTurn(messages, cfg)
     responseText = response.text
@@ -622,6 +704,23 @@ export async function runEval(
       }
     } catch (e: any) {
       errors.push(`ask_user follow-up error: ${e.message}`)
+    }
+
+    // Wakes after the user's turn: [Task update]s, schedules and heartbeats, as production sends them.
+    if (eval_.sim?.wakes) {
+      const max = eval_.sim.wakes.maxWakes ?? 12
+      for (let n = 0; n < max; n++) {
+        const wake = await nextSimWake()
+        if (!wake) break
+        if (cfg.verbose) console.log(`      [wake ${n + 1}] ${wake.at} ${wake.kind}: ${wake.text.split('\n')[0].slice(0, 100)}`)
+        messages.push({ role: 'user', parts: [{ type: 'text', text: wake.text }] })
+        const wakeResp = await sendTurn(messages, cfg)
+        messages.push({ role: 'assistant', parts: [{ type: 'text', text: wakeResp.text }] })
+        toolCalls.push(...wakeResp.toolCalls)
+        perTurnToolCalls.push(wakeResp.toolCalls)
+        perTurnResponseText.push(wakeResp.text)
+        accumulate(wakeResp)
+      }
     }
   } catch (err: any) {
     errors.push(err.message)
@@ -662,6 +761,17 @@ export async function runEval(
     ? [...cfg.pipelineToolCalls, ...toolCalls]
     : undefined
 
+  let sim: EvalResult['sim']
+  if (eval_.sim) {
+    try {
+      const res = await fetch(cfg.agentEndpoint.replace(/\/agent\/chat\/?$/, '/agent/tool-mocks/sim-state'), { signal: AbortSignal.timeout(15_000) })
+      if (res.ok) sim = await res.json() as EvalResult['sim']
+      else errors.push(`sim-state: HTTP ${res.status}`)
+    } catch (e: any) {
+      errors.push(`sim-state: ${e.message}`)
+    }
+  }
+
   // Score criteria
   const evalBase: EvalResult = {
     eval: eval_,
@@ -675,6 +785,7 @@ export async function runEval(
     finalTurnToolCalls,
     perTurnToolCalls,
     pipelineToolCalls: pipelineCumulativeToolCalls,
+    phaseToolCalls: toolCalls,
     criteriaResults: [],
     triggeredAntiPatterns: [],
     timing: { startTime, endTime, durationMs },
@@ -685,6 +796,7 @@ export async function runEval(
     loopDetected,
     hitMaxTurns,
     responseEmpty,
+    sim,
   }
 
   // For intention criteria we transparently swap `toolCalls` to the
@@ -727,7 +839,7 @@ export async function runEval(
   const triggeredAntiPatterns: string[] = []
   if (eval_.antiPatterns) {
     for (const pattern of eval_.antiPatterns) {
-      if (checkAntiPattern(pattern, responseText, toolCalls)) {
+      if (checkAntiPattern(pattern, responseText, toolCalls, loopDetected)) {
         triggeredAntiPatterns.push(pattern)
       }
     }

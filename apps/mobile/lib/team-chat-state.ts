@@ -7,6 +7,9 @@
  */
 import type { ChatMessage, ConversationSummary, Mentionables, TeamChatEvent } from './team-chat-api'
 import { docTokenFor, fullDateLabel, parseDocToken, relativeDateLabel, shortDateLabel } from './doc-tokens'
+import { normalizeRichTextPaste } from './rich-text-paste'
+import { voiceNotePreview } from './voice-note'
+import { MENTION_HREF_PREFIX } from '../components/chat/file-links'
 
 // ─── Timeline ────────────────────────────────────────────────────────────────
 
@@ -29,6 +32,22 @@ export function belongsToScope(message: ChatMessage, scope: TimelineScope): bool
   if (message.conversationId !== scope.conversationId) return false
   if (scope.threadRootId) return message.id === scope.threadRootId || message.threadRootId === scope.threadRootId
   return !message.threadRootId || message.alsoSentToChannel
+}
+
+/**
+ * The newest message seq that counts as "read" for the channel view, i.e. the
+ * same rule `belongsToScope` uses to decide what renders in the main feed: a
+ * thread reply only counts if it was also sent to the channel. Used to mark
+ * the channel read while visible -- otherwise a thread reply that *is* on
+ * screen in the channel never gets its seq marked read, and its badge can
+ * never clear.
+ */
+export function newestReadableSeq(messages: ChatMessage[]): number {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i]!
+    if (!m.pending && (!m.threadRootId || m.alsoSentToChannel)) return m.seq
+  }
+  return 0
 }
 
 function sortMessages(messages: ChatMessage[]): ChatMessage[] {
@@ -182,7 +201,15 @@ export function applyListEvent(
         lastSeq: Math.max(c.lastSeq, message.seq),
         lastMessageAt: visibleInChannel ? message.createdAt : c.lastMessageAt,
         lastMessage: visibleInChannel && (c.kind === 'dm' || c.kind === 'group_dm')
-          ? { preview: inlinePreview(message.text, { users: new Map(), agents: new Map() }, 140), authorId: message.authorUserId, authorType: message.authorType, createdAt: message.createdAt }
+          ? {
+              // A voice note carries no text, so fall back to what it is.
+              preview:
+                inlinePreview(message.text, { users: new Map(), agents: new Map() }, 140) ||
+                voiceNotePreview(message.attachments),
+              authorId: message.authorUserId,
+              authorType: message.authorType,
+              createdAt: message.createdAt,
+            }
           : c.lastMessage,
         lastReadSeq: caughtUp ? Math.max(c.lastReadSeq, message.seq) : c.lastReadSeq,
         unreadCount: caughtUp ? 0 : c.joined && visibleInChannel ? c.unreadCount + 1 : c.unreadCount,
@@ -212,6 +239,8 @@ export function applyListEvent(
         refetch: false,
       }
     }
+    case 'conversation.deleted':
+      return { list: list.filter((c) => c.id !== event.conversationId), refetch: false }
     case 'conversation.created':
     case 'conversation.updated':
     case 'member.joined':
@@ -282,6 +311,8 @@ export interface MentionCandidate {
   /** For an agent: its project (null for the workspace agent). For a project: its id. */
   projectId?: string | null
   image?: string | null
+  /** For a user candidate, when the open conversation's membership is known: false if they are not in it. */
+  inChannel?: boolean
 }
 
 /** The text a candidate stands for in the composer. */
@@ -295,7 +326,16 @@ export function dateCandidate(value: string, now = new Date(), tz?: string | nul
   return { kind: 'date', display, token: docTokenFor({ kind: 'date', value }), subtitle: fullDateLabel(value, now, tz) }
 }
 
-export function mentionCandidates(mentionables: Mentionables | null, meId: string | null): MentionCandidate[] {
+/**
+ * `channelMemberIds`, when given, marks each person candidate `inChannel`
+ * so the composer can flag "Not in channel" and list members first —
+ * only meaningful for a channel (public/private), so pass it only there.
+ */
+export function mentionCandidates(
+  mentionables: Mentionables | null,
+  meId: string | null,
+  channelMemberIds?: Set<string> | null,
+): MentionCandidate[] {
   if (!mentionables) return []
   const agents = mentionables.agents.map<MentionCandidate>((a) => ({
     kind: 'agent',
@@ -306,7 +346,14 @@ export function mentionCandidates(mentionables: Mentionables | null, meId: strin
   }))
   const people = mentionables.people
     .filter((p) => p.id !== meId)
-    .map<MentionCandidate>((p) => ({ kind: 'user', display: p.name, token: `<@u:${p.id}>`, subtitle: p.email, userId: p.id }))
+    .map<MentionCandidate>((p) => ({
+      kind: 'user',
+      display: p.name,
+      token: `<@u:${p.id}>`,
+      subtitle: p.email,
+      userId: p.id,
+      inChannel: channelMemberIds ? channelMemberIds.has(p.id) : undefined,
+    }))
   const groups = (mentionables.groups ?? []).map<MentionCandidate>((g) => ({
     kind: 'group',
     display: g.handle,
@@ -328,9 +375,14 @@ export function activeMentionQuery(text: string, cursor: number): { start: numbe
   return { start: before.length - match[2].length - 1, query: match[2] }
 }
 
+/** Within equal relevance, a person not in the channel sorts after everyone else. */
+function notInChannelRank(c: MentionCandidate): number {
+  return c.inChannel === false ? 1 : 0
+}
+
 export function filterCandidates(candidates: MentionCandidate[], query: string, limit = 8): MentionCandidate[] {
   const q = query.toLowerCase()
-  if (!q) return candidates.slice(0, limit)
+  if (!q) return [...candidates].sort((a, b) => notInChannelRank(a) - notInChannelRank(b)).slice(0, limit)
   const scored = candidates
     .map((c) => {
       const name = c.display.toLowerCase()
@@ -338,7 +390,7 @@ export function filterCandidates(candidates: MentionCandidate[], query: string, 
       return { c, score }
     })
     .filter((x) => x.score >= 0)
-    .sort((a, b) => a.score - b.score)
+    .sort((a, b) => a.score - b.score || notInChannelRank(a.c) - notInChannelRank(b.c))
   return scored.slice(0, limit).map((x) => x.c)
 }
 
@@ -397,6 +449,25 @@ export function renderMentions(text: string, names: MentionNames): string {
     .replace(/<!date:([^>]+)>/g, (_m, value) => `**${dateTokenLabel(value)}**`)
 }
 
+function mentionLink(label: string): string {
+  return `[${label.replace(/[[\]\\]/g, '\\$&')}](${MENTION_HREF_PREFIX})`
+}
+
+/**
+ * Render wire tokens as mention links that `MarkdownText` draws as highlighted
+ * tags. Only for markdown renderers; plain-text callers use `renderMentions`.
+ */
+export function renderMentionsMarkdown(text: string, names: MentionNames): string {
+  return text
+    .replace(/<@u:([^>]+)>/g, (_m, id) => mentionLink(`@${names.users.get(id) ?? 'someone'}`))
+    .replace(/<@a:(ws|p:[^>]+)>/g, (_m, key) => mentionLink(`@${names.agents.get(key) ?? 'agent'}`))
+    .replace(/<!(here|channel)>/g, (_m, which) => mentionLink(`@${which}`))
+    .replace(/<#c:([^>]+)>/g, (_m, id) => mentionLink(`#${names.conversations?.get(id) ?? 'channel'}`))
+    .replace(/<@g:([^>]+)>/g, (_m, id) => mentionLink(`@${names.groups?.get(id) ?? 'group'}`))
+    .replace(/<#p:([^>]+)>/g, (_m, id) => mentionLink(names.projects?.get(id) ?? 'project'))
+    .replace(/<!date:([^>]+)>/g, (_m, value) => mentionLink(dateTokenLabel(value)))
+}
+
 /** Mention tokens as plain `@name` labels, leaving the message's own markdown alone. */
 function renderMentionLabels(text: string, names: MentionNames): string {
   return text
@@ -429,7 +500,7 @@ interface InlineStyle {
  * Mirrors `flattenMarkdownBlocks` in the API's `conversation-mentions`.
  */
 export function flattenMarkdownBlocks(text: string): string {
-  let source = text.replace(/\r\n/g, '\n')
+  let source = normalizeRichTextPaste(text).replace(/\r\n/g, '\n')
   source = source.replace(/```[^\n]*\n([\s\S]*?)```/g, (_m, code: string) => code.replace(/\n+$/, ''))
   source = source.replace(/~~~[^\n]*\n([\s\S]*?)~~~/g, (_m, code: string) => code.replace(/\n+$/, ''))
   source = source.replace(/^[ \t]*```[^\n]*$/gm, '')

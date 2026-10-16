@@ -28,15 +28,23 @@ import {
   CAPABILITY_INFO,
   CAPABILITY_KEYS,
   mergeCapabilitySettingsIntoConfig,
-  normalizeCapabilitySettings,
   type CapabilityKey,
   type CapabilitySettings,
 } from '@shogo/shared-runtime/capability-settings'
 import type { ToolContext } from './gateway-tools'
-import { textResult } from './gateway-tools'
-import { capabilityState, effectiveCapabilityValue, lockedCapabilityKeys } from './capability-status-prompt'
+import { BACKGROUND_TASK_HINT, textResult } from './gateway-tools'
+import { trackRemoteTask } from './remote-tasks'
+import { capabilityState, effectiveCapabilityValue, lockedCapabilityKeys, resolveRuntimeCapabilities } from './capability-status-prompt'
 import { resolveWorkspaceConfigFilePath } from './workspace-defaults'
+import { isMetalRuntime } from './remote-tools'
+import { availableModelsHint, isAvailableModel } from './available-models'
+import { channelIdentity } from './channel-tools'
 import {
+  agentBoardsRequest,
+  createTrigger,
+  deleteTrigger,
+  listTriggers,
+  updateTrigger,
   attachProject as apiAttachProject,
   callProjectAgent as apiCallProjectAgent,
   configureProject as apiConfigureProject,
@@ -47,6 +55,7 @@ import {
   hasInternalApiCredentials,
   listTeamChannels,
   projectScopedId,
+  syncTeamChannelOwnership,
   upsertTeamChannel,
   type ProjectGraphNode,
 } from './internal-api'
@@ -55,8 +64,14 @@ import {
   IMPLICIT_ANCHOR,
   isSafeRelativePath,
   parseSystemManifest,
+  manifestHints,
+  resolveAgentRef,
   summarizeDiff,
+  type BoardOp,
+  type LiveBoard,
   type LiveProject,
+  type LiveTrigger,
+  type TriggerSpec,
   type LiveTeamChannels,
   type SystemDiff,
   type SystemLock,
@@ -116,7 +131,7 @@ export function resolveProjectDir(ctx: ToolContext, projectId: string): string |
 }
 
 /** Resolve a project reference (id, exact name, or manifest key via lock) to an id. */
-async function resolveProjectRef(
+export async function resolveProjectRef(
   ctx: ToolContext,
   ref: string,
 ): Promise<{ id: string; name: string } | { error: string; code: string }> {
@@ -159,6 +174,13 @@ function writeLock(ctx: ToolContext, lock: SystemLock): void {
   writeFileSync(p, JSON.stringify(lock, null, 2) + '\n', 'utf-8')
 }
 
+function settingsObject(settings: unknown): Record<string, unknown> {
+  if (typeof settings === 'string') {
+    try { return settingsObject(JSON.parse(settings)) } catch { return {} }
+  }
+  return settings && typeof settings === 'object' && !Array.isArray(settings) ? settings as Record<string, unknown> : {}
+}
+
 function toLive(nodes: ProjectGraphNode[]): LiveProject[] {
   return nodes.map((n) => ({
     id: n.id,
@@ -166,7 +188,42 @@ function toLive(nodes: ProjectGraphNode[]): LiveProject[] {
     description: n.description,
     attachments: n.attachments,
     agent: n.agent,
+    capabilities: settingsObject(n.settings),
   }))
+}
+
+/** Manifest trigger → the triggers API body. */
+function triggerBody(spec: TriggerSpec, idOf: (key: string) => string | null) {
+  const card = spec.card
+  return {
+    name: spec.name,
+    filter: spec.filter ?? null,
+    prompt: spec.prompt,
+    notifyConversationId: spec.notify ?? null,
+    enabled: spec.enabled,
+    ...(spec.target === 'project' ? { targetProjectId: spec.project ? idOf(spec.project) ?? undefined : undefined, targetMode: spec.mode ?? 'agent' } : {}),
+    ...(card ? {
+      workItemTarget: {
+        board: card.board,
+        channel: card.channel,
+        column: card.column,
+        dedupeKey: card.dedupeKey,
+        mapping: {
+          title: card.title,
+          description: card.description,
+          message: card.description,
+          priority: card.priority,
+          externalRef: card.externalRef,
+          dueAt: card.dueAt,
+          fields: card.fields,
+          stack: card.stack,
+          environment: card.environment,
+          release: card.release,
+          url: card.url,
+        },
+      },
+    } : {}),
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -217,6 +274,7 @@ export function createProjectCreateTool(ctx: ToolContext): AgentTool {
       'Create a new Shogo project in this workspace. Each project is a module: its own AGENTS.md, .shogo/agents/*.md, skills, database, canvas UI, heartbeat and history.',
       'By default the new project is attached read-write to the current one so you can write its prompt files and call its agent with project_call.',
       'Pass `techStackId` (e.g. "react-app") for a project that needs a UI/dashboard; omit it for a prompt-only agent project.',
+      'In the AGENTS.md you write for it, do not tell it to tag you (or any agent) when it finishes: cards it moves and calls it answers already notify you, and agents that are told to tag back tend to loop.',
     ].join(' '),
     parameters: Type.Object({
       name: Type.String({ description: 'Display name (unique within the workspace is strongly recommended).' }),
@@ -261,9 +319,11 @@ export function createProjectCreateTool(ctx: ToolContext): AgentTool {
         attachment,
         mounted,
         projectDir: resolveProjectDir(ctx, created.data.id),
-        note: mounted
-          ? `Project files are reachable at ${resolveProjectDir(ctx, created.data.id) ?? '<sibling folder>'}. Write its AGENTS.md next.`
-          : 'Attachment recorded. Files become reachable on the next runtime start; use project_call to talk to it meanwhile, or system_apply to write its files.',
+        note: isMetalRuntime()
+          ? `Write its files with write_file / edit_file and \`project: "${created.data.id}"\` (they run in that project's own runtime). Write its AGENTS.md next.`
+          : mounted
+            ? `Project files are reachable at ${resolveProjectDir(ctx, created.data.id) ?? '<sibling folder>'}. Write its AGENTS.md next.`
+            : 'Attachment recorded. Files become reachable on the next runtime start; use project_call to talk to it meanwhile, or system_apply to write its files.',
       })
     },
   }
@@ -277,8 +337,9 @@ export function createProjectAttachTool(ctx: ToolContext): AgentTool {
   return {
     name: 'project_attach',
     label: 'Attach Project',
-    description:
-      'Attach an existing workspace project to the current project so its files appear as a sibling folder (readwrite lets you edit its prompts; readonly is for inspection). Idempotent; re-running with a different mode changes the mode.',
+    description: isMetalRuntime()
+      ? 'Attach an existing workspace project to the current project (readwrite lets you edit it; readonly is for inspection). Its files are not mounted here: work in it with `connect_project` and the `project` parameter of the file and shell tools. Idempotent; re-running with a different mode changes the mode.'
+      : 'Attach an existing workspace project to the current project so its files appear as a sibling folder (readwrite lets you edit its prompts; readonly is for inspection). Idempotent; re-running with a different mode changes the mode.',
     parameters: Type.Object({
       project: Type.String({ description: 'Project id, exact name, or manifest key.' }),
       mode: Type.Optional(Type.Union([Type.Literal('readwrite'), Type.Literal('readonly')], { description: 'Default readwrite.' })),
@@ -333,7 +394,7 @@ export function createProjectConfigureTool(ctx: ToolContext): AgentTool {
       project: Type.Optional(Type.String({ description: 'Project id, name, or manifest key. Default: current project.' })),
       name: Type.Optional(Type.String()),
       description: Type.Optional(Type.String()),
-      model: Type.Optional(Type.String({ description: 'Default model id/alias for the agent (e.g. "claude-haiku-4-5").' })),
+      model: Type.Optional(Type.String({ description: `Default model for the agent. Defaults to "auto" (recommended). ${availableModelsHint()}` })),
       provider: Type.Optional(Type.String({ description: 'Model provider (usually inferred).' })),
       heartbeatEnabled: Type.Optional(Type.Boolean()),
       heartbeatInterval: Type.Optional(Type.Number({ description: 'Seconds, minimum 60.' })),
@@ -355,6 +416,9 @@ export function createProjectConfigureTool(ctx: ToolContext): AgentTool {
       }
       if (p.heartbeatInterval !== undefined && p.heartbeatInterval < 60) {
         return textResult({ error: 'heartbeatInterval must be at least 60 seconds' })
+      }
+      if (p.model !== undefined && !isAvailableModel(p.model)) {
+        return textResult({ error: `Model "${p.model}" is not available in this workspace. ${availableModelsHint()}` })
       }
 
       const agent: Record<string, unknown> = {}
@@ -406,7 +470,7 @@ function capabilityChangesSchema() {
 }
 
 function capabilityStatus(config: ToolContext['config'], changed: boolean) {
-  const caps = normalizeCapabilitySettings(config)
+  const caps = resolveRuntimeCapabilities(config as unknown as Record<string, unknown>)
   const view = capabilityState(config)
   const resolved: CapabilitySettings = { ...caps }
   for (const key of view.locked) {
@@ -466,7 +530,7 @@ export function createCapabilitiesConfigureTool(ctx: ToolContext): AgentTool {
         return textResult({ error: 'changes must be an object of capability flags', code: 'bad_request' })
       }
 
-      const current = normalizeCapabilitySettings(ctx.config)
+      const current = resolveRuntimeCapabilities(ctx.config as unknown as Record<string, unknown>)
       const locked = new Set(lockedCapabilityKeys(ctx.config.capabilityProfile))
       const patch: Partial<CapabilitySettings> = {}
       for (const [key, value] of Object.entries(raw)) {
@@ -526,7 +590,7 @@ export function createProjectCallTool(ctx: ToolContext): AgentTool {
     description: [
       'Send a message to another project\'s agent and (by default) wait for its reply. This is how one module of a multi-project system invokes the next: intake calls analyst, planner calls implementer, and so on.',
       'Always pass the same `runId` for every hop of one piece of work; a new one is minted and returned when omitted. The callee runs in its own session `run:<runId>` and every cost metric it emits is stamped with that runId, so the run can be traced across projects.',
-      'Use `wait: false` for long jobs and let the callee report back via project_call to you, or poll its outputs.',
+      'Use `wait: false` for long jobs: the call runs in the background as a task and its reply arrives like any other task result.',
     ].join(' '),
     parameters: Type.Object({
       project: Type.String({ description: 'Target project id, exact name, or manifest key.' }),
@@ -556,12 +620,14 @@ export function createProjectCallTool(ctx: ToolContext): AgentTool {
         dynamic: true,
         preliminary: true,
       })
+      const background = p.wait === false
       const res = await apiCallProjectAgent(target.id, {
         message: p.message,
         runId,
-        wait: p.wait !== false,
+        wait: !background,
         timeoutMs: p.timeoutMs,
         callerProjectId: ctx.projectId,
+        ...(background ? { track: true } : {}),
       })
       if (!res.ok || !res.data) {
         return textResult({
@@ -578,6 +644,23 @@ export function createProjectCallTool(ctx: ToolContext): AgentTool {
                 ? 'The requester is not allowed to do that.'
                 : undefined,
         })
+      }
+      if (background && res.data.tracked && ctx.commandRegistry && ctx.sessionId) {
+        const task = await trackRemoteTask(ctx.commandRegistry, ctx.sessionId, {
+          source: 'project_call',
+          targetRef: `${target.id}:${runId}`,
+          title: `${target.name}: ${p.message.replace(/\s+/g, ' ').slice(0, 80)}`,
+        })
+        if (task) {
+          return textResult({
+            ok: true,
+            project: { id: target.id, name: target.name },
+            runId,
+            ...task,
+            chatSessionId: res.data.chatSessionId ?? res.data.sessionId,
+            hint: BACKGROUND_TASK_HINT,
+          })
+        }
       }
       const reply = res.data.reply ?? null
       const urls = reply
@@ -631,9 +714,10 @@ export function createSystemApplyTool(ctx: ToolContext): AgentTool {
     name: 'system_apply',
     label: 'Apply System Manifest',
     description: [
-      'Reconcile a `shogo-system.yaml` manifest against the workspace: create missing projects, attach them as declared, set heartbeat/model, write each project\'s prompt files (AGENTS.md, HEARTBEAT.md, .shogo/agents/*.md), and create the `teamChannels` the agents work in with their members.',
+      'Reconcile a `shogo-system.yaml` manifest against the workspace: create missing projects, attach them as declared, set heartbeat/model/capabilities, write each project\'s prompt files (AGENTS.md, HEARTBEAT.md, .shogo/agents/*.md), create the `teamChannels` the agents work in with their members and `boards`, and set up `triggers` (including ones that turn events into cards).',
       'Idempotent: a second run reports an empty diff. Bindings from manifest key to project id are recorded in .shogo/system.lock.json so renames do not create duplicates.',
-      'Run with `dryRun: true` first and show the plan to the user before applying. Channels and integrations are listed under `manual` because they need credentials.',
+      'This is also how you create a team channel or change one (privacy, topic, members): edit its `teamChannels` entry and apply.',
+      'Run with `dryRun: true` first. If the plan does only what the person asked for, apply it; if it changes more, show the plan and ask before applying. Chat integrations and external channels are listed under `manual` because they need credentials.',
     ].join(' '),
     parameters: Type.Object({
       manifestPath: Type.Optional(Type.String({ description: `Path relative to the project root (default "${DEFAULT_MANIFEST_PATH}").` })),
@@ -659,8 +743,18 @@ export function createSystemApplyTool(ctx: ToolContext): AgentTool {
       }
 
       const parsed = parseSystemManifest(source)
-      if (!parsed.ok || !parsed.manifest) return textResult({ error: 'Manifest is invalid', issues: parsed.errors })
+      if (!parsed.ok || !parsed.manifest) return textResult({ error: 'Manifest is invalid', issues: parsed.errors, hints: manifestHints(parsed.errors) })
       const manifest = parsed.manifest
+
+      const unavailable = manifest.projects
+        .filter((pr) => pr.agent?.model !== undefined && !isAvailableModel(pr.agent.model))
+        .map((pr) => `${pr.key}: ${pr.agent?.model}`)
+      if (unavailable.length > 0) {
+        return textResult({
+          error: `Manifest uses models not available in this workspace (${unavailable.join(', ')}). ${availableModelsHint()}`,
+          code: 'model_unavailable',
+        })
+      }
 
       const graphRes = await apiGetWorkspaceProjectGraph(workspaceId)
       if (!graphRes.ok || !graphRes.data) return apiFailure(graphRes)
@@ -685,7 +779,32 @@ export function createSystemApplyTool(ctx: ToolContext): AgentTool {
         if (res.ok && res.data) teamChannels = res.data
       }
 
-      const diff = computeSystemDiff(manifest, live, lock, { callerProjectId: ctx.projectId, readFile, teamChannels })
+      const work = resolveRuntimeCapabilities(ctx.config as unknown as Record<string, unknown>)
+      const boardIdentity = channelIdentity(ctx).projectId
+      let boards: LiveBoard[] | undefined
+      let boardsUnavailable: string | undefined
+      if (manifest.teamChannels.some((c) => c.boards.length)) {
+        if (!work.boardsEnabled || !work.boardAdminEnabled) {
+          boardsUnavailable = 'board management is off for this agent (turn on Boards and Board Management)'
+        } else {
+          const res = await agentBoardsRequest<{ boards: LiveBoard[] }>(workspaceId, 'GET', '/agent-boards', { query: { includeArchived: true, projectId: boardIdentity } })
+          if (res.ok && res.data) boards = res.data.boards ?? []
+          else boardsUnavailable = `boards could not be read (${res.error ?? 'failed'})`
+        }
+      }
+      let triggers: LiveTrigger[] | undefined
+      let triggersUnavailable: string | undefined
+      if (manifest.triggers.length || Object.keys(lock?.triggers ?? {}).length) {
+        if (!work.workTriggersEnabled) triggersUnavailable = 'trigger changes are off for this agent (turn on Triggers)'
+        else if (!ctx.userId) triggersUnavailable = 'triggers run as a person, and no one started this run'
+        else {
+          const res = await listTriggers(workspaceId)
+          if (res.ok && res.data) triggers = res.data
+          else triggersUnavailable = `triggers could not be read (${res.error ?? 'failed'})`
+        }
+      }
+
+      const diff = computeSystemDiff(manifest, live, lock, { callerProjectId: ctx.projectId, readFile, teamChannels, boards, boardsUnavailable, triggers, triggersUnavailable })
       const report: ApplyReport = {
         ok: true,
         dryRun: p.dryRun === true,
@@ -840,24 +959,127 @@ export function createSystemApplyTool(ctx: ToolContext): AgentTool {
           removeAgentProjectIds: op.removeAgents.map((r) => r.projectId),
           userEmails: op.userEmails,
           groupHandles: op.groupHandles,
+          system: ctx.projectId,
+          ...(ctx.userId ? { onBehalfOfUserId: ctx.userId } : {}),
         })
         if (!res.ok) report.errors.push(`channel #${op.name}: ${res.error ?? 'failed'}${res.code ? ` (${res.code})` : ''}`)
         else report.applied.push(`${res.data?.created ? 'create' : 'update'} channel #${op.name}`)
       }
+      // Declared channels can't be deleted out from under the system; ones this
+      // manifest no longer declares can be again. Protection is bookkeeping, so
+      // only releases are reported. Not fatal: an older API lacks the endpoint.
+      const ownership = await syncTeamChannelOwnership(workspaceId, ctx.projectId, manifest.teamChannels.map((ch) => ch.name))
+      if (!ownership.ok) report.skipped.push(`channel ownership: ${ownership.error ?? 'failed'}`)
+      else for (const name of ownership.data?.released ?? []) report.applied.push(`release channel #${name}`)
 
-      // 6. Lock.
+      // 6. Boards (after channels, so they have somewhere to live).
+      const appliedBindings: Record<string, string> = {}
+      for (const pr of manifest.projects) {
+        const id = idOf(pr.key)
+        if (id) appliedBindings[pr.key] = id
+      }
+      const agentRef = (ref: string | null | undefined) => (ref == null ? ref : resolveAgentRef(ref, appliedBindings))
+      const columnBody = (v: Record<string, unknown>) => ({ ...v, ...(v.agent !== undefined ? { agent: agentRef(v.agent as string | null) } : {}) })
+      for (const op of diff.boards) {
+        const failed = await applyBoardOp(workspaceId, op, { system: ctx.projectId, projectId: boardIdentity, sessionId: ctx.sessionId }, agentRef, columnBody)
+        if (failed) report.errors.push(`board #${op.channel} ${op.name}: ${failed}`)
+        else report.applied.push(`${op.action} board #${op.channel} ${op.name}`)
+      }
+
+      // 7. Triggers. Each runs as the person who started this run.
+      const triggerLock: Record<string, { id: string; hash: string }> = { ...(lock?.triggers ?? {}) }
+      for (const op of diff.triggers) {
+        if (!ctx.userId) break
+        if (op.action === 'delete') {
+          const res = await deleteTrigger(workspaceId, op.triggerId!, ctx.userId)
+          if (!res.ok) report.errors.push(`trigger ${op.key}: ${res.error ?? 'delete failed'}`)
+          else { delete triggerLock[op.key]; report.applied.push(`delete trigger ${op.key}`) }
+          continue
+        }
+        const spec = op.spec!
+        const body = triggerBody(spec, idOf)
+        if (op.action === 'update') {
+          const res = await updateTrigger(workspaceId, op.triggerId!, { userId: ctx.userId, ...body } as any)
+          if (!res.ok) { report.errors.push(`trigger ${op.key}: ${res.error ?? 'update failed'}${res.code ? ` (${res.code})` : ''}`); continue }
+          triggerLock[op.key] = { id: op.triggerId!, hash: op.hash! }
+          report.applied.push(`update trigger ${op.key}`)
+          continue
+        }
+        if (op.action === 'replace') {
+          const res = await deleteTrigger(workspaceId, op.triggerId!, ctx.userId)
+          if (!res.ok) { report.errors.push(`trigger ${op.key}: ${res.error ?? 'replace failed'}`); continue }
+        }
+        const res = await createTrigger(workspaceId, {
+          userId: ctx.userId,
+          eventType: spec.event,
+          target: spec.target,
+          triggerConfig: spec.config,
+          ...body,
+        } as any)
+        if (!res.ok || !res.data) {
+          report.errors.push(`trigger ${op.key}: ${res.error ?? 'create failed'}${res.code ? ` (${res.code})` : ''}`)
+          if (op.action === 'replace') delete triggerLock[op.key]
+          continue
+        }
+        triggerLock[op.key] = { id: res.data.trigger.id, hash: op.hash! }
+        report.applied.push(`${op.action} trigger ${op.key}`)
+      }
+
+      // 8. Lock.
       const finalBindings: Record<string, string> = {}
       for (const spec of manifest.projects) {
         const id = idOf(spec.key)
         if (id) finalBindings[spec.key] = id
       }
       for (const op of diff.inaccessible) finalBindings[op.key] = op.projectId
-      writeLock(ctx, { version: 1, name: manifest.name, bindings: finalBindings })
+      writeLock(ctx, {
+        version: 1,
+        name: manifest.name,
+        bindings: finalBindings,
+        ...(Object.keys(triggerLock).length ? { triggers: triggerLock } : {}),
+      })
       report.bindings = finalBindings
       report.ok = report.errors.length === 0
       return textResult(report)
     },
   }
+}
+
+/** Apply one board op through the agent-boards API; returns an error message, or null. */
+async function applyBoardOp(
+  workspaceId: string,
+  op: BoardOp,
+  identity: { system: string; projectId: string | null; sessionId?: string },
+  agentRef: (ref: string | null | undefined) => string | null | undefined,
+  columnBody: (v: Record<string, unknown>) => Record<string, unknown>,
+): Promise<string | null> {
+  const who = { projectId: identity.projectId, sessionId: identity.sessionId }
+  const values = {
+    ...op.values,
+    ...(op.values.default_agent !== undefined ? { default_agent: agentRef(op.values.default_agent) } : {}),
+    ...(op.values.columns ? { columns: op.values.columns.map((c) => columnBody(c as unknown as Record<string, unknown>)) } : {}),
+  }
+  if (op.action === 'create') {
+    const res = await agentBoardsRequest(workspaceId, 'POST', '/agent-boards', { body: { ...values, name: op.name, channel: op.channel, system: identity.system, ...who } })
+    return res.ok ? null : `${res.error ?? 'create failed'}${res.code ? ` (${res.code})` : ''}`
+  }
+  const board = encodeURIComponent(op.boardId!)
+  if (op.action === 'restore') {
+    const res = await agentBoardsRequest(workspaceId, 'POST', `/agent-boards/${board}/archive`, { body: { archived: false, ...who } })
+    if (!res.ok) return res.error ?? 'restore failed'
+  }
+  if (Object.keys(values).length) {
+    const res = await agentBoardsRequest(workspaceId, 'PATCH', `/agent-boards/${board}`, { body: { ...values, ...who } })
+    if (!res.ok) return res.error ?? 'update failed'
+  }
+  for (const col of op.columns) {
+    const body = { ...columnBody(col.values as Record<string, unknown>), ...(col.after ? { after: col.after } : {}), ...who }
+    const res = col.action === 'create'
+      ? await agentBoardsRequest(workspaceId, 'POST', `/agent-boards/${board}/columns`, { body: { ...body, name: col.column } })
+      : await agentBoardsRequest(workspaceId, 'PATCH', `/agent-boards/${board}/columns/${encodeURIComponent(col.column)}`, { body })
+    if (!res.ok) return `column ${col.column}: ${res.error ?? 'failed'}`
+  }
+  return null
 }
 
 // ---------------------------------------------------------------------------

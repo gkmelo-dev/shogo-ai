@@ -9,7 +9,7 @@ import { createElement, memo, useCallback, useEffect, useRef, useState, type Rea
 import { ActionSheetIOS, Alert, Image, Linking, Modal, Platform, Pressable, Text, TextInput, View } from 'react-native'
 import { useRouter } from 'expo-router'
 import * as Clipboard from 'expo-clipboard'
-import { AlarmClock, AlertCircle, Bookmark, Check, CircleDot, CornerDownRight, FileText, Link2, Loader2, MessageSquare, MoreHorizontal, Pencil, Pin, SmilePlus, Square, Trash2 } from 'lucide-react-native'
+import { AlarmClock, AlertCircle, Bookmark, Check, CircleDot, CornerDownRight, KanbanSquare, Link2, Loader2, MessageSquare, MoreHorizontal, Pencil, Pin, SmilePlus, Square, Trash2 } from 'lucide-react-native'
 import { cn } from '@shogo/shared-ui/primitives'
 import { ChatMarkdown } from '../chat/ChatMarkdown'
 import { SidebarContextMenu, type SidebarMenuEntry } from '../layout/SidebarContextMenu'
@@ -22,16 +22,29 @@ import { AgentAvatar } from './AgentAvatar'
 import { AgentProfileCard } from './AgentProfileCard'
 import { PersonCardById } from './PersonProfileCard'
 import { ApprovalCardView, StatusCardView } from './AgentStatus'
-import { approvalOf, messageKind, statusCardOf, workOf } from '../../lib/team-chat-kinds'
+import { QuestionCardView } from './QuestionCard'
+import { approvalOf, connectRequestsOf, isAskedOf, messageKind, questionRefsOf, questionsOf, statusCardOf, workOf } from '../../lib/team-chat-kinds'
+import { continueAfterConnect } from '../../lib/question-answer'
+import { IntegrationConnectCard } from '../chat/IntegrationConnectCard'
+import { ImagePreviewModal } from '../chat/ImagePreviewModal'
 import { AgentWorkedFor, AgentWorkingStatus } from './AgentWork'
-import { renderMentions, type MentionNames } from '../../lib/team-chat-state'
+import { renderMentions, renderMentionsMarkdown, type MentionNames } from '../../lib/team-chat-state'
+import { isVoiceNote } from '../../lib/voice-note'
+import { VoiceNotePlayer } from './VoiceNotePlayer'
+import { DownloadBadge, FileAttachmentCard } from './FileAttachmentCard'
+import { hasReacted, reactionTooltip } from '../../lib/team-chat-reactions'
+import { WebTooltip } from '../chat/WebTooltip'
 import { useUserStatus } from '../../hooks/useChatPrefs'
 import { PresenceDot } from './PresenceDot'
+import { resolveAvatarUrl } from '../../lib/chat-attachment-url'
 import { toggleSaved, useIsSaved } from '../../hooks/useChatItems'
 import { customEmojiFor, jumboEmojiCodes, useCustomEmoji } from '../../hooks/useCustomEmoji'
 import { useEditRequest } from '../../hooks/useChatShortcuts'
 
 export const QUICK_REACTIONS = ['👍', '✅', '👀', '🎉', '❤️', '😂']
+
+/** Above this, an update carrying a question for the viewer folds behind "Show full update". */
+const LONG_UPDATE_CHARS = 600
 
 const api = teamChatApi()
 
@@ -62,7 +75,8 @@ export interface MessageRowProps {
   workspaceId?: string
   inThread?: boolean
   onReply?: (message: ChatMessage) => void
-  onReact: (message: ChatMessage, emoji: string) => void
+  /** Add (`on: true`) or remove (`on: false`) a reaction; omit to let the handler toggle. */
+  onReact: (message: ChatMessage, emoji: string, on?: boolean) => void
   onEdit: (message: ChatMessage, text: string) => Promise<void>
   onDelete: (message: ChatMessage) => void
   onStopAgent: (message: ChatMessage) => void
@@ -73,6 +87,8 @@ export interface MessageRowProps {
   onOpenProjectPane?: (projectId: string, name: string) => void
   /** Move the read line back to just before this message. */
   onMarkUnread?: (message: ChatMessage) => void
+  /** Turn this message into a card on one of the channel's boards. */
+  onMakeCard?: (message: ChatMessage) => void
   /** Briefly emphasized after opening a link to it. */
   highlighted?: boolean
 }
@@ -125,12 +141,6 @@ function TimeTooltip({ iso, align = 'center', children }: { iso: string; align?:
   )
 }
 
-function formatBytes(size: number): string {
-  if (size < 1024) return `${size} B`
-  if (size < 1024 * 1024) return `${Math.round(size / 1024)} KB`
-  return `${(size / (1024 * 1024)).toFixed(1)} MB`
-}
-
 function initials(name: string): string {
   return name.split(/\s+/).filter(Boolean).slice(0, 2).map((w) => w[0]!.toUpperCase()).join('') || '?'
 }
@@ -160,7 +170,7 @@ function Avatar({ message, onPress }: { message: ChatMessage; onPress?: () => vo
   const avatar = (
     <View className="relative">
       {message.author?.image ? (
-        <Image source={{ uri: message.author.image }} className="h-8 w-8 rounded-lg" accessibilityIgnoresInvertColors />
+        <Image source={{ uri: resolveAvatarUrl(message.author.image) ?? undefined }} className="h-8 w-8 rounded-lg" accessibilityIgnoresInvertColors />
       ) : (
         <View className="h-8 w-8 items-center justify-center rounded-lg bg-secondary">
           <Text className="text-xs font-semibold text-secondary-foreground">{initials(name)}</Text>
@@ -224,7 +234,7 @@ function UnfurlCards({ message }: { message: ChatMessage }) {
             {u.description ? <Text className="mt-0.5 text-xs text-muted-foreground" numberOfLines={3}>{u.description}</Text> : null}
           </View>
           {u.image ? (
-            <Image source={{ uri: u.image }} className="h-16 w-16 rounded" resizeMode="cover" accessibilityIgnoresInvertColors />
+            <Image source={{ uri: resolveAvatarUrl(u.image) ?? undefined }} className="h-16 w-16 rounded" resizeMode="cover" accessibilityIgnoresInvertColors />
           ) : null}
         </Pressable>
       ))}
@@ -290,7 +300,22 @@ function MessageRowImpl(props: MessageRowProps) {
   const onBehalfOf = message.authorType === 'agent' ? onBehalfOfName(message) : null
   const canOpenSession = message.authorType === 'agent' && !!message.agentSessionId && !!props.onOpenSession
   const work = !running && message.authorType === 'agent' ? workOf(message) : null
+  const connectRequests = !running && message.authorType === 'agent' ? connectRequestsOf(message) : []
+  const [continuedConnects, setContinuedConnects] = useState<string[]>([])
+  const questions = !running && message.authorType === 'agent' ? questionsOf(message) : []
+  const questionRefs = !running && message.authorType === 'agent' ? questionRefsOf(message) : []
+  const openQuestion = questions.some((q) => q.status === 'open')
+  const askedOfMe = questions.some((q) => q.status === 'open' && isAskedOf(q, me))
+  const [showFullUpdate, setShowFullUpdate] = useState(false)
+  const foldBody = askedOfMe && !showFullUpdate && (body?.length ?? 0) > LONG_UPDATE_CHARS
   const isWeb = Platform.OS === 'web'
+  // Clicking an image opens the same viewer the agent chat uses instead of
+  // handing the URL to the browser. The gallery is the message's own images,
+  // so a post with several can be stepped through.
+  const [lightboxIndex, setLightboxIndex] = useState<number | null>(null)
+  const imageAttachments = deleted ? [] : message.attachments.filter((a) => a.mimeType.startsWith('image/'))
+  const imageIndexById = new Map(imageAttachments.map((a, index) => [a.id, index]))
+  const activeLightboxImage = lightboxIndex === null ? null : imageAttachments[lightboxIndex] ?? null
   useEditRequest(message.id, () => {
     if (!mine || deleted || message.authorType !== 'user') return
     setDraft(message.text)
@@ -316,10 +341,15 @@ function MessageRowImpl(props: MessageRowProps) {
   }
   const canAct = !deleted && !message.pending && message.authorType !== 'system'
 
+  /** Clicking a reaction you already have removes it; otherwise it adds it. */
+  const toggleReact = (emoji: string) => {
+    props.onReact(message, emoji, !hasReacted(message.reactions, emoji, props.me))
+  }
+
   const openActions = () => {
     if (deleted || message.pending) return
     const options: Array<{ label: string; run: () => void; destructive?: boolean }> = [
-      ...QUICK_REACTIONS.slice(0, 4).map((emoji) => ({ label: emoji, run: () => props.onReact(message, emoji) })),
+      ...QUICK_REACTIONS.slice(0, 4).map((emoji) => ({ label: emoji, run: () => toggleReact(emoji) })),
       { label: 'Add reaction…', run: () => setPickerOpen(true) },
     ]
     if (props.onReply && !inThread) options.push({ label: 'Reply in thread', run: () => props.onReply!(message) })
@@ -328,6 +358,7 @@ function MessageRowImpl(props: MessageRowProps) {
     options.push({ label: saved ? 'Remove from saved' : 'Save for later', run: save })
     if (props.workspaceId) options.push({ label: 'Remind me in 1 hour', run: () => remind(REMIND_OPTIONS[1].at()) })
     if (props.canPin) options.push({ label: message.pinned ? 'Unpin' : 'Pin to conversation', run: pin })
+    if (props.onMakeCard && canAct) options.push({ label: 'Make a card', run: () => props.onMakeCard!(message) })
     if (mine && message.authorType === 'user') options.push({ label: 'Edit', run: () => { setDraft(message.text); setEditing(true) } })
     if (mine || canManage) options.push({ label: 'Delete', run: () => props.onDelete(message), destructive: true })
     if (Platform.OS === 'ios') {
@@ -358,6 +389,7 @@ function MessageRowImpl(props: MessageRowProps) {
         }
       }
       if (props.canPin) items.push({ label: message.pinned ? 'Unpin' : 'Pin to conversation', icon: icon(Pin, message.pinned ? 'text-amber-600' : undefined), onSelect: pin })
+      if (props.onMakeCard) items.push({ label: 'Make a card', icon: icon(KanbanSquare), onSelect: () => props.onMakeCard!(message) })
     }
     if (mine && message.authorType === 'user') items.push({ label: 'Edit message', icon: icon(Pencil), onSelect: startEditing })
     if (mine || canManage) {
@@ -419,7 +451,7 @@ function MessageRowImpl(props: MessageRowProps) {
       >
         <View className="mt-1.5 h-1.5 w-1.5 rounded-full bg-primary/60" />
         <View className="min-w-0 flex-1">
-          <ChatMarkdown isStreaming={false}>{renderMentions(message.text, names)}</ChatMarkdown>
+          <ChatMarkdown isStreaming={false}>{renderMentionsMarkdown(message.text, names)}</ChatMarkdown>
           {detail ? (
             <Text className="mt-0.5 text-xs text-muted-foreground" numberOfLines={2}>{renderMentions(detail, names)}</Text>
           ) : null}
@@ -495,7 +527,7 @@ function MessageRowImpl(props: MessageRowProps) {
             {onBehalfOf && (
               <Text className="text-[11px] text-muted-foreground">on behalf of {onBehalfOf}</Text>
             )}
-            {(kind === 'decision' && (!approval || approval.status === 'pending')) || kind === 'alert' ? (
+            {(kind === 'decision' && (approval ? approval.status === 'pending' : questions.length ? openQuestion : true)) || kind === 'alert' ? (
               <View className={cn('rounded px-1.5 py-px', kind === 'alert' ? 'bg-destructive/15' : 'bg-amber-500/20')}>
                 <Text className={cn('text-[10px] font-semibold', kind === 'alert' ? 'text-destructive' : 'text-amber-700 dark:text-amber-400')} testID={`kind-${kind}`}>
                   {kind === 'alert' ? 'ALERT' : 'NEEDS A DECISION'}
@@ -561,8 +593,54 @@ function MessageRowImpl(props: MessageRowProps) {
             {card ? <StatusCardView card={card} onOpenLink={openMessageLinkInApp} /> : null}
             {approval ? <ApprovalCardView approval={approval} messageId={message.id} canDecide={!message.pending} onDecide={(decision) => api.decideApproval(message.id, decision)} /> : null}
             {work ? <AgentWorkedFor messageId={message.id} work={work} /> : null}
+            {connectRequests.filter((c) => !continuedConnects.includes(c.provider)).map((c) => (
+              <View key={c.provider} className="mt-1.5 max-w-[520px] rounded-lg border border-border bg-card p-3" testID="connect-card">
+                <IntegrationConnectCard
+                  request={c}
+                  onContinue={(label) => {
+                    setContinuedConnects((prev) => [...prev, c.provider])
+                    void continueAfterConnect({
+                      conversationId: message.conversationId,
+                      messageId: message.id,
+                      threadRootId: message.threadRootId ?? null,
+                      agentProjectId: message.authorAgent?.projectId ?? null,
+                      label,
+                    }).catch(() => setContinuedConnects((prev) => prev.filter((p) => p !== c.provider)))
+                  }}
+                />
+              </View>
+            ))}
+            {questions.length ? (
+              <QuestionCardView
+                questions={questions}
+                messageId={message.id}
+                workspaceId={props.workspaceId ?? message.workspaceId}
+                me={me}
+                names={names}
+                canAnswer={!message.pending}
+                agentName={message.authorAgent?.name}
+              />
+            ) : null}
+            {questionRefs.map((ref) => (
+              <Pressable
+                key={`${ref.messageId}:${ref.questionId}`}
+                onPress={() => router.push({ pathname: '/(app)/c/[conversationId]', params: { conversationId: message.conversationId, msg: ref.messageId } } as any)}
+                accessibilityRole="link"
+                className="mt-1 flex-row items-center gap-1.5 self-start rounded-md border border-amber-500/40 bg-amber-500/10 px-2 py-1 active:bg-amber-500/20"
+                testID="question-ref"
+              >
+                <Text className="text-[11px] font-semibold text-amber-700 dark:text-amber-400">Still waiting</Text>
+                <Text className="text-[11px] text-foreground" numberOfLines={1}>{ref.header}</Text>
+                <Text className="text-[11px] text-primary">View question</Text>
+              </Pressable>
+            ))}
             {/* While an agent works the row shows its status; its closing message appears when it is done. */}
-            {!card && !approval && !!body && !(running && message.authorType === 'agent') && (() => {
+            {!card && !approval && !!body && !(running && message.authorType === 'agent') && foldBody ? (
+              <Pressable onPress={() => setShowFullUpdate(true)} accessibilityRole="button" className="mt-1 self-start" testID="show-full-update">
+                <Text className="text-xs font-medium text-primary">Show full update</Text>
+              </Pressable>
+            ) : null}
+            {!card && !approval && !!body && !foldBody && !(running && message.authorType === 'agent') && (() => {
               const jumbo = running ? null : jumboEmojiCodes(body, customEmoji)
               return (
                 <View className={cn(message.pending && 'opacity-60')}>
@@ -571,7 +649,7 @@ function MessageRowImpl(props: MessageRowProps) {
                       {jumbo.map((code, i) => <ReactionGlyph key={`${code}-${i}`} emoji={code} size={32} />)}
                     </View>
                   ) : (
-                    <ChatMarkdown isStreaming={running} onLinkPress={openMessageLinkInApp}>{renderMentions(body, names)}</ChatMarkdown>
+                    <ChatMarkdown isStreaming={running} onLinkPress={openMessageLinkInApp}>{renderMentionsMarkdown(body, names)}</ChatMarkdown>
                   )}
                 </View>
               )
@@ -616,28 +694,43 @@ function MessageRowImpl(props: MessageRowProps) {
         {!deleted && message.attachments.length > 0 && (
           <View className="mt-1.5 flex-row flex-wrap gap-2">
             {message.attachments.map((a) =>
-              a.mimeType.startsWith('image/') ? (
-                <Pressable key={a.id} onPress={() => Linking.openURL(absoluteApiUrl(a.url))}>
-                  <Image
-                    source={{ uri: absoluteApiUrl(a.url) }}
-                    className="rounded-lg border border-border"
-                    style={{ width: 220, height: a.width && a.height ? Math.min(260, (220 * a.height) / a.width) : 160 }}
-                    resizeMode="cover"
-                    accessibilityLabel={a.name}
-                  />
-                </Pressable>
-              ) : (
-                <Pressable
+              isVoiceNote(a) ? (
+                <VoiceNotePlayer
                   key={a.id}
-                  onPress={() => Linking.openURL(absoluteApiUrl(a.url))}
-                  className="flex-row items-center gap-2 rounded-lg border border-border bg-card px-3 py-2 active:bg-muted"
-                >
-                  <FileText size={16} className="text-muted-foreground" />
-                  <View>
-                    <Text className="text-xs font-medium text-foreground" numberOfLines={1}>{a.name}</Text>
-                    <Text className="text-[10px] text-muted-foreground">{formatBytes(a.size)}</Text>
-                  </View>
-                </Pressable>
+                  attachmentId={a.id}
+                  url={absoluteApiUrl(a.url)}
+                  durationMs={a.durationMs}
+                  peaks={a.peaks}
+                  name={a.name}
+                />
+              ) : a.mimeType.startsWith('image/') ? (
+                <View key={a.id} className="relative">
+                  <Pressable
+                    onPress={() => setLightboxIndex(imageIndexById.get(a.id) ?? 0)}
+                    accessibilityRole="button"
+                    accessibilityLabel={`Open ${a.name}`}
+                    className={isWeb ? 'cursor-pointer' : undefined}
+                  >
+                    <Image
+                      source={{ uri: absoluteApiUrl(a.url) }}
+                      className="rounded-lg border border-border"
+                      style={{ width: 220, height: a.width && a.height ? Math.min(260, (220 * a.height) / a.width) : 160 }}
+                      resizeMode="cover"
+                      accessibilityLabel={a.name}
+                    />
+                  </Pressable>
+                  <DownloadBadge url={absoluteApiUrl(a.url)} name={a.name} />
+                </View>
+              ) : (
+                <FileAttachmentCard
+                  key={a.id}
+                  name={a.name}
+                  mimeType={a.mimeType}
+                  size={a.size}
+                  url={absoluteApiUrl(a.url)}
+                  preview={a.preview}
+                  onOpen={() => void Linking.openURL(absoluteApiUrl(a.url))}
+                />
               ),
             )}
           </View>
@@ -658,19 +751,22 @@ function MessageRowImpl(props: MessageRowProps) {
         {!deleted && message.reactions.length > 0 && (
           <View className="mt-1 flex-row flex-wrap gap-1">
             {message.reactions.map((r) => {
-              const reacted = !!me && r.userIds.includes(me)
+              const reacted = hasReacted(message.reactions, r.emoji, me)
+              const who = reactionTooltip(r.emoji, r.userIds, me, names)
               return (
                 <Pressable
                   key={r.emoji}
-                  onPress={() => props.onReact(message, r.emoji)}
-                  accessibilityLabel={`${r.emoji} ${r.count}`}
+                  onPress={() => toggleReact(r.emoji)}
+                  accessibilityLabel={who}
                   className={cn(
                     'flex-row items-center gap-1 rounded-full border px-2 py-0.5',
                     reacted ? 'border-primary/50 bg-primary/10' : 'border-border bg-card',
                   )}
                 >
-                  <ReactionGlyph emoji={r.emoji} />
-                  <Text className={cn('text-[11px]', reacted ? 'text-primary' : 'text-muted-foreground')}>{r.count}</Text>
+                  <WebTooltip label={who}>
+                    <ReactionGlyph emoji={r.emoji} />
+                    <Text className={cn('text-[11px]', reacted ? 'text-primary' : 'text-muted-foreground')}>{r.count}</Text>
+                  </WebTooltip>
                 </Pressable>
               )
             })}
@@ -693,7 +789,7 @@ function MessageRowImpl(props: MessageRowProps) {
       {isWeb && active && !deleted && !message.pending && !editing && (
         <View className="absolute right-3 -top-3 flex-row items-center rounded-lg border border-border bg-card px-1 py-0.5 shadow-sm">
           {QUICK_REACTIONS.slice(0, 3).map((emoji) => (
-            <Pressable key={emoji} onPress={() => props.onReact(message, emoji)} className="rounded px-1.5 py-1 hover:bg-muted">
+            <Pressable key={emoji} onPress={() => toggleReact(emoji)} className="rounded px-1.5 py-1 hover:bg-muted">
               <Text className="text-sm">{emoji}</Text>
             </Pressable>
           ))}
@@ -735,12 +831,24 @@ function MessageRowImpl(props: MessageRowProps) {
                 workspaceId={props.workspaceId}
                 onPick={(code) => {
                   setPickerOpen(false)
-                  props.onReact(message, code)
+                  toggleReact(code)
                 }}
               />
             </Pressable>
           </Pressable>
         </Modal>
+      )}
+      {lightboxIndex !== null && (
+        <ImagePreviewModal
+          visible
+          onClose={() => setLightboxIndex(null)}
+          url={absoluteApiUrl(activeLightboxImage?.url ?? '')}
+          gallery={imageAttachments.map((a) => ({ url: absoluteApiUrl(a.url), title: a.name, alt: a.name }))}
+          initialIndex={lightboxIndex}
+          mediaType={activeLightboxImage?.mimeType}
+          title={activeLightboxImage?.name ?? 'Image'}
+          alt={activeLightboxImage?.name ?? 'Image attachment'}
+        />
       )}
     </Pressable>
   )

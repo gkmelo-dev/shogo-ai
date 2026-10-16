@@ -15,8 +15,7 @@ import { homeRegionWorkspaceWhere } from '../lib/region'
 import { finishAgentReply, startAgentReply, streamAgentReply } from './chat-providers/outbound'
 import {
   agentKey,
-  collectMentionIds,
-  groupNames,
+  loadNamesForTexts,
   mentionedAgents,
   renderMentionsAsText,
   type AgentTarget,
@@ -44,6 +43,7 @@ import {
   MAX_AGENT_PING_PONG_TURNS,
   MAX_AGENT_TURNS_PER_THREAD,
   nextChain,
+  pingPongRun,
   readChain,
   rootChain,
   threadOwner,
@@ -52,8 +52,9 @@ import {
 } from './conversation-agent-chain'
 import { resolveFriendlyMentions } from './conversation-directory'
 import { expirePendingApprovals, postApprovalCard, type ApprovalRequest } from './conversation-approvals'
-import type { AgentWork, StatusCard } from './conversation-message-kind'
+import type { AgentWork, IntegrationConnectRequest, StatusCard } from './conversation-message-kind'
 import { agentWorkOf } from './agent-work-log'
+import { emitTaskEvent, replyEvent, replyTargetRef } from './background-tasks.service'
 import { DOC_TOKEN_GUIDE, docContextFor } from './conversation-doc.service'
 import { parseMuteCommand, pickResponder, type RelevanceCandidate } from './conversation-agent-relevance'
 
@@ -111,15 +112,23 @@ export async function settleOrphanedAgentReplies(minAgeMs = 0): Promise<number> 
       deletedAt: null,
       ...(home ? { conversation: { workspace: home } } : {}),
     },
-    select: { id: true },
+    select: { id: true, threadRootId: true, authorAgentRef: true },
     take: 500,
   })
-  const ids = stale.map((m: { id: string }) => m.id).filter((id: string) => !running.has(id))
+  const orphans = stale.filter((m: { id: string }) => !running.has(m.id))
+  const ids = orphans.map((m: { id: string }) => m.id)
   if (!ids.length) return 0
   const { count } = await db.conversationMessage.updateMany({
     where: { id: { in: ids }, agentStatus: 'running' },
     data: { agentStatus: 'error', text: 'This reply was interrupted because the server restarted. Mention the agent again to retry.' },
   })
+  const { noteCardRunEnded } = await import('./work-boards.service')
+  for (const m of orphans) {
+    if (!m.threadRootId) continue
+    const projectId = (m.authorAgentRef as { projectId?: string | null } | null)?.projectId ?? null
+    await noteCardRunEnded({ threadRootId: m.threadRootId, projectId, messageId: m.id, agentStatus: 'error' })
+      .catch((err: Error) => console.error('[ChannelAgent] orphaned card run note failed:', err.message))
+  }
   return count
 }
 
@@ -360,13 +369,36 @@ function replyThreadRoot(conversation: any, trigger: any): string | null {
  * mentions in it. Runs the mentioned agents as the next hop of the chain,
  * billed to the person who started it, unless a chain limit trips.
  */
-export async function dispatchAgentsFromAgentMessage(result: Pick<PostMessageResult, 'row' | 'conversation' | 'duplicate'>): Promise<AgentTarget[]> {
-  const { row, conversation } = result
+/** Agents an agent's post hands work to: the ones `dispatchAgentsFromAgentMessage` would start. */
+export async function agentPostTargets(result: Pick<PostMessageResult, 'row' | 'conversation' | 'duplicate'>): Promise<AgentTarget[]> {
+  const { row } = result
   if (result.duplicate || row.authorType !== 'agent') return []
   const chain = readChain(row.agentChain)
   if (!chain?.originUserId || !mentionedAgents(row.text).length) return []
-  const targets = await selectAgentTargets(result, { fromAgent: true })
+  return selectAgentTargets(result, { fromAgent: true })
+}
+
+export async function dispatchAgentsFromAgentMessage(result: Pick<PostMessageResult, 'row' | 'conversation' | 'duplicate'>): Promise<AgentTarget[]> {
+  const { row, conversation } = result
+  const { watchesThreadCard } = await import('./work-boards.service')
+  const threadRootId = replyThreadRoot(conversation, row)
+  const targets: AgentTarget[] = []
+  for (const target of await agentPostTargets(result)) {
+    if (!(await watchesThreadCard(threadRootId, target))) targets.push(target)
+  }
+  return startChained(conversation, row, targets)
+}
+
+/** A card-thread post's tag to the card's watcher, run once the run that wrote it ended without a card update to fold it into. */
+export async function startDeferredReply(row: any, target: AgentTarget): Promise<AgentTarget[]> {
+  const conversation = await db.conversation.findUnique({ where: { id: row.conversationId } })
+  if (!conversation || !readChain(row.agentChain)?.originUserId) return []
+  return startChained(conversation, row, [target])
+}
+
+async function startChained(conversation: any, row: any, targets: AgentTarget[]): Promise<AgentTarget[]> {
   if (!targets.length) return []
+  const chain = readChain(row.agentChain)!
 
   const turns = await agentTurnsSinceHuman(conversation.id, replyThreadRoot(conversation, row))
   const started: AgentTarget[] = []
@@ -376,10 +408,14 @@ export async function dispatchAgentsFromAgentMessage(result: Pick<PostMessageRes
     const limit = chainLimitHit(next)
     if (limit) {
       tripped ??= limit
+      await emitTaskEvent('agent_reply', replyTargetRef(row.id, target.projectId), {
+        status: 'failed',
+        summary: `not started: paused ${pausedReason(limit)}`,
+      })
       continue
     }
     started.push(target)
-    void runAgentReply({ conversation, trigger: row, target, userId: chain.originUserId, chain: next })
+    void runAgentReply({ conversation, trigger: row, target, userId: chain.originUserId!, chain: next })
       .catch((err) => console.error('[ChannelAgent] chained reply failed:', err))
   }
   if (tripped) await postChainPaused(conversation, row, chain, tripped)
@@ -452,20 +488,11 @@ async function createSession(conversation: any, target: AgentTarget, label: stri
  */
 /** Display names for every mention token in `texts`. */
 export async function loadMentionNames(workspaceId: string, texts: string[]): Promise<MentionNames> {
-  const ids = collectMentionIds(texts)
-  const [users, projects, conversations, workspaceAgentName] = await Promise.all([
-    ids.userIds.length ? db.user.findMany({ where: { id: { in: ids.userIds } }, select: { id: true, name: true, email: true } }) : [],
-    ids.projectIds.length ? db.project.findMany({ where: { id: { in: ids.projectIds } }, select: { id: true, name: true } }) : [],
-    ids.conversationIds.length ? db.conversation.findMany({ where: { id: { in: ids.conversationIds } }, select: { id: true, name: true } }) : [],
+  const [names, workspaceAgentName] = await Promise.all([
+    loadNamesForTexts(db, workspaceId, texts),
     agentName(workspaceId, { projectId: null }),
   ])
-  return {
-    users: new Map<string, string>(users.map((u: any) => [u.id, u.name || u.email])),
-    projects: new Map<string, string>(projects.map((p: any) => [p.id, p.name])),
-    conversations: new Map<string, string>(conversations.map((c: any) => [c.id, c.name ?? 'channel'])),
-    groups: await groupNames(db, workspaceId, ids.groupIds),
-    workspaceAgentName,
-  }
+  return { ...names, workspaceAgentName }
 }
 
 export async function renderTranscript(workspaceId: string, history: any[], markMessageId?: string): Promise<string> {
@@ -474,8 +501,12 @@ export async function renderTranscript(workspaceId: string, history: any[], mark
     m.authorType === 'user' ? (m.authorUser?.name || m.authorUser?.email || m.blocks?.externalAuthor?.name || 'Someone')
       : m.authorType === 'agent' ? `${m.authorAgentRef?.name ?? 'Agent'} (agent)`
         : m.authorType === 'bot' ? 'Bot' : 'System'
+  const files = (m: any) => {
+    const list = (m.attachments ?? []).map((a: any) => `${a.name} (file id ${a.id})`)
+    return list.length ? ` [attached: ${list.join(', ')}]` : ''
+  }
   return history
-    .map((m) => `${author(m)}${m.id === markMessageId ? ' [mentions you]' : ''}: ${renderMentionsAsText(m.text, names)}`)
+    .map((m) => `${author(m)}${m.id === markMessageId ? ' [mentions you]' : ''}: ${renderMentionsAsText(m.text, names)}${files(m)}`)
     .join('\n')
 }
 
@@ -587,6 +618,11 @@ async function buildIsolatedPrompt(args: {
   return lines.join('\n')
 }
 
+const TRANSCRIPT_INCLUDE = {
+  authorUser: { select: { name: true, email: true } },
+  attachments: { select: { id: true, name: true } },
+}
+
 async function buildPrompt(args: {
   conversation: any
   trigger: any
@@ -607,17 +643,18 @@ async function buildPrompt(args: {
       where: { conversationId: conversation.id, OR: [{ id: threadRootId }, { threadRootId }], deletedAt: null },
       orderBy: { seq: 'desc' },
       take: CONTEXT_MESSAGES,
-      include: { authorUser: { select: { name: true, email: true } } },
+      include: TRANSCRIPT_INCLUDE,
     })
   } else {
     history = await db.conversationMessage.findMany({
       where: { conversationId: conversation.id, threadRootId: null, deletedAt: null, seq: { lte: trigger.seq } },
       orderBy: { seq: 'desc' },
       take: reusedSession ? 6 : CONTEXT_MESSAGES,
-      include: { authorUser: { select: { name: true, email: true } } },
+      include: TRANSCRIPT_INCLUDE,
     })
   }
-  history = history.reverse().filter((m) => m.text?.trim() && !(m.authorType === 'agent' && m.agentStatus === 'running'))
+  history = history.reverse().filter((m) =>
+    (m.text?.trim() || m.attachments?.length) && !(m.authorType === 'agent' && m.agentStatus === 'running'))
 
   if (reusedSession) {
     const lastAgentIdx = history.map((m) => m.authorType).lastIndexOf('agent')
@@ -638,6 +675,9 @@ async function buildPrompt(args: {
     'Reply to the latest message addressed to you. Write concise Markdown suitable for a chat message.',
     'Do real work with your tools when asked. The team sees only your final reply here; your full session is linked from it.',
     ...chainContext(conversation, trigger, threadRootId, chain),
+    ...(history.some((m) => m.attachments?.length)
+      ? ['Files attached below can be read or searched with fetch_chat_files (pass the file id); download one only when you need the raw file.']
+      : []),
     ...(await channelDocContext(conversation)),
     '',
     transcript,
@@ -676,10 +716,29 @@ function chainContext(conversation: any, trigger: any, threadRootId: string | nu
   if (chain.runId) ids.push(`run id ${chain.runId}`)
   const lines = [`Team chat context: ${ids.join(', ')}.`]
   if (trigger.authorType === 'agent') {
-    lines.push(`${trigger.authorAgentRef?.name ?? 'Another agent'} (an agent) handed this to you.`)
+    const by = trigger.authorAgentRef?.name ?? 'Another agent'
+    lines.push(
+      `${by} (an agent) handed this to you. Your reply lands in this thread where everyone can read it, so do not tag ` +
+        `${by} just to report back, thank it or say you are done; tag it only if it has a next step to take.`,
+      'Agents tagging each other can loop. Act only if this message gives you work you have not done or information ' +
+        'that changes it. If it only acknowledges, thanks, agrees, repeats what you already said or reports work that ' +
+        'needs nothing from you, reply in one line and tag nobody: that ends the exchange.',
+    )
+    const rounds = pingPongRun(chain.hops)
+    if (chain.turns > 1) {
+      lines.push(
+        `So far: ${chain.turns} agent replies in this thread since a person last wrote` +
+          (rounds >= 3 ? `, the last ${rounds} alternating between you and ${by}` : '') + '. ' +
+          'If the recent replies did not move the work forward (the same question, objection or fix again), do not ' +
+          'hand it back again, even with clearer instructions: say where it is stuck and tag the person who asked ' +
+          '(with @; a name without it notifies nobody) for a decision.',
+      )
+    }
   }
   lines.push(
-    'To hand work to another agent, tag them in your reply (e.g. @Planner); they run next in this thread. ' +
+    'Tagging an agent (e.g. @Planner) wakes it: it runs next in this thread. Tag an agent only to hand it a specific task ' +
+      'it has to do now. Never tag agents to acknowledge, agree, thank, give an FYI or sign off; to refer to one, write its ' +
+      'name without the @. Tag at most one agent per reply unless the work truly splits. ' +
       'Tag people only when you need a decision from them.',
     'Write your reply so someone reading the thread later understands it: in two to four sentences, say what you did, ' +
       'what you found or decided and why, and what you need next. No bare "your turn" or "done".',
@@ -813,6 +872,8 @@ export interface StreamSummary {
   /** What the agent said last, after its final tool call. Empty if the run ended on a tool. */
   finalText?: string
   toolCount?: number
+  /** Accounts the run needed someone to connect, one per provider. */
+  connect?: IntegrationConnectRequest[]
   failed: boolean
   error?: string
 }
@@ -842,6 +903,7 @@ export async function readAgentStream(
   let segments = 0
   let tool: string | null = null
   const tools: Array<{ id: string; name: string; done: boolean }> = []
+  const connect: IntegrationConnectRequest[] = []
   let failed = false
   let error: string | undefined
 
@@ -873,6 +935,14 @@ export async function readAgentStream(
       const request = chunk.data ?? chunk
       if (onPermission && typeof request?.id === 'string' && typeof request?.toolName === 'string') onPermission(request)
       return
+    } else if (type === 'data-integration-auth-required') {
+      const d = chunk.data ?? {}
+      if (typeof d.provider !== 'string' || typeof d.connectUrl !== 'string') return
+      const entry: IntegrationConnectRequest = { provider: d.provider, connectUrl: d.connectUrl, ...(typeof d.message === 'string' && d.message ? { message: d.message } : {}) }
+      const i = connect.findIndex((c) => c.provider === d.provider)
+      if (i >= 0) connect[i] = entry
+      else connect.push(entry)
+      return
     } else if (type === 'error') {
       failed = true
       error = String(chunk.errorText || chunk.error || 'The agent hit an error')
@@ -900,7 +970,14 @@ export async function readAgentStream(
   } finally {
     reader.releaseLock()
   }
-  return { text, finalText: afterTool ? '' : current.trim(), toolCount: tools.length, failed, error }
+  return {
+    text,
+    finalText: afterTool ? '' : current.trim(),
+    toolCount: tools.length,
+    ...(connect.length ? { connect } : {}),
+    failed,
+    error,
+  }
 }
 
 async function latestAssistantText(sessionId: string, after: Date): Promise<string | null> {
@@ -965,7 +1042,10 @@ export interface RunAgentReplyArgs {
 
 export async function runAgentReply(args: RunAgentReplyArgs): Promise<string | null> {
   const { conversation, trigger, target, userId } = args
-  if (!(await inWorkspace(conversation.workspaceId, [target])).length) return null
+  if (!(await inWorkspace(conversation.workspaceId, [target])).length) {
+    await emitTaskEvent('agent_reply', replyTargetRef(trigger.id, target.projectId), { status: 'failed', summary: 'that agent is not in this workspace' })
+    return null
+  }
   const threadRootId = replyThreadRoot(conversation, trigger)
   const chain = args.chain ?? nextChain(humanChain(trigger, userId, await rootChain(trigger.threadRootId)), target, 0)
   const name = await agentName(conversation.workspaceId, target)
@@ -990,7 +1070,20 @@ export async function runAgentReply(args: RunAgentReplyArgs): Promise<string | n
   })
   const messageId = reply.messageId
   let work: AgentWork | null = null
-  const settle = (text: string, agentStatus: string) => finishAgentReply(reply, { text, agentStatus, work })
+  let connect: IntegrationConnectRequest[] = []
+  let endedAs: string | null = null
+  const settle = async (text: string, agentStatus: string) => {
+    endedAs = agentStatus
+    await finishAgentReply(reply, { text, agentStatus, work, connect })
+    await emitTaskEvent('agent_reply', replyTargetRef(trigger.id, target.projectId), replyEvent(agentStatus, text))
+  }
+  // After the reply's own tags are dispatched, so a card watcher knows whether the work was handed on.
+  const noteRunEnded = async () => {
+    if (!endedAs) return
+    const { noteCardRunEnded } = await import('./work-boards.service')
+    await noteCardRunEnded({ threadRootId, projectId: target.projectId, messageId, agentStatus: endedAs, startedAt })
+      .catch((err: Error) => console.error('[ChannelAgent] card run-end note failed:', err.message))
+  }
 
   const controller = new AbortController()
   running.set(messageId, controller)
@@ -1070,13 +1163,14 @@ export async function runAgentReply(args: RunAgentReplyArgs): Promise<string | n
       ? summary.finalText?.trim() ?? ''
       : summary.text.trim() || (await latestAssistantText(sessionId, startedAt)) || ''
     work = await agentWorkOf(sessionId, startedAt, summary.toolCount ?? 0).catch(() => null)
+    connect = summary.connect ?? []
     if (controller.signal.aborted) {
       await settle(finalText || latest.text.trim() || (work ? '' : '_Stopped._'), 'stopped')
     } else if (summary.failed && !finalText) {
       await settle(`I couldn't finish that: ${summary.error ?? 'the agent run failed'}`, 'error')
     } else if (summary.failed) {
       await settle(finalText, 'error')
-    } else if (!finalText && !work) {
+    } else if (!finalText && !work && !connect.length) {
       await settle('_No response._', 'done')
     } else if (!finalText) {
       // The run ended on a tool call: nothing more to say than what it did.
@@ -1103,6 +1197,7 @@ export async function runAgentReply(args: RunAgentReplyArgs): Promise<string | n
     release?.()
     // Once the run ends nothing is waiting on an approval card any more.
     if (approvalCards.length) await expirePendingApprovals(approvalCards)
+    await noteRunEnded()
   }
 }
 

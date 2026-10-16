@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Shogo Technologies, Inc.
 
-import { describe, expect, mock, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from 'bun:test'
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { Fragment, createElement, createRef, forwardRef, useImperativeHandle } from 'react'
+import { Linking } from 'react-native'
 import { createReactNativeMock } from '../../../test/react-native-mock'
 
 const sentTyping: string[] = []
@@ -13,15 +14,23 @@ const uploaded: string[] = []
 const updates: Array<{ id: string; patch: unknown }> = []
 const decisions: Array<{ id: string; decision: string }> = []
 let decisionError: string | null = null
+const deletes: string[] = []
+let deleteError: string | null = null
 
 mock.module('react-native', () =>
   createReactNativeMock({
     Platform: { OS: 'web', select: (s: any) => s.web ?? s.default },
+    // A press goes to the innermost Pressable only, as in React Native — not
+    // on to a modal's backdrop that closes it.
     Pressable: ({ accessibilityLabel, children, onPress, onHoverIn, onHoverOut, onPointerEnter, onPointerLeave, onContextMenu, disabled, testID }: any) =>
       createElement(
         'div',
         {
-          role: 'button', 'aria-label': accessibilityLabel, onClick: onPress, onMouseEnter: onHoverIn, onMouseLeave: onHoverOut,
+          role: 'button', 'aria-label': accessibilityLabel, onMouseEnter: onHoverIn, onMouseLeave: onHoverOut,
+          onClick: (e: any) => {
+            e.stopPropagation()
+            onPress?.(e)
+          },
           onPointerEnter, onPointerLeave, onContextMenu, disabled, 'data-testid': testID,
         },
         children,
@@ -89,6 +98,7 @@ mock.module('../../../lib/team-chat-api', () => ({
   newClientMsgId: () => 'client-msg-1',
   conversationTitle: () => 'DM',
   isAgentDm: (c: any) => c.kind === 'dm' && (c.participants ?? []).some((p: any) => p.type === 'agent'),
+  isSelfDm: (c: any) => c.kind === 'dm' && (c.participants ?? []).some((p: any) => p.type === 'user' && p.self === true),
   teamChatApi: () => ({
     pin: async (id: string, pinned: boolean) => { pins.push({ id, pinned }) },
     workLog: (id: string) => { workLogs.push(id); return workLogResult() },
@@ -99,6 +109,10 @@ mock.module('../../../lib/team-chat-api', () => ({
     update: async (id: string, patch: unknown) => {
       updates.push({ id, patch })
       return {}
+    },
+    delete: async (id: string) => {
+      if (deleteError) throw new Error(deleteError)
+      deletes.push(id)
     },
     decideApproval: async (id: string, decision: string) => {
       if (decisionError) throw Object.assign(new Error('failed'), { response: { data: { error: { message: decisionError } } } })
@@ -118,7 +132,7 @@ mock.module('../../../lib/team-chat-api', () => ({
     },
   }),
 }))
-mock.module('../../../hooks/usePresence', () => ({ usePresence: () => null }))
+mock.module('../../../hooks/usePresence', () => ({ usePresence: () => null, useInHuddle: () => false }))
 mock.module('../../../hooks/useChatItems', () => ({
   useDraft: () => ({ stored: '', save: () => {} }),
   useIsSaved: () => false,
@@ -183,17 +197,60 @@ mock.module('../../chat/AttachSourceSheet', () => ({ AttachSourceSheet: () => nu
 mock.module('../../chat/ContextTracker', () => ({ ContextTracker: () => null, formatTokenCount: (n: number) => String(n) }))
 mock.module('../../chat/ModelPickerMenu', () => ({ ModelPickerMenu: () => null, ComposerModelPicker: () => null, getNativeModelMenuWidth: () => 280 }))
 mock.module('../../chat/FileViewerModal', () => ({ FileViewerModal: () => null }))
+// The real viewer pulls in gesture-handler + glustack Portal; probe its props
+// instead so these assert the wiring, not the modal's internals.
+mock.module('../../chat/ImagePreviewModal', () => ({
+  ImagePreviewModal: ({ visible, url, gallery, initialIndex, title, onClose }: any) =>
+    visible
+      ? createElement(
+          'div',
+          {
+            role: 'dialog',
+            'data-testid': 'image-lightbox',
+            'data-url': url,
+            'data-index': String(initialIndex),
+            'data-count': String(gallery?.length ?? 0),
+            'data-title': title,
+          },
+          createElement('button', { 'aria-label': 'Close lightbox', onClick: onClose }),
+        )
+      : null,
+}))
 mock.module('../../chat/EnvironmentPicker', () => ({ EnvironmentPicker: () => null }))
 mock.module('../../voice-mode/ChatBridgeContext', () => ({ useChatBridgeOptional: () => null }))
 mock.module('../../chat/ChatContext', () => ({ useChatContextSafe: () => null }))
 mock.module('../../../hooks/useWorkspaceExperience', () => ({ useWorkspaceExperience: () => ({ kind: 'team' }) }))
+// A voice note records and plays through expo-audio on a device; this is a DOM test.
+mock.module('expo-audio', () => ({
+  RecordingPresets: { LOW_QUALITY: {}, HIGH_QUALITY: {} },
+  requestRecordingPermissionsAsync: async () => ({ granted: false }),
+  setAudioModeAsync: async () => {},
+  useAudioRecorder: () => ({
+    prepareToRecordAsync: async () => {},
+    record: () => {},
+    stop: async () => {},
+    getStatus: () => ({ durationMillis: 0, metering: -160, isRecording: false }),
+    currentTime: 0,
+    uri: null,
+  }),
+  useAudioRecorderState: () => ({ isRecording: false, durationMillis: 0, metering: -160 }),
+  createAudioPlayer: () => ({
+    addListener: () => ({ remove: () => {} }),
+    replace: () => {},
+    play: () => {},
+    pause: () => {},
+    seekTo: async () => {},
+    setPlaybackRate: () => {},
+    remove: () => {},
+  }),
+}))
 
 const { Composer } = await import('../Composer')
 type ComposerHandle = import('../Composer').ComposerHandle
 const { PhoneLayoutOverrideProvider } = await import('../../../lib/native-phone-layout')
 const { MessageRow } = await import('../MessageRow')
 const { MessageList } = await import('../MessageList')
-const { ConversationHeader } = await import('../ConversationHeader')
+const { ConversationHeader, splitHeaderActions } = await import('../ConversationHeader')
 const { TimelinePane } = await import('../TimelinePane')
 
 const mentionables = {
@@ -344,6 +401,12 @@ function message(overrides: Record<string, unknown> = {}): any {
 }
 
 const names = { users: new Map([['u-ana', 'Ana Lopez']]), agents: new Map([['p:proj-1', 'Billing Bot']]) }
+
+/** Members beyond the one reactor the `names` fixture names, for the "who reacted" cases. */
+const reactors = {
+  users: new Map([['u-ana', 'Ana Lopez'], ['u-bob', 'Bob Chen'], ['u-cid', 'Cid Rao'], ['u-dee', 'Dee Park']]),
+  agents: new Map<string, string>(),
+}
 const handlers = () => ({
   onReact: mock(() => {}), onEdit: mock(async () => {}), onDelete: mock(() => {}), onStopAgent: mock(() => {}),
   onRetry: mock(() => {}), onDiscard: mock(() => {}), onReply: mock(() => {}), onOpenSession: mock(() => {}),
@@ -617,8 +680,36 @@ describe('MessageRow', () => {
     fireEvent.click(screen.getByLabelText('More reactions'))
     fireEvent.change(screen.getByLabelText('Search emoji'), { target: { value: 'rocket' } })
     fireEvent.click(screen.getByLabelText('rocket'))
-    expect(h.onReact).toHaveBeenCalledWith(expect.objectContaining({ id: 'm1' }), '🚀')
+    expect(h.onReact).toHaveBeenCalledWith(expect.objectContaining({ id: 'm1' }), '🚀', true)
     expect(shim('emoji-picker')).toBeNull()
+  })
+
+  test('clicking a reaction you already have removes it', () => {
+    const h = handlers()
+    render(<MessageRow message={message({ reactions: [{ emoji: '👍', count: 1, userIds: ['u-me'] }] })} grouped={false} me="u-me" names={names} canManage={false} {...h} />)
+    fireEvent.click(screen.getByLabelText('You reacted with 👍'))
+    expect(h.onReact).toHaveBeenCalledWith(expect.objectContaining({ id: 'm1' }), '👍', false)
+  })
+
+  test('clicking a reaction you do not have yet adds it', () => {
+    const h = handlers()
+    render(<MessageRow message={message({ reactions: [{ emoji: '👍', count: 1, userIds: ['u-ana'] }] })} grouped={false} me="u-me" names={names} canManage={false} {...h} />)
+    fireEvent.click(screen.getByLabelText('Ana Lopez reacted with 👍'))
+    expect(h.onReact).toHaveBeenCalledWith(expect.objectContaining({ id: 'm1' }), '👍', true)
+  })
+
+  test('the reaction chip names who reacted on hover, in the viewer\u2019s terms', () => {
+    const reactions = [{ emoji: '👍', count: 3, userIds: ['u-me', 'u-ana', 'u-gone'] }]
+    render(<MessageRow message={message({ reactions })} grouped={false} me="u-me" names={reactors} canManage={false} />)
+    const label = 'You, Ana Lopez and Someone reacted with 👍'
+    expect(screen.getByLabelText(label).querySelector('[title]')?.getAttribute('title')).toBe(label)
+  })
+
+  test('a crowded reaction collapses the tail instead of listing everyone', () => {
+    const reactions = [{ emoji: '🎉', count: 5, userIds: ['u-ana', 'u-bob', 'u-cid', 'u-dee', 'u-me'] }]
+    render(<MessageRow message={message({ reactions })} grouped={false} me="u-me" names={reactors} canManage={false} />)
+    const label = 'Ana Lopez, Bob Chen and 3 others reacted with 🎉'
+    expect(screen.getByLabelText(label).querySelector('[title]')?.getAttribute('title')).toBe(label)
   })
 })
 
@@ -859,6 +950,32 @@ describe('ConversationHeader channel editing', () => {
     expect(updates).toEqual([{ id: 'c9', patch: { topic: null } }])
   })
 
+  test('every header icon names itself on hover, matching its accessible label', () => {
+    render(<ConversationHeader conversation={channel()} mentionables={null} me="u-me" onChanged={() => {}} onLeft={() => {}} />)
+    for (const label of ['Edit channel', 'Notification settings', 'Star', 'Pinned messages', 'Members', 'Leave channel', 'Archive']) {
+      const tooltip = screen.getByLabelText(label).querySelector('[title]')
+      expect(tooltip?.getAttribute('title')).toBe(label)
+    }
+  })
+
+  test('the floating phone header names its icons too', () => {
+    render(
+      <ConversationHeader
+        conversation={channel()}
+        mentionables={null}
+        me="u-me"
+        onChanged={() => {}}
+        onLeft={() => {}}
+        floating
+        onBack={() => {}}
+      />,
+    )
+    for (const label of ['Back', 'More actions']) {
+      const tooltip = screen.getByLabelText(label).querySelector('[title]')
+      expect(tooltip?.getAttribute('title')).toBe(label)
+    }
+  })
+
   test('the floating phone header goes back and keeps every action in its sheet', async () => {
     updates.length = 0
     const onBack = mock(() => {})
@@ -886,6 +1003,117 @@ describe('ConversationHeader channel editing', () => {
       fireEvent.click(screen.getByLabelText('Save channel'))
     })
     expect(updates).toEqual([{ id: 'c9', patch: { topic: 'Ship it' } }])
+  })
+})
+
+describe('desktop header overflow', () => {
+  // The desktop channel header's actions, in the order the header builds them.
+  const actions = ['agent-profile', 'edit', 'notify', 'star', 'pins', 'files', 'catchup', 'members', 'leave', 'archive', 'delete'].map((key) => ({ key }))
+  const keys = (list: Array<{ key: string }>) => list.map((a) => a.key)
+
+  test('an unmeasured or wide header keeps every action inline', () => {
+    expect(splitHeaderActions(actions, 0)).toEqual({ inline: actions, overflow: [] })
+    expect(splitHeaderActions(actions, 1100)).toEqual({ inline: actions, overflow: [] })
+  })
+
+  test('More appears only once the actions no longer fit', () => {
+    // 196px of fixed room plus 36px per icon: all 11 actions need 592px.
+    expect(splitHeaderActions(actions, 592).overflow).toEqual([])
+    expect(splitHeaderActions(actions, 591).overflow.length).toBeGreaterThan(0)
+  })
+
+  test('a narrow header keeps the most useful actions inline and moves the rest under More', () => {
+    const { inline, overflow } = splitHeaderActions(actions, 480)
+    expect(keys(inline)).toEqual(['notify', 'star', 'pins', 'files', 'catchup', 'members'])
+    expect(keys(overflow)).toEqual(['agent-profile', 'edit', 'leave', 'archive', 'delete'])
+  })
+
+  test('below the compact width only More remains, with every action under it', () => {
+    expect(splitHeaderActions(actions, 240)).toEqual({ inline: [], overflow: actions })
+  })
+})
+
+describe('deleting a channel', () => {
+  const channel = (overrides: Record<string, unknown> = {}): any => ({
+    id: 'c9', workspaceId: 'ws', kind: 'public', name: 'design', slug: 'design', topic: null, lastSeq: 0, lastMessageAt: null,
+    archivedAt: null, createdAt: '2026-09-29T10:00:00.000Z', joined: true, starred: false, muted: false, notifyLevel: 'default',
+    lastReadSeq: 0, canPost: true, canReply: true, canManage: true, canDelete: true, systemManaged: false, members: [], ...overrides,
+  })
+  const reset = () => {
+    deletes.length = 0
+    updates.length = 0
+    deleteError = null
+  }
+
+  test('only deletes once the channel name is typed, then leaves the channel', async () => {
+    reset()
+    const onDeleted = mock(() => {})
+    const onChanged = mock(() => {})
+    render(<ConversationHeader conversation={channel()} mentionables={null} me="u-me" onChanged={onChanged} onLeft={() => {}} onDeleted={onDeleted} />)
+    fireEvent.click(screen.getByLabelText('Delete channel'))
+    expect(screen.getByText('Delete #design?')).toBeTruthy()
+
+    const confirm = screen.getByLabelText('Delete permanently')
+    expect(confirm.hasAttribute('disabled')).toBe(true)
+    await act(async () => {
+      fireEvent.click(confirm)
+    })
+    expect(deletes).toEqual([])
+
+    fireEvent.change(screen.getByLabelText('Channel name to confirm'), { target: { value: 'desig' } })
+    expect(screen.getByLabelText('Delete permanently').hasAttribute('disabled')).toBe(true)
+    fireEvent.change(screen.getByLabelText('Channel name to confirm'), { target: { value: ' #Design ' } })
+    expect(screen.getByLabelText('Delete permanently').hasAttribute('disabled')).toBe(false)
+    await act(async () => {
+      fireEvent.click(screen.getByLabelText('Delete permanently'))
+    })
+    expect(deletes).toEqual(['c9'])
+    expect(onDeleted).toHaveBeenCalled()
+    expect(onChanged).not.toHaveBeenCalled()
+  })
+
+  test('offers archiving instead', async () => {
+    reset()
+    const onChanged = mock(() => {})
+    render(<ConversationHeader conversation={channel()} mentionables={null} me="u-me" onChanged={onChanged} onLeft={() => {}} />)
+    fireEvent.click(screen.getByLabelText('Delete channel'))
+    await act(async () => {
+      fireEvent.click(screen.getByLabelText('Archive instead'))
+    })
+    expect(updates).toEqual([{ id: 'c9', patch: { archived: true } }])
+    expect(deletes).toEqual([])
+    expect(onChanged).toHaveBeenCalled()
+  })
+
+  test('keeps the dialog open and shows why when the server refuses', async () => {
+    reset()
+    deleteError = 'Only channel owners and workspace admins can do that'
+    render(<ConversationHeader conversation={channel()} mentionables={null} me="u-me" onChanged={() => {}} onLeft={() => {}} />)
+    fireEvent.click(screen.getByLabelText('Delete channel'))
+    fireEvent.change(screen.getByLabelText('Channel name to confirm'), { target: { value: 'design' } })
+    await act(async () => {
+      fireEvent.click(screen.getByLabelText('Delete permanently'))
+    })
+    expect(screen.getByText('Only channel owners and workspace admins can do that')).toBeTruthy()
+    expect(screen.getByText('Delete #design?')).toBeTruthy()
+  })
+
+  test('explains instead of deleting a channel an agent system declares', () => {
+    reset()
+    render(<ConversationHeader conversation={channel({ canDelete: false, systemManaged: true })} mentionables={null} me="u-me" onChanged={() => {}} onLeft={() => {}} />)
+    fireEvent.click(screen.getByLabelText('Delete channel'))
+    expect(screen.getByText(/Remove it from teamChannels there and run system_apply/)).toBeTruthy()
+    expect(screen.queryByLabelText('Delete permanently')).toBeNull()
+    expect(screen.queryByLabelText('Channel name to confirm')).toBeNull()
+  })
+
+  test('is not offered to people who cannot delete it, or by older servers', () => {
+    reset()
+    render(<ConversationHeader conversation={channel({ canManage: false, canDelete: false })} mentionables={null} me="u-me" onChanged={() => {}} onLeft={() => {}} />)
+    expect(screen.queryByLabelText('Delete channel')).toBeNull()
+    cleanup()
+    render(<ConversationHeader conversation={channel({ canDelete: undefined, systemManaged: undefined })} mentionables={null} me="u-me" onChanged={() => {}} onLeft={() => {}} />)
+    expect(screen.queryByLabelText('Delete channel')).toBeNull()
   })
 })
 
@@ -1131,5 +1359,120 @@ describe('#activity filters', () => {
     expect(screen.queryByText(/answered the ticket/)).toBeNull()
     expect(screen.getByLabelText('Agent: Workspace agent, Billing Bot')).toBeTruthy()
     expect(screen.getByText('2 agents')).toBeTruthy()
+  })
+})
+
+describe('MessageRow image attachments', () => {
+  const image = (id: string, name: string) => ({
+    id, name, mimeType: 'image/png', size: 2048, width: 800, height: 600, url: `/api/uploads/${id}`,
+  })
+  const file = (id: string, name: string) => ({
+    id, name, mimeType: 'application/pdf', size: 4096, width: null, height: null, url: `/api/uploads/${id}`,
+  })
+  const voiceNote = (id: string) => ({
+    id, name: 'Voice note.m4a', mimeType: 'audio/mp4', size: 12_000, width: null, height: null,
+    url: `/api/uploads/${id}`, durationMs: 12_000, peaks: '20 40 100 60',
+  })
+  const renderRow = (attachments: unknown[]) =>
+    render(<MessageRow message={message({ attachments })} grouped={false} me="u-me" names={names} canManage={false} {...handlers()} />)
+
+  let openURL: ReturnType<typeof spyOn>
+
+  beforeEach(() => {
+    openURL = spyOn(Linking, 'openURL').mockImplementation(() => Promise.resolve())
+  })
+  afterEach(() => {
+    openURL.mockRestore()
+  })
+
+  test('clicking an image opens the viewer instead of the browser, seeded with that image', () => {
+    renderRow([image('a1', 'shot-1.png'), image('a2', 'shot-2.png')])
+    expect(screen.queryByTestId('image-lightbox')).toBeNull()
+
+    fireEvent.click(screen.getByLabelText('Open shot-1.png'))
+
+    const lightbox = screen.getByTestId('image-lightbox')
+    expect(lightbox.getAttribute('data-url')).toBe('/api/uploads/a1')
+    expect(lightbox.getAttribute('data-index')).toBe('0')
+    expect(lightbox.getAttribute('data-count')).toBe('2')
+    expect(lightbox.getAttribute('data-title')).toBe('shot-1.png')
+    expect(openURL).not.toHaveBeenCalled()
+  })
+
+  test('a later image in the same message opens at its own index', () => {
+    renderRow([image('a1', 'one.png'), image('a2', 'two.png'), image('a3', 'three.png')])
+
+    fireEvent.click(screen.getByLabelText('Open two.png'))
+
+    const lightbox = screen.getByTestId('image-lightbox')
+    expect(lightbox.getAttribute('data-url')).toBe('/api/uploads/a2')
+    expect(lightbox.getAttribute('data-index')).toBe('1')
+    expect(lightbox.getAttribute('data-count')).toBe('3')
+    expect(openURL).not.toHaveBeenCalled()
+  })
+
+  test('files in the mix do not shift the gallery index', () => {
+    renderRow([file('f1', 'notes.pdf'), image('a1', 'one.png'), image('a2', 'two.png')])
+
+    fireEvent.click(screen.getByLabelText('Open two.png'))
+
+    const lightbox = screen.getByTestId('image-lightbox')
+    // Second image, not third attachment.
+    expect(lightbox.getAttribute('data-index')).toBe('1')
+    expect(lightbox.getAttribute('data-count')).toBe('2')
+  })
+
+  test('close dismisses the viewer', () => {
+    renderRow([image('a1', 'shot-1.png')])
+    fireEvent.click(screen.getByLabelText('Open shot-1.png'))
+    expect(screen.getByTestId('image-lightbox')).toBeTruthy()
+
+    fireEvent.click(screen.getByLabelText('Close lightbox'))
+
+    expect(screen.queryByTestId('image-lightbox')).toBeNull()
+  })
+
+  test('a single image opens without gallery controls', () => {
+    renderRow([image('a1', 'only.png')])
+
+    fireEvent.click(screen.getByLabelText('Open only.png'))
+
+    expect(screen.getByTestId('image-lightbox').getAttribute('data-count')).toBe('1')
+  })
+
+  test('non-image attachments still open their URL in the browser', () => {
+    renderRow([file('f1', 'notes.pdf')])
+
+    fireEvent.click(screen.getByText('notes.pdf'))
+
+    expect(openURL).toHaveBeenCalledWith('/api/uploads/f1')
+    expect(screen.queryByTestId('image-lightbox')).toBeNull()
+  })
+
+  test('a voice note renders a player, not a file row that opens a URL', () => {
+    renderRow([voiceNote('v1')])
+
+    expect(screen.getByLabelText('Play Voice note.m4a')).toBeDefined()
+    expect(screen.getByText('0:12')).toBeDefined()
+    // The waveform is scrubbable, and clicking the row does not leave the app.
+    expect(screen.getByLabelText('Seek Voice note.m4a')).toBeDefined()
+    expect(openURL).not.toHaveBeenCalled()
+    expect(screen.queryByText('Voice note.m4a')).toBeNull()
+  })
+
+  test('a deleted message shows neither attachments nor the viewer', () => {
+    render(
+      <MessageRow
+        message={message({ attachments: [image('a1', 'shot-1.png')], deletedAt: '2026-09-29T11:00:00.000Z' })}
+        grouped={false}
+        me="u-me"
+        names={names}
+        canManage={false}
+        {...handlers()}
+      />,
+    )
+
+    expect(screen.queryByLabelText('Open shot-1.png')).toBeNull()
+    expect(screen.queryByTestId('image-lightbox')).toBeNull()
   })
 })

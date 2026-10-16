@@ -10,19 +10,23 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context'
 import { ChevronLeft, Upload, X } from 'lucide-react-native'
 import { cn } from '@shogo/shared-ui/primitives'
 import { conversationTitle, teamChatApi, type ChatMessage, type ConversationDetail, type Mentionables } from '../../lib/team-chat-api'
-import { mentionNames } from '../../lib/team-chat-state'
-import { privateMemberIds } from '../../lib/mention-menu'
+import { mentionNames, newestReadableSeq } from '../../lib/team-chat-state'
 import { ACTIVITY_CHANNEL_FILTERS, EMPTY_ACTIVITY_FILTER, isActivityFilterActive, matchesActivityFilters, type ActivityFilterState } from '../../lib/activity-channel-filters'
-import { TIMELINE_SOFT_LIMIT, useConversationList, useConversationTimeline, useMarkReadWhileVisible, useTypingUsers } from '../../hooks/useTeamChat'
+import { TIMELINE_SOFT_LIMIT, useConversationList, useConversationTimeline, useMarkReadWhileVisible, useTypingUsers, type SendInput } from '../../hooks/useTeamChat'
 import { requestEditMessage } from '../../hooks/useChatShortcuts'
 import { threadCrumbs } from '../../lib/team-chat-nav'
+import { nonMemberMentionIds } from '../../lib/team-chat-mention-nudge'
+import { dismissMentionNudgeForever, getMentionNudgeDismissed } from '../../lib/mention-nudge-preference'
 import { Breadcrumb } from './SessionBreadcrumb'
 import { ActivityFilterPicker } from './ActivityFilterPicker'
 import { MessageList } from './MessageList'
 import { Composer, type ComposerHandle } from './Composer'
+import { MentionNudgeCard } from './MentionNudgeCard'
 import { CHROME_SIZE, GlassButton, GlassChip } from './FloatingChrome'
 import { usePhoneChromeOverlay } from '../layout/PhoneChromeOverlay'
 import { GlassBlurTarget } from '../ui/LiquidGlassBackdrop'
+import { MakeCardSheet } from '../boards/MakeCardSheet'
+import type { WorkItem } from '../../lib/work-boards-api'
 
 const api = teamChatApi()
 /** Pages of 200 to load back when jumping to an older message before opening it on its own. */
@@ -51,6 +55,8 @@ export interface TimelinePaneProps {
   floating?: boolean
   /** Height of the floating header drawn over this pane. */
   topInset?: number
+  /** Open a card made from a message here. "Make a card" only shows when this is set. */
+  onOpenCard?: (item: WorkItem) => void
 }
 
 /** Files dropped anywhere on a web pane go to the composer. */
@@ -122,6 +128,14 @@ export function TimelinePane(props: TimelinePaneProps) {
   const insets = useSafeAreaInsets()
   const [threadHeaderHeight, setThreadHeaderHeight] = useState(0)
   const [footerHeight, setFooterHeight] = useState(0)
+  const [cardFrom, setCardFrom] = useState<ChatMessage | null>(null)
+  const [cardNotice, setCardNotice] = useState<string | null>(null)
+  useEffect(() => {
+    if (!cardNotice) return
+    const t = setTimeout(() => setCardNotice(null), 4000)
+    return () => clearTimeout(t)
+  }, [cardNotice])
+  const canMakeCards = !!props.onOpenCard && (conversation.kind === 'public' || conversation.kind === 'private') && conversation.canReply
   const showActivityFilters = conversation.kind === 'activity' && !threadRootId
   const channelList = useConversationList(showActivityFilters ? workspaceId : null)
   const [activityFilter, setActivityFilter] = useState<ActivityFilterState>(EMPTY_ACTIVITY_FILTER)
@@ -135,13 +149,7 @@ export function TimelinePane(props: TimelinePaneProps) {
       conversations: new Map(channelList.list.map((c) => [c.id, c.slug ?? c.name ?? 'channel'])),
     }
   }, [mentionables, showActivityFilters, channelList.list])
-  const newestSeq = useMemo(() => {
-    for (let i = timeline.state.messages.length - 1; i >= 0; i--) {
-      const m = timeline.state.messages[i]!
-      if (!m.pending && !m.threadRootId) return m.seq
-    }
-    return 0
-  }, [timeline.state.messages])
+  const newestSeq = useMemo(() => newestReadableSeq(timeline.state.messages), [timeline.state.messages])
   // What was unread when the reader opened this conversation; messages arriving later aren't "new".
   const [unread, setUnread] = useState<{ afterSeq: number; upToSeq: number } | null>(() =>
     !threadRootId && conversation.joined && conversation.lastSeq > conversation.lastReadSeq
@@ -246,7 +254,7 @@ export function TimelinePane(props: TimelinePaneProps) {
   const composerRef = useRef<ComposerHandle>(null)
   const rootRef = useRef<View>(null)
 
-  const onReact = useCallback((m: ChatMessage, emoji: string) => void timeline.react(m.id, emoji).catch(() => {}), [timeline.react])
+  const onReact = useCallback((m: ChatMessage, emoji: string, on?: boolean) => void timeline.react(m.id, emoji, on).catch(() => {}), [timeline.react])
   const onEdit = useCallback((m: ChatMessage, text: string) => timeline.edit(m.id, text), [timeline.edit])
   const onDelete = useCallback(async (m: ChatMessage) => {
     if (await confirmDelete()) await timeline.remove(m.id).catch(() => {})
@@ -265,6 +273,34 @@ export function TimelinePane(props: TimelinePaneProps) {
   }, [timeline.state.messages, me])
 
   const isChannel = conversation.kind === 'public' || conversation.kind === 'private'
+
+  // Flags @-mentions of non-members in the composer, and offers to add
+  // anyone the sender just mentioned who isn't in the channel (never for
+  // DMs: there's no "member" concept to flag against).
+  const channelMemberIds = useMemo(
+    () => (isChannel ? new Set(conversation.members.flatMap((m) => (m.type === 'user' ? [m.userId] : []))) : null),
+    [isChannel, conversation.members],
+  )
+  const [mentionNudge, setMentionNudge] = useState<{ ids: string[]; busy: boolean; error: string | null } | null>(null)
+  useEffect(() => setMentionNudge(null), [conversation.id, threadRootId])
+  const handleSend = useCallback(async (input: SendInput) => {
+    setMentionNudge(null)
+    const sent = await timeline.send(input)
+    if (!sent || !channelMemberIds || getMentionNudgeDismissed()) return
+    const ids = nonMemberMentionIds(input.text, channelMemberIds, me)
+    if (ids.length) setMentionNudge({ ids, busy: false, error: null })
+  }, [timeline.send, channelMemberIds, me])
+  const addMentioned = useCallback(async () => {
+    if (!mentionNudge) return
+    setMentionNudge((n) => (n ? { ...n, busy: true, error: null } : n))
+    try {
+      await api.addMembers(conversation.id, mentionNudge.ids)
+      setMentionNudge(null)
+    } catch (err) {
+      setMentionNudge((n) => (n ? { ...n, busy: false, error: err instanceof Error ? err.message : 'Could not add them' } : n))
+    }
+  }, [mentionNudge, conversation.id])
+
   const placeholder = threadRootId
     ? 'Reply in thread…'
     : isChannel
@@ -278,10 +314,9 @@ export function TimelinePane(props: TimelinePaneProps) {
   const canPostHere = threadRootId ? conversation.canReply : conversation.canPost
   const showComposer = !(!conversation.joined && isChannel && !threadRootId)
   const dragging = useFileDrop(rootRef, showComposer && canPostHere, (files) => composerRef.current?.addFiles(files))
-  const memberIds = useMemo(() => privateMemberIds(conversation), [conversation])
 
   const crumbs = threadCrumbs({ kind: conversation.kind, label: conversationTitle(conversation) })
-  const typingText = typingLabel(typing)
+  const typingText = cardNotice ?? typingLabel(typing)
   const listInsets = floating
     ? { top: (showActivityFilters ? 0 : topInset) + threadHeaderHeight, bottom: footerHeight }
     : undefined
@@ -310,6 +345,7 @@ export function TimelinePane(props: TimelinePaneProps) {
       onOpenSession={props.onOpenSession}
       onOpenProjectPane={props.onOpenProjectPane}
       onMarkUnread={threadRootId || !conversation.joined ? undefined : onMarkUnread}
+      onMakeCard={canMakeCards ? setCardFrom : undefined}
       unreadAfterSeq={filtering ? null : unread?.afterSeq ?? null}
       unreadUpToSeq={unread?.upToSeq}
       unreadNotLoaded={filtering ? false : unreadNotLoaded}
@@ -352,27 +388,57 @@ export function TimelinePane(props: TimelinePaneProps) {
       ))}
     </ScrollView>
   ) : null
-  const composer = (
-    <Composer
-      ref={composerRef}
+  const makeCardSheet = cardFrom ? (
+    <MakeCardSheet
       workspaceId={workspaceId}
       conversationId={conversation.id}
-      threadRootId={threadRootId}
-      placeholder={placeholder}
-      mentionables={mentionables}
-      me={me}
-      disabled={!canPostHere}
-      disabledReason={disabledReason}
-      onSend={timeline.send}
-      onEditLast={onEditLast}
-      memberIds={memberIds}
+      message={cardFrom}
+      onClose={() => setCardFrom(null)}
+      onError={setCardNotice}
+      onCreated={(item) => {
+        setCardNotice(`Made ${item.key}`)
+        props.onOpenCard?.(item)
+      }}
     />
+  ) : null
+  const composer = (
+    <>
+      {mentionNudge && (
+        <MentionNudgeCard
+          names={mentionNudge.ids.map((id) => names.users.get(id) ?? 'Someone')}
+          busy={mentionNudge.busy}
+          error={mentionNudge.error}
+          onAdd={() => void addMentioned()}
+          onDismiss={() => setMentionNudge(null)}
+          onDontShowAgain={() => {
+            void dismissMentionNudgeForever()
+            setMentionNudge(null)
+          }}
+        />
+      )}
+      <Composer
+        ref={composerRef}
+        workspaceId={workspaceId}
+        conversationId={conversation.id}
+        threadRootId={threadRootId}
+        placeholder={placeholder}
+        mentionables={mentionables}
+        me={me}
+        disabled={!canPostHere}
+        disabledReason={disabledReason}
+        onSend={handleSend}
+        onEditLast={onEditLast}
+        channelMemberIds={channelMemberIds}
+        membersOnly={conversation.kind === 'private'}
+      />
+    </>
   )
 
   if (floating) {
     return (
       <View className="flex-1" ref={rootRef}>
         {filterBar}
+        {makeCardSheet}
         <GlassBlurTarget>
           {timeline.error && !timeline.state.messages.length ? (
             <View className="flex-1 items-center justify-center gap-2 px-8">
@@ -440,9 +506,9 @@ export function TimelinePane(props: TimelinePaneProps) {
   return (
     <View className="flex-1" ref={rootRef}>
       {threadRootId && (
-        <View className="flex-row items-center border-b border-border px-4 py-2.5">
+        <View className="flex-row items-center border-b border-border bg-background px-4 py-2.5">
           <Breadcrumb
-            className="flex-1 flex-row flex-wrap items-center gap-x-1"
+            className="min-w-0 flex-1 flex-row flex-wrap items-center gap-x-1"
             items={crumbs.map((c) => ({
               key: c.key,
               label: c.label,
@@ -457,6 +523,7 @@ export function TimelinePane(props: TimelinePaneProps) {
         </View>
       )}
       {filterBar}
+      {makeCardSheet}
       {timeline.error && !timeline.state.messages.length ? (
         <View className="flex-1 items-center justify-center gap-2 px-8">
           <Text className="text-center text-sm text-muted-foreground">{timeline.error}</Text>

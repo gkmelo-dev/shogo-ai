@@ -25,6 +25,7 @@
 import { randomUUID } from 'node:crypto'
 import type { Context } from 'hono'
 import { PROJECT_CALL_MESSAGE_AGENT, runChatSessionId } from '@shogo/shared-runtime/project-call-chat'
+import { putAgentCall } from '../lib/agent-call-store'
 
 export { runChatSessionId } from '@shogo/shared-runtime/project-call-chat'
 
@@ -38,6 +39,8 @@ export interface AgentCallRequest {
   wait?: boolean
   /** Reply timeout in ms when waiting (default 5 min, max 20 min). */
   timeoutMs?: number
+  /** With `wait: false`, record the outcome so `GET .../agent-call/:runId` can poll it. */
+  track?: boolean
   callerProjectId?: string
   /** Signed requester ticket for the callee, so it can act as the person behind the call. */
   requesterTicket?: string
@@ -104,7 +107,13 @@ async function callChatDb(): Promise<any> {
   return prisma as any
 }
 
-async function ensureCallSession(projectId: string, sessionId: string, name: string, message: string): Promise<boolean> {
+async function ensureCallSession(
+  projectId: string,
+  sessionId: string,
+  name: string,
+  message: string,
+  runId: string,
+): Promise<boolean> {
   try {
     const db = await callChatDb()
     const label = oneLine(`${name}: ${message}`, 120)
@@ -118,7 +127,11 @@ async function ensureCallSession(projectId: string, sessionId: string, name: str
         sessionId,
         role: 'user',
         content: message,
-        parts: JSON.stringify([{ type: 'text', text: message }]),
+        // The marker lets an open chat keep watching for the call's turn.
+        parts: JSON.stringify([
+          { type: 'text', text: message },
+          { type: 'data-project-call', data: { runId, callerName: name } },
+        ]),
         // Not 'technical': funnels treat that pair (role user + agent technical)
         // as a person. The list hook still returns this row in the technical thread.
         agent: PROJECT_CALL_MESSAGE_AGENT,
@@ -185,7 +198,9 @@ function detachedContext(c: Context): Context {
  * runtime keeps matches the chat. Persistence failures never fail the call.
  *
  * With `wait: false` the API keeps the call going in the background and saves
- * the reply when it lands; the caller gets a 202 straight away.
+ * the reply when it lands; the caller gets a 202 straight away. Add
+ * `track: true` to also record the outcome in the agent-call store, where
+ * `GET .../agent-call/:runId` can poll it from any API replica.
  */
 export async function callProjectAgentAsChat(
   c: Context,
@@ -193,12 +208,15 @@ export async function callProjectAgentAsChat(
   workspaceId: string,
   req: AgentCallRequest,
 ): Promise<AgentCallOutcome> {
+  if (req.message && req.message.trim() && req.wait === false && req.track) {
+    return startTrackedCall(c, projectId, workspaceId, req)
+  }
   if (!req.message || !req.message.trim() || req.sessionId) {
     return callProjectAgent(c, projectId, workspaceId, req)
   }
   const runId = req.runId?.trim() || randomUUID()
   const chatSessionId = runChatSessionId(projectId, runId)
-  const persisted = await ensureCallSession(projectId, chatSessionId, await callerName(req.callerProjectId), req.message)
+  const persisted = await ensureCallSession(projectId, chatSessionId, await callerName(req.callerProjectId), req.message, runId)
   if (!persisted) return callProjectAgent(c, projectId, workspaceId, { ...req, runId })
 
   const call = { ...req, runId, sessionId: chatSessionId }
@@ -227,6 +245,142 @@ export async function callProjectAgentAsChat(
   return { status: outcome.status, body: withChat(outcome.body) }
 }
 
+async function startTrackedCall(
+  c: Context,
+  projectId: string,
+  workspaceId: string,
+  req: AgentCallRequest,
+): Promise<AgentCallOutcome> {
+  const runId = req.runId?.trim() || randomUUID()
+  let chatSessionId: string | undefined
+  if (!req.sessionId) {
+    const candidate = runChatSessionId(projectId, runId)
+    if (await ensureCallSession(projectId, candidate, await callerName(req.callerProjectId), req.message, runId)) {
+      chatSessionId = candidate
+    }
+  }
+  const sessionId = req.sessionId ?? chatSessionId
+  const startedAt = Date.now()
+  await putAgentCall(projectId, { status: 'running', runId, sessionId, chatSessionId, startedAt, updatedAt: startedAt })
+
+  const detached = detachedContext(c)
+  void callProjectAgent(detached, projectId, workspaceId, {
+    ...req,
+    runId,
+    sessionId,
+    wait: true,
+    timeoutMs: 20 * 60_000,
+  })
+    .then(async (outcome) => {
+      const ok = outcome.status >= 200 && outcome.status < 300
+      const reply = ok && typeof outcome.body?.reply === 'string' ? outcome.body.reply : null
+      if (reply?.trim() && chatSessionId) await saveCallReply(chatSessionId, reply)
+      const err = outcome.body?.error
+      await putAgentCall(projectId, {
+        status: ok ? 'completed' : 'failed',
+        runId,
+        reply,
+        sessionId: (typeof outcome.body?.sessionId === 'string' ? outcome.body.sessionId : undefined) ?? sessionId,
+        chatSessionId,
+        ...(ok
+          ? {}
+          : {
+              error: {
+                code: typeof err === 'object' && err ? err.code : undefined,
+                message:
+                  (typeof err === 'string' ? err : err?.message) ?? `Project agent call failed (HTTP ${outcome.status})`,
+              },
+            }),
+        startedAt,
+        updatedAt: Date.now(),
+      })
+    })
+    .catch(async (err) => {
+      console.warn('[AgentCall] tracked background call failed:', err?.message ?? err)
+      await putAgentCall(projectId, {
+        status: 'failed',
+        runId,
+        sessionId,
+        chatSessionId,
+        error: { code: 'agent_call_failed', message: err?.message ?? String(err) },
+        startedAt,
+        updatedAt: Date.now(),
+      }).catch(() => {})
+    })
+
+  return {
+    status: 202,
+    body: { status: 'accepted', tracked: true, runId, ...(sessionId ? { sessionId } : {}), ...(chatSessionId ? { chatSessionId } : {}) },
+  }
+}
+
+export interface RemoteToolRequest {
+  tool: string
+  args: Record<string, unknown>
+  callerProjectId?: string
+  /** Signed requester ticket for the target, so its tool can act as the person behind the call. */
+  requesterTicket?: string
+  timeoutMs?: number
+}
+
+/**
+ * Run one tool on the target project's own runtime (`/agent/remote/tool`).
+ * Resolving here is what brings the target online: it wakes `ws:proj:<id>`
+ * and never mounts the project anywhere else. Never throws.
+ */
+export async function callProjectRemoteTool(
+  c: Context,
+  projectId: string,
+  workspaceId: string,
+  req: RemoteToolRequest,
+): Promise<AgentCallOutcome> {
+  const timeoutMs = Math.min(Math.max(req.timeoutMs ?? 5 * 60_000, 10_000), 20 * 60_000)
+  let runtimeUrl: string
+  try {
+    const overridden = runtimeUrlOverride ? await runtimeUrlOverride(projectId) : null
+    if (overridden) {
+      runtimeUrl = overridden
+    } else {
+      const { resolveProjectPodUrl } = await import('../lib/resolve-pod-url')
+      runtimeUrl = (await resolveProjectPodUrl(projectId, { logTag: 'RemoteTool' })).url
+    }
+  } catch (err: any) {
+    const { WorkspaceCapacityError, describeCapacityRefusal } = await import('../lib/workspace-compute-budget')
+    if (err instanceof WorkspaceCapacityError) {
+      const described = await describeCapacityRefusal(err).catch(() => null)
+      return {
+        status: 409,
+        body: {
+          error: 'workspace_capacity',
+          message:
+            described?.message ??
+            'Your workspace is out of room for running projects. Stop a project or upgrade your instance size.',
+          capacity: described,
+        },
+      }
+    }
+    console.warn(`[RemoteTool] could not resolve runtime for ${projectId}: ${err?.message ?? err}`)
+    return {
+      status: 502,
+      body: { error: { code: 'target_unavailable', message: `Project ${projectId} runtime is unavailable: ${err?.message ?? err}` } },
+    }
+  }
+
+  return forwardToProjectRuntime(
+    c,
+    projectId,
+    workspaceId,
+    '/agent/remote/tool',
+    JSON.stringify({ tool: req.tool, args: req.args, callerProjectId: req.callerProjectId }),
+    {
+      runtimeUrl,
+      timeoutMs,
+      ...(req.requesterTicket ? { headers: { 'X-Requester-Ticket': req.requesterTicket } } : {}),
+      timeoutMessage: `The target project did not finish ${req.tool} within ${Math.round(timeoutMs / 1000)}s.`,
+    },
+  )
+}
+
 let runtimeUrlOverride: ((projectId: string) => Promise<string | null> | string | null) | null = null
 
 /** Test seam: resolve project runtime URLs directly (null falls through to the real resolver). */
@@ -246,7 +400,13 @@ export async function forwardToProjectRuntime(
   workspaceId: string,
   agentPath: string,
   forwardBody: string,
-  opts: { timeoutMs: number; timeoutMessage?: string; headers?: Record<string, string> },
+  opts: {
+    timeoutMs: number
+    timeoutMessage?: string
+    headers?: Record<string, string>
+    /** Already-resolved runtime URL; skips the resolver below. */
+    runtimeUrl?: string
+  },
 ): Promise<AgentCallOutcome> {
   const extraHeaders = opts.headers ?? {}
   try {
@@ -254,7 +414,7 @@ export async function forwardToProjectRuntime(
     const runtimeToken = await deriveProjectRuntimeToken(projectId, { workspaceId })
 
     let runtimeUrl: string
-    const overridden = runtimeUrlOverride ? await runtimeUrlOverride(projectId) : null
+    const overridden = opts.runtimeUrl ?? (runtimeUrlOverride ? await runtimeUrlOverride(projectId) : null)
     if (overridden) {
       runtimeUrl = overridden
     } else if (process.env.SHOGO_LOCAL_MODE === 'true') {

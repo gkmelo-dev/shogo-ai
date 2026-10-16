@@ -1,7 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Shogo Technologies, Inc.
 import { test, expect, type Page } from "./fixtures"
-import { homeComposerInput, makeTestUser, signUpAndUpgradeToPro, waitForAgentResponse } from "./helpers"
+import {
+  homeComposerInput,
+  makeTestUser,
+  NO_BUILD_PROJECT_PROMPT,
+  signUpAndUpgradeToPro,
+  waitForAgentResponse,
+  type ProUpgradeMethod,
+} from "./helpers"
 
 /**
  * Pro Feature Gating E2E Tests
@@ -25,10 +32,11 @@ test.describe("Pro Feature Gating", () => {
   test.describe.configure({ mode: "serial" })
 
   let page: Page
+  let upgradeMethod: ProUpgradeMethod
 
   test.beforeAll(async ({ browser }) => {
     page = await browser.newPage()
-    await signUpAndUpgradeToPro(page, TEST_USER)
+    upgradeMethod = await signUpAndUpgradeToPro(page, TEST_USER)
   })
 
   test.afterAll(async () => {
@@ -67,7 +75,7 @@ test.describe("Pro Feature Gating", () => {
 
     const input = homeComposerInput(page)
     await input.click()
-    await input.fill("Test model gating")
+    await input.fill(NO_BUILD_PROJECT_PROMPT)
     await page.waitForTimeout(500)
     await page.keyboard.press("Enter")
     await page.waitForURL(/\/projects\//, { timeout: 60_000 })
@@ -94,14 +102,15 @@ test.describe("Pro Feature Gating", () => {
 
   test("project header hides Upgrade button for Pro users", async () => {
     // Should still be on the project page from the previous test
-    // The "Upgrade" text in the project top bar should not be visible for Pro users
-    const upgradeBtn = page.locator("text=Upgrade").first()
-    await expect(upgradeBtn).not.toBeVisible({ timeout: 5_000 })
+    // Scoped to the top bar's control: a bare text=Upgrade also matches chat or
+    // preview content that happens to mention upgrading.
+    await expect(page.getByLabel("Upgrade plan", { exact: true })).toHaveCount(0, { timeout: 5_000 })
   })
 
   // ── Manage Subscription ──────────────────────────────────────────
 
   test("Manage button opens Stripe customer portal", async () => {
+    test.skip(upgradeMethod === "bootstrap", "a bootstrapped subscription has no real Stripe customer to open a portal for")
     await page.goto("/billing")
     await page.waitForSelector("text=Billing", { timeout: 10_000 })
 

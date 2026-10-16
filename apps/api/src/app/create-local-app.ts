@@ -22,6 +22,7 @@ import { workspaceChatRoutes } from '../routes/workspace-chat'
 import { workspaceAgentRoutes, sessionAuthorize } from '../routes/workspace-agent'
 import { workspaceMeetingRoutes, sharedMeetingRoutes } from '../routes/workspace-meetings'
 import { conversationRoutes } from '../routes/conversations'
+import { workBoardRoutes } from '../routes/work-boards'
 import { configureConversationAgentDispatcher, settleOrphanedAgentReplies } from '../services/conversation-agent-dispatcher'
 import { scriptedAgentInvokeFromEnv } from '../services/conversation-agent-script'
 import { createAgentTaskRoutes } from '../routes/agent-tasks'
@@ -51,6 +52,8 @@ import { localRemoteHostsRoutes } from '../routes/local-remote-hosts'
 import { localLogsRoutes } from '../routes/local-logs'
 import { meetingRoutes } from '../routes/meetings'
 import { historyRoutes } from '../routes/history'
+import { scopedAnalyticsRoutes } from '../routes/scoped-analytics'
+import { costAnalyticsRoutes } from '../routes/cost-analytics'
 import { localSystemRoutes } from '../routes/local-system'
 import { cloudWorkspaceListMiddleware, localCloudWorkspaceRoutes } from '../routes/local-cloud-proxy'
 import { localPlatformRoutes } from '../routes/local-platform'
@@ -149,6 +152,7 @@ export function createLocalApp(): LocalAppBundle {
   // One process writes every reply here, so any placeholder still marked running was cut off by a restart.
   void settleOrphanedAgentReplies().catch((err) => console.warn('[Channels] could not settle interrupted replies:', err?.message ?? err))
   app.route('/api', conversationRoutes({ resolveUserId: getAuthUserId }))
+  app.route('/api', workBoardRoutes({ resolveUserId: getAuthUserId }))
   app.post('/api/webhooks/livekit', async (c) => {
     const { handleLiveKitWebhook } = await import('../services/huddle.service')
     const result = await handleLiveKitWebhook({ rawBody: await c.req.text(), authorization: c.req.header('authorization') })
@@ -156,6 +160,10 @@ export function createLocalApp(): LocalAppBundle {
   })
   app.route('/api', createAgentTaskRoutes({ runtimeManager }))
   app.route('/api', historyRoutes({ resolveUserId: getAuthUserId }))
+  // Usage and Cost Optimizer on the desktop. server.ts mounts these for cloud
+  // only; without these two lines every local analytics call 404s.
+  app.route('/api', scopedAnalyticsRoutes())
+  app.route('/api', costAnalyticsRoutes())
   app.route('/api', diagnosticsRoutes({ workspacesDir }))
   app.route('/api', testsRoutes({ workspacesDir }))
   app.route('/api', securityRoutes({ workspacesDir }))

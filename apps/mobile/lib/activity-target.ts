@@ -18,7 +18,7 @@ export function activityTarget(blocks: Record<string, unknown> | null | undefine
   if (!blocks || blocks.type !== 'activity' || typeof blocks.kind !== 'string') return null
   const kind = blocks.kind
 
-  if (kind === 'agent.message') {
+  if (kind === 'agent.message' || kind.startsWith('question.')) {
     const conversationId = text(blocks.conversationId)
     const messageId = text(blocks.messageId)
     if (!conversationId || !messageId) return null
@@ -46,6 +46,17 @@ export function activityTarget(blocks: Record<string, unknown> | null | undefine
     const chatSessionId = text(blocks.chatSessionId)
     if (!chatSessionId) return null
     return { type: 'route', pathname: '/(app)/agent', params: { chatSessionId } }
+  }
+
+  if (kind.startsWith('work.')) {
+    const card = text(blocks.workItemId)
+    if (!card) return null
+    const conversationId = text(blocks.conversationId)
+    if (!conversationId) return { type: 'route', pathname: '/(app)/work', params: { card } }
+    const params: Record<string, string> = { conversationId, card }
+    const board = text(blocks.boardId)
+    if (board) params.board = board
+    return { type: 'route', pathname: '/(app)/c/[conversationId]', params }
   }
 
   if (kind === 'goal.event') {

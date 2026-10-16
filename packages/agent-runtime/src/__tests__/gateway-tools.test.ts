@@ -439,15 +439,17 @@ describe('gateway-tools', () => {
     test('createTools returns expected tools', () => {
       // Base tool count with every feature flag at its production default
       // (notably SHOGO_SEARCH_ENABLED unset, so `search` is not registered).
-      // 68 = 52 + `search_history` + `read_history` (chat/plan history search)
+      // 69 = 52 + `search_history` + `read_history` (chat/plan history search)
       // + the 8 project-lifecycle tools (project_list/create/attach/detach/
       // configure/call, capabilities_configure, system_apply — see
-      // project-tools.ts) + github_create_pr
+      // project-tools.ts) + connect_project (remote-tools.ts) + github_create_pr
       // + github_merge_pr + github_connect + expose_port + social_media.
       // (`notify_user_error` was removed along with the noisy error toast UI.)
       // `social_media` is registered here and then hidden unless the project
-      // opts in (`filterDisabledCapabilityTools`).
-      expect(createTools(createCtx())).toHaveLength(68)
+      // opts in (`filterDisabledCapabilityTools`). Plus the background task
+      // tools: wait, task_list, task_cancel. `terminal_exec` is only
+      // registered when the desktop terminal bridge (ctx.terminalExec) is wired.
+      expect(createTools(createCtx())).toHaveLength(71)
       expect(createTools(createCtx()).find((t) => t.name === 'heartbeat_configure')).toBeDefined()
       expect(createTools(createCtx()).find((t) => t.name === 'heartbeat_status')).toBeDefined()
       expect(createTools(createCtx()).find((t) => t.name === 'memory_search')).toBeDefined()

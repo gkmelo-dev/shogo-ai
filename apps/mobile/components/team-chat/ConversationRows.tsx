@@ -11,10 +11,11 @@ import { Bot, ChevronDown, ChevronRight, Hash, Lock, Pencil, Plus, Radio, Users 
 import { cn } from '@shogo/shared-ui/primitives'
 import { densityFor } from '../../lib/phone-density'
 import { usePhoneLayout } from '../../lib/native-phone-layout'
-import { conversationTitle, type ConversationSummary } from '../../lib/team-chat-api'
+import { conversationTitle, isSelfDm, type ConversationSummary } from '../../lib/team-chat-api'
 import { useHasDraft } from '../../hooks/useChatItems'
 import { PresenceDot } from './PresenceDot'
 import { InlineMarkdown } from './InlineMarkdown'
+import { UserAvatar } from './UserAvatar'
 
 export function conversationHref(id: string): string {
   return `/(app)/c/${encodeURIComponent(id)}`
@@ -73,7 +74,13 @@ export function ConversationRow({ conversation: c, workspaceId, active = false, 
   const unread = !active && c.unreadCount > 0 && !c.muted && c.joined
   const title = rowTitle(c)
   const peers = c.kind === 'dm' ? c.participants ?? [] : []
-  const dmPeer = peers.length === 1 && peers[0]!.type === 'user' ? peers[0]!.id : null
+  // A direct message names the other person and says whether they are around.
+  // The one row that names you is the note-to-self, and nobody sits across from
+  // you there, so it shows your own face in that same leading slot.
+  const peer = peers.length === 1 ? peers[0]! : null
+  const self = peer?.type === 'user' && peer.self === true ? peer : null
+  const dmPeer = peer?.type === 'user' && !isSelfDm(c) ? peer.id : null
+  const iconSize = comfortable ? density.icon.nav : 12
   const mentions = !active ? c.mentionCount : 0
   return (
     <Pressable
@@ -92,13 +99,17 @@ export function ConversationRow({ conversation: c, workspaceId, active = false, 
             : 'hover:bg-sidebar-accent/60 active:bg-sidebar-accent/60',
       )}
     >
-      {dmPeer ? (
-        <View style={{ width: comfortable ? density.icon.nav : 12 }} className="items-center">
+      {self ? (
+        <View style={{ width: iconSize }} className="items-center">
+          <UserAvatar name={self.name} image={self.image} size={iconSize} />
+        </View>
+      ) : dmPeer ? (
+        <View style={{ width: iconSize }} className="items-center">
           <PresenceDot userId={dmPeer} workspaceId={workspaceId} />
         </View>
       ) : (
         <Icon
-          size={comfortable ? density.icon.nav : 12}
+          size={iconSize}
           className={
             comfortable
               ? active || unread
@@ -152,14 +163,16 @@ export interface PanelSectionProps {
   onAdd?: () => void
   /** Hide the chevron and keep the section open. */
   fixed?: boolean
+  /** Start closed, for groups that are rarely needed. */
+  defaultCollapsed?: boolean
   children: ReactNode
 }
 
 /** A collapsible, labelled group of rows with an optional "+" action. */
-export function PanelSection({ label, addLabel, onAdd, fixed, children }: PanelSectionProps) {
+export function PanelSection({ label, addLabel, onAdd, fixed, defaultCollapsed, children }: PanelSectionProps) {
   const comfortable = usePhoneLayout()
   const density = densityFor(comfortable)
-  const [expanded, setExpanded] = useState(true)
+  const [expanded, setExpanded] = useState(!defaultCollapsed)
   const Chevron = expanded ? ChevronDown : ChevronRight
   return (
     <View className={comfortable ? 'mb-2' : 'mb-2 mt-3'}>

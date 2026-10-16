@@ -4,8 +4,10 @@
  * Workspace activity in team chat.
  *
  * - `#activity` gets a system line for agent task outcomes, schedule runs,
- *   goal events, publishes, new members, and finished agent posts in public
- *   channels, so the whole team can see what agents and teammates are doing.
+ *   goal events, publishes, new members, finished agent posts in public
+ *   channels, and questions agents ask people (asked, answered, closed), so
+ *   the whole team can see what agents and teammates are doing. A question
+ *   from a private conversation is only shown to its members (`visibleTo`).
  * - Schedules and tasks with `notifyConversationId` also post their result
  *   into that channel/DM as the agent that did the work.
  * - "Catch me up" summarizes unread messages with the workspace agent.
@@ -48,6 +50,12 @@ export type ActivityKind =
   | 'project.published'
   | 'member.joined'
   | 'agent.message'
+  | 'question.asked'
+  | 'question.answered'
+  | 'question.closed'
+  | 'work.created'
+  | 'work.done'
+  | 'work.regressed'
 
 export interface ActivityInput {
   kind: ActivityKind
@@ -381,6 +389,48 @@ export async function recordGoalEvent(workspaceId: string, event: {
     })
   } catch (err) {
     logFailure('goal event', err)
+  }
+}
+
+const WORK_VERB: Record<'work.created' | 'work.done' | 'work.regressed', string> = {
+  'work.created': 'opened',
+  'work.done': 'finished',
+  'work.regressed': 'reopened',
+}
+
+/**
+ * Card milestones on boards in public channels: opened, done, and problems
+ * that came back. Moves between open columns stay in the card thread.
+ */
+export async function recordWorkItemActivity(kind: keyof typeof WORK_VERB, input: {
+  item: { id: string; key: string; title: string; workspaceId: string; conversationId?: string | null; threadRootMessageId?: string | null }
+  board: { id: string; name: string; conversationId?: string | null }
+  actor: string
+  link: string
+  projectId?: string | null
+  actorUserId?: string | null
+  ref: string
+}): Promise<void> {
+  try {
+    if (!input.board.conversationId) return
+    const conversation = await db.conversation.findUnique({ where: { id: input.board.conversationId }, select: { kind: true, archivedAt: true } })
+    if (conversation?.kind !== 'public' || conversation.archivedAt) return
+    await postActivity(input.item.workspaceId, {
+      kind,
+      text: `**${input.actor}** ${WORK_VERB[kind]} ${input.item.key} “${clip(input.item.title, 200)}” on ${input.board.name} in <#c:${input.board.conversationId}>`,
+      ref: `work:${input.item.id}:${input.ref}`,
+      link: input.link,
+      projectId: input.projectId ?? null,
+      actorUserId: input.actorUserId ?? null,
+      meta: {
+        conversationId: input.board.conversationId,
+        boardId: input.board.id,
+        workItemId: input.item.id,
+        threadRootId: input.item.threadRootMessageId ?? null,
+      },
+    })
+  } catch (err) {
+    logFailure('work item', err)
   }
 }
 

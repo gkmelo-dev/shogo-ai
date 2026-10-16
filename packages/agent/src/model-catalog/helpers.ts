@@ -18,6 +18,7 @@ import {
   type CapabilityReliability,
 } from './models'
 import { MODEL_ALIASES, resolveAgentModeDefault } from './aliases'
+import { getDynamicModel, isAnthropicBacked } from './dynamic-models'
 
 /** True if `id` is an OpenRouter-routed model (carries the `openrouter:` prefix). */
 export function isOpenRouterModel(id: string): boolean {
@@ -118,6 +119,13 @@ export function inferProviderFromModel(modelId: string, fallback: string = 'anth
   if (modelId.startsWith('claude')) return 'anthropic'
   if (modelId.startsWith('gemini')) return 'google'
 
+  // DB-defined models are addressed by opaque ids (UUIDs). When the API has
+  // told us one is Anthropic-backed, route it natively: the 'custom'
+  // chat-completions path below loses Anthropic prompt caching, which bills
+  // every step of a long agent turn at the full uncached input price.
+  // Other DB providers keep the 'custom' route, which the proxy resolves.
+  if (isAnthropicBacked(getDynamicModel(modelId))) return 'anthropic'
+
   // Unknown model id: not in the static catalog and not a recognized native
   // prefix. These are DB-defined OpenAI-compatible models (e.g. MiMo) that
   // only the AI proxy knows how to route. Returning the (historically
@@ -172,7 +180,7 @@ const DEFAULT_MAX_OUTPUT_TOKENS = 64_000
 export function getMaxOutputTokens(id: string): number {
   const entry = getModelEntry(id)
   if (entry) return entry.maxOutputTokens
-  return DEFAULT_MAX_OUTPUT_TOKENS
+  return getDynamicModel(id)?.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS
 }
 
 /**
@@ -235,6 +243,13 @@ export const MODEL_DOLLAR_COSTS: Record<BillingModel, {
   'gpt-5.4-mini': { inputPerMillion: 0.75, cacheWritePerMillion: 0.9375, cachedInputPerMillion: 0.075, outputPerMillion: 4.40 },
   sonnet:         { inputPerMillion: 3.00, cacheWritePerMillion: 3.75, cachedInputPerMillion: 0.30, outputPerMillion: 15.00 },
   opus:           { inputPerMillion: 5.00, cacheWritePerMillion: 6.25, cachedInputPerMillion: 0.50, outputPerMillion: 25.00 },
+  // Anthropic-published rates (platform.claude.com/docs/en/models/haiku-5-5/overview,
+  // launched 2026-10-07). ALL four buckets are tiered: the values below are for
+  // prompts ≤100k tokens; above 100k the step-up is 5x across all buckets
+  // ($0.50 in / $2.50 out / $0.625 cache-write / $0.05 cache-read per MTok).
+  // `cacheWritePerMillion` is the 5-minute cache-write rate ($0.20/MTok for
+  // 1-hour writes — not represented in this flat cost shape).
+  'claude-haiku-5-5': { inputPerMillion: 0.10, cacheWritePerMillion: 0.125, cachedInputPerMillion: 0.01, outputPerMillion: 0.50 },
   // Anthropic-published rates (anthropic.com/claude-opus-5-5, launched
   // 2026-09-22) — 20% cheaper than Opus 5 on input/output, 60% cheaper on
   // cache reads. `cacheWritePerMillion` is the 5-minute cache-write rate

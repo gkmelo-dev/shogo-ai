@@ -180,8 +180,9 @@ You explain what you're about to do, then do it. You prefer showing over telling
 ## Priorities
 1. User requests — respond promptly and take action
 2. Urgent alerts — surface immediately via channels
-3. Scheduled checks — run on heartbeat cadence
-4. Proactive suggestions — offer when relevant context is available
+3. Work you handed off — act on its \`[Task update]\` as soon as it arrives; never schedule check-ins to follow it
+4. Scheduled checks — run on heartbeat cadence (a safety net for stalls, not the way to follow work)
+5. Proactive suggestions — offer when relevant context is available
 `,
   'HEARTBEAT.md': '',
   'TOOLS.md': `# Tools
@@ -219,7 +220,7 @@ Long-lived facts and learnings are stored here.
       activeMode: 'canvas',
       model: {
         provider: 'anthropic',
-        name: 'claude-sonnet-4-6',
+        name: 'auto',
       },
     },
     null,
@@ -395,7 +396,7 @@ export function seedPersonalCompanionTemplate(dir: string): boolean {
     ...(pristineConfig ? templateConfig : {}),
     model: config.model ?? {
       provider: templateConfig.modelProvider ?? 'anthropic',
-      name: templateConfig.modelName ?? 'claude-sonnet-4-5',
+      name: templateConfig.modelName ?? 'auto',
     },
   }
   if (JSON.stringify(config) !== JSON.stringify(merged)) {
@@ -860,8 +861,33 @@ export function seedRuntimeTemplate(dir: string): boolean {
     },
   })
 
+  materializeWorkspaceSdkPin(dir, templatePath)
   console.log('[workspace-defaults] Seeded runtime template into workspace')
   return true
+}
+
+/**
+ * A dev checkout's template pins `@shogo-ai/sdk` to `workspace:*`, which no
+ * `bun install` outside the monorepo can resolve. Rewrite it to the sibling
+ * `packages/sdk` version, as `migrateLegacyShogoSdkPin` does for existing
+ * workspaces. Shipped templates are already materialized, so this no-ops.
+ */
+function materializeWorkspaceSdkPin(dir: string, templatePath: string): void {
+  const pkgPath = join(dir, 'package.json')
+  let raw: string
+  let pkgJson: { dependencies?: Record<string, string> }
+  try {
+    raw = readFileSync(pkgPath, 'utf-8')
+    pkgJson = JSON.parse(raw)
+  } catch { return }
+  if (!pkgJson.dependencies?.['@shogo-ai/sdk']?.startsWith('workspace:')) return
+  let version: string | undefined
+  try {
+    version = JSON.parse(readFileSync(join(templatePath, '..', '..', 'packages', 'sdk', 'package.json'), 'utf-8')).version
+  } catch { return }
+  if (typeof version !== 'string') return
+  pkgJson.dependencies['@shogo-ai/sdk'] = `^${version}`
+  writeFileSync(pkgPath, JSON.stringify(pkgJson, null, 2) + (raw.endsWith('\n') ? '\n' : ''))
 }
 
 // ---------------------------------------------------------------------------
