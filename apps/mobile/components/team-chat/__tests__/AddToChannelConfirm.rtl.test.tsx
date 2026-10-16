@@ -38,6 +38,7 @@ const {
   ADD_TO_CHANNEL_BODY,
   ADD_TO_CHANNEL_TITLE,
   AddToChannelConfirmHost,
+  confirmsAddToChannel,
   requestAddToChannelConfirm,
   __resetAddToChannelConfirmForTest,
 } = await import('../AddToChannelConfirm')
@@ -95,5 +96,21 @@ describe('add to channel confirmation', () => {
     expect(alerts[0].buttons.map((b) => b.text)).toEqual(['Cancel', 'Add'])
     alerts[0].buttons[1].onPress()
     expect(await answer).toBe(true)
+  })
+})
+
+describe('confirmsAddToChannel', () => {
+  test('a public channel is added to without asking', async () => {
+    const ask = mock(async () => false)
+    expect(await confirmsAddToChannel('public', ask)).toBe(true)
+    expect(ask).not.toHaveBeenCalled()
+  })
+
+  test('a private channel asks, and a decline stops the add', async () => {
+    expect(await confirmsAddToChannel('private', async () => false)).toBe(false)
+  })
+
+  test('a private channel asks, and a confirm goes through', async () => {
+    expect(await confirmsAddToChannel('private', async () => true)).toBe(true)
   })
 })

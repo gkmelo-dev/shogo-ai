@@ -27,7 +27,7 @@ import { usePresence } from '../../hooks/usePresence'
 import { resolveAvatarUrl } from '../../lib/chat-attachment-url'
 import { PresenceDot, presenceLabel } from './PresenceDot'
 import { AgentAvatar } from './AgentAvatar'
-import { requestAddToChannelConfirm } from './AddToChannelConfirm'
+import { confirmsAddToChannel } from './AddToChannelConfirm'
 import { UserAvatar } from './UserAvatar'
 import { HuddleButton } from './Huddle'
 
@@ -1010,7 +1010,7 @@ function MembersModal({
                       void (async () => {
                         // A private channel's history (and its files) is handed
                         // over on add — the same warning the mention nudge gives.
-                        if (conversation.kind === 'private' && !(await requestAddToChannelConfirm())) return
+                        if (!(await confirmsAddToChannel(conversation.kind))) return
                         void act(() => api.addMembers(conversation.id, [p.id]))
                       })()
                     }}

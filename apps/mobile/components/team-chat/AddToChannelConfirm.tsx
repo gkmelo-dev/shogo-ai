@@ -74,6 +74,17 @@ export function requestAddToChannelConfirm(): Promise<boolean> {
   return new Promise((resolve) => pushRequest({ resolve }))
 }
 
+/**
+ * Whether to ask before adding. Only a private channel needs it: its history —
+ * files included — is what the new member gains, which is not obvious from an
+ * "Add them" button. A public channel's history is already public, so Slack
+ * adds without a prompt and so do we.
+ */
+export async function confirmsAddToChannel(kind: string, ask: () => Promise<boolean> = requestAddToChannelConfirm): Promise<boolean> {
+  if (kind !== 'private') return true
+  return ask()
+}
+
 /** Mount once in the chat tree. Renders nothing until a request comes in. */
 export function AddToChannelConfirmHost() {
   const [request, setRequest] = useState<AddToChannelRequest | null>(null)

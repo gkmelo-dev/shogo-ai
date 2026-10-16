@@ -25,7 +25,7 @@ import { MessageList } from './MessageList'
 import { Composer, type ComposerHandle } from './Composer'
 import { MentionNudgeCard } from './MentionNudgeCard'
 import { EphemeralNotice } from './EphemeralNotice'
-import { AddToChannelConfirmHost, requestAddToChannelConfirm } from './AddToChannelConfirm'
+import { AddToChannelConfirmHost, confirmsAddToChannel } from './AddToChannelConfirm'
 import { CHROME_SIZE, GlassButton, GlassChip } from './FloatingChrome'
 import { usePhoneChromeOverlay } from '../layout/PhoneChromeOverlay'
 import { GlassBlurTarget } from '../ui/LiquidGlassBackdrop'
@@ -299,7 +299,7 @@ export function TimelinePane(props: TimelinePaneProps) {
     const { ids } = mentionNudge
     // Adding to a private channel hands over the whole history, files
     // included — the warning Slack puts in front of it.
-    if (conversation.kind === 'private' && !(await requestAddToChannelConfirm())) return
+    if (!(await confirmsAddToChannel(conversation.kind))) return
     setMentionNudge((n) => (n ? { ...n, busy: true, error: null } : n))
     try {
       await api.addMembers(conversation.id, ids)
