@@ -128,6 +128,9 @@ export default observer(function BillingPage() {
     planSource,
     usageWindows,
     overagePayment,
+    promoCredit,
+    trialEligible,
+    trialEndsAt,
   } = useBillingData(currentWorkspace?.id)
   // A grant-conferred plan has no Stripe customer / portal, so hide
   // "Manage" / Stripe-only affordances and let "Free Plan"-style copy
@@ -414,7 +417,10 @@ export default observer(function BillingPage() {
 
   const billingPeriodLabel = billingInterval === 'annual' ? 'per year' : 'per month'
 
-  const handleCheckout = useCallback(async (planType: 'pro' | 'business' | 'basic', seats: number) => {
+  const fmtBillingDate = (iso: string) =>
+    new Date(iso).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })
+
+  const handleCheckout = useCallback(async (planType: 'pro' | 'business' | 'basic', seats: number, opts?: { trial?: boolean }) => {
     if (!currentWorkspace?.id) return
     setIsCheckoutLoading(true)
     try {
@@ -483,6 +489,8 @@ export default observer(function BillingPage() {
         billingInterval,
         userEmail: user?.email,
         referralId: getRewardfulReferral(),
+        // Server re-checks eligibility; ineligible accounts get the normal checkout.
+        ...(opts?.trial && { trial: true }),
         ...(redirectBase && {
           successUrl: `${redirectBase}/?workspace=${currentWorkspace.id}&checkout=success&session_id={CHECKOUT_SESSION_ID}`,
           cancelUrl: `${redirectBase}/?workspace=${currentWorkspace.id}&checkout=canceled`,
@@ -657,6 +665,30 @@ export default observer(function BillingPage() {
           </Text>
         </View>
       </View>
+
+      {/* Signup credit + free trial status */}
+      {(promoCredit && (promoCredit.availableUsd > 0 || promoCredit.pendingVerificationUsd > 0)) || trialEndsAt ? (
+        <Card className="mb-4 rounded-2xl border-border shadow-none">
+          <CardContent className="p-4 gap-2">
+            {promoCredit && promoCredit.availableUsd > 0 && (
+              <Text className="text-sm font-medium text-foreground">
+                ${promoCredit.availableUsd.toFixed(2)} free credit left
+                {promoCredit.expiresAt ? ` · expires ${fmtBillingDate(promoCredit.expiresAt)}` : ''}
+              </Text>
+            )}
+            {promoCredit && !promoCredit.emailVerified && promoCredit.pendingVerificationUsd > 0 && (
+              <Text className="text-sm text-muted-foreground">
+                Verify your email to unlock ${promoCredit.pendingVerificationUsd.toFixed(2)} more free credit.
+              </Text>
+            )}
+            {trialEndsAt && (
+              <Text className="text-sm text-muted-foreground">
+                Free trial ends {fmtBillingDate(trialEndsAt)}. Cancel anytime before then and you won't be charged.
+              </Text>
+            )}
+          </CardContent>
+        </Card>
+      ) : null}
 
       {/* Current Plan Card */}
       <Card className="mb-4 rounded-2xl border-border shadow-none">
@@ -919,6 +951,18 @@ export default observer(function BillingPage() {
 
               <View className="hidden lg:block lg:min-h-[76px]" />
 
+              {trialEligible && !hasStripeSubscription && (
+                <View className="gap-1">
+                  <Pressable
+                    onPress={() => handleCheckout('basic', 1, { trial: true })}
+                    disabled={isCheckoutLoading}
+                    className="w-full items-center justify-center py-3 rounded-md bg-primary active:bg-primary/80"
+                  >
+                    <Text className="text-sm font-medium text-primary-foreground">Start 7-day free trial</Text>
+                  </Pressable>
+                  <Text className="text-xs text-center text-muted-foreground">$0 today. Card required; cancel anytime.</Text>
+                </View>
+              )}
               <Pressable
                 onPress={() => handleCheckout('basic', 1)}
                 disabled={isCheckoutLoading}
@@ -981,6 +1025,18 @@ export default observer(function BillingPage() {
                 </View>
               )}
 
+              {trialEligible && !hasStripeSubscription && (
+                <View className="gap-1">
+                  <Pressable
+                    onPress={() => handleCheckout('pro', proSeats, { trial: true })}
+                    disabled={isCheckoutLoading}
+                    className="w-full items-center justify-center py-3 rounded-md bg-primary active:bg-primary/80"
+                  >
+                    <Text className="text-sm font-medium text-primary-foreground">Start 7-day free trial</Text>
+                  </Pressable>
+                  <Text className="text-xs text-center text-muted-foreground">$0 today. Card required; cancel anytime.</Text>
+                </View>
+              )}
               <Pressable
                 onPress={() => handleCheckout('pro', proSeats)}
                 disabled={isCheckoutLoading}
@@ -1047,6 +1103,18 @@ export default observer(function BillingPage() {
                 </View>
               )}
 
+              {trialEligible && !hasStripeSubscription && (
+                <View className="gap-1">
+                  <Pressable
+                    onPress={() => handleCheckout('business', businessSeats, { trial: true })}
+                    disabled={isCheckoutLoading}
+                    className="w-full items-center justify-center py-3 rounded-md bg-primary active:bg-primary/80"
+                  >
+                    <Text className="text-sm font-medium text-primary-foreground">Start 7-day free trial</Text>
+                  </Pressable>
+                  <Text className="text-xs text-center text-muted-foreground">$0 today. Card required; cancel anytime.</Text>
+                </View>
+              )}
               <Pressable
                 onPress={() => handleCheckout('business', businessSeats)}
                 disabled={isCheckoutLoading}

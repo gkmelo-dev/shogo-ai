@@ -41,6 +41,10 @@ import {
   getSubscription,
   getUsageWallet,
 } from '../services/billing.service'
+import { allocateFreeWallet } from '../services/billing.service'
+import { releaseSignupCreditOnVerification } from '../services/signup-credit.service'
+import { promoCreditAvailableUsd } from '../config/usage-plans'
+import { e2eBootstrapEnabled, e2eBootstrapSecretMatches } from '../lib/e2e-bootstrap-secret'
 import { prisma, SubscriptionStatus, BillingInterval } from '../lib/prisma'
 
 const app = new Hono()
@@ -48,21 +52,8 @@ const app = new Hono()
 const ALLOWED_PLANS = new Set(['basic', 'pro', 'business'])
 const ALLOWED_INTERVALS = new Set<BillingInterval>(['monthly', 'annual'])
 
-function bootstrapEnabled(): boolean {
-  const prod = process.env.NODE_ENV === 'production'
-  const override = process.env.SHOGO_E2E_BOOTSTRAP_ENABLED === '1'
-  return !prod || override
-}
-
-function secretMatches(header: string | undefined): boolean {
-  const expected = process.env.SHOGO_E2E_BOOTSTRAP_SECRET
-  if (!expected) return false
-  if (!header) return false
-  // Constant-time comparison — both sides are short so straight
-  // `!==` is acceptable here; we don't want Node's `crypto.timingSafeEqual`
-  // to bring Buffer allocation noise for a rarely-hit endpoint.
-  return header === expected
-}
+const bootstrapEnabled = e2eBootstrapEnabled
+const secretMatches = e2eBootstrapSecretMatches
 
 /**
  * POST /api/internal/e2e/bootstrap-subscription
@@ -106,6 +97,7 @@ app.post('/bootstrap-subscription', async (c) => {
     seats?: number
     billingInterval?: BillingInterval
     daysUntilPeriodEnd?: number
+    status?: 'active' | 'trialing'
   }
   try {
     body = await c.req.json()
@@ -199,13 +191,19 @@ app.post('/bootstrap-subscription', async (c) => {
       planId,
       seats,
       billingInterval,
-      status: SubscriptionStatus.active,
+      status: body.status === 'trialing' ? SubscriptionStatus.trialing : SubscriptionStatus.active,
       currentPeriodStart: now,
       currentPeriodEnd: periodEnd,
       cancelAtPeriodEnd: false,
     })
 
-    const wallet = await allocateMonthlyIncluded(workspaceId, planId, seats)
+    // A trial has no paid invoice yet, so the monthly allowance waits for
+    // the first paid cycle (invoice.payment_succeeded). Trialing users get the
+    // free wallet only, matching the real webhook path.
+    const wallet =
+      body.status === 'trialing'
+        ? await allocateFreeWallet(workspaceId)
+        : await allocateMonthlyIncluded(workspaceId, planId, seats)
 
     // eslint-disable-next-line no-console
     console.info(
@@ -339,6 +337,42 @@ app.post('/recycle-runtime', async (c) => {
 })
 
 /**
+ * POST /api/internal/e2e/verify-email
+ *
+ * Body: { userEmail: string } (must be e2e-*@mailnull.com)
+ *
+ * Marks the e2e user's email verified and runs the same release path as the
+ * `afterEmailVerification` hook, so tests can exercise the $8 release without
+ * reading an inbox. Gated by the same guardrails as the other e2e routes.
+ */
+app.post('/verify-email', async (c) => {
+  if (!bootstrapEnabled()) {
+    return c.json({ ok: false, error: 'e2e_bootstrap_disabled' }, 503)
+  }
+  if (!secretMatches(c.req.header('x-e2e-bootstrap-secret'))) {
+    return c.json({ ok: false, error: 'unauthorized' }, 401)
+  }
+
+  let body: { userEmail?: string }
+  try {
+    body = await c.req.json()
+  } catch {
+    return c.json({ ok: false, error: 'invalid_json' }, 400)
+  }
+  const email = body.userEmail?.trim().toLowerCase()
+  if (!email || !email.startsWith('e2e-') || !email.endsWith('@mailnull.com')) {
+    return c.json({ ok: false, error: 'userEmail_must_be_e2e_address' }, 400)
+  }
+
+  const user = await prisma.user.findUnique({ where: { email }, select: { id: true } })
+  if (!user) return c.json({ ok: false, error: 'user_not_found' }, 404)
+
+  await prisma.user.update({ where: { id: user.id }, data: { emailVerified: true } })
+  const outcome = await releaseSignupCreditOnVerification({ userId: user.id })
+  return c.json({ ok: true, userId: user.id, outcome })
+})
+
+/**
  * GET /api/internal/e2e/subscription-state
  *
  * Diagnostic endpoint — returns the current subscription + wallet for
@@ -363,6 +397,75 @@ app.get('/subscription-state', async (c) => {
   ])
 
   return c.json({ ok: true, subscription, wallet })
+})
+
+/**
+ * GET /api/internal/e2e/signup-credit-state?userEmail=e2e-…@mailnull.com
+ *
+ * Read-only. Returns the e2e user's risk assessment and the promo credit on
+ * their team workspace, so signup-credit and signup-risk specs can assert the
+ * staged grant without reading the database. e2e addresses only.
+ */
+app.get('/signup-credit-state', async (c) => {
+  if (!bootstrapEnabled()) {
+    return c.json({ ok: false, error: 'e2e_bootstrap_disabled' }, 503)
+  }
+  if (!secretMatches(c.req.header('x-e2e-bootstrap-secret'))) {
+    return c.json({ ok: false, error: 'unauthorized' }, 401)
+  }
+
+  const email = c.req.query('userEmail')?.trim().toLowerCase()
+  if (!email || !email.startsWith('e2e-') || !email.endsWith('@mailnull.com')) {
+    return c.json({ ok: false, error: 'userEmail_must_be_e2e_address' }, 400)
+  }
+
+  const user = await prisma.user.findUnique({
+    where: { email },
+    select: {
+      id: true,
+      emailVerified: true,
+      members: {
+        where: { workspaceId: { not: null }, projectId: null },
+        select: { workspaceId: true, workspace: { select: { kind: true } } },
+        orderBy: { createdAt: 'asc' },
+      },
+    },
+  })
+  if (!user) return c.json({ ok: false, error: 'user_not_found' }, 404)
+
+  const members = user.members
+  const workspaceId =
+    (members.find((m) => m.workspace?.kind === 'team') ?? members[0])?.workspaceId ?? null
+
+  const [assessment, wallet] = await Promise.all([
+    prisma.signupRiskAssessment.findUnique({
+      where: { userId: user.id },
+      select: {
+        band: true,
+        score: true,
+        decision: true,
+        signals: true,
+        reviewDecision: true,
+      },
+    }),
+    workspaceId ? getUsageWallet(workspaceId) : Promise.resolve(null),
+  ])
+
+  return c.json({
+    ok: true,
+    userId: user.id,
+    workspaceId,
+    emailVerified: user.emailVerified,
+    assessment,
+    promoCredit: wallet
+      ? {
+          availableUsd: promoCreditAvailableUsd(wallet),
+          grantedUsd: wallet.promoCreditGrantedUsd,
+          stage: wallet.promoCreditStage,
+          expiresAt: wallet.promoCreditExpiresAt,
+        }
+      : null,
+  })
 })
 
 export default app

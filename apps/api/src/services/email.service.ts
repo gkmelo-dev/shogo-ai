@@ -227,6 +227,26 @@ export async function sendPlanUpgradedEmail(params: {
 }
 
 /**
+ * Send the "your free trial ends soon" reminder. Triggered by Stripe's
+ * `customer.subscription.trial_will_end` (about 3 days before the trial ends).
+ * Requires a `trial-ending` template on the email provider.
+ */
+export async function sendTrialEndingEmail(params: {
+  to: string
+  workspaceName: string
+  planName: string
+  trialEndsAt: string
+  dashboardUrl: string
+}): Promise<{ success: boolean; error?: string }> {
+  return sendTemplateEmail('trial-ending', params.to, {
+    workspaceName: params.workspaceName,
+    planName: params.planName,
+    trialEndsAt: params.trialEndsAt,
+    dashboardUrl: params.dashboardUrl,
+  })
+}
+
+/**
  * Send a payment receipt email
  */
 export async function sendPaymentReceiptEmail(params: {

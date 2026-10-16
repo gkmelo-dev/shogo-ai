@@ -135,6 +135,8 @@ import { loadPlatformModelSetting, platformModelSettingRoutes } from './routes/p
 import { resetCloudKeyState } from './lib/cloud-key-state'
 import { userProfileRoutes } from './routes/local-user'
 import { localCloudBillingRoutes } from './routes/local-cloud-billing'
+import { adminSignupRiskRoutes } from './routes/admin-signup-risk'
+import { TRIAL_PERIOD_DAYS, SIGNUP_CREDIT_TOTAL_USD, SIGNUP_CREDIT_VERIFIED_USD, promoCreditAvailableUsd } from './config/usage-plans'
 import { meetingRoutes } from './routes/meetings'
 import { localProjectsRoutes } from './routes/local-projects'
 import { localLogsRoutes } from './routes/local-logs'
@@ -206,6 +208,9 @@ const INSTANCE_SIZES: any = cloud.INSTANCE_SIZES ?? {}
 const INSTANCE_SIZE_ORDER: any = cloud.INSTANCE_SIZE_ORDER ?? []
 const getInstanceDisplayPrice: any = cloud.getInstanceDisplayPrice ?? (() => undefined)
 const sendPlanUpgradedEmail: any = cloud.sendPlanUpgradedEmail ?? (async () => {})
+const sendTrialEndingEmail: any = cloud.sendTrialEndingEmail ?? (async () => {})
+const trialService: any = cloud.trialService ?? {}
+const signupCreditService: any = cloud.signupCreditService ?? {}
 const sendInvitationEmail: any = cloud.sendInvitationEmail ?? (async () => {})
 const sendProjectInviteEmail: any = cloud.sendProjectInviteEmail ?? (async () => {})
 const sendInviteAcceptedEmail: any = cloud.sendInviteAcceptedEmail ?? (async () => {})
@@ -5870,6 +5875,12 @@ app.post('/api/projects/:projectId/permission-response', async (c) => {
 // =============================================================================
 
 app.use('/api/admin/pods/*', authMiddleware, requireAuth, requireSuperAdmin)
+// Signup risk review (cloud only: the desktop schema has no risk tables).
+if (!LOCAL_MODE) {
+  app.use('/api/admin/signup-risk', authMiddleware, requireAuth, requireSuperAdmin)
+  app.use('/api/admin/signup-risk/*', authMiddleware, requireAuth, requireSuperAdmin)
+  app.route('/api/admin/signup-risk', adminSignupRiskRoutes())
+}
 app.use('/api/admin/pods', authMiddleware, requireAuth, requireSuperAdmin)
 app.use('/api/admin/pod-stats', authMiddleware, requireAuth, requireSuperAdmin)
 app.use('/api/admin/warm-pool', authMiddleware, requireAuth, requireSuperAdmin)
@@ -7092,7 +7103,7 @@ app.post('/api/billing/checkout', async (c) => {
     const userId = authCtx?.userId as string | undefined
 
     const body = await c.req.json()
-    const { workspaceId, planId, seats: rawSeats, billingInterval, userEmail, referralId, successUrl: clientSuccessUrl, cancelUrl: clientCancelUrl } = body
+    const { workspaceId, planId, seats: rawSeats, billingInterval, userEmail, referralId, successUrl: clientSuccessUrl, cancelUrl: clientCancelUrl, trial: wantsTrial } = body
 
     if (!workspaceId || !planId || !billingInterval) {
       return c.json({ error: { code: 'invalid_request', message: 'Missing required fields' } }, 400)
@@ -7129,7 +7140,20 @@ app.post('/api/billing/checkout', async (c) => {
       || `${frontendUrl}/?workspace=${workspaceId}&checkout=canceled`
 
     const affiliateOverrides = await affiliateCheckoutOverrides(userId)
-    const sessionMetadata = { ...metadata, ...(affiliateOverrides.metadata ?? {}) }
+    // Free trial (card required). Only when the client asks for it AND the
+    // account is eligible; otherwise this is a normal paid checkout.
+    const trialDays = wantsTrial && (await trialService.trialEligibility({ userId: userId, workspaceId: workspaceId, planId })).eligible
+      ? TRIAL_PERIOD_DAYS
+      : 0
+    const trialParams = trialService.trialCheckoutParams(trialDays, {
+      workspaceId: workspaceId,
+      planId,
+      billingInterval,
+      seats: String(seats),
+      ...(affiliateOverrides.subscription_data?.metadata ?? {}),
+    })
+
+    const sessionMetadata = { ...metadata, ...(affiliateOverrides.metadata ?? {}), ...(trialParams.metadata ?? {}) }
 
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription',
@@ -7144,7 +7168,10 @@ app.post('/api/billing/checkout', async (c) => {
       // is authoritative).
       ...(referralId && { client_reference_id: referralId }),
       ...(affiliateOverrides.customer_creation && { customer_creation: affiliateOverrides.customer_creation }),
-      ...(affiliateOverrides.subscription_data && { subscription_data: affiliateOverrides.subscription_data }),
+      ...((affiliateOverrides.subscription_data || trialParams.subscription_data) && {
+        subscription_data: { ...(affiliateOverrides.subscription_data ?? {}), ...(trialParams.subscription_data ?? {}) },
+      }),
+      ...(trialParams.payment_method_collection && { payment_method_collection: trialParams.payment_method_collection }),
     })
 
     return c.json({ sessionId: session.id, url: session.url }, 200)
@@ -7214,6 +7241,25 @@ app.get('/api/billing/workspace-plan', async (c) => {
       billingService.getUsageWindows(workspaceId),
       billingService.getOverageStatus(workspaceId),
     ])
+    // Signup promo credit + trial eligibility for the billing UI. Cloud only
+    // (local mode has no signup risk rows and no Stripe).
+    const promoUser = userId && !LOCAL_MODE
+      ? await prisma.user.findUnique({ where: { id: userId }, select: { emailVerified: true } })
+      : null
+    const promoRisk = userId && !LOCAL_MODE
+      ? await prisma.signupRiskAssessment.findUnique({ where: { userId }, select: { decision: true } })
+      : null
+    const trialCheck = !sub && userId && !LOCAL_MODE
+      ? await trialService.trialEligibility({ userId, workspaceId })
+      : { eligible: false }
+    const promoEmailVerified = Boolean(promoUser?.emailVerified)
+    const promoPendingUsd = promoEmailVerified
+      ? 0
+      : promoRisk?.decision === 'credit_initial'
+        ? SIGNUP_CREDIT_VERIFIED_USD
+        : promoRisk?.decision === 'credit_held'
+          ? SIGNUP_CREDIT_TOTAL_USD
+          : 0
     const source: 'subscription' | 'grant' | 'free' =
       sub ? 'subscription' : effective !== 'free' ? 'grant' : 'free'
     return c.json({
@@ -7260,6 +7306,19 @@ app.get('/api/billing/workspace-plan', async (c) => {
       // Rolling usage windows (time-gated "unlimited"). `limitUsd: null`
       // means the window is uncapped (enterprise).
       usageWindows,
+      // Signup promo credit: spendable balance (0 once expired), what unlocks
+      // on email verification, and the expiry. Economy models only.
+      promoCredit: {
+        availableUsd: wallet ? promoCreditAvailableUsd(wallet) : 0,
+        grantedUsd: wallet?.promoCreditGrantedUsd ?? 0,
+        expiresAt: wallet?.promoCreditExpiresAt ?? null,
+        emailVerified: promoEmailVerified,
+        pendingVerificationUsd: promoPendingUsd,
+      },
+      // Free trial: eligible to start one (card required), and when the
+      // current trial ends.
+      trialEligible: trialCheck.eligible,
+      trialEndsAt: sub?.status === 'trialing' ? (sub as any).currentPeriodEnd ?? null : null,
     })
   } catch (error: any) {
     return c.json({ error: { code: 'plan_query_failed', message: error.message } }, 500)
@@ -7299,7 +7358,7 @@ app.post('/api/billing/workspace-checkout', async (c) => {
     }
 
     const body = await c.req.json()
-    const { workspaceName, planId, seats: rawSeats, billingInterval, userEmail, referralId, successUrl: clientSuccessUrl, cancelUrl: clientCancelUrl } = body
+    const { workspaceName, planId, seats: rawSeats, billingInterval, userEmail, referralId, successUrl: clientSuccessUrl, cancelUrl: clientCancelUrl, trial: wantsTrial } = body
 
     if (!workspaceName || !planId || !billingInterval) {
       return c.json({ error: { code: 'invalid_request', message: 'Missing required fields: workspaceName, planId, billingInterval' } }, 400)
@@ -7341,7 +7400,20 @@ app.post('/api/billing/workspace-checkout', async (c) => {
       : `${frontendUrl}/?workspace=${newWorkspaceId}&checkout=canceled`
 
     const affiliateOverrides = await affiliateCheckoutOverrides(userId)
-    const sessionMetadata = { ...metadata, ...(affiliateOverrides.metadata ?? {}) }
+    // Free trial (card required). Only when the client asks for it AND the
+    // account is eligible; otherwise this is a normal paid checkout.
+    const trialDays = wantsTrial && (await trialService.trialEligibility({ userId: userId, workspaceId: newWorkspaceId, planId })).eligible
+      ? TRIAL_PERIOD_DAYS
+      : 0
+    const trialParams = trialService.trialCheckoutParams(trialDays, {
+      workspaceId: newWorkspaceId,
+      planId,
+      billingInterval,
+      seats: String(seats),
+      ...(affiliateOverrides.subscription_data?.metadata ?? {}),
+    })
+
+    const sessionMetadata = { ...metadata, ...(affiliateOverrides.metadata ?? {}), ...(trialParams.metadata ?? {}) }
 
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription',
@@ -7352,7 +7424,10 @@ app.post('/api/billing/workspace-checkout', async (c) => {
       ...(userEmail && { customer_email: userEmail }),
       ...(referralId && { client_reference_id: referralId }),
       ...(affiliateOverrides.customer_creation && { customer_creation: affiliateOverrides.customer_creation }),
-      ...(affiliateOverrides.subscription_data && { subscription_data: affiliateOverrides.subscription_data }),
+      ...((affiliateOverrides.subscription_data || trialParams.subscription_data) && {
+        subscription_data: { ...(affiliateOverrides.subscription_data ?? {}), ...(trialParams.subscription_data ?? {}) },
+      }),
+      ...(trialParams.payment_method_collection && { payment_method_collection: trialParams.payment_method_collection }),
     })
 
     return c.json({ sessionId: session.id, url: session.url, workspaceId: newWorkspaceId }, 200)
@@ -8107,6 +8182,23 @@ app.post('/api/webhooks/stripe', async (c) => {
             const item = subscription.items?.data?.[0]
             const quantity = Math.max(1, Math.floor(item?.quantity ?? 1))
             const billingInterval = (subscription.metadata?.billingInterval as 'monthly' | 'annual') || 'monthly'
+
+            // Free trial: enforce one trial per card/user before provisioning.
+            // A blocked card's subscription is cancelled inside recordTrialStart.
+            if (subscription.status === 'trialing') {
+              const trialOutcome = await trialService.recordTrialStart({
+                stripe,
+                workspaceId: wsId,
+                userId: null,
+                planId: metaPlanId,
+                subscriptionId: subscription.id,
+                stripeCustomerId: subscription.customer as string,
+              })
+              if (trialOutcome === 'blocked') {
+                console.warn('[Webhook] Trial blocked (card already used for a trial):', wsId)
+                break
+              }
+            }
             const now = Date.now()
             const currentPeriodStart = subscription.current_period_start
               ? subscription.current_period_start * 1000
@@ -8133,7 +8225,11 @@ app.post('/api/webhooks/stripe', async (c) => {
             // mid-cycle quantity changes we want to preserve overage, so we
             // call it only on `created` (provisioning) — `updated` skips the
             // reset and only updates the included totals.
-            if (event.type === 'customer.subscription.created') {
+            if (subscription.status === 'trialing') {
+              // Trial: keep the free allowance. The paid monthly allocation and
+              // overage start with the first paid invoice (refill below).
+              await billingService.allocateFreeWallet(wsId)
+            } else if (event.type === 'customer.subscription.created') {
               await billingService.allocateMonthlyIncluded(wsId, metaPlanId, quantity)
             } else {
               // Stack any active super-admin grants on top of the plan's
@@ -8192,6 +8288,38 @@ app.post('/api/webhooks/stripe', async (c) => {
           }
         } catch (err: any) {
           console.error('[Webhook] Failed to sync instance subscription status:', err.message)
+        }
+        break
+      }
+      case 'customer.subscription.trial_will_end': {
+        // Stripe fires this ~3 days before a trial ends. Remind the workspace
+        // owner so the charge isn't a surprise. The workspace is found through
+        // the local Subscription row (subscription metadata is not always set).
+        const subscription = event.data.object as StripeTypes.Subscription
+        try {
+          const sub = await prisma.subscription.findFirst({
+            where: { stripeSubscriptionId: subscription.id },
+            select: { workspaceId: true, planId: true },
+          })
+          if (sub) {
+            const workspace = await prisma.workspace.findUnique({
+              where: { id: sub.workspaceId },
+              include: { members: { where: { role: 'owner', projectId: null }, include: { user: { select: { email: true } } } } },
+            })
+            const ownerEmail = workspace?.members?.[0]?.user?.email
+            if (ownerEmail) {
+              const planLabel = sub.planId.charAt(0).toUpperCase() + sub.planId.slice(1)
+              sendTrialEndingEmail({
+                to: ownerEmail,
+                workspaceName: workspace!.name,
+                planName: planLabel,
+                trialEndsAt: new Date((subscription.trial_end ?? 0) * 1000).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }),
+                dashboardUrl: `${getFrontendUrl()}/billing`,
+              }).catch((err: any) => console.error('[Webhook] trial-ending email failed:', err))
+            }
+          }
+        } catch (err: any) {
+          console.error('[Webhook] trial_will_end handling failed:', err.message)
         }
         break
       }
@@ -8300,6 +8428,25 @@ app.post('/api/webhooks/stripe', async (c) => {
               ? stripeSubscription.current_period_end * 1000
               : now + (30 * 24 * 60 * 60 * 1000)
 
+            // Free trial: record it first (one trial per user/workspace/card). A
+            // card already used for a trial elsewhere gets cancelled inside
+            // recordTrialStart, so skip provisioning entirely in that case.
+            const trialing = stripeSubscription.status === 'trialing'
+            if (trialing) {
+              const trialOutcome = await trialService.recordTrialStart({
+                stripe,
+                workspaceId,
+                userId: null,
+                planId,
+                subscriptionId: stripeSubscription.id,
+                stripeCustomerId: session.customer as string,
+              })
+              if (trialOutcome === 'blocked') {
+                console.warn('[Webhook] Trial blocked (card already used for a trial):', workspaceId)
+                break
+              }
+            }
+
             await billingService.syncFromStripe({
               stripeSubscriptionId: stripeSubscription.id,
               stripeCustomerId: session.customer as string,
@@ -8313,8 +8460,16 @@ app.post('/api/webhooks/stripe', async (c) => {
               cancelAtPeriodEnd: stripeSubscription.cancel_at_period_end ?? false,
             })
 
-            await billingService.allocateMonthlyIncluded(workspaceId, planId, checkoutSeats)
-            console.log('[Webhook] Subscription created + monthly included USD allocated for workspace:', workspaceId, 'plan:', planId, 'seats:', checkoutSeats)
+            if (trialing) {
+              // No paid invoice yet: keep the free allowance. The monthly
+              // allocation (and overage) starts with the first paid cycle, in
+              // invoice.payment_succeeded.
+              await billingService.allocateFreeWallet(workspaceId)
+              console.log('[Webhook] Trial started for workspace:', workspaceId, 'plan:', planId, 'seats:', checkoutSeats)
+            } else {
+              await billingService.allocateMonthlyIncluded(workspaceId, planId, checkoutSeats)
+              console.log('[Webhook] Subscription created + monthly included USD allocated for workspace:', workspaceId, 'plan:', planId, 'seats:', checkoutSeats)
+            }
 
             // Send plan-upgraded email to workspace owner
             try {
@@ -8393,6 +8548,10 @@ app.post('/api/webhooks/stripe', async (c) => {
                   const cycleSeats = Math.max(1, Math.floor(sub.items?.data?.[0]?.quantity ?? 1))
                   await billingService.allocateMonthlyIncluded(wsId, planId, cycleSeats)
                   console.log('[Webhook] Monthly USD refilled for workspace:', wsId, 'plan:', planId, 'seats:', cycleSeats, 'reason:', reason)
+                  if (reason === 'subscription_cycle') {
+                    // First paid cycle after a trial (no-op for non-trial workspaces).
+                    await trialService.markTrialStatus(wsId, 'converted')
+                  }
                 } catch (allocErr: any) {
                   console.error('[Webhook] Failed to refill monthly included USD:', allocErr.message)
                 }
@@ -9894,6 +10053,12 @@ setTimeout(async () => {
         '[GrantRefill] failed to schedule grant refill (non-fatal):',
         err?.message ?? err,
       )
+    }
+    try {
+      const { startExpireSignupCreditsCron } = await import('./jobs/expire-signup-credits')
+      startExpireSignupCreditsCron()
+    } catch (err: any) {
+      console.error('[SignupCredit] failed to schedule expiry cron (non-fatal):', err?.message ?? err)
     }
   })()
 }

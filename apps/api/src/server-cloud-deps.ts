@@ -19,8 +19,11 @@ import * as instanceService from './services/instance.service'
 import * as storageService from './services/storage.service'
 import * as nodeMetricsService from './services/node-metrics.service'
 import * as affiliateService from './services/affiliate.service'
+import * as trialService from './services/trial.service'
+import * as signupCreditService from './services/signup-credit.service'
 import {
   sendPlanUpgradedEmail,
+  sendTrialEndingEmail,
   sendInvitationEmail,
   sendProjectInviteEmail,
   sendInviteAcceptedEmail,
@@ -82,7 +85,10 @@ export {
   storageService,
   nodeMetricsService,
   affiliateService,
+  trialService,
+  signupCreditService,
   sendPlanUpgradedEmail,
+  sendTrialEndingEmail,
   sendInvitationEmail,
   sendProjectInviteEmail,
   sendInviteAcceptedEmail,
