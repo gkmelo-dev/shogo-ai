@@ -292,6 +292,17 @@ function MessageRowImpl(props: MessageRowProps) {
   const kind = message.authorType === 'agent' ? messageKind(message) : null
   const onBehalfOf = message.authorType === 'agent' ? onBehalfOfName(message) : null
   const canOpenSession = message.authorType === 'agent' && !!message.agentSessionId && !!props.onOpenSession
+  // Stop lives in the header beside the AGENT tag and time, never beside the streamed work.
+  const stopButton = running ? (
+    <Pressable
+      onPress={() => props.onStopAgent(message)}
+      accessibilityLabel="Stop agent"
+      className="flex-row items-center gap-1 rounded-md border border-border px-2 py-0.5 active:bg-muted"
+    >
+      <Square size={10} className="text-muted-foreground" />
+      <Text className="text-[11px] text-muted-foreground">Stop</Text>
+    </Pressable>
+  ) : null
   const work = !running && message.authorType === 'agent' ? workOf(message) : null
   const connectRequests = !running && message.authorType === 'agent' ? connectRequestsOf(message) : []
   const [continuedConnects, setContinuedConnects] = useState<string[]>([])
@@ -530,8 +541,14 @@ function MessageRowImpl(props: MessageRowProps) {
             <TimeTooltip iso={message.createdAt}>
               {(h) => <Text className={cn('text-[11px] text-muted-foreground', h && 'underline')}>{formatTime(message.createdAt)}</Text>}
             </TimeTooltip>
+            {stopButton}
           </View>
         )}
+
+        {/* A grouped reply has no header, so a running one gets a header line carrying only Stop. */}
+        {grouped && stopButton ? (
+          <View className="flex-row items-baseline gap-2">{stopButton}</View>
+        ) : null}
 
         {message.pinned && !deleted && (
           <View className="flex-row items-center gap-1">
@@ -658,14 +675,6 @@ function MessageRowImpl(props: MessageRowProps) {
                   className="rounded-md active:bg-muted"
                 >
                   <AgentWorkingStatus tools={streaming?.tools ?? (streaming?.tool ? [{ name: streaming.tool, done: false }] : [])} />
-                </Pressable>
-                <Pressable
-                  onPress={() => props.onStopAgent(message)}
-                  accessibilityLabel="Stop agent"
-                  className="flex-row items-center gap-1 rounded-md border border-border px-2 py-0.5 active:bg-muted"
-                >
-                  <Square size={10} className="text-muted-foreground" />
-                  <Text className="text-[11px] text-muted-foreground">Stop</Text>
                 </Pressable>
               </View>
             )}
