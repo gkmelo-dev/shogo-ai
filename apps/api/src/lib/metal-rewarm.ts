@@ -201,7 +201,7 @@ export function rewarmConfig() {
   return {
     auto: process.env.METAL_REWARM_AUTO !== 'false',
     sinceHours: envInt('METAL_REWARM_SINCE_HOURS', 48),
-    concurrencyPerHost: envInt('METAL_REWARM_CONCURRENCY_PER_HOST', 2),
+    concurrencyPerHost: envInt('METAL_REWARM_CONCURRENCY_PER_HOST', 4),
     maxRuntimes: envInt('METAL_REWARM_MAX_RUNTIMES', 1000),
     maxBytes: envInt('METAL_REWARM_MAX_BYTES', 0),
     minIntervalMs: envInt('METAL_REWARM_MIN_INTERVAL_MS', 2 * 60 * 60_000),
