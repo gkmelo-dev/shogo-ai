@@ -97,6 +97,21 @@ function relativeUsageCopy(planId: string): string {
 
 // ─── Main Page ─────────────────────────────────────────────
 
+function StartTrialButton({ onPress, disabled }: { onPress: () => void; disabled: boolean }) {
+  return (
+    <View className="gap-1">
+      <Pressable
+        onPress={onPress}
+        disabled={disabled}
+        className="w-full items-center justify-center py-3 rounded-md bg-primary active:bg-primary/80"
+      >
+        <Text className="text-sm font-medium text-primary-foreground">Start 7-day free trial</Text>
+      </Pressable>
+      <Text className="text-xs text-center text-muted-foreground">$0 today. Card required; cancel anytime.</Text>
+    </View>
+  )
+}
+
 export default observer(function BillingPage() {
   const router = useRouter()
   const { redeem: redeemParam, workspace: workspaceParam } = useLocalSearchParams<{
@@ -952,16 +967,10 @@ export default observer(function BillingPage() {
               <View className="hidden lg:block lg:min-h-[76px]" />
 
               {trialEligible && !hasStripeSubscription && (
-                <View className="gap-1">
-                  <Pressable
-                    onPress={() => handleCheckout('basic', 1, { trial: true })}
-                    disabled={isCheckoutLoading}
-                    className="w-full items-center justify-center py-3 rounded-md bg-primary active:bg-primary/80"
-                  >
-                    <Text className="text-sm font-medium text-primary-foreground">Start 7-day free trial</Text>
-                  </Pressable>
-                  <Text className="text-xs text-center text-muted-foreground">$0 today. Card required; cancel anytime.</Text>
-                </View>
+                <StartTrialButton
+                  onPress={() => handleCheckout('basic', 1, { trial: true })}
+                  disabled={isCheckoutLoading}
+                />
               )}
               <Pressable
                 onPress={() => handleCheckout('basic', 1)}
@@ -1026,16 +1035,10 @@ export default observer(function BillingPage() {
               )}
 
               {trialEligible && !hasStripeSubscription && (
-                <View className="gap-1">
-                  <Pressable
-                    onPress={() => handleCheckout('pro', proSeats, { trial: true })}
-                    disabled={isCheckoutLoading}
-                    className="w-full items-center justify-center py-3 rounded-md bg-primary active:bg-primary/80"
-                  >
-                    <Text className="text-sm font-medium text-primary-foreground">Start 7-day free trial</Text>
-                  </Pressable>
-                  <Text className="text-xs text-center text-muted-foreground">$0 today. Card required; cancel anytime.</Text>
-                </View>
+                <StartTrialButton
+                  onPress={() => handleCheckout('pro', proSeats, { trial: true })}
+                  disabled={isCheckoutLoading}
+                />
               )}
               <Pressable
                 onPress={() => handleCheckout('pro', proSeats)}
@@ -1104,16 +1107,10 @@ export default observer(function BillingPage() {
               )}
 
               {trialEligible && !hasStripeSubscription && (
-                <View className="gap-1">
-                  <Pressable
-                    onPress={() => handleCheckout('business', businessSeats, { trial: true })}
-                    disabled={isCheckoutLoading}
-                    className="w-full items-center justify-center py-3 rounded-md bg-primary active:bg-primary/80"
-                  >
-                    <Text className="text-sm font-medium text-primary-foreground">Start 7-day free trial</Text>
-                  </Pressable>
-                  <Text className="text-xs text-center text-muted-foreground">$0 today. Card required; cancel anytime.</Text>
-                </View>
+                <StartTrialButton
+                  onPress={() => handleCheckout('business', businessSeats, { trial: true })}
+                  disabled={isCheckoutLoading}
+                />
               )}
               <Pressable
                 onPress={() => handleCheckout('business', businessSeats)}

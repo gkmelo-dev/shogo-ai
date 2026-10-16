@@ -40,20 +40,21 @@ import {
   allocateMonthlyIncluded,
   getSubscription,
   getUsageWallet,
+  allocateFreeWallet,
 } from '../services/billing.service'
-import { allocateFreeWallet } from '../services/billing.service'
 import { releaseSignupCreditOnVerification } from '../services/signup-credit.service'
 import { promoCreditAvailableUsd } from '../config/usage-plans'
-import { e2eBootstrapEnabled, e2eBootstrapSecretMatches } from '../lib/e2e-bootstrap-secret'
+import {
+  E2E_BOOTSTRAP_HEADER,
+  e2eBootstrapEnabled as bootstrapEnabled,
+  e2eBootstrapSecretMatches as secretMatches,
+} from '../lib/e2e-bootstrap-secret'
 import { prisma, SubscriptionStatus, BillingInterval } from '../lib/prisma'
 
 const app = new Hono()
 
 const ALLOWED_PLANS = new Set(['basic', 'pro', 'business'])
 const ALLOWED_INTERVALS = new Set<BillingInterval>(['monthly', 'annual'])
-
-const bootstrapEnabled = e2eBootstrapEnabled
-const secretMatches = e2eBootstrapSecretMatches
 
 /**
  * POST /api/internal/e2e/bootstrap-subscription
@@ -85,7 +86,7 @@ app.post('/bootstrap-subscription', async (c) => {
     )
   }
 
-  if (!secretMatches(c.req.header('x-e2e-bootstrap-secret'))) {
+  if (!secretMatches(c.req.header(E2E_BOOTSTRAP_HEADER))) {
     // Intentionally generic message — no hint that the env var exists.
     return c.json({ ok: false, error: 'unauthorized' }, 401)
   }
@@ -247,7 +248,7 @@ app.post('/suspend-runtime', async (c) => {
   if (!bootstrapEnabled()) {
     return c.json({ ok: false, error: 'e2e_bootstrap_disabled' }, 503)
   }
-  if (!secretMatches(c.req.header('x-e2e-bootstrap-secret'))) {
+  if (!secretMatches(c.req.header(E2E_BOOTSTRAP_HEADER))) {
     return c.json({ ok: false, error: 'unauthorized' }, 401)
   }
 
@@ -303,7 +304,7 @@ app.post('/recycle-runtime', async (c) => {
   if (!bootstrapEnabled()) {
     return c.json({ ok: false, error: 'e2e_bootstrap_disabled' }, 503)
   }
-  if (!secretMatches(c.req.header('x-e2e-bootstrap-secret'))) {
+  if (!secretMatches(c.req.header(E2E_BOOTSTRAP_HEADER))) {
     return c.json({ ok: false, error: 'unauthorized' }, 401)
   }
 
@@ -349,7 +350,7 @@ app.post('/verify-email', async (c) => {
   if (!bootstrapEnabled()) {
     return c.json({ ok: false, error: 'e2e_bootstrap_disabled' }, 503)
   }
-  if (!secretMatches(c.req.header('x-e2e-bootstrap-secret'))) {
+  if (!secretMatches(c.req.header(E2E_BOOTSTRAP_HEADER))) {
     return c.json({ ok: false, error: 'unauthorized' }, 401)
   }
 
@@ -382,7 +383,7 @@ app.get('/subscription-state', async (c) => {
   if (!bootstrapEnabled()) {
     return c.json({ ok: false, error: 'e2e_bootstrap_disabled' }, 503)
   }
-  if (!secretMatches(c.req.header('x-e2e-bootstrap-secret'))) {
+  if (!secretMatches(c.req.header(E2E_BOOTSTRAP_HEADER))) {
     return c.json({ ok: false, error: 'unauthorized' }, 401)
   }
 
@@ -410,7 +411,7 @@ app.get('/signup-credit-state', async (c) => {
   if (!bootstrapEnabled()) {
     return c.json({ ok: false, error: 'e2e_bootstrap_disabled' }, 503)
   }
-  if (!secretMatches(c.req.header('x-e2e-bootstrap-secret'))) {
+  if (!secretMatches(c.req.header(E2E_BOOTSTRAP_HEADER))) {
     return c.json({ ok: false, error: 'unauthorized' }, 401)
   }
 

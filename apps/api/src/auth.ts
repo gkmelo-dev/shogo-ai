@@ -29,6 +29,17 @@ import { isBlockedEmailDomain } from "./services/signup-risk-scoring"
 const isLocalMode = process.env.SHOGO_LOCAL_MODE === 'true'
 const LOAD_TEST_SECRET = process.env.LOAD_TEST_SECRET
 
+/**
+ * Signup provider for risk scoring. Google and Apple sign-ups arrive on the
+ * OAuth callback (`/callback/:provider`, Apple form-posts there too) or an
+ * ID-token sign-in (`/sign-in/social`). Anything else, including server-side
+ * user creation with no request context, is scored as a credential signup so
+ * it never earns the trusted-provider credit.
+ */
+export function signupProviderFromPath(path: string | undefined): 'credential' | 'social' {
+  return path?.startsWith('/callback/') || path === '/sign-in/social' ? 'social' : 'credential'
+}
+
 function isLoadTestBypass(request: Request): boolean {
   return !!(LOAD_TEST_SECRET && request?.headers?.get?.('x-load-test-key') === LOAD_TEST_SECRET)
 }
@@ -677,7 +688,7 @@ export const auth = betterAuth({
               const risk = await assessNewSignup({
                 userId: user.id,
                 email: user.email,
-                provider: ctx?.path === '/sign-up/email' ? 'credential' : 'social',
+                provider: signupProviderFromPath(ctx?.path),
                 emailVerified: Boolean(user.emailVerified),
                 headers: ctx?.request?.headers ?? ctx?.headers ?? null,
               })

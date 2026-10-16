@@ -71,7 +71,8 @@ function newWallet(workspaceId: string): Row {
   return w
 }
 
-const prismaDouble = {
+const prismaDouble: Record<string, any> = {
+  $transaction: async (fn: (tx: any) => Promise<any>) => fn(prismaDouble),
   member: {
     findFirst: async ({ where }: { where: Row }) =>
       members.find((m) => matches(m, where)) ?? null,
@@ -218,12 +219,13 @@ describe('applyInitialSignupCredit', () => {
     expect(wallets.get('ws-1')!.promoCreditStage).toBe(1)
   })
 
-  test('medium band: nothing now, stage stays 1 until verification', async () => {
+  test('medium band: nothing now, and the expiry clock does not start', async () => {
     const result = scoreSignupRisk({ ...CLEAN, emailVerified: false, ipLinkedAccounts: 1, burstSignups: 1 })
     expect(result.band).toBe('medium')
-    await credit.applyInitialSignupCredit({ userId: 'u-1', result })
-    expect(wallets.get('ws-1')!.promoCreditUsd).toBe(0)
-    expect(wallets.get('ws-1')!.promoCreditStage).toBe(1)
+    const out = await credit.applyInitialSignupCredit({ userId: 'u-1', result })
+    expect(out.granted).toBe(false)
+    expect(wallets.get('ws-1')?.promoCreditStage ?? 0).toBe(0)
+    expect(wallets.get('ws-1')?.promoCreditExpiresAt ?? null).toBeNull()
   })
 
   test('no_credit (disposable or high band): no wallet change', async () => {
@@ -253,13 +255,16 @@ describe('releaseSignupCreditOnVerification', () => {
     expect(wallets.get('ws-1')!.promoCreditUsd).toBe(10)
   })
 
-  test('held (medium) signups release the full $10', async () => {
+  test('held (medium) signups release the full $10, expiring 30 days after verification', async () => {
     seedAssessment(CREDIT_DECISIONS.held)
-    await credit.grantPromoCredit({ workspaceId: 'ws-1', amountUsd: 0, toStage: 1 })
-    const out = await credit.releaseSignupCreditOnVerification({ userId: 'u-1' })
+    const verifiedAt = new Date('2026-10-20T00:00:00Z')
+    const out = await credit.releaseSignupCreditOnVerification({ userId: 'u-1', now: verifiedAt })
     expect(out.released).toBe(true)
     expect(out.amountUsd).toBe(10)
-    expect(wallets.get('ws-1')!.promoCreditUsd).toBe(10)
+    const w = wallets.get('ws-1')!
+    expect(w.promoCreditUsd).toBe(10)
+    expect(w.promoCreditStage).toBe(2)
+    expect(new Date(w.promoCreditExpiresAt).getTime()).toBe(verifiedAt.getTime() + 30 * DAY)
   })
 
   test('a re-score that turns high risk (burst since signup) blocks the release', async () => {
@@ -289,17 +294,48 @@ describe('approve / revoke (admin)', () => {
     expect(wallets.get('ws-1')!.promoCreditUsd).toBe(10)
     expect(assessments.get('u-1')!.reviewDecision).toBe('approved')
     expect(assessments.get('u-1')!.reviewedByUserId).toBe('admin-1')
+    // Settled: a later verification must not release more.
+    expect(assessments.get('u-1')!.decision).toBe(CREDIT_DECISIONS.released)
   })
 
-  test('revoke zeroes the remaining balance but keeps the granted total', async () => {
+  test('approving twice grants once', async () => {
+    seedAssessment(CREDIT_DECISIONS.held)
+    await credit.approveSignupCredit({ userId: 'u-1', adminUserId: 'admin-1' })
+    const again = await credit.approveSignupCredit({ userId: 'u-1', adminUserId: 'admin-1' })
+    expect(again.granted).toBe(false)
+    expect(wallets.get('ws-1')!.promoCreditUsd).toBe(10)
+  })
+
+  test('revoke zeroes the balance, takes it off the granted total, and writes an audit event', async () => {
     seedAssessment(CREDIT_DECISIONS.initial)
     await credit.grantPromoCredit({ workspaceId: 'ws-1', amountUsd: 2, toStage: 1 })
     const out = await credit.revokeSignupCredit({ userId: 'u-1', adminUserId: 'admin-1' })
     expect(out.revokedUsd).toBe(2)
     const w = wallets.get('ws-1')!
     expect(w.promoCreditUsd).toBe(0)
-    expect(w.promoCreditGrantedUsd).toBe(2)
+    expect(w.promoCreditGrantedUsd).toBe(0)
     expect(assessments.get('u-1')!.reviewDecision).toBe('revoked')
+    expect(usageEvents).toHaveLength(1)
+    expect(usageEvents[0]).toMatchObject({ actionType: 'signup_credit_revoked', billedUsd: 0, balanceBefore: 2 })
+  })
+
+  test('approve after a revoke restores the full $10', async () => {
+    seedAssessment(CREDIT_DECISIONS.initial)
+    await credit.grantPromoCredit({ workspaceId: 'ws-1', amountUsd: 10, toStage: 2 })
+    wallets.get('ws-1')!.promoCreditUsd = 6 // $4 already spent
+    await credit.revokeSignupCredit({ userId: 'u-1', adminUserId: 'admin-1' })
+    const out = await credit.approveSignupCredit({ userId: 'u-1', adminUserId: 'admin-1' })
+    expect(out.grantedUsd).toBe(6)
+    expect(wallets.get('ws-1')!.promoCreditUsd).toBe(6)
+    expect(wallets.get('ws-1')!.promoCreditGrantedUsd).toBe(10)
+  })
+
+  test('approve gives expired credit a fresh expiry', async () => {
+    seedAssessment(CREDIT_DECISIONS.none)
+    const now = new Date('2026-12-01T00:00:00Z')
+    await credit.grantPromoCredit({ workspaceId: 'ws-1', amountUsd: 2, toStage: 1, now: new Date('2026-10-01T00:00:00Z') })
+    await credit.approveSignupCredit({ userId: 'u-1', adminUserId: 'admin-1', now })
+    expect(new Date(wallets.get('ws-1')!.promoCreditExpiresAt).getTime()).toBe(now.getTime() + 30 * DAY)
   })
 })
 
@@ -316,6 +352,7 @@ describe('expireSignupCredits', () => {
     expect(usageEvents).toHaveLength(1)
     expect(usageEvents[0]).toMatchObject({
       actionType: 'signup_credit_expired',
+      balanceBefore: 3,
       billedUsd: 0,
       source: 'promo',
       workspaceId: 'ws-1',

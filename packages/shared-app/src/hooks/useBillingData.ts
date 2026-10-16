@@ -63,11 +63,14 @@ export interface UsageWindows {
   weekly: UsageWindowView
 }
 
-/** Signup promo credit as reported by workspace-plan (economy models only). */
+/**
+ * Signup promo credit as reported by workspace-plan. Spendable on the models the
+ * workspace's plan allows (economy tier on Free and Basic).
+ */
 export interface PromoCreditView {
   /** Spendable now. 0 once expired. */
   availableUsd: number
-  /** Total ever granted to this workspace. */
+  /** Total granted to this workspace, net of admin revokes. */
   grantedUsd: number
   /** ISO timestamp when unspent credit expires, or null. */
   expiresAt: string | null

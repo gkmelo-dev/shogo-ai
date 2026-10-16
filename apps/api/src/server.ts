@@ -136,7 +136,7 @@ import { resetCloudKeyState } from './lib/cloud-key-state'
 import { userProfileRoutes } from './routes/local-user'
 import { localCloudBillingRoutes } from './routes/local-cloud-billing'
 import { adminSignupRiskRoutes } from './routes/admin-signup-risk'
-import { TRIAL_PERIOD_DAYS, SIGNUP_CREDIT_TOTAL_USD, SIGNUP_CREDIT_VERIFIED_USD, promoCreditAvailableUsd } from './config/usage-plans'
+import { SIGNUP_CREDIT_TOTAL_USD, SIGNUP_CREDIT_VERIFIED_USD, promoCreditAvailableUsd } from './config/usage-plans'
 import { meetingRoutes } from './routes/meetings'
 import { localProjectsRoutes } from './routes/local-projects'
 import { localLogsRoutes } from './routes/local-logs'
@@ -209,6 +209,7 @@ const INSTANCE_SIZE_ORDER: any = cloud.INSTANCE_SIZE_ORDER ?? []
 const getInstanceDisplayPrice: any = cloud.getInstanceDisplayPrice ?? (() => undefined)
 const sendPlanUpgradedEmail: any = cloud.sendPlanUpgradedEmail ?? (async () => {})
 const sendTrialEndingEmail: any = cloud.sendTrialEndingEmail ?? (async () => {})
+const sendTrialUnavailableEmail: any = cloud.sendTrialUnavailableEmail ?? (async () => {})
 const trialService: any = cloud.trialService ?? {}
 const signupCreditService: any = cloud.signupCreditService ?? {}
 const sendInvitationEmail: any = cloud.sendInvitationEmail ?? (async () => {})
@@ -7093,6 +7094,42 @@ async function affiliateCheckoutOverrides(
   }
 }
 
+/** Owner email and workspace name for a billing email, or null when there is no owner. */
+async function workspaceOwnerContact(
+  workspaceId: string,
+): Promise<{ email: string; workspaceName: string } | null> {
+  const workspace = await prisma.workspace.findUnique({
+    where: { id: workspaceId },
+    select: {
+      name: true,
+      members: {
+        where: { role: 'owner', projectId: null },
+        select: { user: { select: { email: true } } },
+        orderBy: { createdAt: 'asc' },
+        take: 1,
+      },
+    },
+  })
+  const email = workspace?.members?.[0]?.user?.email
+  return email && workspace ? { email, workspaceName: workspace.name } : null
+}
+
+function planDisplayName(planId: string): string {
+  return planId.charAt(0).toUpperCase() + planId.slice(1)
+}
+
+/** Fire-and-forget: the trial checkout was cancelled as a duplicate; tell the owner. */
+function notifyTrialBlocked(workspaceId: string, planId: string): void {
+  workspaceOwnerContact(workspaceId)
+    .then((owner) => owner && sendTrialUnavailableEmail({
+      to: owner.email,
+      workspaceName: owner.workspaceName,
+      planName: planDisplayName(planId),
+      dashboardUrl: `${getFrontendUrl()}/billing`,
+    }))
+    .catch((err: any) => console.error('[Webhook] trial-unavailable email failed:', err?.message ?? err))
+}
+
 app.post('/api/billing/checkout', async (c) => {
   try {
     if (!stripe) {
@@ -7140,27 +7177,20 @@ app.post('/api/billing/checkout', async (c) => {
       || `${frontendUrl}/?workspace=${workspaceId}&checkout=canceled`
 
     const affiliateOverrides = await affiliateCheckoutOverrides(userId)
-    // Free trial (card required). Only when the client asks for it AND the
-    // account is eligible; otherwise this is a normal paid checkout.
-    const trialDays = wantsTrial && (await trialService.trialEligibility({ userId: userId, workspaceId: workspaceId, planId })).eligible
-      ? TRIAL_PERIOD_DAYS
-      : 0
-    const trialParams = trialService.trialCheckoutParams(trialDays, {
-      workspaceId: workspaceId,
+    const trialFields = await trialService.buildCheckoutTrialFields({
+      wantsTrial: Boolean(wantsTrial),
+      userId,
+      workspaceId,
       planId,
-      billingInterval,
-      seats: String(seats),
-      ...(affiliateOverrides.subscription_data?.metadata ?? {}),
+      metadata,
+      affiliate: affiliateOverrides,
     })
-
-    const sessionMetadata = { ...metadata, ...(affiliateOverrides.metadata ?? {}), ...(trialParams.metadata ?? {}) }
 
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription',
       line_items: [{ price: priceId, quantity: seats }],
       success_url: successUrl,
       cancel_url: cancelUrl,
-      metadata: sessionMetadata,
       ...(userEmail && { customer_email: userEmail }),
       // `referralId` was the Rewardful query parameter. Kept for one
       // release so in-flight mobile clients don't 500; ignored server-side
@@ -7168,10 +7198,9 @@ app.post('/api/billing/checkout', async (c) => {
       // is authoritative).
       ...(referralId && { client_reference_id: referralId }),
       ...(affiliateOverrides.customer_creation && { customer_creation: affiliateOverrides.customer_creation }),
-      ...((affiliateOverrides.subscription_data || trialParams.subscription_data) && {
-        subscription_data: { ...(affiliateOverrides.subscription_data ?? {}), ...(trialParams.subscription_data ?? {}) },
-      }),
-      ...(trialParams.payment_method_collection && { payment_method_collection: trialParams.payment_method_collection }),
+      // Session metadata, subscription_data (affiliate + trial) and, for a
+      // trial, card-only payment collection.
+      ...trialFields,
     })
 
     return c.json({ sessionId: session.id, url: session.url }, 200)
@@ -7243,15 +7272,18 @@ app.get('/api/billing/workspace-plan', async (c) => {
     ])
     // Signup promo credit + trial eligibility for the billing UI. Cloud only
     // (local mode has no signup risk rows and no Stripe).
-    const promoUser = userId && !LOCAL_MODE
-      ? await prisma.user.findUnique({ where: { id: userId }, select: { emailVerified: true } })
-      : null
-    const promoRisk = userId && !LOCAL_MODE
-      ? await prisma.signupRiskAssessment.findUnique({ where: { userId }, select: { decision: true } })
-      : null
-    const trialCheck = !sub && userId && !LOCAL_MODE
-      ? await trialService.trialEligibility({ userId, workspaceId })
-      : { eligible: false }
+    const cloudUserId = userId && !LOCAL_MODE ? userId : null
+    const [promoUser, promoRisk, trialCheck] = await Promise.all([
+      cloudUserId
+        ? prisma.user.findUnique({ where: { id: cloudUserId }, select: { emailVerified: true } })
+        : null,
+      cloudUserId
+        ? prisma.signupRiskAssessment.findUnique({ where: { userId: cloudUserId }, select: { decision: true } })
+        : null,
+      !sub && cloudUserId
+        ? trialService.trialEligibility({ userId: cloudUserId, workspaceId })
+        : { eligible: false },
+    ])
     const promoEmailVerified = Boolean(promoUser?.emailVerified)
     const promoPendingUsd = promoEmailVerified
       ? 0
@@ -7307,7 +7339,7 @@ app.get('/api/billing/workspace-plan', async (c) => {
       // means the window is uncapped (enterprise).
       usageWindows,
       // Signup promo credit: spendable balance (0 once expired), what unlocks
-      // on email verification, and the expiry. Economy models only.
+      // on email verification, and the expiry.
       promoCredit: {
         availableUsd: wallet ? promoCreditAvailableUsd(wallet) : 0,
         grantedUsd: wallet?.promoCreditGrantedUsd ?? 0,
@@ -7400,34 +7432,26 @@ app.post('/api/billing/workspace-checkout', async (c) => {
       : `${frontendUrl}/?workspace=${newWorkspaceId}&checkout=canceled`
 
     const affiliateOverrides = await affiliateCheckoutOverrides(userId)
-    // Free trial (card required). Only when the client asks for it AND the
-    // account is eligible; otherwise this is a normal paid checkout.
-    const trialDays = wantsTrial && (await trialService.trialEligibility({ userId: userId, workspaceId: newWorkspaceId, planId })).eligible
-      ? TRIAL_PERIOD_DAYS
-      : 0
-    const trialParams = trialService.trialCheckoutParams(trialDays, {
+    const trialFields = await trialService.buildCheckoutTrialFields({
+      wantsTrial: Boolean(wantsTrial),
+      userId,
       workspaceId: newWorkspaceId,
       planId,
-      billingInterval,
-      seats: String(seats),
-      ...(affiliateOverrides.subscription_data?.metadata ?? {}),
+      metadata,
+      affiliate: affiliateOverrides,
     })
-
-    const sessionMetadata = { ...metadata, ...(affiliateOverrides.metadata ?? {}), ...(trialParams.metadata ?? {}) }
 
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription',
       line_items: [{ price: priceId, quantity: seats }],
       success_url: successUrl,
       cancel_url: cancelUrl,
-      metadata: sessionMetadata,
       ...(userEmail && { customer_email: userEmail }),
       ...(referralId && { client_reference_id: referralId }),
       ...(affiliateOverrides.customer_creation && { customer_creation: affiliateOverrides.customer_creation }),
-      ...((affiliateOverrides.subscription_data || trialParams.subscription_data) && {
-        subscription_data: { ...(affiliateOverrides.subscription_data ?? {}), ...(trialParams.subscription_data ?? {}) },
-      }),
-      ...(trialParams.payment_method_collection && { payment_method_collection: trialParams.payment_method_collection }),
+      // Session metadata, subscription_data (affiliate + trial) and, for a
+      // trial, card-only payment collection.
+      ...trialFields,
     })
 
     return c.json({ sessionId: session.id, url: session.url, workspaceId: newWorkspaceId }, 200)
@@ -8194,8 +8218,11 @@ app.post('/api/webhooks/stripe', async (c) => {
                 subscriptionId: subscription.id,
                 stripeCustomerId: subscription.customer as string,
               })
-              if (trialOutcome === 'blocked') {
-                console.warn('[Webhook] Trial blocked (card already used for a trial):', wsId)
+              if (trialOutcome === 'blocked' || trialOutcome === 'already_blocked') {
+                if (trialOutcome === 'blocked') {
+                  console.warn('[Webhook] Trial blocked (card or account already used a trial):', wsId)
+                  notifyTrialBlocked(wsId, metaPlanId)
+                }
                 break
               }
             }
@@ -8301,22 +8328,15 @@ app.post('/api/webhooks/stripe', async (c) => {
             where: { stripeSubscriptionId: subscription.id },
             select: { workspaceId: true, planId: true },
           })
-          if (sub) {
-            const workspace = await prisma.workspace.findUnique({
-              where: { id: sub.workspaceId },
-              include: { members: { where: { role: 'owner', projectId: null }, include: { user: { select: { email: true } } } } },
-            })
-            const ownerEmail = workspace?.members?.[0]?.user?.email
-            if (ownerEmail) {
-              const planLabel = sub.planId.charAt(0).toUpperCase() + sub.planId.slice(1)
-              sendTrialEndingEmail({
-                to: ownerEmail,
-                workspaceName: workspace!.name,
-                planName: planLabel,
-                trialEndsAt: new Date((subscription.trial_end ?? 0) * 1000).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }),
-                dashboardUrl: `${getFrontendUrl()}/billing`,
-              }).catch((err: any) => console.error('[Webhook] trial-ending email failed:', err))
-            }
+          const owner = sub ? await workspaceOwnerContact(sub.workspaceId) : null
+          if (sub && owner) {
+            sendTrialEndingEmail({
+              to: owner.email,
+              workspaceName: owner.workspaceName,
+              planName: planDisplayName(sub.planId),
+              trialEndsAt: new Date((subscription.trial_end ?? 0) * 1000).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }),
+              dashboardUrl: `${getFrontendUrl()}/billing`,
+            }).catch((err: any) => console.error('[Webhook] trial-ending email failed:', err))
           }
         } catch (err: any) {
           console.error('[Webhook] trial_will_end handling failed:', err.message)
@@ -8343,6 +8363,11 @@ app.post('/api/webhooks/stripe', async (c) => {
           }
         } catch (err: any) {
           console.error('[Webhook] Failed to cancel plan subscription:', err.message)
+        }
+        try {
+          await trialService.markTrialEndedForSubscription(subscription.id)
+        } catch (err: any) {
+          console.error('[Webhook] Failed to mark trial ended:', err.message)
         }
         try {
           const instanceSub = await instanceService.findInstanceSubscriptionByStripeId(subscription.id)
@@ -8441,8 +8466,11 @@ app.post('/api/webhooks/stripe', async (c) => {
                 subscriptionId: stripeSubscription.id,
                 stripeCustomerId: session.customer as string,
               })
-              if (trialOutcome === 'blocked') {
-                console.warn('[Webhook] Trial blocked (card already used for a trial):', workspaceId)
+              if (trialOutcome === 'blocked' || trialOutcome === 'already_blocked') {
+                if (trialOutcome === 'blocked') {
+                  console.warn('[Webhook] Trial blocked (card or account already used a trial):', workspaceId)
+                  notifyTrialBlocked(workspaceId, planId)
+                }
                 break
               }
             }
@@ -8543,14 +8571,17 @@ app.post('/api/webhooks/stripe', async (c) => {
               // checkout.session.completed handler above, so only refill on
               // the recurring cycle events.
               const reason = invoice.billing_reason
-              if (reason === 'subscription_cycle' || reason === 'subscription_update') {
+              // A trial's $0 invoices (including a mid-trial seat or plan
+              // change) must not unlock the paid allowance or overage early.
+              const trialing = sub.status === 'trialing'
+              if (!trialing && (reason === 'subscription_cycle' || reason === 'subscription_update')) {
                 try {
                   const cycleSeats = Math.max(1, Math.floor(sub.items?.data?.[0]?.quantity ?? 1))
                   await billingService.allocateMonthlyIncluded(wsId, planId, cycleSeats)
                   console.log('[Webhook] Monthly USD refilled for workspace:', wsId, 'plan:', planId, 'seats:', cycleSeats, 'reason:', reason)
                   if (reason === 'subscription_cycle') {
                     // First paid cycle after a trial (no-op for non-trial workspaces).
-                    await trialService.markTrialStatus(wsId, 'converted')
+                    await trialService.markTrialConverted(wsId)
                   }
                 } catch (allocErr: any) {
                   console.error('[Webhook] Failed to refill monthly included USD:', allocErr.message)
@@ -8559,14 +8590,17 @@ app.post('/api/webhooks/stripe', async (c) => {
               // Receipt: in-app notification + email to all billing admins,
               // deduped on the invoice id so Stripe webhook retries can't
               // double-send. Fire-and-forget (already inside the webhook 200).
-              const planLabel = planId.charAt(0).toUpperCase() + planId.slice(1)
-              void notifyPaymentReceipt(wsId, {
-                planName: planLabel,
-                amountUsd: (invoice.amount_paid || 0) / 100,
-                invoiceDate: new Date((invoice.created || 0) * 1000).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }),
-                invoiceId: invoice.id,
-                invoiceUrl: invoice.hosted_invoice_url ?? undefined,
-              })
+              // Skipped for a trial's $0 invoices: nothing was charged.
+              if (!(trialing && !invoice.amount_paid)) {
+                const planLabel = planId.charAt(0).toUpperCase() + planId.slice(1)
+                void notifyPaymentReceipt(wsId, {
+                  planName: planLabel,
+                  amountUsd: (invoice.amount_paid || 0) / 100,
+                  invoiceDate: new Date((invoice.created || 0) * 1000).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }),
+                  invoiceId: invoice.id,
+                  invoiceUrl: invoice.hosted_invoice_url ?? undefined,
+                })
+              }
             }
           } catch (err: any) {
             console.error('[Webhook] payment-receipt lookup failed:', err.message)

@@ -1575,7 +1575,8 @@ model UsageWallet {
   weeklyUsedUsd                Float     @default(0)
   // Signup promo credit (services/signup-credit.service.ts). Spent after the
   // rolling windows and before overage. `promoCreditUsd` is the remaining
-  // balance; `promoCreditGrantedUsd` is the lifetime total granted;
+  // balance; `promoCreditGrantedUsd` is the total granted, net of admin
+  // revokes (each revoke is also a `signup_credit_revoked` usage event);
   // `promoCreditStage` is 0 (none), 1 (initial grant issued), 2 (fully
   // granted). The stage only moves forward, which makes grants idempotent.
   promoCreditUsd               Float     @default(0)
@@ -1666,7 +1667,8 @@ model TrialRedemption {
   /// free trial, across all accounts.
   cardFingerprint      String?  @unique
   planId               String
-  /// started | converted | ended_duplicate_card | canceled
+  /// trialing | converted | ended | blocked_duplicate_card | blocked_duplicate_user
+  /// (see `TRIAL_STATUS` in services/trial.service.ts)
   status               String
   createdAt            DateTime @default(now())
   updatedAt            DateTime @updatedAt

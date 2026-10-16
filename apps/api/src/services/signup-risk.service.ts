@@ -177,7 +177,6 @@ export async function collectSignupRiskFeatures(params: {
   }
 }
 
-/** Store the assessment and the canonical email on the user row. */
 /**
  * Plain JSON copy for Prisma `Json` columns. Interfaces (e.g. `SignupRiskSignal`)
  * don't satisfy Prisma's `InputJsonValue` index-signature check, and the stored
@@ -187,6 +186,7 @@ function toJsonValue(value: unknown): any {
   return JSON.parse(JSON.stringify(value))
 }
 
+/** Store the assessment and the canonical email on the user row. */
 export async function recordSignupRiskAssessment(params: {
   userId: string
   email: string

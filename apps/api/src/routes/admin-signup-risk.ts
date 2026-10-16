@@ -13,7 +13,7 @@
  * possible and gets scored again.
  */
 
-import { Hono } from 'hono'
+import { Hono, type Context } from 'hono'
 import { prisma } from '../lib/prisma'
 import {
   approveSignupCredit,
@@ -36,6 +36,11 @@ function linkKinds(
   return kinds
 }
 
+function adminUserIdOf(c: Context): string | null {
+  const id = (c.get('auth') as { userId?: unknown } | undefined)?.userId
+  return typeof id === 'string' && id ? id : null
+}
+
 export function adminSignupRiskRoutes() {
   const app = new Hono()
 
@@ -47,8 +52,9 @@ export function adminSignupRiskRoutes() {
 
     const rows = await prisma.signupRiskAssessment.findMany({
       where: {
-        ...(band ? { band } : {}),
+        // `pending` narrows to unreviewed medium/high; an explicit band wins.
         ...(pending ? { reviewDecision: null, band: { in: ['medium', 'high'] } } : {}),
+        ...(band ? { band } : {}),
       },
       orderBy: [{ score: 'desc' }, { createdAt: 'desc' }],
       take: 100,
@@ -187,7 +193,8 @@ export function adminSignupRiskRoutes() {
 
   /** POST /api/admin/signup-risk/:userId/approve — grant the full $10 now. */
   app.post('/:userId/approve', async (c) => {
-    const adminUserId = (c.get('auth') as any)?.userId as string
+    const adminUserId = adminUserIdOf(c)
+    if (!adminUserId) return c.json({ ok: false, error: 'unauthorized' }, 401)
     const userId = c.req.param('userId')
     const result = await approveSignupCredit({ userId, adminUserId })
     return c.json({ ok: true, ...result })
@@ -195,7 +202,8 @@ export function adminSignupRiskRoutes() {
 
   /** POST /api/admin/signup-risk/:userId/revoke — zero remaining credit, stop releases. */
   app.post('/:userId/revoke', async (c) => {
-    const adminUserId = (c.get('auth') as any)?.userId as string
+    const adminUserId = adminUserIdOf(c)
+    if (!adminUserId) return c.json({ ok: false, error: 'unauthorized' }, 401)
     const userId = c.req.param('userId')
     const result = await revokeSignupCredit({ userId, adminUserId, reviewDecision: 'revoked' })
     return c.json({ ok: true, ...result })
@@ -207,7 +215,8 @@ export function adminSignupRiskRoutes() {
    * sign-ins (see module header).
    */
   app.post('/:userId/ban', async (c) => {
-    const adminUserId = (c.get('auth') as any)?.userId as string
+    const adminUserId = adminUserIdOf(c)
+    if (!adminUserId) return c.json({ ok: false, error: 'unauthorized' }, 401)
     const userId = c.req.param('userId')
     const result = await revokeSignupCredit({ userId, adminUserId, reviewDecision: 'banned' })
     const ended = await prisma.session.deleteMany({ where: { userId } })

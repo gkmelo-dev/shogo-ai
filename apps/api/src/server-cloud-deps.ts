@@ -24,6 +24,7 @@ import * as signupCreditService from './services/signup-credit.service'
 import {
   sendPlanUpgradedEmail,
   sendTrialEndingEmail,
+  sendTrialUnavailableEmail,
   sendInvitationEmail,
   sendProjectInviteEmail,
   sendInviteAcceptedEmail,
@@ -89,6 +90,7 @@ export {
   signupCreditService,
   sendPlanUpgradedEmail,
   sendTrialEndingEmail,
+  sendTrialUnavailableEmail,
   sendInvitationEmail,
   sendProjectInviteEmail,
   sendInviteAcceptedEmail,

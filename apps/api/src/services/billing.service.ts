@@ -816,8 +816,9 @@ export async function checkUsageBalance(
   const windowRoom = Math.min(limits.fiveHourUsd - five.used, limits.weeklyUsd - week.used);
   if (windowRoom >= minimumRequiredUsd) return { ok: true };
 
-  // Windows exhausted — unexpired signup promo credit is next (economy models
-  // only; the advanced-model gate in ai-proxy is separate and unchanged).
+  // Windows exhausted — unexpired signup promo credit is next. Which models it
+  // can pay for is the plan's model-tier gate in ai-proxy (economy on Free and
+  // Basic); promo credit doesn't change it.
   if (promoCreditAvailableUsd(wallet, now) >= minimumRequiredUsd) return { ok: true };
 
   // Overage is the fallback when enabled and uncapped,
@@ -1263,18 +1264,35 @@ async function _consumeUsageTransaction(
 
         // Order after the windows: signup promo credit first (it is already
         // paid for and expires), then metered overage, then the hard limit.
-        // Promo spends only if the whole debit fits, so a call never splits.
+        // Overage only applies while the paid entitlement behind it is live:
+        // an expired grant / lapsed subscription falls through to the hard
+        // "Usage limit reached" branch instead of metering unbillable usage.
         const promoAvailable = promoCreditAvailableUsd(wallet, now);
-        if (promoAvailable >= billedUsd) {
-          source = 'promo';
-          balanceBefore = promoAvailable;
-          balanceAfter = promoAvailable - billedUsd;
-          promoCharged = billedUsd;
-        } else if (wallet.overageEnabled && paidTier) {
-          // Overage only applies while the paid entitlement behind it is live:
-          // an expired grant / lapsed subscription falls through to the hard
-          // "Usage limit reached" branch instead of metering unbillable usage.
+        const overageDue = Math.max(0, billedUsd - promoAvailable);
+        const overageApplies = wallet.overageEnabled && paidTier;
+        let overageBlock: 'overage_payment_pending' | 'overage_cap_reached' | null = null;
+        if (overageApplies && overageDue > 0) {
           if (wallet.overageOutstandingInvoiceId) {
+            overageBlock = 'overage_payment_pending';
+          } else {
+            const overageRoom = wallet.overageHardLimitUsd == null
+              ? Number.POSITIVE_INFINITY
+              : Math.max(0, wallet.overageHardLimitUsd - overageAccumulatedUsd);
+            if (overageRoom < overageDue) overageBlock = 'overage_cap_reached';
+          }
+        }
+
+        if (promoAvailable > 0 && (overageDue === 0 || !overageApplies || overageBlock)) {
+          // Promo covers the call. When nothing billable sits behind it, the
+          // last of the balance absorbs the whole call: `checkUsageBalance`
+          // already admitted it on any positive balance, and a refused debit
+          // would leave the balance untouched and the call free, repeatedly.
+          source = 'promo';
+          promoCharged = Math.min(promoAvailable, billedUsd);
+          balanceBefore = promoAvailable;
+          balanceAfter = promoAvailable - promoCharged;
+        } else if (overageApplies) {
+          if (overageBlock === 'overage_payment_pending') {
             return {
               success: false,
               error: 'Overage payment pending',
@@ -1285,10 +1303,7 @@ async function _consumeUsageTransaction(
               resetsAt,
             };
           }
-          const overageRoom = wallet.overageHardLimitUsd == null
-            ? Number.POSITIVE_INFINITY
-            : Math.max(0, wallet.overageHardLimitUsd - overageAccumulatedUsd);
-          if (overageRoom < billedUsd) {
+          if (overageBlock === 'overage_cap_reached') {
             return {
               success: false,
               error: 'Usage hard limit reached',
@@ -1300,12 +1315,14 @@ async function _consumeUsageTransaction(
             };
           }
           // Beyond-window usage is metered to overage and does NOT accrue to
-          // the windows (the window is already full).
+          // the windows (the window is already full). Any remaining promo
+          // balance pays for the first part of the call.
           source = 'overage';
+          promoCharged = promoAvailable;
           balanceBefore = overageAccumulatedUsd;
-          overageAccumulatedUsd += billedUsd;
+          overageAccumulatedUsd += overageDue;
           balanceAfter = overageAccumulatedUsd;
-          overageCharged = billedUsd;
+          overageCharged = overageDue;
         } else {
           // `wallet.overageEnabled` alone doesn't mean overage actually
           // applies — see `resolveEffectivePlan`'s `paidTier` doc comment.

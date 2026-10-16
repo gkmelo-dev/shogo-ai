@@ -158,7 +158,7 @@ mock.module('../lib/prisma', () => ({
 // Now import auth.ts — this triggers betterAuth() with our captured config.
 // ---------------------------------------------------------------------------
 
-const { parseCookieHeader } = await import('../auth')
+const { parseCookieHeader, signupProviderFromPath } = await import('../auth')
 if (!capturedConfig) throw new Error('betterAuth() was not captured')
 
 const origLog = console.log
@@ -229,6 +229,20 @@ describe('parseCookieHeader', () => {
 // ===========================================================================
 // emailAndPassword.sendResetPassword
 // ===========================================================================
+
+describe('signupProviderFromPath', () => {
+  test('OAuth callbacks and ID-token sign-in are social', () => {
+    expect(signupProviderFromPath('/callback/google')).toBe('social')
+    expect(signupProviderFromPath('/callback/apple')).toBe('social')
+    expect(signupProviderFromPath('/sign-in/social')).toBe('social')
+  })
+
+  test('email sign-up, unknown paths and no request context score as credential', () => {
+    expect(signupProviderFromPath('/sign-up/email')).toBe('credential')
+    expect(signupProviderFromPath('/admin/create-user')).toBe('credential')
+    expect(signupProviderFromPath(undefined)).toBe('credential')
+  })
+})
 
 describe('emailAndPassword.sendResetPassword', () => {
   test('success: calls sendPasswordResetEmail and returns silently', async () => {

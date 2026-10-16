@@ -106,12 +106,14 @@ export async function applyInitialSignupCredit(params: {
 }): Promise<{ granted: boolean; workspaceId: string | null }> {
   const { result } = params
   const workspaceId = await findSignupCreditWorkspaceId(params.userId)
-  if (!workspaceId || result.decision === CREDIT_DECISIONS.none) {
+  // Held (medium) signups get nothing now. Granting $0 would still start the
+  // 30-day expiry clock at signup instead of at verification.
+  if (!workspaceId || result.decision === CREDIT_DECISIONS.none || result.initialCreditUsd <= 0) {
     return { granted: false, workspaceId }
   }
 
-  // Verified at signup gets the full amount now. Otherwise stage 1 (low gets
-  // the initial part, medium gets nothing until verification).
+  // Verified at signup gets the full amount now. Otherwise stage 1 (the low
+  // band's initial part; the rest waits for verification).
   const toStage = result.decision === CREDIT_DECISIONS.full ? STAGE_FULL : STAGE_INITIAL
   const granted = await grantPromoCredit({
     workspaceId,
@@ -212,37 +214,61 @@ export async function releaseSignupCreditOnVerification(params: {
   return { released: true, reason: 'released', band: result.band, amountUsd }
 }
 
-/** Admin: grant the full credit regardless of band. Idempotent via the stage. */
+/**
+ * Admin: bring the workspace up to the full credit regardless of band, including
+ * after an earlier revoke. `promoCreditGrantedUsd` is net of revokes, so the
+ * amount owed is simply the total minus what is already granted; once approved
+ * it is 0 and a repeat approval is a no-op. Expired credit gets a fresh expiry.
+ */
 export async function approveSignupCredit(params: {
   userId: string
   adminUserId: string
   now?: Date
-}): Promise<{ granted: boolean }> {
+}): Promise<{ granted: boolean; grantedUsd: number }> {
+  const now = params.now ?? new Date()
   const workspaceId = await findSignupCreditWorkspaceId(params.userId)
-  if (!workspaceId) return { granted: false }
-  // Top up only what is still owed: $2 may already be granted at signup.
-  const wallet = await prisma.usageWallet.findUnique({
-    where: { workspaceId },
-    select: { promoCreditGrantedUsd: true },
-  })
-  const remaining = Math.max(0, SIGNUP_CREDIT_TOTAL_USD - (wallet?.promoCreditGrantedUsd ?? 0))
-  const granted = remaining > 0
-    ? await grantPromoCredit({ workspaceId, amountUsd: remaining, toStage: STAGE_FULL, now: params.now })
-    : false
+  let grantedUsd = 0
+  if (workspaceId) {
+    await allocateFreeWallet(workspaceId)
+    const wallet = await prisma.usageWallet.findUnique({
+      where: { workspaceId },
+      select: { promoCreditGrantedUsd: true, promoCreditExpiresAt: true },
+    })
+    const owed = Math.max(0, SIGNUP_CREDIT_TOTAL_USD - (wallet?.promoCreditGrantedUsd ?? 0))
+    if (wallet && owed > 0) {
+      const live = wallet.promoCreditExpiresAt && new Date(wallet.promoCreditExpiresAt).getTime() > now.getTime()
+      const res = await prisma.usageWallet.updateMany({
+        // Conditional on the granted total read above, so concurrent approvals pay once.
+        where: { workspaceId, promoCreditGrantedUsd: wallet.promoCreditGrantedUsd },
+        data: {
+          promoCreditUsd: { increment: owed },
+          promoCreditGrantedUsd: { increment: owed },
+          promoCreditStage: STAGE_FULL,
+          promoCreditExpiresAt: live
+            ? wallet.promoCreditExpiresAt
+            : new Date(now.getTime() + SIGNUP_CREDIT_TTL_DAYS * 24 * 60 * 60 * 1000),
+        },
+      })
+      if (res.count > 0) grantedUsd = owed
+    }
+  }
   await prisma.signupRiskAssessment.updateMany({
     where: { userId: params.userId },
     data: {
+      // The credit is settled; verification must not release it again.
+      decision: CREDIT_DECISIONS.released,
       reviewDecision: 'approved',
       reviewedByUserId: params.adminUserId,
-      reviewedAt: new Date(),
+      reviewedAt: now,
     },
   })
-  return { granted }
+  return { granted: grantedUsd > 0, grantedUsd }
 }
 
 /**
  * Admin: zero the remaining promo balance and stop any future release. The
- * granted total is kept for the audit trail.
+ * revoked amount comes off `promoCreditGrantedUsd` (so a later approval can
+ * restore it) and is recorded as a zero-cost audit event.
  */
 export async function revokeSignupCredit(params: {
   userId: string
@@ -252,14 +278,22 @@ export async function revokeSignupCredit(params: {
   const workspaceId = await findSignupCreditWorkspaceId(params.userId)
   let revokedUsd = 0
   if (workspaceId) {
-    const wallet = await prisma.usageWallet.findUnique({
-      where: { workspaceId },
-      select: { promoCreditUsd: true },
-    })
-    revokedUsd = wallet?.promoCreditUsd ?? 0
-    await prisma.usageWallet.updateMany({
-      where: { workspaceId },
-      data: { promoCreditUsd: 0 },
+    revokedUsd = await prisma.$transaction(async (tx) => {
+      const wallet = await tx.usageWallet.findUnique({
+        where: { workspaceId },
+        select: { promoCreditUsd: true },
+      })
+      const balance = Math.max(0, wallet?.promoCreditUsd ?? 0)
+      if (balance <= 0) return 0
+      const res = await tx.usageWallet.updateMany({
+        // Conditional on the balance read above: a concurrent spend makes this
+        // a no-op rather than writing a stale revoked amount.
+        where: { workspaceId, promoCreditUsd: balance },
+        data: { promoCreditUsd: 0, promoCreditGrantedUsd: { decrement: balance } },
+      })
+      if (res.count === 0) return 0
+      await recordPromoAuditEvent(tx, workspaceId, 'signup_credit_revoked', balance)
+      return balance
     })
   }
   await prisma.signupRiskAssessment.updateMany({
@@ -274,15 +308,55 @@ export async function revokeSignupCredit(params: {
   return { revokedUsd }
 }
 
+type PrismaTx = Parameters<Parameters<typeof prisma.$transaction>[0]>[0]
+
+/**
+ * Zero-cost `UsageEvent` recording a promo balance change that wasn't a spend
+ * (expiry, revoke). `billedUsd` is 0, so usage totals are unchanged. Attributed
+ * to the workspace's first member; skipped (with a warning) if there is none.
+ */
+async function recordPromoAuditEvent(
+  tx: PrismaTx,
+  workspaceId: string,
+  actionType: 'signup_credit_expired' | 'signup_credit_revoked',
+  amountUsd: number,
+): Promise<void> {
+  const member = await tx.member.findFirst({
+    where: { workspaceId, projectId: null },
+    select: { id: true },
+    orderBy: { createdAt: 'asc' },
+  })
+  if (!member) {
+    console.warn('[signup-credit] promo balance change with no member to attribute the event to', {
+      workspaceId,
+      actionType,
+    })
+    return
+  }
+  await tx.usageEvent.create({
+    data: {
+      workspaceId,
+      memberId: member.id,
+      actionType,
+      actionMetadata: { amountUsd },
+      rawUsd: null,
+      billedUsd: 0,
+      source: 'promo',
+      balanceBefore: amountUsd,
+      balanceAfter: 0,
+    },
+  })
+}
+
 /**
  * Zero promo balances whose expiry has passed and record one zero-cost
- * `UsageEvent` per workspace for the audit trail. `billedUsd` is 0, so usage
- * totals are unchanged. Returns the number of wallets expired.
+ * `UsageEvent` per workspace for the audit trail. Returns the number of
+ * wallets expired.
  */
 export async function expireSignupCredits(now: Date = new Date(), batchSize = 500): Promise<number> {
   const candidates = await prisma.usageWallet.findMany({
     where: { promoCreditUsd: { gt: 0 }, promoCreditExpiresAt: { lte: now } },
-    select: { workspaceId: true, promoCreditUsd: true },
+    select: { workspaceId: true },
     take: batchSize,
   })
   // usage_wallets is home-region partitioned (never replicated), so each region
@@ -290,42 +364,24 @@ export async function expireSignupCredits(now: Date = new Date(), batchSize = 50
   const home = await homeWorkspaceIds(candidates.map((w) => w.workspaceId))
   const due = home ? candidates.filter((w) => home.has(w.workspaceId)) : candidates
   let expired = 0
-  for (const wallet of due) {
-    const res = await prisma.usageWallet.updateMany({
-      where: {
-        workspaceId: wallet.workspaceId,
-        promoCreditUsd: { gt: 0 },
-        promoCreditExpiresAt: { lte: now },
-      },
-      data: { promoCreditUsd: 0 },
-    })
-    if (res.count === 0) continue
-    expired += 1
-
-    const owner = await prisma.member.findFirst({
-      where: { workspaceId: wallet.workspaceId, projectId: null },
-      select: { id: true },
-      orderBy: { createdAt: 'asc' },
-    })
-    if (!owner) {
-      console.warn('[signup-credit] expired credit with no member to attribute the event to', {
-        workspaceId: wallet.workspaceId,
+  for (const { workspaceId } of due) {
+    // The balance write and its audit event commit together.
+    const didExpire = await prisma.$transaction(async (tx) => {
+      const wallet = await tx.usageWallet.findUnique({
+        where: { workspaceId },
+        select: { promoCreditUsd: true },
       })
-      continue
-    }
-    await prisma.usageEvent.create({
-      data: {
-        workspaceId: wallet.workspaceId,
-        memberId: owner.id,
-        actionType: 'signup_credit_expired',
-        actionMetadata: { expiredUsd: wallet.promoCreditUsd },
-        rawUsd: null,
-        billedUsd: 0,
-        source: 'promo',
-        balanceBefore: wallet.promoCreditUsd,
-        balanceAfter: 0,
-      },
+      const balance = wallet?.promoCreditUsd ?? 0
+      if (balance <= 0) return false
+      const res = await tx.usageWallet.updateMany({
+        where: { workspaceId, promoCreditUsd: balance, promoCreditExpiresAt: { lte: now } },
+        data: { promoCreditUsd: 0 },
+      })
+      if (res.count === 0) return false
+      await recordPromoAuditEvent(tx, workspaceId, 'signup_credit_expired', balance)
+      return true
     })
+    if (didExpire) expired += 1
   }
   return expired
 }

@@ -583,7 +583,7 @@ describe('hasPaidSubscription / hasAdvancedModelAccess / isBusinessOrHigherPlan'
   })
 
   test('signup promo credit does not unlock advanced models on a free workspace', async () => {
-    // Promo credit is spendable on economy models only (the advanced gate is plan-based).
+    // Promo credit doesn't change the plan, so the plan-based advanced-model gate still applies.
     walletByWs.set('ws-1', {
       workspaceId: 'ws-1', promoCreditUsd: 10, promoCreditGrantedUsd: 10, promoCreditStage: 2,
       promoCreditExpiresAt: new Date(Date.now() + 10 * 24 * 60 * 60 * 1000),
@@ -973,7 +973,7 @@ describe('consumeUsage promo credit', () => {
     expect(usageEvents[0].source).toBe('promo')
   })
 
-  test('does not split a charge: falls through to overage when promo cannot cover it', async () => {
+  test('splits a charge: the promo remainder pays first, overage meters the rest', async () => {
     subsByWs.set('ws-1', [{ id: 's-1', workspaceId: 'ws-1', status: 'active', stripeCustomerId: 'cus_1', planId: 'pro', seats: 1 }])
     seedWallet('ws-1', {
       ...fullWindows,
@@ -986,7 +986,45 @@ describe('consumeUsage promo credit', () => {
     })
     expect(res.success).toBe(true)
     expect(res.source).toBe('overage')
-    expect(walletByWs.get('ws-1').promoCreditUsd).toBeCloseTo(0.2)
+    expect(res.overageChargedUsd).toBeCloseTo(0.3)
+    expect(walletByWs.get('ws-1').promoCreditUsd).toBeCloseTo(0)
+    expect(walletByWs.get('ws-1').overageAccumulatedUsd).toBeCloseTo(0.3)
+  })
+
+  test('free tier: the last of the promo balance absorbs a larger call (no free repeat calls)', async () => {
+    seedWallet('ws-1', {
+      ...fullWindows,
+      overageEnabled: false,
+      promoCreditUsd: 0.2, promoCreditGrantedUsd: 10, promoCreditStage: 2, promoCreditExpiresAt: FUTURE,
+    })
+    const first = await billing.consumeUsage({
+      workspaceId: 'ws-1', projectId: null, memberId: 'm-1',
+      actionType: 'chat', billedUsd: 0.5,
+    })
+    expect(first.success).toBe(true)
+    expect(first.source).toBe('promo')
+    expect(walletByWs.get('ws-1').promoCreditUsd).toBeCloseTo(0)
+    expect(usageEvents[0].billedUsd).toBe(0.5)
+    expect(usageEvents[0].balanceAfter).toBeCloseTo(0)
+
+    expect((await billing.checkUsageBalance('ws-1')).ok).toBe(false)
+  })
+
+  test('overage payment pending: promo remainder absorbs the call instead of refusing it', async () => {
+    subsByWs.set('ws-1', [{ id: 's-1', workspaceId: 'ws-1', status: 'active', stripeCustomerId: 'cus_1', planId: 'pro', seats: 1 }])
+    seedWallet('ws-1', {
+      ...fullWindows,
+      overageEnabled: true, overageHardLimitUsd: 1000, overageOutstandingInvoiceId: 'in_1',
+      promoCreditUsd: 0.2, promoCreditGrantedUsd: 2, promoCreditStage: 2, promoCreditExpiresAt: FUTURE,
+    })
+    const res = await billing.consumeUsage({
+      workspaceId: 'ws-1', projectId: null, memberId: 'm-1',
+      actionType: 'chat', billedUsd: 0.5,
+    })
+    expect(res.success).toBe(true)
+    expect(res.source).toBe('promo')
+    expect(walletByWs.get('ws-1').promoCreditUsd).toBeCloseTo(0)
+    expect(walletByWs.get('ws-1').overageAccumulatedUsd).toBe(0)
   })
 
   test('ignores expired promo credit (no spend, hard limit applies)', async () => {

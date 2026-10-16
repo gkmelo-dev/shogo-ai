@@ -247,6 +247,24 @@ export async function sendTrialEndingEmail(params: {
 }
 
 /**
+ * Tell the owner their trial checkout was cancelled because the card or account
+ * already used a free trial, so they can subscribe without one. Nothing was
+ * charged. Requires a `trial-unavailable` template on the email provider.
+ */
+export async function sendTrialUnavailableEmail(params: {
+  to: string
+  workspaceName: string
+  planName: string
+  dashboardUrl: string
+}): Promise<{ success: boolean; error?: string }> {
+  return sendTemplateEmail('trial-unavailable', params.to, {
+    workspaceName: params.workspaceName,
+    planName: params.planName,
+    dashboardUrl: params.dashboardUrl,
+  })
+}
+
+/**
  * Send a payment receipt email
  */
 export async function sendPaymentReceiptEmail(params: {
