@@ -714,3 +714,85 @@ describe('estimateTripoTaskCost', () => {
     expect(calculate3dUsageCost(0)).toEqual({ rawUsd: 0, billedUsd: 0 })
   })
 })
+
+// =========================================================================
+// Callers' wire contract
+//
+// The two callers live in other packages (`packages/agent-runtime/src/
+// three-d-tools.ts` and `packages/sdk/bin/three-d-cli.mjs`) and their own
+// tests stub the proxy, so a field-name drift between them and this route
+// stays invisible. Each body below is copied from the caller at the line
+// named in the test, and must be accepted by the real route.
+// =========================================================================
+
+describe('callers wire contract', () => {
+  test('three-d-tools upload body (data_base64) is accepted', async () => {
+    // three-d-tools.ts `uploadFile()`: { filename, contentType, data_base64 }
+    on(`${TRIPO}/files`, () => json({ code: 0, data: { file_token: 'file_from_tool' } }))
+    const res = await call('/ai/v1/3d/files', {
+      method: 'POST',
+      body: JSON.stringify({ filename: 'chest.glb', contentType: 'model/gltf-binary', data_base64: 'Z2xURg==' }),
+    })
+    expect(res.status).toBe(200)
+    expect((await res.json() as any).file_token).toBe('file_from_tool')
+  })
+
+  test('three-d-cli upload body (data_base64) is accepted', async () => {
+    // three-d-cli.mjs `upload()`: { filename, contentType, data_base64 }
+    on(`${TRIPO}/files`, () => json({ code: 0, data: { file_token: 'file_from_cli' } }))
+    const res = await call('/ai/v1/3d/files', {
+      method: 'POST',
+      body: JSON.stringify({ filename: 'ref.png', contentType: 'image/png', data_base64: 'iVBORw0KGgo=' }),
+    })
+    expect(res.status).toBe(200)
+    expect((await res.json() as any).file_token).toBe('file_from_cli')
+  })
+
+  test('single-animation retarget (animation: string) is accepted', async () => {
+    // three-d-tools.ts `edit_3d_model` retarget branch: one preset → `animation`.
+    const wire = mockSubmit({})
+    const { res } = await submit({ op: 'retarget', input: TASK_ID, animation: 'preset:walk' })
+    expect(res.status).toBe(200)
+    expect(wire.animation).toBe('preset:walk')
+    expect(wire.animations).toBeUndefined()
+  })
+
+  test('multi-animation retarget (animations: string[]) is accepted and priced per animation', async () => {
+    // three-d-cli.mjs `edit --animations a,b`: a list → `animations`.
+    const wire = mockSubmit({})
+    const { res, data } = await submit({ op: 'retarget', input: TASK_ID, animations: ['preset:walk', 'preset:run'] })
+    expect(res.status).toBe(200)
+    expect(wire.animations).toEqual(['preset:walk', 'preset:run'])
+    expect(data.estimated_credits).toBe(20)
+  })
+
+  test('a generation body never carries format, and the caller does not send one', async () => {
+    // three-d-cli.mjs `generate` and three-d-tools.ts `generate_3d_model`:
+    // format belongs to convert only, so no generation op allowlists it.
+    const wire = mockSubmit({})
+    const { res } = await submit({
+      op: 'text_to_model',
+      prompt: 'a wooden chest',
+      model: 'tripo-v3.1',
+      texture: true,
+    })
+    expect(res.status).toBe(200)
+    expect('format' in wire).toBe(false)
+  })
+
+  test('format on a generation op is still a 400 unsupported_field', async () => {
+    const { res, data } = await submit({ op: 'text_to_model', prompt: 'a wooden chest', format: 'GLB' })
+    expect(res.status).toBe(400)
+    expect(data.error.code).toBe('unsupported_field')
+    expect(fetchLog).toHaveLength(0)
+  })
+
+  test('the CLI convert body (op + format, input as task id) is accepted', async () => {
+    // three-d-cli.mjs `edit --op convert --input <task> --format USDZ`.
+    const wire = mockSubmit({})
+    const { res } = await submit({ op: 'convert', input: TASK_ID, format: 'USDZ' })
+    expect(res.status).toBe(200)
+    expect(wire.format).toBe('USDZ')
+    expect(wire.input).toBe(TASK_ID)
+  })
+})
