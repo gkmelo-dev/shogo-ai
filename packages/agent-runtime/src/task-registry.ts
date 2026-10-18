@@ -919,9 +919,17 @@ export class TaskRegistry {
     return (entry.finishedAt ?? now) - entry.startedAt >= this.uiVisibleAfterMs
   }
 
-  /** Serializable snapshot of the dock list for persistence. */
+  /**
+   * Serializable snapshot for persistence: every running task plus the
+   * recently finished rows the dock was showing. Running entries are taken
+   * from `listRunning()`, not `listDock()`, because a shell command still
+   * inside the dock visibility delay is invisible but must survive a restart.
+   */
   snapshot(): RunningProcessSnapshot[] {
-    return this.listDock().map((p) => {
+    const persisted = new Map<string, RunningProcess>()
+    for (const p of this.listRunning()) persisted.set(p.id, p)
+    for (const p of this.listDock()) if (!persisted.has(p.id)) persisted.set(p.id, p)
+    return [...persisted.values()].map((p) => {
       const entry = this.entries.get(p.id)
       return {
         runId: p.id,

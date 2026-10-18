@@ -361,6 +361,24 @@ describe('the dock list', () => {
     expect(byId.get(running.entry.id)?.stale).toBe(true)
   })
 
+  test('a running task the dock has not shown yet is still persisted', async () => {
+    const reg = new TaskRegistry({ uiVisibleAfterMs: 30_000 })
+    const hidden = reg.register('npm run dev', fakeHandle().handle)
+    const done = await finishedTask(reg, 'bun test', 2)
+    // Invisible to the dock (below the delay), but it must survive a restart.
+    expect(reg.listDock().map((p) => p.id)).toEqual([done.id])
+
+    const snap = reg.snapshot()
+    expect(snap.map((s) => s.runId).sort()).toEqual([hidden.id, done.id].sort())
+    expect(snap.find((s) => s.runId === hidden.id)?.status).toBe('running')
+
+    const restored = new TaskRegistry()
+    restored.restoreStale(snap)
+    const byId = new Map(restored.listRunning().map((p) => [p.id, p]))
+    expect(byId.get(hidden.id)?.stale).toBe(true)
+    expect(byId.get(hidden.id)?.command).toBe('npm run dev')
+  })
+
   test('a finished row past its retention is not restored', () => {
     const reg = new TaskRegistry()
     reg.restoreStale([{

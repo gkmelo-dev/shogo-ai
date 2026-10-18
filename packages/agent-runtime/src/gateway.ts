@@ -2220,17 +2220,23 @@ export class AgentGateway {
       // `sessionManager.get()` is memory-only: on a cold process the session is
       // not loaded yet, so the seed above sees nothing. Load it once and retry,
       // then fall back to the per-task logs when no snapshot survived.
-      this.hydrateCommandRegistry(sessionId, registry)
+      this.hydrateCommandRegistry(sessionId, registry).catch(() => {})
     }
     return reg
   }
 
-  private hydratingRegistries = new Set<string>()
+  private hydratingRegistries = new Map<string, Promise<void>>()
 
-  private hydrateCommandRegistry(sessionId: string, registry: TaskRegistry): void {
-    if (this.hydratingRegistries.has(sessionId)) return
-    this.hydratingRegistries.add(sessionId)
-    void (async () => {
+  /**
+   * Seed a cold registry from the loaded session (or, failing that, the
+   * per-task logs). Returns the in-flight promise so callers that answer a
+   * request can wait for it: `sessionManager.get()` is memory-only, and a
+   * client that receives an empty dock never asks again.
+   */
+  private hydrateCommandRegistry(sessionId: string, registry: TaskRegistry): Promise<void> {
+    const inflight = this.hydratingRegistries.get(sessionId)
+    if (inflight) return inflight
+    const pending = (async () => {
       try {
         const session = await this.sessionManager.getOrCreateAsync(sessionId)
         // Another caller already re-seeded this registry from the loaded session.
@@ -2248,6 +2254,8 @@ export class AgentGateway {
         this.hydratingRegistries.delete(sessionId)
       }
     })()
+    this.hydratingRegistries.set(sessionId, pending)
+    return pending
   }
 
   // ---------------------------------------------------------------------------
@@ -2362,6 +2370,10 @@ export class AgentGateway {
   /** Tasks for the dock (running + recently finished), remote ones refreshed first. */
   async listSessionTasks(sessionId: string): Promise<import('./task-registry').RunningProcess[]> {
     const reg = this.getOrCreateCommandRegistry(sessionId)
+    // A cold registry is seeded asynchronously; answer from the hydrated list.
+    // The client only polls the seed route while it already has rows, so an
+    // empty first response would never be retried.
+    await this.hydratingRegistries.get(sessionId)
     if (reg.hasRunningRemote()) await reg.refreshRemote()
     return reg.listDock()
   }
