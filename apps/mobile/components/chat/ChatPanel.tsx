@@ -58,7 +58,11 @@ import { useRouter } from "expo-router"
 import { useSafeAreaInsets } from "react-native-safe-area-context"
 import { LinearGradient } from "expo-linear-gradient"
 import { DefaultChatTransport } from "ai"
-import { appendQueuedUserMessage } from "./queued-user-message"
+import {
+  appendQueuedUserMessage,
+  appendQueuedUserMessages,
+  canAttachQueuedTurn,
+} from "./queued-user-message"
 import {
   appendOptimisticEcho,
   buildOptimisticUserMessage,
@@ -102,8 +106,10 @@ import { decideMessagesPropagation } from "./messages-propagation"
 import { useResolvedTheme } from "../../contexts/theme"
 import { useNotifyOnTurnComplete } from "./useNotifyOnTurnComplete"
 import {
+  isLiveTurnOtherThan,
+  probeChatTurn,
   probeChatTurnStatus,
-  shouldAttachLiveStream,
+  type ChatTurnSnapshot,
   type ChatTurnStatus,
 } from "./probe-turn-status"
 import {
@@ -135,6 +141,7 @@ import {
   foldSnapshotContinuation,
   withResumeReplayReset,
 } from "./resume-replay-transport"
+import { markStoppedTail, mergeStoppedSnapshot } from "./stopped-turn"
 import { cn } from "@shogo/shared-ui/primitives"
 import { useBillingData } from "@shogo/shared-app/hooks"
 import { API_URL, api, createHttpClient } from "../../lib/api"
@@ -3206,9 +3213,31 @@ const ChatPanelContent = observer(function ChatPanelContent({
     autoResumeCircuitTrippedRef.current = false
   }, [currentSessionId])
 
+  // The transcript as it stood when the user pressed Stop, with the stopped
+  // reply stamped as finished (see stopped-turn.ts). Held on screen while the
+  // SDK settles so the reply can't blink out between the abort and the next
+  // render, and released — merged into the live array, never over it — as soon
+  // as anything else needs the window.
   const [stoppedMessages, setStoppedMessages] = useState<UIMessage[] | null>(
     null,
   )
+  const stoppedMessagesRef = useRef<UIMessage[] | null>(null)
+  // The turn Stop cancelled. A send right after Stop must not wait behind it.
+  const stoppedTurnIdRef = useRef<string | null>(null)
+  const releaseStopSnapshot = useCallback(() => {
+    const snapshot = stoppedMessagesRef.current
+    stoppedMessagesRef.current = null
+    setStoppedMessages(null)
+    if (!snapshot) return
+    setMessages((prev) => mergeStoppedSnapshot(prev, snapshot))
+  }, [setMessages])
+  // Stop state belongs to one chat: carrying a snapshot (or a cancelled turn
+  // id) into another one would hold that chat's transcript still.
+  useEffect(() => {
+    stoppedMessagesRef.current = null
+    stoppedTurnIdRef.current = null
+    setStoppedMessages(null)
+  }, [currentSessionId])
   // Keep the stop control visible while the transport is recovering a turn
   // whose server-side agent may still be running.
   const [streamAutoRecovering, setStreamAutoRecovering] = useState(false)
@@ -3239,25 +3268,36 @@ const ChatPanelContent = observer(function ChatPanelContent({
   >(() => {})
   const resumeQueuedTurn = useCallback(
     (queuedUserMessage?: UIMessage) => {
-      // A message already on screen means this window showed that turn some
-      // other way and whatever runs now is a later one; attaching bare would
-      // write its reply over the last one. Load the history (which has the
-      // running turn's message) and attach from there.
-      if (
-        !queuedUserMessage ||
-        messagesRef.current.some((m) => m.id === queuedUserMessage.id)
-      ) {
+      // Whatever happens next, the transcript is live again: the stop
+      // snapshot's reply is merged in rather than left frozen behind this turn.
+      releaseStopSnapshot()
+      if (!queuedUserMessage) {
+        reloadAndAttachLiveTurnRef.current()
+        return
+      }
+      const onScreen = messagesRef.current.some(
+        (m) => m.id === queuedUserMessage.id,
+      );
+      // Still queued bubbles are painted from the queue rows, not from this
+      // list, so a message already here came from the server's history (or a
+      // previous dispatch). If nothing landed after it, this turn's reply
+      // belongs at the end and attaching directly is right — no reload, so the
+      // messages still queued behind it keep their bubbles. If something did
+      // land after it, the transcript has moved on and history is the truth.
+      if (onScreen && !canAttachQueuedTurn(messagesRef.current, queuedUserMessage)) {
         reloadAndAttachLiveTurnRef.current()
         return
       }
       // The server saved the queued message and started its turn; show the
       // message before attaching to the reply (see queued-user-message.ts).
-      setMessages((prev) => appendQueuedUserMessage(prev, queuedUserMessage))
+      if (!onScreen) {
+        setMessages((prev) => appendQueuedUserMessage(prev, queuedUserMessage))
+      }
       void resumeStreamSingleFlight().catch((error) => {
         console.warn("[ChatPanel] Failed to attach to queued turn:", error)
       })
     },
-    [resumeStreamSingleFlight, setMessages],
+    [releaseStopSnapshot, resumeStreamSingleFlight, setMessages],
   )
   const serverQueue = useServerMessageQueue({
     sessionId: currentSessionId,
@@ -3395,12 +3435,14 @@ const ChatPanelContent = observer(function ChatPanelContent({
     }
   }, [])
 
+  // The SDK settled after Stop: hand the transcript back. Merging (not
+  // replacing) keeps anything the window gained after the stop — the next
+  // message's bubble and its reply — and the stop marker keeps the cancelled
+  // reply classified as finished for the next replay.
   useEffect(() => {
-    if (status === "ready" && stoppedMessages !== null) {
-      setMessages(stoppedMessages)
-      setStoppedMessages(null)
-    }
-  }, [status, stoppedMessages, setMessages])
+    if (status !== "ready" || stoppedMessages === null) return
+    releaseStopSnapshot()
+  }, [status, stoppedMessages, releaseStopSnapshot])
 
   // Propagate messages to parent (for pendingToolInstalls, TerminalPanel, etc.)
   // but skip the flood of per-token updates during streaming. Firing this on
@@ -3601,21 +3643,38 @@ const ChatPanelContent = observer(function ChatPanelContent({
     }
   }, [messages.length, pendingInitialMessage])
 
+  /**
+   * The transcript plus the bubbles for the rows still waiting on the server.
+   * Derived here (not copied into `messages`) so a deleted or edited queued
+   * message loses its bubble and a history reload cannot drop the ones still
+   * queued (see queued-user-message.ts).
+   */
+  const messagesWithQueued = useMemo(
+    () => appendQueuedUserMessages(messages, serverQueue.pendingUserMessages),
+    [messages, serverQueue.pendingUserMessages],
+  )
+
   useEffect(() => {
     if (!optimisticUserInput) return
     if (optimisticUserInput.sessionId !== currentSessionId) {
       setOptimisticUserInput(null)
       return
     }
-    if (hasMatchingUserMessage(messages, optimisticUserInput)) {
+    if (hasMatchingUserMessage(messagesWithQueued, optimisticUserInput)) {
       setOptimisticUserInput(null)
     }
-  }, [currentSessionId, messages, optimisticUserInput])
+  }, [currentSessionId, messagesWithQueued, optimisticUserInput])
 
   const displayMessages = useMemo((): UIMessage[] => {
-    const effectiveMessages = foldSnapshotContinuation(
-      stoppedMessages ?? messages,
-      resumeSnapshotIdRef.current,
+    // While the stop snapshot is held, the window still shows it — merged with
+    // the live array so a message sent after Stop appears under the reply it
+    // followed, instead of being hidden behind the frozen transcript.
+    const effectiveMessages = appendQueuedUserMessages(
+      foldSnapshotContinuation(
+        stoppedMessages ? mergeStoppedSnapshot(messages, stoppedMessages) : messages,
+        resumeSnapshotIdRef.current,
+      ),
+      serverQueue.pendingUserMessages,
     )
     const currentOptimisticInput =
       optimisticUserInput?.sessionId === currentSessionId
@@ -3671,6 +3730,7 @@ const ChatPanelContent = observer(function ChatPanelContent({
   }, [
     currentSessionId,
     messages,
+    serverQueue.pendingUserMessages,
     stoppedMessages,
     pendingInitialMessage,
     initialMessage,
@@ -3744,14 +3804,14 @@ const ChatPanelContent = observer(function ChatPanelContent({
     async (
       sessionId: string,
       opts: { retryDelaysMs?: readonly number[]; timeoutMs?: number } = {},
-    ) => {
+    ): Promise<ChatTurnSnapshot> => {
       const controller = new AbortController()
       const timer =
         opts.timeoutMs !== undefined
           ? setTimeout(() => controller.abort(), opts.timeoutMs)
           : undefined
       try {
-        return await probeChatTurnStatus({
+        return await probeChatTurn({
           url: buildChatTurnUrl(
             API_URL!,
             projectId,
@@ -3814,7 +3874,7 @@ const ChatPanelContent = observer(function ChatPanelContent({
       return
     }
     lastLiveTurnCheckAtRef.current = Date.now()
-    const turnStatus = await probeLiveTurn(sessionId)
+    const turn = await probeLiveTurn(sessionId)
     if (
       currentSessionIdRef.current !== sessionId ||
       isStreamingRef.current ||
@@ -3822,7 +3882,11 @@ const ChatPanelContent = observer(function ChatPanelContent({
     ) {
       return
     }
-    if (shouldAttachLiveStream(turnStatus)) reloadAndAttachLiveTurn()
+    // The turn Stop just cancelled can still read `active`: attaching to it
+    // would rebuild the reply the user stopped and hide the one that follows.
+    if (isLiveTurnOtherThan(turn, stoppedTurnIdRef.current)) {
+      reloadAndAttachLiveTurn()
+    }
   }, [probeLiveTurn, reloadAndAttachLiveTurn])
 
   useEffect(() => {
@@ -4060,7 +4124,19 @@ const ChatPanelContent = observer(function ChatPanelContent({
     setEmptyResponseError(null)
     setConnectivityWait(null)
     setJustReconnected(false)
-    setStoppedMessages([...messagesRef.current])
+    // Stop is terminal: keep the turn's id (a send right after Stop must not
+    // queue behind it) and stamp the reply as finished so no later replay
+    // deletes it (see stopped-turn.ts).
+    stoppedTurnIdRef.current = currentTurnIdRef.current
+    const snapshot = markStoppedTail(
+      [...messagesRef.current],
+      stoppedTurnIdRef.current,
+    )
+    stoppedMessagesRef.current = snapshot
+    setStoppedMessages(snapshot)
+    // The live array carries the marker too, so a replay that starts before
+    // the snapshot is released keeps the stopped reply as well.
+    setMessages(snapshot)
     stop()
 
     const req = buildStopRequest({
@@ -4085,6 +4161,7 @@ const ChatPanelContent = observer(function ChatPanelContent({
     localAgentUrl,
     expoFetch,
     currentSessionId,
+    setMessages,
   ])
 
   // Keep the shared subagent-stop helper pointed at the current API/runtime
@@ -4550,20 +4627,23 @@ const ChatPanelContent = observer(function ChatPanelContent({
           loadSessionId,
           chatWorkspaceId,
         )
-        void probeChatTurnStatus({
+        void probeChatTurn({
           url: turnUrl,
           fetch: expoFetch,
           headers: nativeHeaders ? nativeHeaders() : undefined,
           credentials: Platform.OS === "web" ? "include" : undefined,
           retryDelaysMs: [1000, 3000],
-        }).then((turnStatus) => {
+        }).then((turn) => {
           if (myGeneration !== loadGenerationRef.current) return
           lastLiveTurnCheckAtRef.current = Date.now()
           const expectedLive = liveTurnExpectedRef.current
           liveTurnExpectedRef.current = false
-          if (shouldAttachLiveStream(turnStatus)) {
+          // A turn this window stopped is not a turn to attach to, even while
+          // the runtime still reports it (stop reaches it a beat later).
+          const stopped = turn.turnId !== null && turn.turnId === stoppedTurnIdRef.current
+          if (isLiveTurnOtherThan(turn, stoppedTurnIdRef.current)) {
             guardedAutoResumeStream("live-turn-probe")
-          } else if (expectedLive) {
+          } else if (expectedLive && !stopped) {
             setTimeout(
               () => reloadAndAttachLiveTurnRef.current({ settle: false }),
               750,
@@ -5228,7 +5308,10 @@ const ChatPanelContent = observer(function ChatPanelContent({
         console.warn("[ChatPanel] No session ID - message will be lost!")
         return
       }
-      setStoppedMessages(null)
+      // Hand the transcript back with the stopped reply still in it: the new
+      // message is appended after it, not painted over it.
+      releaseStopSnapshot()
+      stoppedTurnIdRef.current = null
       setEmptyResponseError(null)
       setErrorDismissed(false)
       userInitiatedStopRef.current = false
@@ -5440,6 +5523,7 @@ const ChatPanelContent = observer(function ChatPanelContent({
       isPhoneViewport,
       windowWidth,
       maybeAutoNameSession,
+      releaseStopSnapshot,
       showOptimisticEcho,
     ],
   )
@@ -5999,6 +6083,14 @@ const ChatPanelContent = observer(function ChatPanelContent({
         references,
         body,
       })
+      // The queued turn is the server's to run, but the bubble is the send's:
+      // waiting for the queue poll to notice the dispatch means the reply
+      // arrives before its own message, and with the previous user bubble
+      // still last, the new reply renders under the old message. The bubble is
+      // painted from the queue row itself (see `displayMessages`), so deleting
+      // or editing the queued message takes it away again; hand back any
+      // stopped snapshot so it lands *below* the stop.
+      releaseStopSnapshot()
     },
     [
       currentSession,
@@ -6011,6 +6103,7 @@ const ChatPanelContent = observer(function ChatPanelContent({
       isPhoneViewport,
       phase,
       projectId,
+      releaseStopSnapshot,
       selectedModel,
       serverQueue,
       userId,
@@ -6101,11 +6194,15 @@ const ChatPanelContent = observer(function ChatPanelContent({
       // so queue the message behind the live turn and show that turn here.
       // Bounded: a cold runtime must not hold the message back. If the probe
       // gives up, the runtime still waits for any live turn before this one.
-      const turnStatus = await probeLiveTurn(currentSessionId, {
+      //
+      // The turn the user just stopped is not "busy": it can still read
+      // `active` for a moment, and queueing behind it is what attached the new
+      // reply to the old message (see stopped-turn.ts).
+      const turn = await probeLiveTurn(currentSessionId, {
         timeoutMs: 1500,
       })
       if (
-        shouldAttachLiveStream(turnStatus) &&
+        isLiveTurnOtherThan(turn, stoppedTurnIdRef.current) &&
         currentSessionIdRef.current === currentSessionId
       ) {
         await queueMessage()

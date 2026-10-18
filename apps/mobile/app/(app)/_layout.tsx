@@ -46,7 +46,6 @@ import { usePostHogIdentify, usePostHogSafe } from "../../contexts/posthog";
 import { DomainProvider, useWorkspaceCollection } from "../../contexts/domain";
 import { useActiveWorkspace } from "../../hooks/useActiveWorkspace";
 import { useWorkspaceExperience } from "../../hooks/useWorkspaceExperience";
-import { getActiveWorkspaceId } from "../../lib/workspace-store";
 import {
   homePathForWorkspaceKind,
   subscribeWorkspaceSwitched,
@@ -131,17 +130,22 @@ function AppLayoutInner() {
   const mobileAgentShellEnabled = isWorkspaceRuntimeEnabled();
   const isHomePage =
     pathname === "/" || pathname === "/(app)" || pathname === "/(app)/index";
+  // `/(app)/home` is the pre-landing home: the team feed on a phone and the
+  // builder on wide web. `/` itself is the workspace agent chat.
+  const isExplicitHome = pathname === "/home" || pathname === "/(app)/home";
+  const isHomeCanvas = (isHomePage || isExplicitHome) && isDark;
   // The workspace agent chat has a route of its own (`/agent`); on phones the
-  // team Home is a feed that links into it.
+  // team Home feed lives on `/(app)/home` and links into it.
   const isAgentChatPage = /\/agent\/?$/.test(pathname);
   const isTeamHomeFeed =
-    isHomePage &&
+    isExplicitHome &&
     !isWide &&
     !isIdeEmbed &&
     mobileAgentShellEnabled &&
     (experience.kind === "team" || !experience.resolved);
   const isWorkspaceChatRoute =
     isHomePage ||
+    isExplicitHome ||
     isAgentChatPage ||
     isProjectDetail ||
     pathname.includes("/new-project") ||
@@ -367,7 +371,7 @@ function AppLayoutInner() {
     windowWidth: width,
     isDark,
     swipeEnabled: nativeDrawerSwipe,
-    closedCanvas: isHomePage && isDark ? NATIVE_PHONE_HOME_CANVAS : undefined,
+    closedCanvas: isHomeCanvas ? NATIVE_PHONE_HOME_CANVAS : undefined,
   });
   const { drawerOpen, closeDrawer, toggleDrawer, openDrawer, resetDrawer } =
     drawer;
@@ -415,23 +419,19 @@ function AppLayoutInner() {
     if (useMobileWorkspaceShell) resetDrawer();
   }, [resetDrawer, useMobileWorkspaceShell]);
 
-  // After a workspace switch, leave the previous screen. Personal opens
-  // main chat; team opens the project builder. `openInWorkspace` navigates
-  // itself and does not emit this.
+  // After a workspace switch, leave the previous screen: every workspace
+  // lands on its agent chat. `openInWorkspace` navigates itself and does not
+  // emit this.
   useEffect(() => {
     return subscribeWorkspaceSwitched(() => {
-      const id = getActiveWorkspaceId();
-      const kind = (workspaces?.all ?? []).find(
-        (workspace: { id: string; kind?: string }) => workspace.id === id
-      )?.kind;
-      const href = homePathForWorkspaceKind(kind);
+      const href = homePathForWorkspaceKind();
       if (Platform.OS === "web" && typeof window !== "undefined") {
         window.location.assign(href.replace(/\/\([^)]+\)/g, "") || "/");
         return;
       }
       router.replace(href as any);
     });
-  }, [router, workspaces]);
+  }, [router]);
 
   useEffect(() => {
     if (Platform.OS !== "web" || typeof window === "undefined") return;
@@ -524,7 +524,7 @@ function AppLayoutInner() {
       isWide={isWide}
       nativeSheetDrawer={nativeSheetDrawer}
       canvas={
-        isHomePage && isDark ? NATIVE_PHONE_HOME_CANVAS : nativeDrawerCanvas
+        isHomeCanvas ? NATIVE_PHONE_HOME_CANVAS : nativeDrawerCanvas
       }
       safeAreaEdges={nativeEdgeToEdgeChrome ? ["left", "right"] : undefined}
       sidebarWide={showSidebar ? <AppSidebar /> : null}
