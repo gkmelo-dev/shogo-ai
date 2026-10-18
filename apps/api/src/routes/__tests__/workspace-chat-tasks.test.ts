@@ -146,12 +146,27 @@ describe('GET /api/workspaces/:workspaceId/chat/:sessionId/tasks', () => {
     expect(await res.json()).toEqual({ tasks: [{ runId: 'proc-1', command: 'sleep 5' }] })
   })
 
-  test('answers with an empty list instead of failing an idle chat', async () => {
+  test('answers with an empty list when the runtime has no task endpoints at all', async () => {
+    store.fetchImpl = async () => new Response('not found', { status: 404 })
+    const res = await buildApp().fetch(new Request(TASKS_URL))
+    expect(res.status).toBe(200)
+    expect(await res.json()).toEqual({ tasks: [] })
+  })
+
+  test('reports an unreadable list instead of pretending nothing is running', async () => {
     store.fetchImpl = async () => {
       throw new Error('pod unreachable')
     }
     const res = await buildApp().fetch(new Request(TASKS_URL))
-    expect(res.status).toBe(200)
-    expect(await res.json()).toEqual({ tasks: [] })
+    // The client holds its wait on a failed read; `{tasks: []}` would look like
+    // "the task finished" and arm a wake probe that cannot see anything.
+    expect(res.status).toBe(502)
+    expect(await res.json()).toEqual({ error: 'task list unavailable' })
+  })
+
+  test('passes a runtime error through as unreadable', async () => {
+    store.fetchImpl = async () => new Response('boom', { status: 500 })
+    const res = await buildApp().fetch(new Request(TASKS_URL))
+    expect(res.status).toBe(502)
   })
 })

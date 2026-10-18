@@ -1363,8 +1363,13 @@ export function workspaceChatRoutes(config: WorkspaceChatRoutesConfig): Hono {
           { method: 'GET' },
           runtimeExtra,
         )
+        // Neither endpoint exists: the runtime has no task concept at all.
+        if (response.status === 404) return c.json({ tasks: [] }, 200)
       }
-      if (!response.ok) return c.json({ tasks: [] })
+      // "Unknown" and "nothing running" are different answers: the client
+      // holds its wait on a failed read, and would arm a wake probe on an
+      // empty one.
+      if (!response.ok) return c.json({ error: 'task list unavailable' as const }, 502)
       const data = await response.json()
       return c.json(
         { tasks: Array.isArray(data?.tasks) ? data.tasks : data?.processes ?? [] },
@@ -1375,7 +1380,7 @@ export function workspaceChatRoutes(config: WorkspaceChatRoutesConfig): Hono {
         `[WorkspaceChat] task list proxy error for ${workspaceId}/${sessionId}:`,
         err?.message || err,
       )
-      return c.json({ tasks: [] })
+      return c.json({ error: 'task list unavailable' as const }, 502)
     }
   })
 

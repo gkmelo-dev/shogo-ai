@@ -260,7 +260,9 @@ test.describe("a server-initiated wake on an open window", () => {
       else await second.waitForTimeout(250)
     }
     soft(renderedAt !== null, "(b) the second, untouched window shows the wake reply").toBe(true)
-    soft(await countOnScreen(first, "wake-ack"), "the window that ran the turn sees it too").toBeGreaterThan(0)
+    // One row, not one per window: the reload must replace the transcript, not
+    // replay the wake into it.
+    soft(await countOnScreen(second, "wake-ack"), "the wake reply is rendered once").toBe(1)
     await second.close()
   })
 

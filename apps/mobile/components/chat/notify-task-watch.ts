@@ -13,15 +13,22 @@
  * never waking up.
  *
  * So an idle window keeps asking while background work is in flight: the
- * task list tells it whether something is still running, and once nothing is
- * listed it probes `/turn` and reloads history until the wake turn shows up
- * in the transcript. The wait is bounded, and it is only armed while a task
- * is listed or the last turn started one, so an idle chat makes no requests.
+ * task list tells it whether something is still running — polled for as long
+ * as it is, however long the task takes — and once nothing is listed it probes
+ * `/turn` and reloads history until the wake turn shows up in the transcript.
+ * Only that last phase is capped, and the whole watch is armed only while a
+ * task is listed or the last turn started one, so an idle chat makes no
+ * requests.
  */
 
 import type { ChatTurnStatus } from './probe-turn-status'
 
 export const NOTIFY_WAKE_POLL_INTERVAL_MS = 5_000
+/**
+ * How long to keep asking for the wake after the task list came back empty.
+ * It applies only to that wait: a task that is still listed is polled for as
+ * long as it runs, however long that is.
+ */
 export const NOTIFY_WAKE_MAX_WAIT_MS = 5 * 60 * 1_000
 
 export interface NotifyWakeWatchOptions {
@@ -42,6 +49,7 @@ export interface NotifyWakeWatchOptions {
   isSettled?: () => boolean
   isCancelled?: () => boolean
   intervalMs?: number
+  /** Bound on the wait for the wake once the task list is empty. */
   maxWaitMs?: number
   sleep?: (ms: number) => Promise<void>
   now?: () => number
@@ -58,7 +66,7 @@ export async function watchForNotifyWake(options: NotifyWakeWatchOptions): Promi
   const maxWaitMs = options.maxWaitMs ?? NOTIFY_WAKE_MAX_WAIT_MS
   const sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)))
   const now = options.now ?? (() => Date.now())
-  const started = now()
+  let wakeWaitingSince: number | null = null
 
   while (!options.isCancelled?.()) {
     let tasks: readonly string[] | null = null
@@ -70,10 +78,13 @@ export async function watchForNotifyWake(options: NotifyWakeWatchOptions): Promi
     if (options.isCancelled?.()) return
 
     // While a task is still listed there is nothing to attach to: its wake is
-    // queued only once it finishes. An empty list is the interesting case, and
-    // it also covers a task that finished too fast to ever be listed. An
-    // unreadable list says nothing, so just wait for the next tick.
+    // queued only once it finishes, and it may run for hours. Keep asking
+    // about it for as long as it is listed — that is also what keeps the
+    // panel's running-task list accurate — and start the wake wait only once
+    // the list comes back empty. An unreadable list says nothing either way,
+    // so hold on to whatever state the wait is in.
     if (tasks && tasks.length === 0) {
+      wakeWaitingSince ??= now()
       let status: ChatTurnStatus = 'unknown'
       try {
         status = await options.probeTurn()
@@ -93,9 +104,14 @@ export async function watchForNotifyWake(options: NotifyWakeWatchOptions): Promi
       }
       if (options.isCancelled?.()) return
       if (options.isSettled?.()) return
+      // Only the wait for the wake is bounded: a wake that has not been queued
+      // within this window after the task list emptied is not coming.
+      if (now() - wakeWaitingSince >= maxWaitMs) return
+    } else if (tasks && tasks.length > 0) {
+      // Still running (or a new task started): no wake to wait for yet.
+      wakeWaitingSince = null
     }
 
-    if (now() - started >= maxWaitMs) return
     await sleep(intervalMs)
   }
 }
