@@ -276,6 +276,7 @@ Commands:
   enable <feature>      Enable a feature in shogo.config.json and re-run codegen
                           (voice | voice.phoneNumber)
   deploy                Reconcile shogo.config.json#agents with the cloud
+  3d <command>          Generate or refine a 3D model (run \`shogo 3d help\`)
   dev                   Runtime-token preflight then passthrough to \`bun run dev\`
   db switch <provider>  Switch Prisma schema provider (sqlite | postgres)
   db status             Show current schema provider
@@ -905,6 +906,19 @@ async function main() {
   if (command === 'dev') {
     await handleDevCommand()
     process.exit(0)
+  }
+
+  // Handle `3d` (3D generation through the AI proxy)
+  if (command === '3d') {
+    const { runThreeDCommand } = await import('../src/cli/three-d')
+    process.exit(
+      await runThreeDCommand(process.argv.slice(3), {
+        fetch: globalThis.fetch,
+        env: process.env,
+        cwd: process.cwd(),
+        stdout: (line) => console.log(line),
+      }),
+    )
   }
 
   // Handle deploy command (reconcile shogo.config.json#agents with cloud)

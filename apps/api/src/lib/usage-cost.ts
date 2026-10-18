@@ -24,6 +24,7 @@ import {
   type BillingModel,
 } from '@shogo/model-catalog'
 import { getDbModelBillingModel, getDbModelPricing } from './db-model-pricing'
+import { estimateTripoCredits, type TripoOp } from './tripo-3d'
 
 export type { ModelTier, AgentMode }
 export { MODEL_DOLLAR_COSTS, calculateDollarCost }
@@ -232,45 +233,26 @@ export function calculateVideoUsageCost(rates: VideoRates, seconds: number, audi
 export const TRIPO_USD_PER_CREDIT = 0.01
 
 /**
- * Credits per generation by series and input mode, from the published tables
- * (`developers.tripo3d.ai/en/models/v3-1`): H-series text 10 / image 20 with
- * no texture, P-series 30 / 40. Texturing adds the surcharge below.
- */
-const TRIPO_BASE_CREDITS = {
-  H: { text: 10, image: 20 },
-  P: { text: 30, image: 40 },
-} as const
-
-/** Extra credits for texture generation, relative to the untextured base. */
-const TRIPO_TEXTURE_CREDITS: Record<string, number> = {
-  none: 0,
-  fast: 10,
-  standard: 10,
-  detailed: 20,
-  extreme: 30,
-}
-
-/** A model id starting `tripo-p` is the low-poly P-series; everything else is H. */
-function tripoSeries(model: string | undefined): 'H' | 'P' {
-  return (model ?? '').startsWith('tripo-p') ? 'P' : 'H'
-}
-
-/**
- * Advisory estimate for the `estimated_usd` on the queued response. Billing is
- * never driven by this: the status route charges the task's own
- * `credits_consumed`.
+ * Advisory estimate for the `estimated_usd` on the queued response, priced
+ * from the operation registry's credit table (`TRIPO_OPS`). Billing is never
+ * driven by this: the status route charges the task's own `credits_consumed`.
  */
 export function estimateTripoTaskCost(params: {
+  op: TripoOp
   model?: string
   texture?: boolean
   textureQuality?: string
-  input?: 'text' | 'image'
+  animations?: string[]
+  animation?: string
+  [opParam: string]: unknown
 }): UsageCostResult {
-  const series = tripoSeries(params.model)
-  const mode = params.input === 'image' ? 'image' : 'text'
-  const texture = params.texture !== false
-  const quality = params.textureQuality || 'standard'
-  const credits = TRIPO_BASE_CREDITS[series][mode] + (texture ? (TRIPO_TEXTURE_CREDITS[quality] ?? TRIPO_TEXTURE_CREDITS.standard) : 0)
+  const { op, textureQuality, animations, animation, ...rest } = params
+  const credits = estimateTripoCredits(op, {
+    ...rest,
+    ...(textureQuality !== undefined ? { texture_quality: textureQuality } : {}),
+    ...(animations !== undefined ? { animations } : {}),
+    ...(animation !== undefined ? { animation } : {}),
+  })
   const rawUsd = credits * TRIPO_USD_PER_CREDIT
   return { rawUsd, billedUsd: rawUsd * MARKUP_MULTIPLIER }
 }

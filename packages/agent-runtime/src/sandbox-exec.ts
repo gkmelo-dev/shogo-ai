@@ -105,6 +105,11 @@ export function rewriteBunxOnWindows(command: string): string {
 const PROJECT_SCOPED_SAFE = new Set([
   'RUNTIME_AUTH_SECRET',
   'WEBHOOK_TOKEN',
+  // The AI proxy token is a JWT pinned to this project + workspace
+  // (apps/api/src/lib/ai-proxy-token.ts), and it is the agent's own credential
+  // for media/LLM calls. Shells need it for `shogo 3d`, which reaches the proxy
+  // rather than the vendor — the vendor key never leaves the server.
+  'AI_PROXY_TOKEN',
 ])
 
 // Env vars that must never leak to agent-spawned child processes.

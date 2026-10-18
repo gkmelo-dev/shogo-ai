@@ -31,8 +31,9 @@ a tool you've turned off, and it won't be told the tool exists.
 ## The capabilities
 
 Most capabilities default to **on**; set a flag to `false` to disable it. Opt-in
-ones (Git worktrees, Social media, Video generation, and some of the
-[work capabilities](#work-capabilities)) default to off.
+ones (Git worktrees, Social media, Video generation, 3D generation, and some of
+the [work capabilities](#work-capabilities)) default to off — the two generation
+modes that bill per output are off until you turn them on.
 
 | Capability | Flag | Gates (tools) | Also trims from prompt |
 |------------|------|---------------|------------------------|
@@ -41,12 +42,33 @@ ones (Git worktrees, Social media, Video generation, and some of the
 | Shell | `shellEnabled` | `exec`, `exec_wait` | — |
 | Image generation | `imageGenEnabled` | `generate_image`, `upscale_image`, `remove_background` | `media` capability line |
 | Video generation (opt-in) | `videoGenEnabled` | `generate_video` | Video mention in the `media` line |
+| 3D generation (opt-in) | `threeDGenEnabled` | `generate_3d_model`, `edit_3d_model` | — |
 | Heartbeat | `heartbeatToolsEnabled` | `heartbeat_configure`, `heartbeat_status` | `devops` line + Action Tools reminder |
 | Memory | `memoryEnabled` | `memory_read`, `memory_search` | — |
 | Quick actions | `quickActionsEnabled` | `quick_action` | Quick Action guide |
 | Channels | `channelsEnabled` | `channel_connect`, `channel_disconnect`, `channel_list`, `send_message` | `channel` line + Action Tools bullet |
 | Integrations | `integrationsEnabled` | `search_integrations`, `connect`, `disconnect` | `integrations` line + Action Tools bullet |
 | Canvas | `canvasEnabled` / `activeMode: "none"` | canvas tools | Canvas file reference + preview context |
+
+### 3D generation
+
+Turning on **3D generation** gives the agent two tools and a CLI command, all
+backed by Tripo through the AI proxy:
+
+- `generate_3d_model` builds a model from a text prompt, one still image, or
+  two to four orthographic views (`views: { front, left, back, right }`).
+- `edit_3d_model` refines an existing model: `texture`, `convert`
+  (GLB/FBX/USDZ/OBJ/STL/3MF), `retopology`, `segment`, `rig`, `retarget`,
+  `complete`, `rig_check` (free — does this model rig?), and `import`.
+  Pass the job id from a generation as `input`.
+- `shogo 3d <generate|edit|status|models>` does the same from a shell, using the
+  project's own `AI_PROXY_TOKEN`.
+
+Every paid task is metered through Shogo billing, and the agent is told the
+per-operation price before it spends: a generation is roughly $0.24, a rig
+$0.29, and `complete` is the most expensive at about $0.58. `rig_check` and
+`import` cost nothing. Asks for a file over 25MB are refused with the job-id
+alternative, since the model already lives on the proxy's side.
 
 ### Work capabilities
 

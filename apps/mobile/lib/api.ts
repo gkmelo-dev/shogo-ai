@@ -3154,6 +3154,7 @@ export interface TechStackSummary {
     heartbeatToolsEnabled?: boolean
     imageGenEnabled?: boolean
     videoGenEnabled?: boolean
+    threeDGenEnabled?: boolean
     memoryEnabled?: boolean
     quickActionsEnabled?: boolean
     sdkGuideEnabled?: boolean
