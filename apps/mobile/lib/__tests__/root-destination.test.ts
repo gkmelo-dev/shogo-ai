@@ -86,16 +86,30 @@ describe('appHomeSurface', () => {
 describe('agentSessionSource', () => {
   test('an explicit chat session in the URL wins over everything', () => {
     expect(
-      agentSessionSource({ initialSessionId: 'session-1', startNewSession: true }),
+      agentSessionSource({
+        initialSessionId: 'session-1',
+        startNewSession: true,
+        kind: 'team',
+      }),
     ).toBe('url')
     expect(agentSessionSource({ initialSessionId: 'session-1' })).toBe('url')
   })
 
-  test('the landing starts a new chat', () => {
-    expect(agentSessionSource({ startNewSession: true })).toBe('new')
+  test('a team landing starts a new chat', () => {
+    expect(agentSessionSource({ startNewSession: true, kind: 'team' })).toBe(
+      'new',
+    )
+  })
+
+  test('a personal landing keeps resuming the last chat', () => {
+    expect(
+      agentSessionSource({ startNewSession: true, kind: 'personal' }),
+    ).toBe('primary')
+    expect(agentSessionSource({ startNewSession: true })).toBe('primary')
   })
 
   test('a plain /agent resumes the primary chat', () => {
     expect(agentSessionSource({})).toBe('primary')
+    expect(agentSessionSource({ kind: 'team' })).toBe('primary')
   })
 })

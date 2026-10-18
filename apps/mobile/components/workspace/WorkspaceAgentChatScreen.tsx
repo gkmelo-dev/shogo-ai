@@ -181,6 +181,9 @@ export const WorkspaceAgentChatScreen = observer(
         const sessionSource = agentSessionSource({
           initialSessionId,
           startNewSession,
+          // The workspace the session belongs to, not the resolved
+          // experience: they can disagree for a frame during a switch.
+          kind: workspace.kind,
         })
         const openLandingSession = () => {
           const cached = landingSession.current
@@ -218,7 +221,7 @@ export const WorkspaceAgentChatScreen = observer(
             : "Could not load Workspace Agent Chat",
         )
       }
-    }, [http, workspace?.id, initialSessionId, startNewSession])
+    }, [http, workspace?.id, workspace?.kind, initialSessionId, startNewSession])
 
     useEffect(() => {
       void loadWorkspaceChat()

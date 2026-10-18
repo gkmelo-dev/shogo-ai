@@ -41,19 +41,26 @@ export function appHomeSurface({
 }
 
 /**
- * Which session the workspace agent screen opens. An explicit
- * `?chatSessionId=` always wins; otherwise the landing starts a new one and
- * the plain `/agent` route keeps resuming the user's primary chat.
+ * Which session the workspace agent screen opens.
+ *
+ * - An explicit `?chatSessionId=` always wins.
+ * - The **team** landing starts a new, empty chat every time; the previous
+ *   conversation stays in history.
+ * - **Personal** workspaces keep resuming their last chat (unchanged).
+ * - A plain `/agent` route also keeps resuming the primary chat.
  */
 export type AgentSessionSource = 'url' | 'new' | 'primary'
 
 export function agentSessionSource({
   initialSessionId,
   startNewSession = false,
+  kind,
 }: {
   initialSessionId?: string
+  /** The landing (`/`) asked for an empty chat. Only team honours it. */
   startNewSession?: boolean
+  kind?: string | null
 }): AgentSessionSource {
   if (initialSessionId) return 'url'
-  return startNewSession ? 'new' : 'primary'
+  return startNewSession && kind === 'team' ? 'new' : 'primary'
 }
