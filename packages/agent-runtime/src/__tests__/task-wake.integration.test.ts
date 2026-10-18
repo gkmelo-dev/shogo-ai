@@ -263,6 +263,43 @@ describe('task wake', () => {
     expect(apiCalls.filter((c) => c.path === '/api/internal/tasks/notify')).toHaveLength(1)
   }, 20_000)
 
+  test('without internal API credentials a pending note is swept into the next turn, once', async () => {
+    const calls: Message[][] = []
+    const gw = await startGateway([
+      buildToolUseResponse([{ name: 'exec', arguments: { command: 'sleep 0.3', background: true }, id: 'tc-1' }]),
+      buildTextResponse('Started; I will report back when it finishes.'),
+      buildTextResponse('Yes, it finished.'),
+      buildTextResponse('Anything else?'),
+    ], (_i, msgs) => calls.push([...msgs]))
+
+    // No credentials means notify is never sent (flushTaskWake can only retry),
+    // so nothing can wake the session between turns: drop them before the task
+    // settles so the flush sees a credential-less runtime.
+    delete process.env.RUNTIME_AUTH_SECRET
+    try {
+      await gw.processChatMessageStream('run the build', writer() as any, { chatSessionId: 'no-creds' })
+      const taskId = execTaskId(calls[1]!)
+
+      await sleep(3_000)
+      expect(apiCalls.filter((c) => c.path === '/api/internal/tasks/notify')).toHaveLength(0)
+
+      // The next turn sweeps the pending note in as its own message — this is
+      // the only delivery path in a runtime that cannot queue a wake.
+      await gw.processChatMessageStream('did the build finish?', writer() as any, { chatSessionId: 'no-creds' })
+      const swept = calls.at(-1)!.filter((m) => m.role === 'user' && textOf(m).includes('[Task update]'))
+      expect(swept).toHaveLength(1)
+      expect(textOf(swept[0]!)).toContain(`(${taskId}) completed`)
+      expect((textOf(swept[0]!).match(/\[Task update\]/g) ?? []).length).toBe(1)
+
+      // Consumed, exactly once: the turn after that does not repeat it.
+      await gw.processChatMessageStream('thanks', writer() as any, { chatSessionId: 'no-creds' })
+      expect(taskUpdatesIn(calls.at(-1)!)).toHaveLength(0)
+      expect(apiCalls.filter((c) => c.path === '/api/internal/tasks/notify')).toHaveLength(0)
+    } finally {
+      process.env.RUNTIME_AUTH_SECRET = 'test-secret'
+    }
+  }, 20_000)
+
   test('a notify the API refuses is retried and delivered exactly once', async () => {
     notifyFailures = 1
     const calls: Message[][] = []
