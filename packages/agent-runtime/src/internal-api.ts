@@ -105,6 +105,7 @@ export interface AgentCostMetricPayload {
   inputTokens: number
   outputTokens: number
   cachedInputTokens: number
+  cacheWriteTokens?: number
   toolCalls: number
   creditCost: number
   wallTimeMs: number
@@ -645,6 +646,18 @@ export async function createSharedFileLink(
   })
 }
 
+/** Download link for a file in a workspace runtime with no single owning project. */
+export async function createWorkspaceSharedFileLink(
+  workspaceId: string,
+  opts: SharedFileOptions,
+): Promise<CheckpointCallResult<SharedFileResult>> {
+  return publishFetch(`/api/internal/workspaces/${encodeURIComponent(workspaceId)}/shared-files`, {
+    method: 'POST',
+    body: JSON.stringify(opts),
+    parse: (j) => j as SharedFileResult,
+  })
+}
+
 // ---------------------------------------------------------------------------
 // Project lifecycle wrappers — back the `project_*` / `system_apply` tools
 // (project-tools.ts). Routes live in apps/api/src/routes/internal.ts under
@@ -1073,6 +1086,8 @@ export async function postAgentChannelMessage(
     kind?: AgentMessageKind
     card?: AgentStatusCard
     questions?: AgentQuestion[]
+    /** Files from `uploadAgentFile` to attach to the post. */
+    attachmentIds?: string[]
     /** Return a background task per agent this post hands work to. */
     trackReplies?: boolean
   },
@@ -1092,6 +1107,7 @@ export async function postAgentChannelMessage(
       kind: input.kind,
       card: input.card,
       questions: input.questions,
+      attachmentIds: input.attachmentIds?.length ? input.attachmentIds : undefined,
       trackReplies: input.trackReplies || undefined,
     }),
     parse: (j) => ({
@@ -1137,6 +1153,51 @@ export async function agentBoardsRequest<T = any>(
     method,
     ...(options.body ? { body: JSON.stringify(options.body) } : {}),
   })
+}
+
+export interface AgentUploadedFile {
+  id: string
+  name: string
+  mimeType: string
+  size: number
+  /** Signed URL that loads without a session (`/api/conversation-files/<id>?t=`). */
+  url: string
+}
+
+/**
+ * Upload a file as this agent. `path` is an agent upload route under the
+ * workspace: `/agent-channels/<channel>/attachments`,
+ * `/agent-boards/<board>/attachments` or `/agent-work-items/<item>/attachments`.
+ */
+export async function uploadAgentFile(
+  workspaceId: string,
+  path: string,
+  file: { bytes: Uint8Array; name: string; mimeType: string },
+  fields: Record<string, string | null | undefined> = {},
+): Promise<CheckpointCallResult<AgentUploadedFile>> {
+  const apiUrl = deriveApiUrl()
+  if (!apiUrl) return { ok: false, status: 0, error: NO_API_URL_ERROR }
+  const form = new FormData()
+  form.set('file', new Blob([file.bytes as Uint8Array<ArrayBuffer>], { type: file.mimeType }), file.name)
+  for (const [k, v] of Object.entries(fields)) if (v) form.set(k, v)
+  const { 'Content-Type': _json, ...headers } = getInternalHeaders()
+  try {
+    const res = await fetch(`${apiUrl}/api/internal/workspaces/${encodeURIComponent(workspaceId)}${path}`, {
+      method: 'POST',
+      headers,
+      body: form,
+      signal: AbortSignal.timeout(120_000),
+    })
+    const json = await res.json().catch(() => null) as any
+    if (!res.ok) {
+      const err = json?.error
+      const message = typeof err === 'string' ? err : err?.message
+      return { ok: false, status: res.status, error: message ?? `HTTP ${res.status}`, code: err?.code }
+    }
+    return { ok: true, status: res.status, data: json?.attachment as AgentUploadedFile }
+  } catch (err: any) {
+    return { ok: false, status: 0, error: err?.message ?? String(err) }
+  }
 }
 
 /** The value a person entered for one of this agent's `secret` questions. */
@@ -1189,6 +1250,42 @@ export async function addAgentChannelMembers(
     method: 'POST',
     body: JSON.stringify({ users: input.users, projectId: input.identity.projectId }),
     parse: (j) => ({ added: (j?.added ?? []) as string[], channel: j?.channel }),
+  })
+}
+
+export interface RunningAgent {
+  messageId: string
+  agent: string
+  projectId: string | null
+  channel: { id: string; name: string | null; kind: string | null }
+  threadRootId: string | null
+  startedAt: string
+  preview: string
+  canStop: boolean
+}
+
+export async function listRunningAgents(
+  workspaceId: string,
+  filter: { channel?: string; threadRootId?: string; sessionId?: string } = {},
+): Promise<CheckpointCallResult<RunningAgent[]>> {
+  const params = new URLSearchParams()
+  if (filter.channel) params.set('channel', filter.channel)
+  if (filter.threadRootId) params.set('threadRootId', filter.threadRootId)
+  if (filter.sessionId) params.set('sessionId', filter.sessionId)
+  return personalFetch(channelsPath(workspaceId, `/running-agents?${params}`), {
+    method: 'GET',
+    parse: (j) => (j?.runs ?? []) as RunningAgent[],
+  })
+}
+
+export async function stopRunningAgents(
+  workspaceId: string,
+  input: { messageId?: string; channel?: string; threadRootId?: string; sessionId?: string },
+): Promise<CheckpointCallResult<{ stopped: RunningAgent[]; skipped: Array<{ messageId: string; reason: string }> }>> {
+  return personalFetch(channelsPath(workspaceId, '/running-agents/stop'), {
+    method: 'POST',
+    body: JSON.stringify(input),
+    parse: (j) => ({ stopped: j?.stopped ?? [], skipped: j?.skipped ?? [] }),
   })
 }
 
@@ -1771,6 +1868,8 @@ export async function detachProject(
 export interface ProjectConfigPatch {
   name?: string
   description?: string | null
+  /** One-way flip to `external` (folder-linked); `external → managed` is refused. */
+  workingMode?: 'managed' | 'external'
   settings?: Record<string, unknown>
   slackEnabled?: boolean
   agent?: {
@@ -1788,6 +1887,7 @@ export interface ProjectConfigSnapshot {
   id: string
   name: string
   description: string | null
+  workingMode: string
   settings: unknown
   slackEnabled: boolean
   agent: {

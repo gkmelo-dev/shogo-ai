@@ -8,6 +8,8 @@ import {
   Terminal,
   Clock,
   ImageIcon,
+  Clapperboard,
+  Box,
   Brain,
   ChevronDown,
   ChevronRight,
@@ -74,6 +76,8 @@ export interface CapabilitySettings {
   shellEnabled: boolean
   heartbeatToolsEnabled: boolean
   imageGenEnabled: boolean
+  videoGenEnabled: boolean
+  threeDGenEnabled: boolean
   memoryEnabled: boolean
   quickActionsEnabled: boolean
   sdkGuideEnabled: boolean
@@ -164,11 +168,40 @@ const CAPABILITIES: CapabilityDef[] = [
   {
     key: 'imageGenEnabled',
     label: 'Image Generation',
-    description: 'Generate images from text descriptions',
-    detail: 'Creates images using AI models from text prompts. Useful for generating app icons, placeholder graphics, concept art, social media assets, diagrams, and visual mockups.',
+    description: 'Generate and edit images from text descriptions',
+    detail: 'Creates images with GPT Image, Nano Banana, Seedream, FLUX, Ideogram, Recraft and Imagen. Pass reference images to edit a picture or keep a character consistent across shots, then upscale or cut out the background. Useful for app icons, game sprites, concept art, social media assets, and visual mockups.',
     disabledDescription: 'No image generation',
     icon: ImageIcon,
-    toolNames: ['generate_image'],
+    toolNames: ['generate_image', 'upscale_image', 'remove_background', 'list_media_models'],
+  },
+  {
+    key: 'videoGenEnabled',
+    optIn: true,
+    label: 'Video Generation',
+    description: 'Generate video clips or animate images',
+    detail: 'Creates short clips with Kling, Veo and MiniMax, from a text prompt or by animating a still image. Clips take one to five minutes to render and are billed per second of video, so this is off until you turn it on.',
+    disabledDescription: 'No video generation',
+    icon: Clapperboard,
+    toolNames: ['generate_video'],
+    examples: [
+      '"Animate the hero image into a 5 second loop for the landing page"',
+      '"Make three 9:16 product shots for TikTok from these photos"',
+    ],
+  },
+  {
+    key: 'threeDGenEnabled',
+    optIn: true,
+    label: '3D Generation',
+    description: 'Turn a prompt or a still image into a 3D model',
+    detail:
+      'Turn a text prompt or still image into a 3D model (GLB), and post-process any model: re-texture, convert formats, retopology, separate parts, rig and animate. Rendered on Tripo and billed per task, roughly $0.10-$0.60 depending on the operation, so this is off until you turn it on.',
+    disabledDescription: 'No 3D model generation',
+    icon: Box,
+    toolNames: ['generate_3d_model', 'edit_3d_model'],
+    examples: [
+      '"Make a low-poly game asset of this chair from the product photo"',
+      '"Build a 3D model of a red fox and save it as public/assets/fox.glb"',
+    ],
   },
   {
     key: 'memoryEnabled',

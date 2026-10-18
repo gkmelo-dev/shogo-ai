@@ -16,6 +16,7 @@ import { join } from 'path'
 import { config } from './config'
 import {
   MetalWarmPool,
+  RepoBundleLfsPushError,
   REPO_STAGING_DIR,
   RepoHydrateRefusedError,
   repoKeepPaths,
@@ -40,6 +41,10 @@ class TestPool extends MetalWarmPool {
   statCalls = 0
   preserved: string[] = []
   preserveKey: string | null = 'conflict/p1/superseded-repo.tar.gz'
+
+  protected override async guestHasRepoBundles(): Promise<boolean> {
+    return false
+  }
 
   protected override async statDurableRepo() {
     this.statCalls++
@@ -423,6 +428,7 @@ describe('pool host-mediated repo persist', () => {
 
     let prevManifest: RepoManifest | null
     let exportCalls: Array<{ since: string[] | null }>
+    let guestCapable = true
     let bundleUploads: string[]
     let manifestWrites: Array<{ manifest: RepoManifest; lineage: RepoLineage }>
     let manifestOutcome: RepoWriteOutcome
@@ -431,12 +437,14 @@ describe('pool host-mediated repo persist', () => {
     function writer(pool: TestPool, exportResult: any) {
       // Keep the background sweep out of the writer tests; it has its own coverage.
       ;(pool as any).scheduleRepoBundleSweep = () => {}
+      ;(pool as any).guestHasRepoBundles = async () => guestCapable
       exportCalls = []
       bundleUploads = []
       manifestWrites = []
       ;(pool as any).repoManifest = async () => (prevManifest ? { manifest: prevManifest, etag: '"m1"', lastModified: null } : null)
       ;(pool as any).exportRepoBundle = async (_a: AssignedVm, since: string[] | null) => {
         exportCalls.push({ since })
+        if (exportResult instanceof Error) throw exportResult
         return exportResult
       }
       ;(pool as any).uploadRepoBundleGuarded = async (_p: string, entry: { sha256: string }) => {
@@ -464,14 +472,10 @@ describe('pool host-mediated repo persist', () => {
     })
 
     beforeEach(() => {
-      process.env.METAL_REPO_BUNDLES = 'on'
+      guestCapable = true
       prevManifest = null
       manifestOutcome = { status: 'created', etag: '"m1"' }
       bundleFetchBytes = ENTRY_BASE_BYTES
-    })
-
-    afterEach(() => {
-      delete process.env.METAL_REPO_BUNDLES
     })
 
     test('a project with no manifest gets a full base, then its manifest is created', async () => {
@@ -612,17 +616,101 @@ describe('pool host-mediated repo persist', () => {
       }
     })
 
-    test('with the flag off and no manifest the tarball path is unchanged', async () => {
-      delete process.env.METAL_REPO_BUNDLES
+    test('bundle support comes from the repo-hydrated probe and is cached per VM', async () => {
+      let answer: unknown = { ok: true, supported: true, deadline: true, bundles: true }
+      const probes: unknown[] = []
+      const guest = Bun.serve({
+        port: 0,
+        fetch: async (req) => {
+          probes.push(await req.json())
+          return typeof answer === 'string' ? new Response(answer) : Response.json(answer)
+        },
+      })
+      try {
+        const pool = makePool(dir)
+        const handle = { ...HANDLE, agentUrl: `http://127.0.0.1:${guest.port}` }
+        const probe = (a: AssignedVm) => (MetalWarmPool.prototype as any).guestHasRepoBundles.call(pool, a)
+        const capable = pool.add('p1', { handle })
+        expect(await probe(capable)).toBe(true)
+        expect(await probe(capable)).toBe(true)
+        expect(probes).toEqual([{ probe: true }])
+
+        answer = 'ok'
+        const legacy = pool.add('p2', { handle })
+        expect(await probe(legacy)).toBe(false)
+      } finally {
+        guest.stop(true)
+      }
+    })
+
+    test('a guest without bundle support and no manifest keeps the tarball path', async () => {
+      guestCapable = false
       const pool = makePool(dir)
       const restore = writer(pool, exportOf(baseEntry))
       try {
         const a = pool.add('p1', { repoParentEtag: undefined })
         expect(await pool.saveRepoToStore(a)).toBe(true)
         expect(exportCalls).toHaveLength(0)
+        expect(manifestWrites).toHaveLength(0)
         expect(pool.uploads).toHaveLength(1)
       } finally {
         restore()
+      }
+    })
+
+    test('a failed LFS push keeps a project with no manifest on the tarball', async () => {
+      const pool = makePool(dir)
+      const restore = writer(pool, new RepoBundleLfsPushError('lfs push failed'))
+      try {
+        const a = pool.add('p1', { repoParentEtag: undefined })
+        expect(await pool.saveRepoToStore(a)).toBe(true)
+        expect(exportCalls).toHaveLength(1)
+        expect(manifestWrites).toHaveLength(0)
+        expect(pool.uploads).toHaveLength(1)
+      } finally {
+        restore()
+      }
+    })
+
+    test('a failed LFS push never sends a migrated project back to the tarball', async () => {
+      const pool = makePool(dir)
+      prevManifest = parseRepoManifest({
+        v: 1,
+        head,
+        refs: { 'refs/heads/main': oldTip },
+        config: '',
+        rootCommitAt: null,
+        bundles: [baseEntry],
+      })
+      const restore = writer(pool, new RepoBundleLfsPushError('lfs push failed'))
+      try {
+        const a = pool.add('p1', { repoParentEtag: '"m1"' })
+        await expect(pool.saveRepoToStore(a)).rejects.toThrow(RepoBundleLfsPushError)
+        expect(manifestWrites).toHaveLength(0)
+        expect(pool.uploads).toHaveLength(0)
+      } finally {
+        restore()
+      }
+    })
+
+    test('the guest LFS refusal is told apart from other export failures', async () => {
+      let answer = Response.json({ error: 'lfs push failed; repo bundle not exported' }, { status: 503 })
+      const guest = Bun.serve({ port: 0, fetch: () => answer.clone() })
+      try {
+        const pool = makePool(dir)
+        const a = pool.add('p1', { handle: { ...HANDLE, agentUrl: `http://127.0.0.1:${guest.port}` } })
+        const exportBundle = () => (MetalWarmPool.prototype as any).exportRepoBundle.call(pool, a, null)
+        await expect(exportBundle()).rejects.toThrow(RepoBundleLfsPushError)
+
+        answer = Response.json({ error: 'push failed', code: 'lfs-push-failed' }, { status: 503 })
+        await expect(exportBundle()).rejects.toThrow(RepoBundleLfsPushError)
+
+        answer = Response.json({ error: 'git bundle create failed' }, { status: 503 })
+        const other = await exportBundle().catch((err: unknown) => err)
+        expect(other).toBeInstanceOf(Error)
+        expect(other).not.toBeInstanceOf(RepoBundleLfsPushError)
+      } finally {
+        guest.stop(true)
       }
     })
   })

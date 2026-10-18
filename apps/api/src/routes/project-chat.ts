@@ -23,22 +23,27 @@ import { prisma } from "../lib/prisma"
 import { loadAccess } from "../lib/authz"
 import type { IRuntimeManager } from "../lib/runtime"
 import * as billingService from "../services/billing-runtime"
-import { getModelTier, resolveModelId } from "@shogo/model-catalog"
+import { buildUsageLimitInfo } from "../lib/usage-limit-info"
+import { AUTO_MODEL_ID, isAutoModel, resolveModelId } from "@shogo/model-catalog"
+import { isModelAccessibleForWorkspace } from "../lib/model-access"
 import { wrapSseStreamWithKeepalive } from "@shogo/shared-runtime/sse-keepalive"
 import { stampModelProvider } from "../lib/stamp-model-provider"
 import { stampWorkspacePlan } from "../lib/stamp-workspace-plan"
 import * as checkpointService from "../services/checkpoint.service"
 import { isGitAvailable } from "../services/git.service"
 import { setProjectUser } from "../lib/project-user-context"
-import { openSession, closeSession, setQualitySignals } from "../lib/proxy-billing-session-runtime"
+import { openSession, closeSession, setQualitySignals, recordTurnUsage } from "../lib/proxy-billing-session-runtime"
 import { enrichWorkspaceReferences, enrichProjectReferences, enrichChatReferences } from "../lib/chat-references"
 import { trackEvent } from "../services/loops.service"
 import { parseProjectSettings } from "../lib/project-settings"
 import { recordClientTurn, isRecentClientTurn } from "../lib/chat-turn-idempotency"
 import { sendPushToUser } from "../lib/push-notifications"
 import {
+  externalizeAssistantTextMedia,
   externalizeToolOutput,
   inlineChatBodyAttachments,
+  newAssistantMediaBudget,
+  workspaceDownloadPath,
 } from "../lib/chat-attachments"
 import {
   clearActiveTurn,
@@ -48,6 +53,7 @@ import {
 } from "../services/chat-turn-state.service"
 import { dispatchNext } from "../services/chat-queue-dispatcher.service"
 import { countLineChanges } from "../lib/tool-line-stats"
+import { fetchFromProjectRuntime } from "../lib/chat-runtime-fetch"
 import { importCloudModule } from "../lib/cloud-import"
 
 const chatTracer = trace.getTracer("shogo-api-chat")
@@ -97,6 +103,21 @@ export function hasFileModifyingTools(toolCallMap: Map<string, { toolName: strin
 // =============================================================================
 // Stream Usage Tracking
 // =============================================================================
+
+/**
+ * How a tracked turn ended. `complete` saw the runtime's terminal frame;
+ * `partial` persisted what arrived before the stream (and any resume) ended;
+ * `foreign` found an older turn in the buffer and persisted nothing.
+ */
+export interface TrackedStreamResult {
+  outcome: 'complete' | 'partial' | 'foreign'
+  status: 'completed' | 'failed' | null
+  text: string
+  assistantMessageId: string | null
+}
+
+/** API and runtime clocks differ; a turn-start this much earlier still counts as the expected turn. */
+const TURN_START_CLOCK_SKEW_MS = 30_000
 
 /**
  * Scan a teed copy of the AI SDK stream for usage/tool-call data.
@@ -151,6 +172,12 @@ export async function trackUsageFromStream(
      */
     resume?: (fromSeq: number) => Promise<Response | null>
     /**
+     * Read a workspace file from the runtime (`/agent/workspace/download/…`).
+     * When set, images and videos the reply embeds by workspace path are
+     * copied into chat-attachment storage before the final persist.
+     */
+    fetchWorkspaceFile?: (path: string) => Promise<Response | null>
+    /**
      * Backoff delays (ms) between resume attempts when `resume()` returns
      * null / throws. Defaults to a short escalating sequence — this
      * covers the window where the runtime is mid-restart (see
@@ -178,8 +205,22 @@ export async function trackUsageFromStream(
     projectName?: string
     /** A delegated task sends its own terminal notification. */
     suppressCompletionPush?: boolean
+    /**
+     * Assistant row this turn already wrote (a reattach after the tracking
+     * pod died). Snapshots update it instead of inserting a second row.
+     */
+    existingAssistantMessageId?: string | null
+    /**
+     * Epoch ms the turn was started from this side. A replayed buffer whose
+     * `data-turn-start` is older belongs to an earlier turn on the same
+     * session and is ignored instead of overwriting this turn's row.
+     */
+    expectedTurnStartedAt?: number
+    /** Workspace of a `project: null` turn, so its usage can still be recorded. */
+    workspaceId?: string
   } = {},
-) {
+): Promise<TrackedStreamResult> {
+  const trackingStartedAt = Date.now()
   const decoder = new TextDecoder()
   type UsageSnapshot = {
     promptTokens?: number
@@ -256,7 +297,10 @@ export async function trackUsageFromStream(
   // newer turn on the same session replaces it. Resume must only replay the
   // turn this tracker owns, or it overwrites this row with the next turn's parts.
   let trackedTurnId: string | undefined
-  let assistantMessageId: string | null = null
+  let assistantMessageId: string | null = options.existingAssistantMessageId ?? null
+  // Set when the buffer turned out to hold an older turn than the one this
+  // tracker owns (see `expectedTurnStartedAt`). Nothing is persisted then.
+  let foreignTurn = false
   let lastPartialPersistAt = 0
   let partialPersistInFlight: Promise<void> | null = null
   let persistenceDirty = false
@@ -281,7 +325,7 @@ export async function trackUsageFromStream(
    * so a hard-killed desktop still has the last completed step on reload.
    */
   async function persistAssistantSnapshot(force = false): Promise<void> {
-    if (!chatSessionId || (!accumulatedText && toolCallMap.size === 0)) return
+    if (foreignTurn || !chatSessionId || (!accumulatedText && toolCallMap.size === 0)) return
     if (!force && assistantMessageId && Date.now() - lastPartialPersistAt < 2_000) return
     if (partialPersistInFlight) {
       await partialPersistInFlight
@@ -581,6 +625,14 @@ export async function trackUsageFromStream(
     // seq 0, so a later replay must not clobber the original start).
     if (type === 'data-turn-start' && turnStartedAt === undefined) {
       const startedAt = data?.data?.startedAt
+      if (
+        typeof startedAt === 'number' &&
+        options.expectedTurnStartedAt !== undefined &&
+        startedAt < options.expectedTurnStartedAt - TURN_START_CLOCK_SKEW_MS
+      ) {
+        foreignTurn = true
+        return
+      }
       if (typeof startedAt === 'number') turnStartedAt = startedAt
     }
     if (type === 'data-turn-start' && trackedTurnId === undefined) {
@@ -704,6 +756,10 @@ export async function trackUsageFromStream(
 
         for (const line of lines) {
           processLine(line)
+          if (foreignTurn) {
+            try { await reader.cancel() } catch { /* already closed */ }
+            return true
+          }
           if (persistenceDirty) {
             const urgent = persistenceUrgent
             persistenceDirty = false
@@ -724,6 +780,12 @@ export async function trackUsageFromStream(
   // First pass: consume the original tee'd tracking stream.
   const firstOk = await consumeStream(stream.getReader())
   if (!firstOk) originalStreamErrored = true
+  if (foreignTurn) {
+    console.log(
+      `[ProjectChat] Buffer for session ${chatSessionId} holds an older turn than expected — nothing persisted`,
+    )
+    return { outcome: 'foreign', status: null, text: '', assistantMessageId }
+  }
 
   // Auto-resume drive: when the original stream EOF'd cleanly but the runtime
   // never emitted `data-turn-complete`, the upstream proxy cut us off mid-turn.
@@ -787,7 +849,12 @@ export async function trackUsageFromStream(
         // the original stream needs to be cleared to avoid duplication.
         resetAccumulatedState()
         const resumeOk = await consumeStream(resumeRes.body.getReader())
-        if (observedTurnComplete) {
+        if (foreignTurn) {
+          resumeOutcome = 'buffer-gone'
+          console.log(
+            `[ProjectChat] Resume for session ${chatSessionId} replayed an older turn — keeping the persisted partial`,
+          )
+        } else if (observedTurnComplete) {
           resumeOutcome = 'recovered'
         } else {
           resumeOutcome = 'failed'
@@ -848,25 +915,47 @@ export async function trackUsageFromStream(
   // recordAgentCostMetric inside closeSession (closeSession deletes the
   // session before reading quality, so a post-close set would be a no-op).
   //
-  // Skipped entirely when there's no anchor project (a workspace-scoped
-  // chat with zero attached projects) — there's no billing session to
-  // close in the first place; see the doc comment above.
+  // With no anchor project (a workspace-scoped chat with zero attached
+  // projects) there's no billing session to close; see the doc comment above.
+  // `recordTurnUsage` covers the one setup where nothing else records it.
+  const streamUsage = {
+    model: usageRef.value?.model,
+    inputTokens,
+    outputTokens,
+    cachedInputTokens: usageRef.value?.cachedInputTokens,
+    cacheWriteTokens: usageRef.value?.cacheWriteTokens,
+  }
   if (project) {
     await setQualitySignals(project.id, qualitySignals, chatSessionId)
     const { billedUsd } = await closeSession(project.id, {
       discardPartial: false,
       chatSessionId,
-      fallbackUsage: {
-        model: usageRef.value?.model,
-        inputTokens,
-        outputTokens,
-        cachedInputTokens: usageRef.value?.cachedInputTokens,
-        cacheWriteTokens: usageRef.value?.cacheWriteTokens,
-      },
+      fallbackUsage: streamUsage,
     })
     if (billedUsd > 0) {
       console.log(`[ProjectChat] 💰 Billing session closed — charged $${billedUsd.toFixed(4)} for project ${project.id}`)
     }
+  } else if (options.workspaceId && options.userId) {
+    await recordTurnUsage({
+      workspaceId: options.workspaceId,
+      userId: options.userId,
+      chatSessionId,
+      usage: streamUsage,
+      quality: qualitySignals,
+      openedAt: options.expectedTurnStartedAt ?? trackingStartedAt,
+    }).catch((err: any) => console.warn('[ProjectChat] Failed to record unanchored turn usage:', err?.message ?? err))
+  }
+
+  if (chatSessionId && options.fetchWorkspaceFile && !foreignTurn && accumulatedText.includes('![')) {
+    const budget = newAssistantMediaBudget()
+    for (const part of orderedParts) {
+      if (part.type !== 'text' || typeof part.text !== 'string') continue
+      part.text = await externalizeAssistantTextMedia(chatSessionId, part.text, options.fetchWorkspaceFile, budget)
+    }
+    accumulatedText = orderedParts
+      .filter((p) => p.type === 'text')
+      .map((p) => p.text)
+      .join('')
   }
 
   // Always perform one final forced flush after resume/replay handling. This
@@ -913,7 +1002,7 @@ export async function trackUsageFromStream(
 
   // Log tool calls with real args, results, duration, and the correct messageId.
   // We log in the partial case too so debugging shows what the user actually saw.
-  if (toolCallMap.size > 0 && chatSessionId) {
+  if (toolCallMap.size > 0 && chatSessionId && !foreignTurn) {
     try {
       const session = assistantMessageId
         ? true
@@ -960,6 +1049,11 @@ export async function trackUsageFromStream(
   // commits into their branch is the cardinal sin every IDE-style tool
   // explicitly avoids. External users keep their own git workflow; the
   // CheckpointsPanel renders a "use your own git" banner instead.
+  // `createCheckpoint` applies the same rule to a *managed* project whose
+  // folder is a checkout of someone else's repo (it has an `origin` but no
+  // `GitHubConnection`) and throws `CheckpointsDisabledForeignRepoError` — no
+  // new gate is needed here, the catch below just stops logging it as a
+  // failure every turn.
   // SHOGO_CLOUD_SYNC=1 indicates a paired worker (cli_worker) is the source
   // of truth for this project's git history — its watcher pushes commits
   // through /api/projects/:id/git/git-receive-pack, and the post-receive
@@ -999,9 +1093,39 @@ export async function trackUsageFromStream(
         message: `AI: ${toolNames} (${toolCallMap.size} tool calls)`,
         isAutomatic: true,
       }).catch((err) => {
+        // A repo we don't own (external folder, or someone else's clone) is an
+        // expected "no checkpoints here", not a failure — log it once at info
+        // level so a per-turn checkpoint never warn-spams the log. Match on the
+        // error code rather than the class so partially-mocked callers keep working.
+        if (
+          err?.code === 'checkpoints_disabled_in_external_mode' ||
+          err?.code === 'checkpoints_disabled_foreign_repo'
+        ) {
+          console.info(`[ProjectChat] Auto-checkpoint skipped: ${err.message}`)
+          return
+        }
         console.warn('[ProjectChat] Auto-checkpoint failed (non-blocking):', err.message)
       })
     }
+  }
+
+  return {
+    outcome: observedTurnComplete ? 'complete' : 'partial',
+    status: turnCompleteStatus,
+    text: accumulatedText,
+    assistantMessageId,
+  }
+}
+
+/** A stopped chat of this project is not woken again by the work it was watching. Never fails the stop. */
+async function silenceStoppedSession(chatSessionId: string, projectId: string): Promise<void> {
+  try {
+    const session = await (prisma as any).chatSession.findUnique({ where: { id: chatSessionId }, select: { contextId: true } })
+    if (session?.contextId !== projectId) return
+    const { silenceSessionTasks } = await import("../services/background-tasks.service")
+    await silenceSessionTasks(chatSessionId)
+  } catch (error) {
+    console.warn(`[ProjectChat] Failed to silence stopped chat ${chatSessionId}:`, error)
   }
 }
 
@@ -1099,14 +1223,7 @@ export function projectChatRoutes(config: ProjectChatRoutesConfig) {
     path: string,
     init?: RequestInit,
   ): Promise<Response> {
-    const baseUrl = await getProjectUrl(projectId)
-    const { deriveProjectRuntimeToken } = await import("../lib/project-runtime-token")
-    const headers = new Headers(init?.headers)
-    if (!headers.has("Content-Type")) {
-      headers.set("Content-Type", "application/json")
-    }
-    headers.set("x-runtime-token", await deriveProjectRuntimeToken(projectId))
-    return fetch(`${baseUrl}${path}`, { ...init, headers })
+    return fetchFromProjectRuntime(projectId, path, init, { resolveUrl: getProjectUrl })
   }
 
   /**
@@ -1176,8 +1293,9 @@ export function projectChatRoutes(config: ProjectChatRoutesConfig) {
         if (limitUserId && limitUserId !== 'system') {
           trackEvent(limitUserId, 'usage_limit_hit', { project_id: projectId }).catch(() => {})
         }
+        const { resetsAt, window } = await buildUsageLimitInfo(project.workspaceId)
         return c.json(
-          { error: { code, message } },
+          { error: { code, message, resetsAt, window } },
           402
         )
       }
@@ -1248,15 +1366,12 @@ export function projectChatRoutes(config: ProjectChatRoutesConfig) {
         // Local LLM models are user-configured and are not cloud-tiered. Do
         // not replace Auto/local routing with the cloud Claude fallback.
         const localLlmConfigured = process.env.SHOGO_LOCAL_MODE === 'true'
-        if (!localLlmConfigured) {
-          const resolved = resolveModelId(parsedBody.agentMode)
-          const tier = getModelTier(resolved)
-          if (tier !== 'economy') {
-            const hasAdvanced = await billingService.hasAdvancedModelAccess(project.workspaceId)
-            if (!hasAdvanced) {
-              parsedBody.agentMode = 'claude-haiku-4-5-20251001'
-            }
-          }
+        if (
+          !localLlmConfigured &&
+          !isAutoModel(parsedBody.agentMode) &&
+          !(await isModelAccessibleForWorkspace(project.workspaceId, resolveModelId(parsedBody.agentMode)))
+        ) {
+          parsedBody.agentMode = AUTO_MODEL_ID
         }
         // Resolve the model's native provider from the registry and stamp it on
         // the forwarded body. Runs after any tier-downgrade so the provider
@@ -1767,6 +1882,8 @@ export function projectChatRoutes(config: ProjectChatRoutesConfig) {
                 return null
               }
             },
+            fetchWorkspaceFile: (path) =>
+              fetchFromRuntime(projectId, workspaceDownloadPath(path), { method: 'GET' }).catch(() => null),
           }).catch((err) =>
             console.error("[ProjectChat] Usage tracking error:", err)
           ).finally(() => {
@@ -2177,6 +2294,9 @@ export function projectChatRoutes(config: ProjectChatRoutesConfig) {
       try { parsed = JSON.parse(body || "{}") } catch { /* noop */ }
       const chatSessionId =
         c.req.header("X-Chat-Session-Id") || parsed?.chatSessionId || parsed?.sessionId
+      if (typeof chatSessionId === "string" && chatSessionId) {
+        await silenceStoppedSession(chatSessionId, projectId)
+      }
       if (typeof chatSessionId === "string" && chatSessionId && response.ok) {
         await clearActiveTurn({ id: chatSessionId, contextId: projectId }).catch((error) =>
           console.warn(`[ProjectChat] Failed to clear stopped chat ${chatSessionId}:`, error),

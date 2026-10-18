@@ -16,6 +16,10 @@ const decisions: Array<{ id: string; decision: string }> = []
 let decisionError: string | null = null
 const deletes: string[] = []
 let deleteError: string | null = null
+/** The viewer's own Shogo buddy look, as the buddy-look context reports it. */
+const personalLook = { color: '#FF7A8A', topper: 'cat-ears' }
+/** What `useMentionables` answers; null until a test needs the workspace agent. */
+const hookMentionables: { value: unknown } = { value: null }
 
 mock.module('react-native', () =>
   createReactNativeMock({
@@ -124,6 +128,7 @@ mock.module('../../../lib/team-chat-api', () => ({
       name: 'Billing Bot',
       iconUrl: 'https://cdn.example.com/billing.png',
       role: 'Sends invoices',
+      model: projectId ? { id: '11111111-1111-4111-8111-111111111111', label: 'Claude Sonnet 4.6' } : { id: 'auto', label: 'Auto' },
       owner: { id: 'u-ana', name: 'Ana Lopez' },
       channels: [{ conversationId: 'c-eng', kind: 'public', name: 'eng', slug: 'eng', agentTrigger: 'auto', muted: false }],
     }),
@@ -176,12 +181,17 @@ mock.module('../../../hooks/useTeamChat', () => ({
   }),
   useMarkReadWhileVisible: () => {},
   useTypingUsers: () => typingUsers,
+  useMentionables: () => hookMentionables.value,
 }))
 const routed: any[] = []
 mock.module('expo-router', () => ({ useRouter: () => ({ push: (r: any) => routed.push(r) }) }))
 // The real buddy draws on a canvas; here it just reports the look it was given.
 mock.module('../../island/buddy/ShogoBuddy', () => ({
   ShogoBuddy: ({ look }: any) => createElement('div', { 'data-rn-shim': 'buddy', 'data-topper': look.topper, 'data-color': look.color }),
+}))
+// The viewer's own Shogo, as the account-level buddy-look context holds it.
+mock.module('../../../contexts/buddy-look', () => ({
+  useBuddyLook: () => ({ look: personalLook, setLook: () => {}, saving: false, error: '' }),
 }))
 // The composer is the shared ChatInput; stub its agent-only dependencies.
 mock.module('@/components/ui/popover', () => ({
@@ -526,7 +536,7 @@ describe('MessageRow', () => {
     expect(markdown?.textContent).not.toContain('**')
   })
 
-  test('tapping an agent opens its profile card with role, owner and channels', async () => {
+  test('tapping an agent opens its profile card with role, model, owner and channels', async () => {
     const h = handlers()
     const agentReply = message({
       id: 'm9', authorType: 'agent', author: null, authorUserId: null,
@@ -540,6 +550,8 @@ describe('MessageRow', () => {
     expect(screen.queryByTestId('agent-profile-card')).toBeNull()
     fireEvent.click(screen.getAllByLabelText('Billing Bot profile')[0])
     expect(await screen.findByText('Sends invoices')).toBeTruthy()
+    expect(screen.getByText('Model')).toBeTruthy()
+    expect(screen.getByText('Claude Sonnet 4.6')).toBeTruthy()
     expect(screen.getByText('Ana Lopez')).toBeTruthy()
     expect(screen.getByText('eng')).toBeTruthy()
     expect(screen.getByText('Replies when relevant')).toBeTruthy()
@@ -969,6 +981,53 @@ describe('agent message kinds', () => {
   })
 })
 
+describe('board card posts', () => {
+  const block = {
+    type: 'status_card',
+    messageKind: 'status',
+    card: { title: 'SHO-17 · Board card posted to a channel', status: 'working', summary: 'In Development · Shogo Dev 3 · high' },
+    workItem: {
+      id: 'i1', key: 'SHO-17', boardId: 'b1', boardName: 'Shogo Dev',
+      title: 'Board card posted to a channel renders as clipped prose',
+      column: { name: 'In Development', category: 'active' }, priority: 'high',
+      assignee: { kind: 'agent', name: 'Shogo Dev 3' }, dueAt: null, path: '/work?card=i1',
+    },
+  }
+  const systemMsg = (blocks: unknown, text: string) =>
+    message({ id: 'w1', authorType: 'system', author: null, authorUserId: null, text, blocks })
+
+  test('a board card paints its own card and not the clipped markdown body', () => {
+    routed.length = 0
+    render(
+      <MessageRow
+        message={systemMsg(block, '**SHO-17 · Board card posted**\nIn Development · Shogo Dev 3 · high\n\nCLIPPED-BODY-MARKER')}
+        grouped={false} me="u-me" names={names} canManage={false} {...handlers()}
+      />,
+    )
+    expect(screen.getByTestId('work-item-card')).toBeTruthy()
+    expect(shim('work-item-key')!.textContent).toBe('SHO-17')
+    expect(shim('work-item-title')!.textContent).toBe(block.workItem.title)
+    expect(screen.getByText('In Development')).toBeTruthy()
+    expect(screen.getByText('Shogo Dev 3')).toBeTruthy()
+    expect(screen.getByText('Shogo Dev')).toBeTruthy()
+    expect(document.body.textContent).not.toContain('CLIPPED-BODY-MARKER')
+
+    fireEvent.click(screen.getByTestId('work-item-card'))
+    expect(routed.at(-1)).toEqual({ pathname: '/(app)/c/[conversationId]', params: { conversationId: 'c1', card: 'i1', board: 'b1' } })
+  })
+
+  test('a block posted before cards carried a title keeps the plain-text rendering', () => {
+    render(
+      <MessageRow
+        message={systemMsg({ workItem: { id: 'i1', key: 'SHO-1', boardId: 'b1' } }, 'SHO-1 · legacy post')}
+        grouped={false} me="u-me" names={names} canManage={false} {...handlers()}
+      />,
+    )
+    expect(screen.queryByTestId('work-item-card')).toBeNull()
+    expect(screen.getByText(/legacy post/)).toBeTruthy()
+  })
+})
+
 describe('ConversationHeader channel editing', () => {
   const channel = (overrides: Record<string, unknown> = {}): any => ({
     id: 'c9', workspaceId: 'ws', kind: 'public', name: 'design', slug: 'design', topic: null, lastSeq: 0, lastMessageAt: null,
@@ -1248,6 +1307,39 @@ describe('agent avatars', () => {
     )
     expect(container.querySelector('img')).toBeTruthy()
     expect(shims('buddy')).toHaveLength(0)
+  })
+})
+
+describe('Shogo on its own messages', () => {
+  const notice = (overrides: Record<string, unknown> = {}) =>
+    message({ id: 'sys-1', authorType: 'system', author: null, authorUserId: null, text: '<@u:u-ana> started a huddle', ...overrides })
+
+  const renderNotice = () =>
+    render(<MessageRow message={notice()} grouped={false} me="u-me" names={names} canManage={false} {...handlers()} />)
+
+  test("a notice from Shogo wears the viewer's own Shogo, still", () => {
+    const { container } = renderNotice()
+    const buddy = shims('buddy')[0]
+    expect(buddy).toBeTruthy()
+    expect(buddy.getAttribute('data-color')).toBe(personalLook.color)
+    expect(buddy.getAttribute('data-topper')).toBe(personalLook.topper)
+    expect(shims('buddy-avatar')).toHaveLength(1)
+    // Shogo is not a person who can be present, so no dot.
+    expect(container.querySelector('[data-rn-shim^="presence-"]')).toBeNull()
+  })
+
+  test("the workspace agent's uploaded picture still wins over the buddy", () => {
+    hookMentionables.value = {
+      people: [],
+      agents: [{ key: 'ws', projectId: null, name: 'Shogo', description: null, image: 'https://cdn.example.com/shogo.png' }],
+    }
+    try {
+      const { container } = renderNotice()
+      expect(container.querySelector('img')?.getAttribute('accessibilitylabel')).toBe('Shogo avatar')
+      expect(shims('buddy')).toHaveLength(0)
+    } finally {
+      hookMentionables.value = null
+    }
   })
 })
 
@@ -1536,6 +1628,14 @@ describe('MessageRow image attachments', () => {
     // Second image, not third attachment.
     expect(lightbox.getAttribute('data-index')).toBe('1')
     expect(lightbox.getAttribute('data-count')).toBe('2')
+  })
+
+  test('a video attachment plays inline instead of showing a file card', () => {
+    renderRow([{ id: 'v1', name: 'demo.mp4', mimeType: 'video/mp4', size: 9000, width: null, height: null, url: '/api/uploads/v1' }])
+
+    const video = screen.getByTestId('message-video')
+    expect(video.tagName).toBe('VIDEO')
+    expect(video.getAttribute('src')).toContain('/api/uploads/v1')
   })
 
   test('close dismisses the viewer', () => {

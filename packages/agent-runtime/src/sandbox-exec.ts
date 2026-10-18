@@ -105,6 +105,11 @@ export function rewriteBunxOnWindows(command: string): string {
 const PROJECT_SCOPED_SAFE = new Set([
   'RUNTIME_AUTH_SECRET',
   'WEBHOOK_TOKEN',
+  // HMAC(projectId + AI_PROXY_SECRET): project-scoped, and it grants nothing
+  // beyond the spend this agent already has through its own tools. Kept
+  // visible so `exec` children (e.g. `bunx shogo 3d generate`) can call the AI
+  // proxy. AI_PROXY_SECRET — the signing key — stays redacted below.
+  'AI_PROXY_TOKEN',
 ])
 
 // Env vars that must never leak to agent-spawned child processes.
@@ -432,9 +437,29 @@ export interface SandboxExecResult {
 // Internal runtime env vars that must not leak to agent-spawned child
 // processes.  PORT / VITE_PORT are set by RuntimeManager for the agent
 // server itself; if they leak, user servers try to bind the same port
-// → EADDRINUSE.  Workspace .env values are merged *after* stripping
-// so explicit user PORT overrides still take effect.
-export const RUNTIME_ONLY_VARS = ['PORT', 'VITE_PORT']
+// → EADDRINUSE.
+//
+// API_PORT / RUNTIME_BASE_PORT / VITE_RUNTIME_BASE / BETTER_AUTH_URL /
+// API_URL are the *desktop app's* own server identity
+// (apps/desktop/src/local-server.ts). Leaking API_PORT is how a Shogo
+// desktop API got SIGKILLed from userland (SHO-26): `bun dev:all` reads
+// API_PORT (scripts/dev-all.ts) and its port-clearing step runs
+// `lsof -ti:<port> | xargs kill -9`, so an agent shell that inherited
+// 39100 killed the running desktop app's API instead of the leftover
+// dev stack on 8002. `scripts/watch-api.ts` reads the same var and would
+// spawn a second API onto the app's port → EADDRINUSE.
+//
+// Workspace .env values are merged *after* stripping so explicit user
+// overrides still take effect.
+export const RUNTIME_ONLY_VARS = [
+  'PORT',
+  'VITE_PORT',
+  'API_PORT',
+  'RUNTIME_BASE_PORT',
+  'VITE_RUNTIME_BASE',
+  'BETTER_AUTH_URL',
+  'API_URL',
+]
 
 export function stripRuntimeVars(env: Record<string, string | undefined>): typeof env {
   for (const key of RUNTIME_ONLY_VARS) delete env[key]

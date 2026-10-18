@@ -245,6 +245,7 @@ const MOBILE_NAV_ITEMS: NavItem[] = settingsNavItems([
 
 const LOCAL_NAV_ITEMS: NavItem[] = settingsNavItems([
   "workspace",
+  "models",
   "integrations",
   "automations",
   "remote-control",
@@ -323,7 +324,6 @@ interface SidebarSection {
 function SettingsSidebar({
   activeTab,
   onTabChange,
-  workspaceName,
   userName,
   onExit,
   showBilling = true,
@@ -331,9 +331,9 @@ function SettingsSidebar({
 }: {
   activeTab: TabId;
   onTabChange: (tab: TabId) => void;
-  workspaceName: string;
   userName: string;
-  onExit: () => void;
+  /** Omitted when the app sidebar is on screen: it already provides navigation and the workspace switcher. */
+  onExit?: () => void;
   showBilling?: boolean;
   localMode?: boolean;
 }) {
@@ -344,9 +344,8 @@ function SettingsSidebar({
   });
 
   const workspaceItems: SidebarItem[] = [
-    ...(!(localMode || !showBilling)
-      ? [tabItem("people"), tabItem("models")]
-      : []),
+    ...(!(localMode || !showBilling) ? [tabItem("people")] : []),
+    tabItem("models"),
     tabItem("integrations"),
     tabItem("automations"),
     tabItem("remote-control"),
@@ -385,19 +384,23 @@ function SettingsSidebar({
       contentContainerClassName="px-3 pb-5 pt-5"
       showsVerticalScrollIndicator={false}
     >
-      <Pressable
-        onPress={onExit}
-        className="mb-5 flex-row items-center gap-1.5 self-start rounded-lg px-2 py-1.5 active:bg-muted"
-      >
-        <ArrowLeft size={14} className="text-muted-foreground" />
-        <Text className="text-sm text-muted-foreground">Go back</Text>
-      </Pressable>
-      <WorkspaceAccountActions
-        onSelectTab={onTabChange}
-        showActions={false}
-        showSignOut={false}
-        variant="sidebar"
-      />
+      {onExit ? (
+        <>
+          <Pressable
+            onPress={onExit}
+            className="mb-5 flex-row items-center gap-1.5 self-start rounded-lg px-2 py-1.5 active:bg-muted"
+          >
+            <ArrowLeft size={14} className="text-muted-foreground" />
+            <Text className="text-sm text-muted-foreground">Go back</Text>
+          </Pressable>
+          <WorkspaceAccountActions
+            onSelectTab={onTabChange}
+            showActions={false}
+            showSignOut={false}
+            variant="sidebar"
+          />
+        </>
+      ) : null}
 
       {sections.map((section, sectionIdx) => (
         <View key={section.id} className={sectionIdx > 0 ? "mt-6" : ""}>
@@ -444,11 +447,13 @@ function SettingsSidebar({
           </View>
         </View>
       ))}
-      <WorkspaceAccountActions
-        onSelectTab={onTabChange}
-        showWorkspace={false}
-        variant="sidebar"
-      />
+      {onExit ? (
+        <WorkspaceAccountActions
+          onSelectTab={onTabChange}
+          showWorkspace={false}
+          variant="sidebar"
+        />
+      ) : null}
     </ScrollView>
   );
 }
@@ -4194,7 +4199,7 @@ export const SettingsContent = observer(function SettingsContent({
     <>
       {activeTab === "workspace" && <WorkspaceSettingsTab />}
       {activeTab === "people" && !isLocal && <PeopleTab />}
-      {activeTab === "models" && !isLocal && <WorkspaceModelsTab />}
+      {activeTab === "models" && <WorkspaceModelsTab />}
       {activeTab === "integrations" && <IntegrationsTab />}
       {activeTab === "automations" && (
         <AutomationsTab
@@ -4230,10 +4235,12 @@ export default observer(function SettingsPage({
   const insets = useSafeAreaInsets();
   const { width, height } = useWindowDimensions();
   const isWide = width >= SETTINGS_WIDE_BREAKPOINT;
+  // Mirrors `showSidebar` in `(app)/_layout.tsx`: wide web renders the app
+  // sidebar beside this page, so the page drops its own exit and switcher.
+  const inAppShell = !onClose && Platform.OS === "web" && isWide;
   const isNativePhone = isNativePhoneIntegrationsLayout(width, height);
   const { user } = useAuth();
   const workspaces = useWorkspaceCollection();
-  const currentWorkspace = useActiveWorkspace();
   const { features, localMode } = usePlatformConfig();
 
   const [activeTab, setActiveTab] = useState<TabId>(() => {
@@ -4267,7 +4274,6 @@ export default observer(function SettingsPage({
   useEffect(() => {
     const isLocal = localMode || !features.billing;
     if (activeTab === "people" && isLocal) setActiveTab("workspace");
-    if (activeTab === "models" && isLocal) setActiveTab("workspace");
     if (activeTab === "compute" && (isLocal || HIDE_COMPUTE_PURCHASES_ON_IOS))
       setActiveTab("workspace");
     if (activeTab === "updates" && !IS_DESKTOP_CLIENT)
@@ -4276,7 +4282,6 @@ export default observer(function SettingsPage({
       setActiveTab("workspace");
   }, [activeTab, features.billing, localMode]);
 
-  const workspaceName = currentWorkspace?.name || "";
   const userName = user?.name || "";
   const activeTabLabel = settingsTab(activeTab).label;
   const exitSettings = () => {
@@ -4297,9 +4302,8 @@ export default observer(function SettingsPage({
           <SettingsSidebar
             activeTab={activeTab}
             onTabChange={setActiveTab}
-            workspaceName={workspaceName}
             userName={userName}
-            onExit={exitSettings}
+            onExit={inAppShell ? undefined : exitSettings}
             showBilling={features.billing}
             localMode={localMode}
           />

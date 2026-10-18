@@ -223,6 +223,7 @@ describe('server.ts runtime-resolving code is pinned to the home region', () => 
  */
 const RESOLVER_FILES: Record<string, string> = {
   'lib/admin-runtime-recycle.ts': 'guard: admin recycle resolves via the resolver layer',
+  'lib/chat-runtime-fetch.ts': 'guard: resolves via resolveWorkspaceRuntimeUrl (home-region guard); callers are route-pinned or home-region filtered (chat-turn-reattach)',
   'lib/heartbeat-scheduler.ts': 'cron: partitioned by workspace home region (#1233) + guard backstop',
   'lib/knative-project-manager.ts': 'resolver: getProjectPodUrl/resolveProjectPodUrl definitions',
   'lib/metal-rewarm.ts': 'cron: rollout re-warm resolves via resolveWorkspaceRuntimeUrl (guard)',
@@ -242,6 +243,7 @@ const RESOLVER_FILES: Record<string, string> = {
   'routes/project-export-import.ts': 'route-pin: mounted under /api/projects/:projectId/',
   'routes/publish.ts': 'route-pin: publish routes under /api/projects/:projectId/ (#1237 proxies bodies to home)',
   'routes/runtime.ts': 'route-pin: runtime routes under /api/projects/:projectId/runtime',
+  'routes/shared-files.ts': 'route-pin: workspace-scoped links call pinWorkspaceToHomeRegion first; resolveWorkspaceRuntimeUrl guard backstops',
   'routes/slack-agent.ts': 'guard: background resolve via resolveWorkspaceRuntimeUrl',
   'routes/workspace-chat.ts': 'route-pin: pinWorkspaceRoutesToHomeRegion on every route (asserted below)',
   'services/agent-call.service.ts': 'guard: agent-to-agent calls resolve via the resolver layer',

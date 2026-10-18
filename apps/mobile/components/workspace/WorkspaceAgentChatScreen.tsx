@@ -19,10 +19,6 @@ import {
   useProjectCollection,
   useWorkspaceCollection,
 } from "../../contexts/domain"
-import {
-  GetStartedChecklist,
-  useGettingStarted,
-} from "../onboarding/GetStartedChecklist"
 import { openInWorkspace } from "../../lib/switch-workspace"
 import { pickTeamWorkspace } from "../../lib/team-workspace"
 import { useActiveWorkspace } from "../../hooks/useActiveWorkspace"
@@ -30,11 +26,14 @@ import { useWorkspaceExperience } from "../../hooks/useWorkspaceExperience"
 import { clearChatPrefill, useChatPrefill } from "../../hooks/useChatPrefill"
 import { API_URL, api, type PersonalAgentProfile } from "../../lib/api"
 import { chatSessionEvents } from "../../lib/chat-session-events"
+import { agentSessionSource } from "../../lib/root-destination"
+import { ensureLandingSession, LANDING_SESSION_NAME } from "../../lib/landing-session"
 import { ChatPanel } from "../chat/ChatPanel"
 import type { OpenProjectPaneRequest } from "../chat/ChatContext"
 import type { PlanData } from "../chat/PlanCard"
 import { PlanStreamProvider } from "../chat/PlanStreamContext"
 import { PlansPanel } from "../project/panels/PlansPanel"
+import { WorkspaceFileViewer } from "./WorkspaceFileViewer"
 import { ProjectSidePane } from "../team-chat/ProjectSidePane"
 import type { RestoreDraftRequest } from "../chat/ChatInput"
 import { NativePhoneSheet } from "../phone/NativePhoneSheet"
@@ -59,6 +58,13 @@ interface ProjectPaneState extends OpenProjectPaneRequest {
   nonce: number
 }
 
+interface FilePaneState {
+  /** Workspace-relative path the assistant mentioned. */
+  path: string
+  /** Changes on every open so re-opening the same file reloads it. */
+  nonce: number
+}
+
 interface PlanPaneState {
   filepath: string | null
   /** Changes on every open so the Plans panel re-selects the requested plan. */
@@ -74,6 +80,11 @@ interface BuildPlanRequest {
 export interface WorkspaceAgentChatScreenProps {
   /** Open this workspace session instead of the primary one (e.g. a session a DM reply ran in). */
   initialSessionId?: string
+  /**
+   * Start a new, empty session instead of resuming the primary one. The
+   * landing (`/`) sets this; an explicit `?chatSessionId=` still wins.
+   */
+  startNewSession?: boolean
   /** Sent as the first message when the opened session is still empty. */
   initialMessage?: string
   /** Rendered above the chat, e.g. the breadcrumb back to the conversation it was opened from. */
@@ -81,7 +92,7 @@ export interface WorkspaceAgentChatScreenProps {
 }
 
 export const WorkspaceAgentChatScreen = observer(
-  function WorkspaceAgentChatScreen({ initialSessionId, initialMessage, header }: WorkspaceAgentChatScreenProps = {}) {
+  function WorkspaceAgentChatScreen({ initialSessionId, startNewSession, initialMessage, header }: WorkspaceAgentChatScreenProps = {}) {
     const [capturedInitialMessage] = useState(() => initialMessage)
     const router = useRouter()
     const { user } = useAuth()
@@ -94,6 +105,7 @@ export const WorkspaceAgentChatScreen = observer(
     const { width, height } = useWindowDimensions()
     const [projectPane, setProjectPane] = useState<ProjectPaneState | null>(null)
     const [planPane, setPlanPane] = useState<PlanPaneState | null>(null)
+    const [filePane, setFilePane] = useState<FilePaneState | null>(null)
     const [buildPlanRequest, setBuildPlanRequest] = useState<BuildPlanRequest | null>(null)
     const [profile, setProfile] = useState<PersonalAgentProfile | null>(null)
     const [sessionId, setSessionId] = useState<string | null>(null)
@@ -118,13 +130,20 @@ export const WorkspaceAgentChatScreen = observer(
     )
     const [scopeError, setScopeError] = useState<string | null>(null)
     const loadVersion = useRef(0)
+    // The empty chat the landing opens. Single-flight per workspace so a
+    // re-running load (a new `http` identity, a re-render) cannot mint a
+    // second empty session; the session itself is reused across cold starts
+    // (see `lib/landing-session`).
+    const landingSession = useRef<{
+      workspaceId: string
+      promise: Promise<{ id: string }>
+    } | null>(null)
     const reloadAttachments = useRef<(() => void) | null>(null)
     const avatarFinishedTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
     const avatarStreaming = useRef(false)
     const crossTabPrefill = useChatPrefill()
     const { showWelcome, dismissWelcome } = useWelcomeMessage(workspace?.id)
     const isPersonalWorkspace = experience.kind === "personal"
-    const gettingStarted = useGettingStarted()
     const workspaces = useWorkspaceCollection()
     const members = useMemberCollection()
     const teamWorkspaceId = pickTeamWorkspace(
@@ -161,10 +180,39 @@ export const WorkspaceAgentChatScreen = observer(
         setSessionId(null)
         setAttachments([])
         setFocusedProjectId(null)
+        const sessionSource = agentSessionSource({
+          initialSessionId,
+          startNewSession,
+          // The workspace the session belongs to, not the resolved
+          // experience: they can disagree for a frame during a switch.
+          kind: workspace.kind,
+        })
+        const openLandingSession = () => {
+          const cached = landingSession.current
+          if (cached && cached.workspaceId === workspace.id) {
+            return cached.promise
+          }
+          const promise = ensureLandingSession(workspace.id, {
+            list: (workspaceId) => api.listWorkspaceSessions(http, workspaceId),
+            create: (workspaceId) =>
+              api.createWorkspaceSession(http, workspaceId, {
+                inferredName: LANDING_SESSION_NAME,
+              }),
+          })
+          landingSession.current = { workspaceId: workspace.id, promise }
+          promise.catch(() => {
+            if (landingSession.current?.promise === promise) {
+              landingSession.current = null
+            }
+          })
+          return promise
+        }
         const [session, nextProfile] = await Promise.all([
-          initialSessionId
-            ? Promise.resolve({ id: initialSessionId })
-            : api.getPrimaryWorkspaceSession(http, workspace.id),
+          sessionSource === "url"
+            ? Promise.resolve({ id: initialSessionId as string })
+            : sessionSource === "new"
+              ? openLandingSession()
+              : api.getPrimaryWorkspaceSession(http, workspace.id),
           api.getAgentProfile(http, workspace.id),
         ])
         if (version !== loadVersion.current) return
@@ -179,23 +227,32 @@ export const WorkspaceAgentChatScreen = observer(
             : "Could not load Workspace Agent Chat",
         )
       }
-    }, [http, workspace?.id, initialSessionId])
+    }, [http, workspace?.id, workspace?.kind, initialSessionId, startNewSession])
 
     useEffect(() => {
       void loadWorkspaceChat()
     }, [loadWorkspaceChat])
 
     const hasSidePane = width >= PROJECT_SIDE_PANE_MIN_WIDTH && !usesMobileWorkspaceChrome
+    // Plan, project, and file panes share one slot: opening any of them closes the others.
     const openProjectPane = useCallback((request: OpenProjectPaneRequest) => {
       setPlanPane(null)
+      setFilePane(null)
       setProjectPane({ ...request, nonce: Date.now() })
     }, [])
     const closeProjectPane = useCallback(() => setProjectPane(null), [])
     const openPlanPane = useCallback((filepath?: string | null) => {
       setProjectPane(null)
+      setFilePane(null)
       setPlanPane({ filepath: filepath ?? null, nonce: Date.now() })
     }, [])
     const closePlanPane = useCallback(() => setPlanPane(null), [])
+    const openFilePane = useCallback((path: string) => {
+      setProjectPane(null)
+      setPlanPane(null)
+      setFilePane({ path, nonce: Date.now() })
+    }, [])
+    const closeFilePane = useCallback(() => setFilePane(null), [])
     const handleBuildPlan = useCallback(
       (plan: PlanData, modelId: string) => {
         setBuildPlanRequest({ plan, modelId, nonce: Date.now() })
@@ -489,6 +546,14 @@ export const WorkspaceAgentChatScreen = observer(
         onClose={closePlanPane}
       />
     ) : null
+    const filePaneContent = filePane ? (
+      <WorkspaceFileViewer
+        agentUrl={workspaceAgentUrl}
+        path={filePane.path}
+        nonce={filePane.nonce}
+        onClose={closeFilePane}
+      />
+    ) : null
 
     return (
       <PlanStreamProvider>
@@ -517,9 +582,7 @@ export const WorkspaceAgentChatScreen = observer(
         ) : null}
         {usesMobileWorkspaceChrome &&
         !header &&
-        ((isPersonalWorkspace && showWelcome) ||
-          gettingStarted.visible ||
-          attachments.length > 0) ? (
+        ((isPersonalWorkspace && showWelcome) || attachments.length > 0) ? (
           // `PersonalAgentMobileHeader` floats above this content instead of
           // reserving layout space, so the welcome card / working-set chip —
           // the first normal-flow content on this screen — need their own
@@ -572,11 +635,6 @@ export const WorkspaceAgentChatScreen = observer(
             </View>
           </View>
         ) : null}
-        {gettingStarted.visible ? (
-          <View className="mx-auto mt-3 w-full max-w-2xl px-4">
-            <GetStartedChecklist state={gettingStarted} />
-          </View>
-        ) : null}
         {attachments.length > 0 ? (
           <View className="mx-auto w-full max-w-[760px] flex-row items-center gap-2 px-4 pb-2 pt-3">
             <Text className="text-xs font-medium text-muted-foreground">
@@ -619,6 +677,7 @@ export const WorkspaceAgentChatScreen = observer(
             presentation="agent"
             onOpenProjectPane={hasSidePane ? openProjectPane : undefined}
             onOpenPlan={isPersonalWorkspace ? undefined : openPlanPane}
+            onOpenFilePath={openFilePane}
             buildPlanRequest={buildPlanRequest}
             onBuildPlanConsumed={handleBuildPlanConsumed}
             prefillRequest={prefillRequest}
@@ -626,6 +685,7 @@ export const WorkspaceAgentChatScreen = observer(
             initialMessage={capturedInitialMessage}
             className="flex-1"
             isActive
+            ownsPlanStream
             phoneTranscriptTopPadding={
               usesMobileWorkspaceChrome ? "floating-agent" : "chrome"
             }
@@ -763,10 +823,25 @@ export const WorkspaceAgentChatScreen = observer(
             <View style={{ height: Math.round(height * 0.8) }}>{plansPanel}</View>
           </NativePhoneSheet>
         ) : null}
+        {!hasSidePane ? (
+          <NativePhoneSheet
+            visible={!!filePane}
+            onClose={closeFilePane}
+            grabber={false}
+            testID="workspace-file-sheet"
+          >
+            <View style={{ height: Math.round(height * 0.8) }}>{filePaneContent}</View>
+          </NativePhoneSheet>
+        ) : null}
       </View>
       {hasSidePane && plansPanel ? (
         <View className="w-[45%] min-w-[420px] border-l border-border" testID="workspace-plan-pane">
           {plansPanel}
+        </View>
+      ) : null}
+      {hasSidePane && filePane ? (
+        <View className="w-[45%] min-w-[420px] border-l border-border" testID="workspace-file-pane">
+          {filePaneContent}
         </View>
       ) : null}
       {activePane ? (

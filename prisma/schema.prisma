@@ -303,6 +303,8 @@ model WorkspaceAgentProfile {
   personality     String?
   statusText      String?
   statusUpdatedAt DateTime?
+  // Model used when the agent is tagged in a channel or thread; null = Auto. Set by workspace admins.
+  defaultModel    String?
   createdAt       DateTime  @default(now())
   updatedAt       DateTime  @updatedAt
 
@@ -1935,7 +1937,13 @@ model BackgroundTask {
   note          String? @db.Text
   notify        Boolean   @default(true)
   consumed      Boolean   @default(false)
+  /// Set when a wake claims this row; cleared again if that wake never ran, so
+  /// the drain sweep can re-queue it.
   notifiedAt    DateTime?
+  /// How many wakes claimed this row and had to be released.
+  attempts      Int       @default(0)
+  /// Earliest time the sweep may re-queue it, so a broken wake cannot hot-loop.
+  nextAttemptAt DateTime?
   /// A finished card watch waits while agents are still working the card's
   /// thread; its wake goes out when the thread goes quiet or at this time.
   heldUntil     DateTime?
@@ -1947,6 +1955,7 @@ model BackgroundTask {
   @@index([source, targetRef, status])
   @@index([chatSessionId, status])
   @@index([expiresAt])
+  @@index([notify, consumed, notifiedAt])
   @@map("background_tasks")
 }
 
@@ -3535,6 +3544,7 @@ model AgentCostMetric {
   inputTokens       Int      @default(0)
   outputTokens      Int      @default(0)
   cachedInputTokens Int      @default(0)
+  cacheWriteTokens  Int      @default(0)
   toolCalls         Int      @default(0)
   creditCost        Float    @default(0)
   wallTimeMs        Int      @default(0)
@@ -4421,7 +4431,10 @@ model ConversationAttachment {
   id             String   @id @default(uuid())
   conversationId String
   messageId      String?
-  uploaderUserId String
+  /// Null when an agent uploaded the file.
+  uploaderUserId String?
+  /// "workspace" or "project:<id>" for files an agent posted.
+  uploaderAgentRef String?
   storageKey     String
   name           String
   mimeType       String

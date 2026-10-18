@@ -11,17 +11,27 @@ import {
   useWindowDimensions,
   View,
   type ColorValue,
+  type ImageStyle,
   type TextStyle,
   type ViewStyle,
 } from "react-native";
-import { isMentionHref, linkifyBareUrls, linkifyFilePaths, pathFromFileHref } from "./file-links";
+import { FileTypeIcon } from "./FileTypeIcon";
+import {
+  isMentionHref,
+  linkifyBareUrls,
+  linkifyFilePaths,
+  pathFromFileHref,
+  rewriteWorkspaceMedia,
+} from "./file-links";
+import { MarkdownMediaNative } from "./MarkdownMediaNative";
 import { normalizeRichTextPaste } from "../../lib/rich-text-paste";
 import { usePhoneLayout } from "../../lib/native-phone-layout";
 import { useMobileWorkspaceChrome } from "../layout/MobileWorkspaceChromeContext";
 
 /**
  * Semantic markdown palette. Light and dark values follow the GitHub gray
- * scale for structure, with an orange for inline code as the one accent.
+ * scale for structure, with color as the only accent: inline code reads as
+ * body text on a neutral grey chip rather than as its own accent color.
  * Keep in sync with the `.chat-md` variables in `global.css` (web path).
  */
 interface ThemeColors {
@@ -29,7 +39,6 @@ interface ThemeColors {
   heading: ColorValue;
   muted: ColorValue;
   link: ColorValue;
-  codeText: ColorValue;
   codeBg: ColorValue;
   border: ColorValue;
   quoteBorder: ColorValue;
@@ -47,6 +56,8 @@ export interface MarkdownTextProps {
   variant?: MarkdownVariant;
   /** Opens a workspace file when the text mentions its path. */
   onFilePress?: (path: string) => void;
+  /** Mentioned paths that pass this check render as file chips. */
+  fileExists?: (path: string) => boolean;
   /** Return true to handle a link in the app instead of opening it in a browser. */
   onLinkPress?: (href: string) => boolean;
 }
@@ -121,8 +132,7 @@ const lightColors: ThemeColors = {
   heading: "#111827",
   muted: "#59636e",
   link: "#0969da",
-  codeText: "#b45309",
-  codeBg: "#f6f8fa",
+  codeBg: "#e4e4e7",
   border: "#d1d9e0",
   quoteBorder: "#d1d9e0",
   tableHeaderBg: "#f6f8fa",
@@ -135,8 +145,7 @@ const darkColors: ThemeColors = {
   heading: "#ffffff",
   muted: "#8b949e",
   link: "#4493f8",
-  codeText: "#fb923c",
-  codeBg: "#161b22",
+  codeBg: "#333333",
   border: "#30363d",
   quoteBorder: "#30363d",
   tableHeaderBg: "#161b22",
@@ -151,7 +160,6 @@ const lightThinkingColors: ThemeColors = {
   heading: "#525252",
   muted: "#a3a3a3",
   link: "#6b9bd2",
-  codeText: "#737373",
   codeBg: "#f0f0f0",
   border: "#e0e0e0",
   quoteBorder: "#e0e0e0",
@@ -165,7 +173,6 @@ const darkThinkingColors: ThemeColors = {
   heading: "#c4c4c4",
   muted: "#737373",
   link: "#7ba8d4",
-  codeText: "#a0a0a0",
   codeBg: "#252525",
   border: "#444444",
   quoteBorder: "#444444",
@@ -192,7 +199,7 @@ function withColors(sizes: MarkedStyles, c: ThemeColors): MarkedStyles {
     h2: { ...sizes.h2, color: c.heading },
     h3: { ...sizes.h3, color: c.heading },
     h4: { ...sizes.h4, color: c.heading },
-    codespan: { ...sizes.codespan, color: c.codeText, backgroundColor: c.codeBg },
+    codespan: { ...sizes.codespan, color: c.text, backgroundColor: c.codeBg },
     blockquote: {
       ...sizes.blockquote,
       borderLeftWidth: 3,
@@ -223,8 +230,10 @@ class NativePhoneMarkdownRenderer extends Renderer {
     private readonly tableWidth: number,
     private readonly tableHeaderBg: ColorValue,
     private readonly mentionColors: { bg: ColorValue; text: ColorValue },
+    private readonly chipColors: { bg: ColorValue; text: ColorValue },
     private readonly onFilePress?: (path: string) => void,
     private readonly onLinkPress?: (href: string) => boolean,
+    private readonly fileExists?: (path: string) => boolean,
   ) {
     super();
   }
@@ -257,6 +266,32 @@ class NativePhoneMarkdownRenderer extends Renderer {
       );
     }
     const path = pathFromFileHref(href);
+    if (path && this.onFilePress && this.fileExists?.(path)) {
+      const open = this.onFilePress;
+      const { bg, text } = this.chipColors;
+      return (
+        <Text
+          accessibilityRole="link"
+          accessibilityLabel={path}
+          testID="chat-file-chip"
+          key={this.getKey()}
+          onPress={() => open(path)}
+          style={[
+            styles,
+            {
+              textDecorationLine: "none",
+              fontWeight: "500",
+              color: text,
+              backgroundColor: bg,
+              borderRadius: 6,
+            },
+          ]}
+        >
+          <FileTypeIcon path={path} size={14} />
+          {` ${path.split("/").pop() || path} `}
+        </Text>
+      );
+    }
     if (path && this.onFilePress) {
       const open = this.onFilePress;
       return (
@@ -290,6 +325,10 @@ class NativePhoneMarkdownRenderer extends Renderer {
       );
     }
     return super.link(children, href, styles, title);
+  }
+
+  override image(uri: string, alt?: string, _style?: ImageStyle, _title?: string): ReactNode {
+    return <MarkdownMediaNative key={this.getKey()} src={uri} alt={alt} />;
   }
 
   override table(
@@ -374,6 +413,7 @@ function markdownPropsEqual(prev: MarkdownTextProps, next: MarkdownTextProps) {
   if (prev.className !== next.className) return false;
   if (prev.isStreaming !== next.isStreaming) return false;
   if (prev.onFilePress !== next.onFilePress) return false;
+  if (prev.fileExists !== next.fileExists) return false;
   if (prev.onLinkPress !== next.onLinkPress) return false;
   const a = prev.children || "";
   const b = next.children || "";
@@ -384,6 +424,7 @@ export const MarkdownText = memo(function MarkdownText({
   children,
   variant = "default",
   onFilePress,
+  fileExists,
   onLinkPress,
 }: MarkdownTextProps) {
   const { colorScheme } = useColorScheme();
@@ -423,7 +464,7 @@ export const MarkdownText = memo(function MarkdownText({
   );
 
   const value = useMemo(() => {
-    const normalized = normalizeRichTextPaste(children || "");
+    const normalized = rewriteWorkspaceMedia(normalizeRichTextPaste(children || ""));
     const fileLinked = onFilePress ? linkifyFilePaths(normalized) : normalized;
     return linkifyBareUrls(fileLinked);
   }, [children, onFilePress]);
@@ -431,16 +472,22 @@ export const MarkdownText = memo(function MarkdownText({
     () => ({ bg: colors.mentionBg, text: colors.mentionText }),
     [colors.mentionBg, colors.mentionText],
   );
+  const chipColors = useMemo(
+    () => ({ bg: colors.codeBg, text: colors.text }),
+    [colors.codeBg, colors.text],
+  );
   const renderer = useMemo(
     () =>
       new NativePhoneMarkdownRenderer(
         width,
         colors.tableHeaderBg,
         mentionColors,
+        chipColors,
         onFilePress,
         onLinkPress,
+        fileExists,
       ),
-    [width, colors.tableHeaderBg, mentionColors, onFilePress, onLinkPress],
+    [width, colors.tableHeaderBg, mentionColors, chipColors, onFilePress, onLinkPress, fileExists],
   );
 
   return (

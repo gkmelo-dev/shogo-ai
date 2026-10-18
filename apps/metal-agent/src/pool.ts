@@ -109,15 +109,6 @@ const PRESIGN_TTL_SEC = 30 * 60
  */
 export const REPO_STAGING_DIR = '.shogo/local/repo-staging'
 
-/**
- * Writer gate for the incremental repo format. Off by default. It only decides
- * which projects migrate: once a project has a manifest it stays on the
- * manifest whatever the flag says.
- */
-export function repoBundlesEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  return env.METAL_REPO_BUNDLES === 'on'
-}
-
 /** Outcome of one bundle-format persist. `unchanged` means durable already. */
 type RepoPersist = 'written' | 'unchanged' | 'quarantined' | 'lost' | 'empty'
 
@@ -128,6 +119,19 @@ interface RepoBundleExport {
   refs: Record<string, string>
   config: string
   rootCommitAt: number | null
+}
+
+/** The guest refused a bundle export because its LFS objects could not be pushed. */
+export class RepoBundleLfsPushError extends Error {}
+
+/** Guests before `code` was added only send the message. */
+function isLfsPushFailure(body: string): boolean {
+  try {
+    const parsed = JSON.parse(body) as { code?: unknown; error?: unknown }
+    return parsed.code === 'lfs-push-failed' || (typeof parsed.error === 'string' && parsed.error.startsWith('lfs push failed'))
+  } catch {
+    return false
+  }
 }
 
 /** How often a project's unreferenced bundles are swept, at most. */
@@ -176,6 +180,8 @@ export class ExportTooLargeError extends Error {
 }
 
 /** Longest the periodic sweep waits before retrying a failed `.git` export. */
+/** How long a rollout rotation that aborted waits before trying again. */
+export const ROTATE_RETRY_MS = 10 * 60_000
 const REPO_EXPORT_MAX_BACKOFF_MS = 30 * 60_000
 const REPO_EXPORT_MIN_BACKOFF_MS = 60_000
 
@@ -772,11 +778,12 @@ function publishedSubdomainFromEnv(env: Record<string, string>): string | undefi
 }
 
 /**
- * Home-directory persistence is per project: workspace runtimes (`ws:` keys)
- * span several projects, and a published site never carries the agent's home.
+ * Home-directory persistence is per runtime key. A `ws:` runtime holds at most
+ * its own anchor project (see {@link ownMemberIds}), so its home belongs to it
+ * alone. A published site never carries the agent's home.
  */
-function homeStateEligible(projectId: string, publishedSubdomain: string | undefined): boolean {
-  return !projectId.startsWith('ws:') && !publishedSubdomain
+function homeStateEligible(publishedSubdomain: string | undefined): boolean {
+  return !publishedSubdomain
 }
 
 /** A workspace runtime's member project ids from its assign env; undefined when not given. */
@@ -1441,9 +1448,9 @@ export class MetalWarmPool {
 
   private claim(vmClass: VmClass = 'standard'): PooledVm | null {
     const idx = this.available.findIndex((v) => v.ready && v.handle.vmClass === vmClass)
-    if (idx === -1) return null
-    const [vm] = this.available.splice(idx, 1)
-    // Replace in background.
+    const vm = idx === -1 ? null : this.available.splice(idx, 1)[0]!
+    // Replace in background. A miss tops up too: a fill whose boots failed is
+    // not retried on its own, so an empty pool would otherwise stay empty.
     this.reconcile().catch(() => {})
     return vm
   }
@@ -2037,7 +2044,7 @@ export class MetalWarmPool {
     // Best-effort like writable state, and for the same reason a failure marks
     // the VM untrusted: it now has an empty home, which must never be exported
     // over the real one.
-    if (homeStateEligible(projectId, publishedSubdomain)) {
+    if (homeStateEligible(publishedSubdomain)) {
       try {
         const h = await timer.time('hydrate_home', () => this.hydrateHomeState(projectId, vm.handle, env))
         if (h === 'unsupported') a.homeExportUnsupported = true
@@ -3028,16 +3035,29 @@ export class MetalWarmPool {
 
   /**
    * The incremental writer. Returns null when the legacy tarball path should
-   * run instead: the flag is off and no manifest exists, or the guest predates
-   * `/pool/export-repo-bundle`. A project with a manifest never falls back.
+   * run instead: no manifest exists yet and the guest cannot read or write
+   * bundles, or cannot push the LFS objects a bundle would leave out. A
+   * project with a manifest never falls back.
    */
   private async storeRepoBundles(a: AssignedVm): Promise<RepoPersist | null> {
     const current = await this.repoManifest(a.projectId)
-    if (!current && !repoBundlesEnabled()) return null
+    if (!current && !(await this.guestHasRepoBundles(a))) return null
     // Past the compaction threshold the export is a full base, which restarts the chain.
     const compact = !!current && needsCompaction(current.manifest.bundles)
     const since = current && !compact ? Object.values(current.manifest.refs) : null
-    const exported = await this.exportRepoBundle(a, since)
+    let exported: RepoBundleExport | null
+    try {
+      exported = await this.exportRepoBundle(a, since)
+    } catch (err) {
+      // The tarball still carries `.git/lfs/objects`; a bundle cannot, so the
+      // project stays unmigrated until its LFS push succeeds.
+      if (!current && err instanceof RepoBundleLfsPushError) {
+        metrics.inc(M.repoBundleLfsFallback)
+        console.warn(`[pool] keeping ${a.projectId} on the repo tarball: ${err.message}`)
+        return null
+      }
+      throw err
+    }
     if (!exported) {
       if (current) {
         throw new Error(`guest cannot export incremental repo for ${a.projectId}; refusing the tarball fallback`)
@@ -3064,6 +3084,28 @@ export class MetalWarmPool {
    * Ask the guest for the next bundle. `since` holds the tips the manifest
    * records; null asks for a full base.
    */
+  /**
+   * Whether this VM's guest advertises bundle support in the repo-hydrated
+   * probe. Only a capable guest may migrate a project, since every later
+   * restore of that project needs the same capability. A failed probe is not
+   * cached, so it is retried on the next save.
+   */
+  protected async guestHasRepoBundles(a: AssignedVm): Promise<boolean> {
+    const known = this.repoBundleCapable.get(a)
+    if (known !== undefined) return known
+    let capable: boolean
+    try {
+      const env: Record<string, string> = a.runtimeToken ? { RUNTIME_AUTH_SECRET: a.runtimeToken } : {}
+      const probe = await this.callRepoHydrated(a.handle, env, { probe: true }, Math.min(this.cfg.hydrateTimeoutMs, 10_000))
+      capable = probe?.bundles === true
+    } catch (err: any) {
+      console.warn(`[pool] repo bundle probe failed for ${a.projectId}: ${err?.message ?? err}`)
+      return false
+    }
+    this.repoBundleCapable.set(a, capable)
+    return capable
+  }
+
   protected async exportRepoBundle(a: AssignedVm, since: string[] | null): Promise<RepoBundleExport | null> {
     const res = await fetch(`${a.handle.agentUrl}/pool/export-repo-bundle`, {
       method: 'POST',
@@ -3072,7 +3114,12 @@ export class MetalWarmPool {
       signal: AbortSignal.timeout(this.cfg.hydrateTimeoutMs),
     })
     if (res.status === 404) return null
-    if (!res.ok) throw new Error(`/pool/export-repo-bundle failed (${res.status}): ${await res.text()}`)
+    if (!res.ok) {
+      const text = await res.text()
+      const message = `/pool/export-repo-bundle failed (${res.status}): ${text}`
+      if (res.status === 503 && isLfsPushFailure(text)) throw new RepoBundleLfsPushError(message)
+      throw new Error(message)
+    }
     return (await res.json()) as RepoBundleExport
   }
 
@@ -3159,6 +3206,7 @@ export class MetalWarmPool {
 
   /** Last sweep per project, so a busy writer does not list the bucket on every save. */
   private repoBundleSweptAt = new Map<string, number>()
+  private repoBundleCapable = new WeakMap<AssignedVm, boolean>()
 
   private promoteUnlinkedManifest(a: AssignedVm, manifest: RepoManifest): Promise<boolean> {
     return this.promoteUnlinkedWith(a, manifest.rootCommitAt, {
@@ -3977,7 +4025,7 @@ export class MetalWarmPool {
    * export before the VM goes away, whose refused bytes are quarantined.
    */
   async saveHomeStateToStore(a: AssignedVm, opts: DataSaveOpts = {}): Promise<boolean> {
-    if (!homeStateEligible(a.projectId, a.publishedSubdomain) || a.homeExportUnsupported) return false
+    if (!homeStateEligible(a.publishedSubdomain) || a.homeExportUnsupported) return false
     return this.homeFlight.run(a.projectId, () => this.saveHomeStateInner(a, opts))
   }
 
@@ -4062,7 +4110,7 @@ export class MetalWarmPool {
   async exportAllHomeState(): Promise<number> {
     let n = 0
     for (const a of this.assigned.values()) {
-      if (a.homeExportUnsupported || !homeStateEligible(a.projectId, a.publishedSubdomain)) continue
+      if (a.homeExportUnsupported || !homeStateEligible(a.publishedSubdomain)) continue
       try {
         if (await this.saveHomeStateToStore(a)) n++
         a.homeExportFailures = 0
@@ -5015,6 +5063,66 @@ export class MetalWarmPool {
   }
 
   /**
+   * Rootfs rollout: retire assigned VMs still on a superseded image (backed up,
+   * stopped without a snapshot) so the control plane warms them on the current
+   * one. A VM goes once it has been idle for `rolloutIdleMs`, or
+   * `rolloutDeadlineMs` after this host first saw it stale, and never during an
+   * agent turn. Unlike `reapIdle`, always-on VMs rotate too; they come back
+   * separately because the control plane boots them again instead of leaving
+   * them suspended.
+   */
+  async rotateStale(now = Date.now()): Promise<{ retired: string[]; alwaysOn: string[] }> {
+    const out = { retired: [] as string[], alwaysOn: [] as string[] }
+    if (!(this.cfg.rolloutIdleMs > 0)) return out
+    const stale = [...this.assigned.values()].filter(
+      (a) => this.rootfsGeneration(this.bootRootfsIdentity(a), a.handle.vmClass) === 'stale',
+    )
+    const staleIds = new Set(stale.map((a) => a.projectId))
+    for (const id of this.staleSince.keys()) if (!staleIds.has(id)) this.staleSince.delete(id)
+    for (const a of stale) if (!this.staleSince.has(a.projectId)) this.staleSince.set(a.projectId, now)
+
+    for (const id of this.rotateRetryAt.keys()) if (!staleIds.has(id)) this.rotateRetryAt.delete(id)
+
+    const due = stale.filter((a) => {
+      if ((a.activeStreams ?? 0) > 0) return false
+      if (now < (this.rotateRetryAt.get(a.projectId) ?? 0)) return false
+      const idleFor = now - (a.lastRealActivityAt ?? a.assignedAt)
+      return idleFor >= this.cfg.rolloutIdleMs || now - this.staleSince.get(a.projectId)! >= this.cfg.rolloutDeadlineMs
+    })
+    const cap = this.cfg.reapMaxPerPass ?? 0
+    if (cap > 0 && due.length > cap) due.length = cap
+    for (const a of due) {
+      const alwaysOn = !!a.alwaysOn
+      try {
+        const r = await this.recycle(a.projectId, { reason: 'stale-rootfs' })
+        if (r.aborted) {
+          this.rotateRetryAt.set(a.projectId, now + ROTATE_RETRY_MS)
+          const failed = r.steps.filter((s) => !s.ok).map((s) => `${s.step}: ${s.detail ?? 'failed'}`)
+          console.warn(
+            `[pool] rollout rotation of ${a.projectId} aborted (${failed.join('; ') || 'no step failed'}); ` +
+              `retrying in ${ROTATE_RETRY_MS / 60_000}m`,
+          )
+          continue
+        }
+      } catch (err: any) {
+        this.rotateRetryAt.set(a.projectId, now + ROTATE_RETRY_MS)
+        console.error(`[pool] rollout rotation failed for ${a.projectId}:`, err?.message ?? err)
+        continue
+      }
+      this.staleSince.delete(a.projectId)
+      this.rotateRetryAt.delete(a.projectId)
+      metrics.inc(M.rolloutRotated)
+      ;(alwaysOn ? out.alwaysOn : out.retired).push(a.projectId)
+    }
+    return out
+  }
+
+  /** When this host first saw each assigned VM on a superseded rootfs (see `rotateStale`). */
+  private staleSince = new Map<string, number>()
+  /** A rotation that aborted (a backup failed) waits until then: each attempt re-runs every backup. */
+  private rotateRetryAt = new Map<string, number>()
+
+  /**
    * Tear down a tracked VM: drop it from the assigned map + adopt-on-restart
    * registry, then stopVM to reclaim tap/socket/rootfs. Shared by the open()
    * liveness/health gate (dead FC process OR mute guest) and the dead-VM reaper.
@@ -5107,6 +5215,9 @@ export class MetalWarmPool {
     try {
       if (a.projectId.startsWith('ws:')) {
         await bounded(this.saveWorkspaceMembersToStore(a))
+        await bounded(this.saveHomeStateToStore(a, { final: true })).catch((err: any) =>
+          console.warn(`[pool] home-directory rescue for ${a.projectId} failed:`, err?.message ?? err),
+        )
         return true
       }
       // `.git` first: it is small and, once git works, carries every commit.
@@ -6041,7 +6152,7 @@ export class MetalWarmPool {
       return untrusted.length ? `database not persisted — ${untrusted.join('; ')}` : null
     })
 
-    if (homeStateEligible(a.projectId, a.publishedSubdomain)) {
+    if (homeStateEligible(a.publishedSubdomain)) {
       await run('home', async () => {
         await this.saveHomeStateToStore(a, { final: true, reason: 'recycle' })
         return a.homeUntrustedReason ? `home directory not persisted — ${a.homeUntrustedReason}` : null

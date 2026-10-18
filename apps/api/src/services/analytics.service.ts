@@ -131,6 +131,8 @@ interface UsageModelAggregate {
   totalBilledUsd: number
   totalRawUsd: number
   totalDurationMs: number
+  /** Desktop events recorded without rates for their model (cost 0, not a guess). */
+  unpricedRequests: number
 }
 
 interface UsageAggregateEvent {
@@ -165,8 +167,12 @@ function aggregateUsageByModel(
     const key = `${event.memberId}::${model}`
     const inputTokens = Number(meta.inputTokens || 0)
     const outputTokens = Number(meta.outputTokens || 0)
-    const totalTokens = Number(meta.totalTokens || inputTokens + outputTokens)
+    const totalTokens = Number(
+      meta.totalTokens ||
+        inputTokens + outputTokens + Number(meta.cachedInputTokens || 0) + Number(meta.cacheWriteTokens || 0),
+    )
     const rawForEvent = event.rawUsd ?? Number(meta.rawUsd ?? meta.dollarCost ?? 0)
+    const unpriced = meta.pricingUnknown === true ? 1 : 0
     const existing = aggregateMap.get(key)
 
     if (existing) {
@@ -177,6 +183,7 @@ function aggregateUsageByModel(
       existing.totalBilledUsd += Number(event.billedUsd || 0)
       existing.totalRawUsd += Number(rawForEvent || 0)
       existing.totalDurationMs += Number(meta.durationMs || 0)
+      existing.unpricedRequests += unpriced
     } else {
       aggregateMap.set(key, {
         userId: event.memberId,
@@ -193,6 +200,7 @@ function aggregateUsageByModel(
         totalBilledUsd: Number(event.billedUsd || 0),
         totalRawUsd: Number(rawForEvent || 0),
         totalDurationMs: Number(meta.durationMs || 0),
+        unpricedRequests: unpriced,
       })
     }
   }
@@ -1643,13 +1651,14 @@ export async function getQualityTimeseries(
     }),
     prisma.agentCostMetric.findMany({
       where: agentWhere,
-      select: { createdAt: true, escalated: true, loopDetected: true, hitMaxTurns: true },
+      select: { createdAt: true, escalated: true, loopDetected: true, hitMaxTurns: true, metadata: true },
     }),
   ])
 
   // Per-day accumulators.
   interface Acc {
     cached: number
+    cacheWrite: number
     input: number
     spend: number
     activeUsers: Set<string>
@@ -1663,7 +1672,7 @@ export async function getQualityTimeseries(
   const ensure = (d: string): Acc => {
     let a = acc.get(d)
     if (!a) {
-      a = { cached: 0, input: 0, spend: 0, activeUsers: new Set(), messages: 0, runs: 0, escalated: 0, loop: 0, maxTurns: 0 }
+      a = { cached: 0, cacheWrite: 0, input: 0, spend: 0, activeUsers: new Set(), messages: 0, runs: 0, escalated: 0, loop: 0, maxTurns: 0 }
       acc.set(d, a)
     }
     return a
@@ -1673,6 +1682,7 @@ export async function getQualityTimeseries(
     const meta = parseMeta(e.actionMetadata)
     const a = ensure(isoDay(e.createdAt))
     a.cached += (meta.cachedInputTokens as number) || 0
+    a.cacheWrite += (meta.cacheWriteTokens as number) || 0
     a.input += (meta.inputTokens as number) || 0
     const cost = e.billedUsd > 0
       ? e.billedUsd
@@ -1684,6 +1694,7 @@ export async function getQualityTimeseries(
   }
   for (const m of messages) ensure(isoDay(m.createdAt)).messages += 1
   for (const r of agentRuns) {
+    if (parseMeta(r.metadata).qualityUnknown === true) continue
     const a = ensure(isoDay(r.createdAt))
     a.runs += 1
     if (r.escalated) a.escalated += 1
@@ -1704,7 +1715,7 @@ export async function getQualityTimeseries(
     const activeUsers = a?.activeUsers.size ?? 0
     days.push({
       date: key,
-      cacheHitRatio: a ? pct(a.cached, a.cached + a.input) : 0,
+      cacheHitRatio: a ? pct(a.cached, a.cached + a.cacheWrite + a.input) : 0,
       costPerMessage: a && a.messages > 0 ? a.spend / a.messages : 0,
       costPerActiveUser: a && activeUsers > 0 ? a.spend / activeUsers : 0,
       agentEscalatedRate: a ? pct(a.escalated, a.runs) : 0,
@@ -1764,6 +1775,7 @@ export interface UsageSummaryEntry {
   totalBilledUsd: number
   totalRawUsd: number
   avgDurationMs: number
+  unpricedRequests: number
 }
 
 /**
@@ -1960,6 +1972,7 @@ export async function getUsageSummary(
         totalBilledUsd: agg.totalBilledUsd,
         totalRawUsd: agg.totalRawUsd,
         avgDurationMs: agg.requestCount > 0 ? Math.round(agg.totalDurationMs / agg.requestCount) : 0,
+        unpricedRequests: agg.unpricedRequests,
       }
     })
     .sort((a, b) => b.totalTokens - a.totalTokens)
@@ -1972,6 +1985,7 @@ export async function getUsageSummary(
     totalTokens: summaries.reduce((s, e) => s + e.totalTokens, 0),
     totalBilledUsd: summaries.reduce((s, e) => s + e.totalBilledUsd, 0),
     totalRawUsd: summaries.reduce((s, e) => s + e.totalRawUsd, 0),
+    unpricedRequests: summaries.reduce((s, e) => s + e.unpricedRequests, 0),
     totalToolCalls,
     uniqueUsers: new Set(summaries.map((s) => s.userId)).size,
     uniqueModels: new Set([...aggregateMap.values()].map((a) => a.model)).size,

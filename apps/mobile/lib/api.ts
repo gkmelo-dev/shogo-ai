@@ -1728,8 +1728,26 @@ export const api = {
       /** Pin the session to this project so chat runs on the runtime serving its preview. */
       anchorProjectId?: string
     } = {},
-  ): Promise<{ id: string; workspaceId: string; attached: Array<{ id: string; projectId: string; attachMode: string }> }> {
-    const res = await http.post<{ session: { id: string; workspaceId: string; attached: Array<{ id: string; projectId: string; attachMode: string }> } }>(
+  ): Promise<{
+    id: string
+    workspaceId: string
+    name?: string | null
+    inferredName?: string | null
+    createdAt?: string | null
+    lastActiveAt?: string | null
+    attached: Array<{ id: string; projectId: string; attachMode: string }>
+  }> {
+    const res = await http.post<{
+      session: {
+        id: string
+        workspaceId: string
+        name?: string | null
+        inferredName?: string | null
+        createdAt?: string | null
+        lastActiveAt?: string | null
+        attached: Array<{ id: string; projectId: string; attachMode: string }>
+      }
+    }>(
       `/api/workspaces/${encodeURIComponent(workspaceId)}/sessions`,
       opts,
     )
@@ -1754,11 +1772,12 @@ export const api = {
 
   /**
    * List the signed-in user's personal workspace-agent chats, newest first.
+   * `messageCount` lets a caller tell an empty chat from a used one.
    */
   async listWorkspaceSessions(
     http: HttpClient,
     workspaceId: string,
-  ): Promise<Array<{ id: string; workspaceId: string; isPrimary?: boolean; isPinned?: boolean; isArchived?: boolean; name?: string | null; inferredName?: string | null; createdAt?: string; lastActiveAt?: string }>> {
+  ): Promise<Array<{ id: string; workspaceId: string; isPrimary?: boolean; isPinned?: boolean; isArchived?: boolean; name?: string | null; inferredName?: string | null; createdAt?: string; lastActiveAt?: string; messageCount?: number }>> {
     const res = await http.get<{
       sessions?: Array<{
         id: string
@@ -1770,6 +1789,7 @@ export const api = {
         inferredName?: string | null
         createdAt?: string
         lastActiveAt?: string
+        messageCount?: number
       }>
     }>(`/api/workspaces/${encodeURIComponent(workspaceId)}/sessions`)
     return res.data?.sessions ?? []
@@ -1795,6 +1815,23 @@ export const api = {
     )
     if (!res.data?.profile) throw new Error('updateAgentProfile: no profile returned')
     return res.data.profile
+  },
+
+  /** Model the workspace agent uses when tagged in team chat (`null` = Auto). */
+  async getAgentDefaultModel(http: HttpClient, workspaceId: string) {
+    const res = await http.get<{ defaultModel: string | null; canManage: boolean }>(
+      `/api/workspaces/${encodeURIComponent(workspaceId)}/agent-default-model`,
+    )
+    return { defaultModel: res.data?.defaultModel ?? null, canManage: !!res.data?.canManage }
+  },
+
+  /** Workspace owners/admins only; pass `null` to go back to Auto. */
+  async setAgentDefaultModel(http: HttpClient, workspaceId: string, defaultModel: string | null) {
+    const res = await http.request<{ defaultModel: string | null; canManage: boolean }>(
+      `/api/workspaces/${encodeURIComponent(workspaceId)}/agent-default-model`,
+      { method: 'PUT', body: { defaultModel } },
+    )
+    return res.data?.defaultModel ?? null
   },
 
   async listWorkspaceGoals(
@@ -1917,11 +1954,12 @@ export const api = {
    * Best-effort: warm the merged-root workspace runtime. Mirrors
    * prewarmProjectRuntime. Pass the workspace session id (and/or explicit
    * attach project ids) so the runtime mounts the right subfolders.
+   * `source` labels the warm in the server's `runtime.prewarm_ms` metric.
    */
   async prewarmWorkspaceRuntime(
     http: HttpClient,
     workspaceId: string,
-    opts: { sessionId?: string; attachProjectIds?: string[] } = {},
+    opts: { sessionId?: string; attachProjectIds?: string[]; source?: 'onboarding' | 'home_draft' } = {},
   ): Promise<void> {
     try {
       await http.post(`/api/workspaces/${encodeURIComponent(workspaceId)}/runtime/prewarm`, opts)
@@ -3117,6 +3155,8 @@ export interface TechStackSummary {
     shellEnabled?: boolean
     heartbeatToolsEnabled?: boolean
     imageGenEnabled?: boolean
+    videoGenEnabled?: boolean
+    threeDGenEnabled?: boolean
     memoryEnabled?: boolean
     quickActionsEnabled?: boolean
     sdkGuideEnabled?: boolean

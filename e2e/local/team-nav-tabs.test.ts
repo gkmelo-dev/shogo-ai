@@ -153,8 +153,11 @@ test.describe("Team workspace: desktop rail and panels", () => {
   })
 
   test("there is one profile button and one workspace switcher, both on the rail", async () => {
+    // `/` is the workspace-agent chat since SHO-4, and that screen's header has
+    // its own "<agent> profile and settings" button (`PersonalAgentHeader`).
+    // Match the rail's ProfileMenu label exactly so it is not counted.
     await expect(page.getByTestId("profile-avatar")).toHaveCount(1)
-    await expect(page.getByRole("button", { name: "Profile and settings" })).toHaveCount(1)
+    await expect(page.getByRole("button", { name: "Profile and settings", exact: true })).toHaveCount(1)
     const switcher = page.getByRole("button", { name: /— open account menu/ })
     await expect(switcher).toHaveCount(1)
     await expect(rail(page).getByRole("button", { name: /— open account menu/ })).toBeVisible()
@@ -272,7 +275,7 @@ test.describe("Team workspace: desktop rail and panels", () => {
     await page.getByRole("menuitem", { name: "Resume notifications" }).click()
     await expect(page.getByRole("menuitem", { name: "Pause notifications" })).toBeVisible({ timeout: 15_000 })
 
-    await page.getByRole("menuitem", { name: "Preferences" }).click()
+    await page.getByRole("menuitem", { name: "Settings" }).click()
     await expect(page).toHaveURL(/\/settings/)
   })
 

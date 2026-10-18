@@ -123,6 +123,10 @@ import {
 import { AccountMenu, WorkspaceHeaderButton, type AccountMenuProps } from "./AccountMenu";
 import { CreateWorkspaceModal } from "./CreateWorkspaceModal";
 import { InboxPanel } from "./InboxPanel";
+import {
+  GetStartedChecklist,
+  useGettingStarted,
+} from "../../onboarding/GetStartedChecklist";
 import { useHasAdminAccess } from "../../../hooks/useHasAdminAccess";
 import { useWorkspacePlans } from "../../../hooks/useWorkspacePlans";
 import { usePooledWorkspaceCreation } from "../../../hooks/usePooledWorkspaceCreation";
@@ -189,6 +193,7 @@ export const AppSidebar = observer(function AppSidebar({
   const workspaces = useWorkspaceCollection();
   const actions = useDomainActions();
   const http = useDomainHttp();
+  const gettingStarted = useGettingStarted();
 
   const [pendingInvites, setPendingInvites] = useState<any[]>([]);
   const [processingInvite, setProcessingInvite] = useState<{
@@ -840,6 +845,10 @@ export const AppSidebar = observer(function AppSidebar({
 
   const isHomePage =
     pathname === "/" || pathname === "/(app)" || pathname === "/(app)/index";
+  // `/(app)/home` is the pre-landing home (phone feed / wide builder); `/`
+  // itself is the workspace agent chat.
+  const isExplicitHome =
+    pathname === "/home" || pathname === "/(app)/home";
   const isMeetingsPage =
     pathname.startsWith("/meetings") || pathname.startsWith("/(app)/meetings");
   const isMarketplacePage =
@@ -1466,6 +1475,12 @@ export const AppSidebar = observer(function AppSidebar({
         className={isNativeDrawer ? undefined : "border-t border-border"}
         style={{ paddingBottom: drawerFooterInset }}
       >
+        {gettingStarted.visible && !collapsed && (
+          <View className={cn("px-2", isNativeDrawer ? "pt-3" : "pt-2")}>
+            <GetStartedChecklist state={gettingStarted} compact />
+          </View>
+        )}
+
         {/* Upgrade to Pro CTA */}
         {((features.billing && !isPaidPlan) || showLocalUpgrade) && !collapsed && (
           <View className={cn("px-2", isNativeDrawer ? "pt-3" : "pt-2")}>
@@ -1685,8 +1700,8 @@ export const AppSidebar = observer(function AppSidebar({
               <NavItem
                 icon={Home}
                 label="Home"
-                href="/(app)"
-                active={isHomePage}
+                href="/(app)/home"
+                active={isExplicitHome}
                 collapsed={false}
                 onNavPress={onNavPress}
               />

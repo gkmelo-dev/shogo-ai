@@ -60,6 +60,9 @@ mock.module('@shogo/model-catalog', () => ({
   calculateDollarCost: () => 0,
   getModelBillingModel: (id: string) => id,
   resolveAgentModeDefault: (mode: string) => mode,
+  AUTO_MODEL_ID: 'auto',
+  isAutoModel: (id: string) => id === 'auto',
+  inferProviderFromModel: (_id: string, fallback: string) => fallback,
 }))
 
 mock.module('../services/cost-analytics.service', () => ({
@@ -559,7 +562,7 @@ describe('trackUsageFromStream — processLine branches', () => {
       'data: {"type":"text-delta","delta":"a"}\n',
       'data: {"type":"data-turn-complete","data":{"status":"completed"}}\n',
     ])
-    await expect(trackUsageFromStream(stream, { chatSessionId: 's-err' }, { id: 'p-1', workspaceId: 'w-1' })).resolves.toBeUndefined()
+    await expect(trackUsageFromStream(stream, { chatSessionId: 's-err' }, { id: 'p-1', workspaceId: 'w-1' })).resolves.toMatchObject({ outcome: 'complete' })
   })
 
   test('tool-call log error is caught (does not throw)', async () => {
@@ -570,7 +573,7 @@ describe('trackUsageFromStream — processLine branches', () => {
       'data: {"type":"tool-output-available","toolCallId":"t1","output":{}}\n',
       'data: {"type":"data-turn-complete","data":{"status":"completed"}}\n',
     ])
-    await expect(trackUsageFromStream(stream, { chatSessionId: 's-log' }, { id: 'p-1', workspaceId: 'w-1' })).resolves.toBeUndefined()
+    await expect(trackUsageFromStream(stream, { chatSessionId: 's-log' }, { id: 'p-1', workspaceId: 'w-1' })).resolves.toMatchObject({ outcome: 'complete' })
   })
 
   test('filters out empty/whitespace text and reasoning parts', async () => {
