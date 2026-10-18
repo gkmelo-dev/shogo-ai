@@ -7,7 +7,7 @@
  */
 
 import { describe, test, expect } from 'bun:test'
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, mkdirSync, copyFileSync } from 'node:fs'
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, mkdirSync, copyFileSync, readdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { execFileSync } from 'node:child_process'
@@ -257,6 +257,27 @@ describe('repo bundles: chain rules', () => {
     expect(next.bundles[1].kind).toBe('incr')
     const restored = await restore(next, objects)
     expect(git(restored, 'rev-list', '--count', 'HEAD')).toBe('2')
+  })
+
+  // A CI runner left a `.rev` next to a restored pack that `git fsck` could not
+  // load, so the restore died with "unable to load rev-index for pack" although
+  // the objects were fine. The reverse index is only a cache; a restore must
+  // never depend on one.
+  test('a restore imports packs without a reverse-index cache for fsck to load', async () => {
+    const root = tmp('revindex')
+    const repo = newRepo(root)
+    const objects = store(tmp('objs'))
+    const work = join(root, 'w')
+    const base = await commitState(repo, work, null, objects)
+    commitFile(repo, 'b.txt', 'b\n', 'second')
+    const next = await commitState(repo, work, base, objects)
+
+    const restored = await restore(next, objects)
+    const packDir = join(restored, '.git', 'objects', 'pack')
+    const entries = readdirSync(packDir)
+    // Still a pack-based import — the assertion below must not pass vacuously.
+    expect(entries.filter((f) => f.endsWith('.pack')).length).toBeGreaterThan(0)
+    expect(entries.filter((f) => f.endsWith('.rev'))).toEqual([])
   })
 })
 
