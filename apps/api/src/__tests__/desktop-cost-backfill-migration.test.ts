@@ -12,7 +12,7 @@ import { readFileSync, readdirSync } from 'node:fs'
 import { resolve } from 'node:path'
 
 const MIGRATIONS_DIR = resolve(import.meta.dir, '../../../desktop/prisma/migrations')
-const BACKFILL = '20261017234500_backfill_agent_cost_metrics_cache_costs'
+const BACKFILL = '20261018120000_backfill_agent_cost_metrics_cache_costs'
 const backfillSql = readFileSync(resolve(MIGRATIONS_DIR, BACKFILL, 'migration.sql'), 'utf-8')
 
 let db: Database
