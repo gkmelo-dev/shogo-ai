@@ -193,7 +193,13 @@ describe('edit_3d_model', () => {
     const r = await run('edit_3d_model', { op: 'convert', input: 'models/source.glb', format: 'USDZ' })
 
     expect(r.error).toBeUndefined()
-    expect(uploadBody).toMatchObject({ filename: 'source.glb', contentType: 'model/gltf-binary' })
+    // The route reads `data_base64`; a `content_base64` body is a 400.
+    expect(uploadBody).toMatchObject({
+      filename: 'source.glb',
+      contentType: 'model/gltf-binary',
+      data_base64: expect.any(String),
+    })
+    expect(uploadBody).not.toHaveProperty('content_base64')
     const body = submitBodies()[0]
     expect(body).toMatchObject({ op: 'convert', input: 'file_abc', format: 'USDZ' })
     expect(r.path).toMatch(/^models\/convert-.*\.usdz$/)
