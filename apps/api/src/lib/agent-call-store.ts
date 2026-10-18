@@ -1,24 +1,20 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Shogo Technologies, Inc.
 /**
- * Agent-Call Store — cross-pod status of tracked background `project_call`s.
+ * Where a tracked `project_call` keeps its progress: one record per call
+ * (`AgentCall`, keyed by project + runId) and one link per callee chat session
+ * (`AgentCallSessionLink`).
  *
- * A runtime starts a tracked call (`POST /api/internal/projects/:id/agent-call`
- * with `wait: false, track: true`) on one API replica and long-polls
- * `GET .../agent-call/:runId` on whichever replica the load balancer picks,
- * so the record lives in Redis (shared ioredis client from `./tunnel-redis`).
- * Local mode, and cloud mode while Redis is unreachable, use a per-process
- * Map instead.
+ * The caller polls `GET /api/internal/projects/:id/agent-call/:runId?waitMs=`,
+ * the stream follower in `agent-call.service.ts` writes the record, and
+ * `agent-call-reconcile.service.ts` reads it to repair a chat whose reply never
+ * landed.
  *
- * The desktop app has no Redis and does restart its local API mid-call (app
- * update, quit/relaunch, the SIGKILL recovery in `apps/desktop/src/local-server.ts`),
- * so local mode also writes the record and the callee-chat link through to the
- * app's SQLite database. The Map stays the hot path; the database is what makes
- * the caller's poll and the chat's repair-on-read survive the restart.
+ * Both surfaces run this one path against the database — SQLite on desktop,
+ * Postgres in the cloud — because the record has to outlive the process that
+ * wrote it. A restart used to lose an in-flight call entirely: the caller's
+ * poll found nothing and the callee chat stayed a prompt with no answer.
  */
-
-import { getSharedRedis } from './tunnel-redis'
-
 export type AgentCallStatus = 'running' | 'completed' | 'failed'
 
 export interface AgentCallRecord {
@@ -32,53 +28,36 @@ export interface AgentCallRecord {
   updatedAt: number
 }
 
-/** A background call has no time limit, so its record has to outlive long turns. */
-export const AGENT_CALL_TTL_SECONDS = 7 * 24 * 60 * 60
-const TTL_SECONDS = AGENT_CALL_TTL_SECONDS
-const POLL_INTERVAL_MS = 1_000
+/** Which tracked call a callee chat session is running, so a reattach can complete it. */
+export interface AgentCallSessionLink {
+  projectId: string
+  runId: string
+  startedAt: number
+}
 
-const isLocalMode = process.env.SHOGO_LOCAL_MODE === 'true'
-const records = new Map<string, { record: AgentCallRecord; expiresAt: number }>()
+/** Records are pruned by expiry, not by count: a week is plenty to reopen a chat. */
+export const AGENT_CALL_TTL_SECONDS = 7 * 24 * 60 * 60
 
 /**
- * Local mode is the one place with no shared store, so it keeps a durable copy
- * in the app database. `SHOGO_APP_DATABASE_URL` is what the desktop launcher
- * (and the local-database test helper) sets; a local-mode process without one
- * keeps the memory-only behaviour.
+ * How often the process that owns a running call refreshes `updatedAt`.
+ * 15 s is short enough that a dead owner is noticed quickly and long enough
+ * that it costs one small upsert per in-flight call per beat.
  */
-const durableLocal = isLocalMode && !!(process.env.SHOGO_APP_DATABASE_URL ?? process.env.DATABASE_URL)
+export const AGENT_CALL_HEARTBEAT_MS = 15_000
 
-/** A call that was already running when this process started cannot finish in it. */
-let processStartedAt = Date.now()
+/**
+ * A `running` call whose `updatedAt` has not moved for this long is treated as
+ * gone and failed with `interrupted`. It has to be comfortably larger than both
+ * `AGENT_CALL_HEARTBEAT_MS` (6 missed beats) and the runtime's 60 s long-poll
+ * (`AGENT_CALL_POLL_WAIT_MS` in `packages/agent-runtime/src/internal-api.ts`),
+ * otherwise a slow but perfectly healthy call — one whose beat lands late, or
+ * whose follower is merely busy — would be killed. Never shrink it below 90 s.
+ */
+export const AGENT_CALL_STALE_MS = 90_000
 
-function key(projectId: string, runId: string): string {
-  return `agent-call:${projectId}:${runId}`
-}
+const POLL_INTERVAL_MS = 1_000
 
-function redisOrNull() {
-  if (isLocalMode) return null
-  return getSharedRedis()
-}
-
-function putLocal(k: string, record: AgentCallRecord, expiresAt?: number): void {
-  const now = Date.now()
-  for (const [rk, entry] of records) {
-    if (entry.expiresAt <= now) records.delete(rk)
-  }
-  records.set(k, { record, expiresAt: expiresAt ?? now + TTL_SECONDS * 1000 })
-}
-
-function getLocal(k: string): AgentCallRecord | undefined {
-  const entry = records.get(k)
-  if (!entry) return undefined
-  if (entry.expiresAt <= Date.now()) {
-    records.delete(k)
-    return undefined
-  }
-  return entry.record
-}
-
-// ─── Durable local store (desktop) ───────────────────────────────────────────
+// ─── Database ────────────────────────────────────────────────────────────────
 
 interface AgentCallRow {
   projectId: string
@@ -102,40 +81,39 @@ interface AgentCallLinkRow {
 }
 
 /** Just the two tables this store owns, so the prisma client stays opaque here. */
-interface LocalCallDb {
+interface AgentCallDb {
   agentCall: {
     findUnique(args: any): Promise<AgentCallRow | null>
     upsert(args: any): Promise<unknown>
     delete(args: any): Promise<unknown>
-    deleteMany(args: any): Promise<{ count: number }>
     updateMany(args: any): Promise<{ count: number }>
   }
   agentCallSessionLink: {
     findUnique(args: any): Promise<AgentCallLinkRow | null>
     upsert(args: any): Promise<unknown>
     delete(args: any): Promise<unknown>
-    deleteMany(args: any): Promise<{ count: number }>
   }
 }
 
-let dbPromise: Promise<LocalCallDb | null> | null = null
-let startupSweep: Promise<void> | null = null
+let dbPromise: Promise<AgentCallDb | null> | null = null
 let warnedDbFailure = false
 
 function warnDbFailure(what: string, err: unknown): void {
   if (warnedDbFailure) return
   warnedDbFailure = true
-  console.warn(
-    `[agent-call-store] local database ${what} failed; keeping the call in memory only:`,
-    (err as Error)?.message ?? err,
-  )
+  console.warn(`[agent-call-store] database ${what} failed; the call keeps running untracked:`, (err as Error)?.message ?? err)
 }
 
-async function localDb(): Promise<LocalCallDb | null> {
-  if (!durableLocal) return null
+/**
+ * The app's Prisma client — the sqlite one on desktop, the Postgres one in the
+ * cloud; `lib/prisma` picks it. Loaded lazily so this module stays importable
+ * (and cheap) in tests that never touch a call.
+ */
+async function callDb(): Promise<AgentCallDb | null> {
+  if (!process.env.SHOGO_APP_DATABASE_URL && !process.env.DATABASE_URL) return null
   if (!dbPromise) {
     dbPromise = import('./prisma')
-      .then((mod) => (mod.prisma as unknown as LocalCallDb) ?? null)
+      .then((mod) => (mod.prisma as unknown as AgentCallDb) ?? null)
       .catch((err) => {
         warnDbFailure('open', err)
         return null
@@ -173,91 +151,112 @@ function rowToRecord(row: AgentCallRow): AgentCallRecord {
   return record
 }
 
+const INTERRUPTED = { code: 'interrupted', message: 'The call stopped reporting in, so its reply was lost.' }
+
 /**
- * Once per process: drop expired rows, and fail the calls that were still
- * `running` when the previous process died. Nothing here can complete them, so
- * without this the caller's poll and the chat's repair-on-read would wait on
- * "running" forever — the silent blank the store exists to prevent.
+ * A `running` record that has not been refreshed inside the staleness window
+ * belongs to a process that is gone (a restart, a crash, an evicted pod).
+ * Nothing will ever finish it here, so fail it — otherwise the caller waits out
+ * its whole budget and the callee chat keeps a prompt with no answer.
+ *
+ * Conditional update: if another replica refreshed or finished the record in
+ * the same instant, the update matches nothing and the fresh row wins.
  */
-async function ensureSwept(db: LocalCallDb): Promise<void> {
-  if (startupSweep) return startupSweep
-  startupSweep = (async () => {
-    const now = new Date()
-    const interrupted = await db.agentCall.updateMany({
-      where: { status: 'running', startedAt: { lt: new Date(processStartedAt) } },
-      data: {
-        status: 'failed',
-        error: JSON.stringify({ code: 'api_restart', message: 'The Shogo API restarted while this call was running.' }),
-      },
-    })
-    await db.agentCall.deleteMany({ where: { expiresAt: { lte: now } } })
-    await db.agentCallSessionLink.deleteMany({ where: { expiresAt: { lte: now } } })
-    if (interrupted.count > 0) {
-      console.warn(`[agent-call-store] marked ${interrupted.count} interrupted call(s) failed after an API restart`)
-    }
-  })().catch((err) => {
-    warnDbFailure('startup sweep', err)
+async function failIfStale(db: AgentCallDb, row: AgentCallRow): Promise<AgentCallRow> {
+  if (row.status !== 'running') return row
+  const cutoff = new Date(Date.now() - AGENT_CALL_STALE_MS)
+  if (toMillis(row.updatedAt) > cutoff.getTime()) return row
+  const where = { projectId: row.projectId, runId: row.runId }
+  await db.agentCall.updateMany({
+    where: { ...where, status: 'running', updatedAt: { lt: cutoff } },
+    data: { status: 'failed', error: JSON.stringify(INTERRUPTED) },
   })
-  return startupSweep
+  const fresh = await db.agentCall.findUnique({ where: { projectId_runId: where } })
+  return fresh ?? row
 }
 
-async function putDurable(projectId: string, record: AgentCallRecord): Promise<void> {
-  const db = await localDb()
-  if (!db) return
-  await ensureSwept(db)
-  const now = Date.now()
-  const fields = {
-    status: record.status,
-    reply: record.reply ?? null,
-    error: record.error ? JSON.stringify(record.error) : null,
-    sessionId: record.sessionId ?? null,
-    chatSessionId: record.chatSessionId ?? null,
-    startedAt: new Date(record.startedAt || now),
-    expiresAt: new Date(now + TTL_SECONDS * 1000),
+// ─── Writes ──────────────────────────────────────────────────────────────────
+
+/** One upsert, no reads: this runs on every status change of every call. */
+export async function putAgentCall(projectId: string, record: AgentCallRecord): Promise<void> {
+  const db = await callDb()
+  if (db) {
+    const now = Date.now()
+    const fields = {
+      status: record.status,
+      reply: record.reply ?? null,
+      error: record.error ? JSON.stringify(record.error) : null,
+      sessionId: record.sessionId ?? null,
+      chatSessionId: record.chatSessionId ?? null,
+      startedAt: new Date(record.startedAt || now),
+      expiresAt: new Date(now + AGENT_CALL_TTL_SECONDS * 1000),
+    }
+    try {
+      await db.agentCall.upsert({
+        where: { projectId_runId: { projectId, runId: record.runId } },
+        create: { projectId, runId: record.runId, ...fields },
+        update: fields,
+      })
+    } catch (err) {
+      warnDbFailure('write', err)
+    }
   }
+  if (record.status !== 'running') {
+    const { emitTaskEvent } = await import('../services/background-tasks.service')
+    await emitTaskEvent('project_call', `${projectId}:${record.runId}`, {
+      status: record.status === 'completed' ? 'completed' : 'failed',
+      line: record.reply?.trim() || record.error?.message,
+      summary: record.status === 'completed' ? 'replied' : record.error?.message,
+    })
+  }
+}
+
+/**
+ * Heartbeat for the process that owns a running call: one unchanged record
+ * write, which is what `getAgentCall` uses to tell a live call from a dead one.
+ * Returns the stop function; safe to call without ever awaiting anything.
+ */
+export function startAgentCallHeartbeat(projectId: string, runId: string): () => void {
+  let stopped = false
+  let inFlight = false
+  const timer = setInterval(() => {
+    if (stopped || inFlight) return
+    inFlight = true
+    void touchAgentCall(projectId, runId).finally(() => {
+      inFlight = false
+    })
+  }, AGENT_CALL_HEARTBEAT_MS)
+  timer.unref?.()
+  return () => {
+    stopped = true
+    clearInterval(timer)
+  }
+}
+
+/** Refresh a running call's lease. A no-op once the call is terminal. */
+export async function touchAgentCall(projectId: string, runId: string): Promise<void> {
+  const db = await callDb()
+  if (!db) return
+  const now = new Date()
   try {
-    await db.agentCall.upsert({
-      where: { projectId_runId: { projectId, runId: record.runId } },
-      create: { projectId, runId: record.runId, ...fields },
-      update: fields,
+    await db.agentCall.updateMany({
+      where: { projectId, runId, status: 'running' },
+      data: { updatedAt: now, expiresAt: new Date(now.getTime() + AGENT_CALL_TTL_SECONDS * 1000) },
     })
   } catch (err) {
-    warnDbFailure('write', err)
+    warnDbFailure('heartbeat', err)
   }
 }
 
-async function getDurable(projectId: string, runId: string): Promise<AgentCallRecord | undefined> {
-  const db = await localDb()
-  if (!db) return undefined
-  await ensureSwept(db)
-  const where = { projectId_runId: { projectId, runId } }
-  try {
-    const row = await db.agentCall.findUnique({ where })
-    if (!row) return undefined
-    const expiresAt = toMillis(row.expiresAt)
-    if (expiresAt <= Date.now()) {
-      await db.agentCall.delete({ where }).catch(() => {})
-      return undefined
-    }
-    const record = rowToRecord(row)
-    putLocal(key(projectId, runId), record, expiresAt)
-    return record
-  } catch (err) {
-    warnDbFailure('read', err)
-    return undefined
-  }
-}
-
-async function putDurableLink(chatSessionId: string, link: AgentCallSessionLink): Promise<void> {
-  const db = await localDb()
+export async function linkAgentCallSession(chatSessionId: string, link: AgentCallSessionLink): Promise<void> {
+  const db = await callDb()
   if (!db) return
-  await ensureSwept(db)
   const now = Date.now()
   const fields = {
     projectId: link.projectId,
     runId: link.runId,
     startedAt: new Date(link.startedAt || now),
-    expiresAt: new Date(now + TTL_SECONDS * 1000),
+    expiresAt: new Date(now + AGENT_CALL_TTL_SECONDS * 1000),
   }
   try {
     await db.agentCallSessionLink.upsert({
@@ -270,72 +269,45 @@ async function putDurableLink(chatSessionId: string, link: AgentCallSessionLink)
   }
 }
 
-async function getDurableLink(chatSessionId: string): Promise<AgentCallSessionLink | undefined> {
-  const db = await localDb()
+// ─── Reads ───────────────────────────────────────────────────────────────────
+
+/**
+ * The call as the caller should see it. `undefined` means no call was ever
+ * tracked under this runId in this project, or the record has expired.
+ */
+export async function getAgentCall(projectId: string, runId: string): Promise<AgentCallRecord | undefined> {
+  const db = await callDb()
   if (!db) return undefined
-  await ensureSwept(db)
-  const where = { chatSessionId }
+  const where = { projectId_runId: { projectId, runId } }
   try {
-    const row = await db.agentCallSessionLink.findUnique({ where })
+    const row = await db.agentCall.findUnique({ where })
     if (!row) return undefined
-    const expiresAt = toMillis(row.expiresAt)
-    if (expiresAt <= Date.now()) {
-      await db.agentCallSessionLink.delete({ where }).catch(() => {})
+    if (toMillis(row.expiresAt) <= Date.now()) {
+      await db.agentCall.delete({ where }).catch(() => {})
       return undefined
     }
-    const link: AgentCallSessionLink = {
-      projectId: row.projectId,
-      runId: row.runId,
-      startedAt: toMillis(row.startedAt),
-    }
-    sessionLinks.set(sessionKey(chatSessionId), { link, expiresAt })
-    return link
+    return rowToRecord(await failIfStale(db, row))
   } catch (err) {
-    warnDbFailure('link read', err)
+    warnDbFailure('read', err)
     return undefined
   }
 }
 
-export async function putAgentCall(projectId: string, record: AgentCallRecord): Promise<void> {
-  await storeAgentCall(projectId, record)
-  if (record.status !== 'running') {
-    const { emitTaskEvent } = await import('../services/background-tasks.service')
-    await emitTaskEvent('project_call', `${projectId}:${record.runId}`, {
-      status: record.status === 'completed' ? 'completed' : 'failed',
-      line: record.reply?.trim() || record.error?.message,
-      summary: record.status === 'completed' ? 'replied' : record.error?.message,
-    })
-  }
-}
-
-async function storeAgentCall(projectId: string, record: AgentCallRecord): Promise<void> {
-  const k = key(projectId, record.runId)
-  const r = redisOrNull()
-  if (!r) {
-    putLocal(k, record)
-    await putDurable(projectId, record)
-    return
-  }
+export async function getAgentCallSessionLink(chatSessionId: string): Promise<AgentCallSessionLink | undefined> {
+  const db = await callDb()
+  if (!db) return undefined
+  const where = { chatSessionId }
   try {
-    await r.set(k, JSON.stringify(record), 'EX', TTL_SECONDS)
+    const row = await db.agentCallSessionLink.findUnique({ where })
+    if (!row) return undefined
+    if (toMillis(row.expiresAt) <= Date.now()) {
+      await db.agentCallSessionLink.delete({ where }).catch(() => {})
+      return undefined
+    }
+    return { projectId: row.projectId, runId: row.runId, startedAt: toMillis(row.startedAt) }
   } catch (err) {
-    console.warn('[agent-call-store] Redis SET failed, falling back to local map:', (err as Error).message)
-    putLocal(k, record)
-    await putDurable(projectId, record)
-  }
-}
-
-export async function getAgentCall(projectId: string, runId: string): Promise<AgentCallRecord | undefined> {
-  const k = key(projectId, runId)
-  const r = redisOrNull()
-  if (!r) return getLocal(k) ?? (await getDurable(projectId, runId))
-  try {
-    const raw = await r.get(k)
-    if (!raw) return getLocal(k) ?? (await getDurable(projectId, runId))
-    return JSON.parse(raw) as AgentCallRecord
-  } catch (err) {
-    console.warn('[agent-call-store] Redis GET failed, falling back to local map:', (err as Error).message)
-    return getLocal(k) ?? (await getDurable(projectId, runId))
+    warnDbFailure('link read', err)
+    return undefined
   }
 }
 
@@ -358,77 +330,4 @@ export async function waitForAgentCall(
     record = await getAgentCall(projectId, runId)
   }
   return record
-}
-
-/** Which tracked call a callee chat session is running, so a reattach can complete it. */
-export interface AgentCallSessionLink {
-  projectId: string
-  runId: string
-  startedAt: number
-}
-
-const sessionLinks = new Map<string, { link: AgentCallSessionLink; expiresAt: number }>()
-
-function sessionKey(chatSessionId: string): string {
-  return `agent-call-session:${chatSessionId}`
-}
-
-export async function linkAgentCallSession(chatSessionId: string, link: AgentCallSessionLink): Promise<void> {
-  const k = sessionKey(chatSessionId)
-  const putLocalLink = () => {
-    const now = Date.now()
-    for (const [lk, entry] of sessionLinks) {
-      if (entry.expiresAt <= now) sessionLinks.delete(lk)
-    }
-    sessionLinks.set(k, { link, expiresAt: now + TTL_SECONDS * 1000 })
-  }
-  const r = redisOrNull()
-  if (!r) {
-    putLocalLink()
-    await putDurableLink(chatSessionId, link)
-    return
-  }
-  try {
-    await r.set(k, JSON.stringify(link), 'EX', TTL_SECONDS)
-  } catch (err) {
-    console.warn('[agent-call-store] Redis SET failed, falling back to local map:', (err as Error).message)
-    putLocalLink()
-    await putDurableLink(chatSessionId, link)
-  }
-}
-
-export async function getAgentCallSessionLink(chatSessionId: string): Promise<AgentCallSessionLink | undefined> {
-  const k = sessionKey(chatSessionId)
-  const getLocalLink = () => {
-    const entry = sessionLinks.get(k)
-    if (!entry || entry.expiresAt <= Date.now()) return undefined
-    return entry.link
-  }
-  const r = redisOrNull()
-  if (!r) return getLocalLink() ?? (await getDurableLink(chatSessionId))
-  try {
-    const raw = await r.get(k)
-    return raw ? (JSON.parse(raw) as AgentCallSessionLink) : (getLocalLink() ?? (await getDurableLink(chatSessionId)))
-  } catch (err) {
-    console.warn('[agent-call-store] Redis GET failed, falling back to local map:', (err as Error).message)
-    return getLocalLink() ?? (await getDurableLink(chatSessionId))
-  }
-}
-
-/**
- * Test seam — clears the in-memory Maps, and the durable layer's caches, so a
- * test can act like a freshly started API process.
- */
-export const _testing = {
-  records,
-  sessionLinks,
-  simulateRestart(): void {
-    records.clear()
-    sessionLinks.clear()
-    dbPromise = null
-    startupSweep = null
-    warnedDbFailure = false
-    processStartedAt = Date.now()
-  },
-  processStartedAt: () => processStartedAt,
 }

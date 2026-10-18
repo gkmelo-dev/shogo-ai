@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Shogo Technologies, Inc.
 
-import { afterEach, beforeEach, describe, expect, it, mock } from 'bun:test'
+import { afterAll, afterEach, beforeEach, describe, expect, it, mock } from 'bun:test'
+import { rmSync } from 'fs'
 
 // ─── mocks ───────────────────────────────────────────────────────────────────
 
@@ -40,8 +41,13 @@ mock.module('../../lib/tunnel-relay', () => ({
   },
 }))
 
+const { setupChannelsTestDb } = await import('../../__tests__/helpers/channels-test-db')
+const { dir } = setupChannelsTestDb()
+
 const svc = await import('../agent-call.service')
 const agentCallStore = await import('../../lib/agent-call-store')
+const { prisma: callDb } = await import('../../lib/prisma')
+const db = callDb as any
 
 // ─── fixtures ────────────────────────────────────────────────────────────────
 
@@ -57,6 +63,12 @@ beforeEach(() => {
 const realFetch = globalThis.fetch
 afterEach(() => {
   globalThis.fetch = realFetch
+})
+afterAll(async () => {
+  await db.agentCall.deleteMany({})
+  await db.agentCallSessionLink.deleteMany({})
+  await db.$disconnect?.()
+  rmSync(dir, { recursive: true, force: true })
 })
 
 // ─── tests ───────────────────────────────────────────────────────────────────
@@ -458,9 +470,9 @@ describe('callProjectAgentAsChat — chat persistence', () => {
   })
 
   describe('track=true', () => {
-    beforeEach(() => {
-      agentCallStore._testing.records.clear()
-      agentCallStore._testing.sessionLinks.clear()
+    beforeEach(async () => {
+      await db.agentCall.deleteMany({})
+      await db.agentCallSessionLink.deleteMany({})
     })
 
     async function settled(runId: string) {

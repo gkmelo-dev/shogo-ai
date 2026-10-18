@@ -59,16 +59,6 @@ const INTENTIONAL_DIFFERENCES: Allow[] = [
     reason:
       'Stores desktop-app-only preferences (chosen instance size, last-opened workspace, etc.). Never persisted to the cloud DB.',
   },
-  {
-    key: 'AgentCall',
-    reason:
-      'Durable copy of an in-flight tracked `project_call`, only needed where there is no Redis. The cloud keeps the record in Redis; the desktop API restarts mid-call and has no shared store, so `apps/api/src/lib/agent-call-store.ts` keeps it in SQLite instead.',
-  },
-  {
-    key: 'AgentCallSessionLink',
-    reason:
-      'Callee chat session → call link that pairs with AgentCall. Cloud stores it in Redis; desktop keeps it in SQLite so a chat opened after an API restart can still repair its missing reply.',
-  },
   // PG-only models — none yet; SignupAttribution etc. should be mirrored.
   {
     key: 'ConversationMessageEmbedding.embedding',

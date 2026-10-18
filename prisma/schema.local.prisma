@@ -2435,14 +2435,15 @@ model LocalConfig {
 }
 
 // =============================================================================
-// LOCAL AGENT-CALL STORE (Desktop/Local mode only)
+// Tracked `project_call` store
 //
-// An in-flight tracked `project_call` lives in Redis in the cloud. Local mode
-// has no Redis, so the record and the callee-chat link used to live only in a
-// per-process Map — a desktop API restart (app update, quit/relaunch, the
-// SIGKILL recovery in apps/desktop/src/local-server.ts) lost both, and the
-// caller's long-poll plus the callee chat's repair-on-read went blank. These
-// tables are the durable copy; the Map stays the hot path.
+// One record per call plus one link per callee chat session, so a call in
+// flight outlives the process that is writing it (the desktop API restarts on
+// app update, quit/relaunch and the SIGKILL recovery in
+// apps/desktop/src/local-server.ts; the cloud rolls pods). `updatedAt` is the
+// liveness signal, see AGENT_CALL_STALE_MS in
+// apps/api/src/lib/agent-call-store.ts. Identical to prisma/schema.prisma —
+// desktop and cloud run the same store code.
 // =============================================================================
 
 model AgentCall {
@@ -2460,7 +2461,7 @@ model AgentCall {
   expiresAt     DateTime
 
   @@id([projectId, runId])
-  @@index([status, startedAt])
+  @@index([status, updatedAt])
   @@index([expiresAt])
   @@map("agent_calls")
 }

@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Shogo Technologies, Inc.
 /**
- * The desktop API restarts mid-call — an app update, quit/relaunch, or the
- * SIGKILL recovery in `apps/desktop/src/local-server.ts`. A `project_call`'s
- * record and its callee-chat link used to live only in per-process Maps, so
- * after the restart the caller's long-poll found nothing and the callee chat
- * stayed a prompt with no answer, forever.
+ * A tracked `project_call` in flight, and the process that was writing it goes
+ * away — a desktop API restart (app update, quit/relaunch, the SIGKILL recovery
+ * in `apps/desktop/src/local-server.ts`) or a cloud pod roll. The record and the
+ * callee-chat link used to live in per-process state, so after the restart the
+ * caller's long-poll found nothing and the callee chat stayed a prompt with no
+ * answer, forever.
  *
- * These tests run the real store against the real desktop SQLite schema (a temp
- * database replayed from `apps/desktop/prisma/migrations`) and rebuild the
- * process Maps between steps with `_testing.simulateRestart()`.
+ * The store keeps both in the database now, on both surfaces. This spec runs
+ * against SQLite by default and against Postgres when `CHANNELS_TEST_PG_URL` is
+ * set (the same helper the other cloud integration suites use), so the two
+ * tracks are exercised by one file.
  */
 import { afterAll, describe, expect, test } from 'bun:test'
 import { rmSync } from 'fs'
@@ -24,21 +26,22 @@ const { reconcileCallReplyOnRead } = await import('../services/agent-call-reconc
 const db = prisma as any
 const seed: SeededWorkspace = await seedWorkspace(db)
 
-/**
- * Replace the API process: drop every per-process cache. On a build without the
- * durable store that is the whole store, which is the bug this guards.
- */
-function restart() {
-  store._testing.records.clear()
-  store._testing.sessionLinks.clear()
-  store._testing.simulateRestart?.()
-}
-
 afterAll(async () => {
-  restart()
   await db.$disconnect?.()
   rmSync(dir, { recursive: true, force: true })
 })
+
+/**
+ * Replace the API process. On a build that still keeps per-process state this
+ * drops it — which is exactly what the caller and the callee chat then have to
+ * survive.
+ */
+function simulateRestart() {
+  const testing = (store as any)._testing
+  testing?.records?.clear?.()
+  testing?.sessionLinks?.clear?.()
+  testing?.simulateRestart?.()
+}
 
 /** What `callProjectAgentAsChat` leaves behind: the session and the prompt row. */
 async function seedCallChat(chatSessionId: string, projectId: string, runId: string, text = 'Reply with PONG') {
@@ -66,7 +69,27 @@ async function assistantRows(chatSessionId: string) {
   })
 }
 
-describe('agent-call store across an API restart (local mode)', () => {
+/** A runId left `running` by a process that then died. */
+async function seedStaleCall(projectId: string, runId: string, chatSessionId: string, silentForMs: number) {
+  const startedAt = Date.now() - 10 * 60_000
+  await db.agentCall.create({
+    data: {
+      projectId,
+      runId,
+      status: 'running',
+      sessionId: chatSessionId,
+      chatSessionId,
+      startedAt: new Date(startedAt),
+      updatedAt: new Date(Date.now() - silentForMs),
+      expiresAt: new Date(Date.now() + 60 * 60_000),
+    },
+  })
+  await db.agentCallSessionLink.create({
+    data: { chatSessionId, projectId, runId, startedAt: new Date(startedAt), expiresAt: new Date(Date.now() + 60 * 60_000) },
+  })
+}
+
+describe('agent-call store across a restart', () => {
   test('the record and the chat link survive, so opening the chat writes the reply once', async () => {
     const projectId = seed.projectId
     const runId = 'run-restart-1'
@@ -94,10 +117,7 @@ describe('agent-call store across an API restart (local mode)', () => {
       updatedAt: Date.now(),
     })
 
-    // The API process is replaced: every Map is gone.
-    restart()
-    expect(store._testing.records.size).toBe(0)
-    expect(store._testing.sessionLinks.size).toBe(0)
+    simulateRestart()
 
     expect(await store.getAgentCall(projectId, runId)).toMatchObject({ status: 'completed', reply: 'PONG' })
     expect(await store.getAgentCallSessionLink(chatSessionId)).toMatchObject({ projectId, runId })
@@ -115,53 +135,98 @@ describe('agent-call store across an API restart (local mode)', () => {
     expect(await assistantRows(chatSessionId)).toHaveLength(1)
   })
 
-  test('a call that was still running when the API died ends as an explicit failure row', async () => {
+  test('a call whose owner died ends as an explicit failure row once it is stale', async () => {
     const projectId = seed.projectId
     const runId = 'run-restart-2'
     const chatSessionId = `chat-restart-2-${crypto.randomUUID().slice(0, 8)}`
-    const startedAt = Date.now() - 5 * 60_000
 
     await seedCallChat(chatSessionId, projectId, runId)
-    // Left behind by the previous process: a running record and its link.
-    await db.agentCall.create({
-      data: {
-        projectId,
-        runId,
-        status: 'running',
-        sessionId: chatSessionId,
-        chatSessionId,
-        startedAt: new Date(startedAt),
-        expiresAt: new Date(Date.now() + 60 * 60_000),
-      },
-    })
-    await db.agentCallSessionLink.create({
-      data: { chatSessionId, projectId, runId, startedAt: new Date(startedAt), expiresAt: new Date(Date.now() + 60 * 60_000) },
-    })
+    await seedStaleCall(projectId, runId, chatSessionId, store.AGENT_CALL_STALE_MS + 60_000)
 
-    restart()
+    simulateRestart()
 
     const record = await store.getAgentCall(projectId, runId)
     expect(record).toMatchObject({ status: 'failed' })
-    expect(record?.error?.code).toBe('api_restart')
+    expect(record?.error?.code).toBe('interrupted')
 
-    // The caller's poll settles instead of hanging on `running`.
+    // The caller's poll settles instead of waiting out its whole budget.
     expect((await store.waitForAgentCall(projectId, runId, 0))?.status).toBe('failed')
 
     expect(await reconcileCallReplyOnRead(db, chatSessionId)).toBe(true)
     const rows = await assistantRows(chatSessionId)
     expect(rows).toHaveLength(1)
-    expect(rows[0].content).toContain('api_restart')
+    expect(rows[0].content).toContain('interrupted')
+  })
+
+  test('a call another replica is still running is never failed', async () => {
+    const projectId = seed.projectId
+    const runId = 'run-live-elsewhere'
+    const chatSessionId = `chat-live-${crypto.randomUUID().slice(0, 8)}`
+
+    await seedCallChat(chatSessionId, projectId, runId)
+    // Beaten a moment ago: the owner is alive on some other replica.
+    await seedStaleCall(projectId, runId, chatSessionId, store.AGENT_CALL_STALE_MS - 5_000)
+
+    expect((await store.getAgentCall(projectId, runId))?.status).toBe('running')
+  })
+
+  test('the staleness boundary sits exactly at AGENT_CALL_STALE_MS', async () => {
+    // The window has to be longer than the runtime's 60 s long-poll and the
+    // owner's beat, or a slow-but-healthy call would be killed.
+    expect(store.AGENT_CALL_STALE_MS).toBeGreaterThan(store.AGENT_CALL_HEARTBEAT_MS * 3)
+    expect(store.AGENT_CALL_STALE_MS).toBeGreaterThan(60_000)
+
+    const projectId = seed.projectId
+    const inside = 'run-boundary-inside'
+    const outside = 'run-boundary-outside'
+    await seedStaleCall(projectId, inside, `chat-boundary-in-${crypto.randomUUID().slice(0, 8)}`, store.AGENT_CALL_STALE_MS - 2_000)
+    await seedStaleCall(projectId, outside, `chat-boundary-out-${crypto.randomUUID().slice(0, 8)}`, store.AGENT_CALL_STALE_MS + 2_000)
+
+    expect((await store.getAgentCall(projectId, inside))?.status).toBe('running')
+    expect((await store.getAgentCall(projectId, outside))?.status).toBe('failed')
+
+    // The row really moved, so the next reader (another replica) agrees.
+    const row = await db.agentCall.findUnique({ where: { projectId_runId: { projectId, runId: outside } } })
+    expect(row.status).toBe('failed')
+  })
+
+  test('a heartbeat keeps a slow call alive', async () => {
+    const projectId = seed.projectId
+    const runId = 'run-heartbeat'
+    const chatSessionId = `chat-beat-${crypto.randomUUID().slice(0, 8)}`
+    const startedAt = Date.now()
+
+    await store.putAgentCall(projectId, {
+      status: 'running',
+      runId,
+      sessionId: chatSessionId,
+      chatSessionId,
+      startedAt,
+      updatedAt: startedAt,
+    })
+    // Pretend it has been running longer than the window: a beat just landed.
+    await db.agentCall.update({
+      where: { projectId_runId: { projectId, runId } },
+      data: { startedAt: new Date(Date.now() - 30 * 60_000), updatedAt: new Date(Date.now() - store.AGENT_CALL_STALE_MS + 2_000) },
+    })
+    await store.touchAgentCall(projectId, runId)
+
+    const record = await store.getAgentCall(projectId, runId)
+    expect(record?.status).toBe('running')
+    expect(record!.updatedAt).toBeGreaterThan(Date.now() - 5_000)
+
+    // A beat after the call is terminal changes nothing: the status is final.
+    await store.putAgentCall(projectId, { status: 'completed', runId, reply: 'late', startedAt, updatedAt: Date.now() })
+    await store.touchAgentCall(projectId, runId)
+    expect(await store.getAgentCall(projectId, runId)).toMatchObject({ status: 'completed', reply: 'late' })
   })
 
   test('expired records and links resolve to nothing and are deleted', async () => {
     const projectId = seed.projectId
-    const runId = 'run-restart-3'
-    const chatSessionId = `chat-restart-3-${crypto.randomUUID().slice(0, 8)}`
-
-    // Trigger the once-per-process sweep first, so this exercises the read path.
-    expect(await store.getAgentCall(projectId, 'run-never-tracked')).toBeUndefined()
-
+    const runId = 'run-expired'
+    const chatSessionId = `chat-expired-${crypto.randomUUID().slice(0, 8)}`
     const expiredAt = new Date(Date.now() - 60_000)
+
     await db.agentCall.create({
       data: {
         projectId,
@@ -188,9 +253,9 @@ describe('agent-call store across an API restart (local mode)', () => {
     expect(await db.agentCallSessionLink.count({ where: { chatSessionId } })).toBe(0)
   })
 
-  test('a call record is scoped to its project, and to its 7-day TTL', async () => {
+  test('a call is scoped to its project and carries a 7-day expiry', async () => {
     const projectId = seed.projectId
-    const runId = 'run-restart-4'
+    const runId = 'run-scoped'
     const startedAt = Date.now()
 
     await store.putAgentCall(projectId, { status: 'completed', runId, reply: 'PONG', startedAt, updatedAt: startedAt })
@@ -199,11 +264,7 @@ describe('agent-call store across an API restart (local mode)', () => {
 
     const row = await db.agentCall.findUnique({ where: { projectId_runId: { projectId, runId } } })
     const ttlMs = new Date(row.expiresAt).getTime() - Date.now()
-    expect(ttlMs).toBeGreaterThan(agentCallTtlMs() - 60_000)
-    expect(ttlMs).toBeLessThanOrEqual(agentCallTtlMs())
+    expect(ttlMs).toBeGreaterThan(store.AGENT_CALL_TTL_SECONDS * 1000 - 60_000)
+    expect(ttlMs).toBeLessThanOrEqual(store.AGENT_CALL_TTL_SECONDS * 1000)
   })
 })
-
-function agentCallTtlMs(): number {
-  return store.AGENT_CALL_TTL_SECONDS * 1000
-}
