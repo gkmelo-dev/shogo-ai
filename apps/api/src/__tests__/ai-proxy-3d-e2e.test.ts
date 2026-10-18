@@ -254,7 +254,13 @@ describe('shogo 3d → /ai/v1/3d end to end', () => {
 
   test('models reports per-op credit estimates the agent can budget from', async () => {
     stubTripo()
-    const { code, out } = await cli(['models'])
+    // The default output is a price table for humans; --json is the machine form.
+    const human = await cli(['models'])
+    expect(human.code).toBe(0)
+    expect(human.out).toContain('rig_check')
+    expect(human.out).toMatch(/rig_check\s+free/)
+
+    const { code, out } = await cli(['models', '--json'])
     expect(code).toBe(0)
     const catalog = JSON.parse(out)
     expect(catalog.models.length).toBeGreaterThan(0)
