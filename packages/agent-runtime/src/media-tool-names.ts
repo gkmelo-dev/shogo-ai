@@ -8,7 +8,7 @@ export const IMAGE_TOOL_NAMES = ['generate_image', 'upscale_image', 'remove_back
 export const VIDEO_TOOL_NAMES = ['generate_video'] as const
 
 /** Tools gated by the opt-in `threeDGenEnabled`. */
-export const THREE_D_TOOL_NAMES = ['generate_3d_model'] as const
+export const THREE_D_TOOL_NAMES = ['generate_3d_model', 'edit_3d_model'] as const
 
 /** Every media generation tool, all delegated to the `media` subagent on team workspaces. */
 export const MEDIA_TOOL_NAMES = [

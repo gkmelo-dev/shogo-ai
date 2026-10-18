@@ -73,7 +73,8 @@ export const CAPABILITY_INFO: Record<CapabilityKey, { label: string; summary: st
   },
   threeDGenEnabled: {
     label: '3D generation',
-    summary: 'Opt-in. Gates `generate_3d_model` (text or image → GLB). Each task is billed, roughly $0.12-$0.60.',
+    summary:
+      'Opt-in. Gates `generate_3d_model` and `edit_3d_model` (text/image/multiview → GLB, plus texture, convert, retopology, rig and animation). Each task is billed, roughly $0.10-$0.60.',
   },
   memoryEnabled: {
     label: 'Memory',

@@ -42,7 +42,7 @@ modes that bill per output are off until you turn them on.
 | Shell | `shellEnabled` | `exec`, `exec_wait` | — |
 | Image generation | `imageGenEnabled` | `generate_image`, `upscale_image`, `remove_background` | `media` capability line |
 | Video generation (opt-in) | `videoGenEnabled` | `generate_video` | Video mention in the `media` line |
-| 3D generation (opt-in) | `threeDGenEnabled` | `generate_3d_model` | — |
+| 3D generation (opt-in) | `threeDGenEnabled` | `generate_3d_model`, `edit_3d_model` | — |
 | Heartbeat | `heartbeatToolsEnabled` | `heartbeat_configure`, `heartbeat_status` | `devops` line + Action Tools reminder |
 | Memory | `memoryEnabled` | `memory_read`, `memory_search` | — |
 | Quick actions | `quickActionsEnabled` | `quick_action` | Quick Action guide |

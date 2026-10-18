@@ -194,10 +194,10 @@ const CAPABILITIES: CapabilityDef[] = [
     label: '3D Generation',
     description: 'Turn a prompt or a still image into a 3D model',
     detail:
-      'Turn a text prompt or a still image into a 3D model (GLB). Rendered on Tripo and billed per task, roughly $0.12-$0.60 depending on model and texture quality, so this is off until you turn it on.',
+      'Turn a text prompt or still image into a 3D model (GLB), and post-process any model: re-texture, convert formats, retopology, separate parts, rig and animate. Rendered on Tripo and billed per task, roughly $0.10-$0.60 depending on the operation, so this is off until you turn it on.',
     disabledDescription: 'No 3D model generation',
     icon: Box,
-    toolNames: ['generate_3d_model'],
+    toolNames: ['generate_3d_model', 'edit_3d_model'],
     examples: [
       '"Make a low-poly game asset of this chair from the product photo"',
       '"Build a 3D model of a red fox and save it as public/assets/fox.glb"',
