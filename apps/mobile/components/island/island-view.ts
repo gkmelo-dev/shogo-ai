@@ -6,7 +6,7 @@
  * and project chats hang off it.
  */
 
-import { isWorkspaceAgentId, type IslandFileRef } from "./types"
+import { isWorkspaceAgentId, type IslandFileRef, type IslandSession } from "./types"
 import type { IslandInitialSend } from "./IslandChatHost"
 
 export type IslandView =
@@ -39,6 +39,38 @@ export function initialIslandView(workspaceAgentEnabled: boolean): IslandView {
 /** True for a chat that belongs to the workspace agent rather than a project. */
 export function isWorkspaceAgentChat(view: IslandView): boolean {
   return view.name === "chat" && isWorkspaceAgentId(view.projectId)
+}
+
+/** The chat a session is shown in. */
+export function chatViewFor(session: IslandSession): IslandView {
+  return {
+    name: "chat",
+    projectId: session.projectId,
+    projectName: session.projectName,
+    sessionId: session.sessionId,
+    title: session.title,
+  }
+}
+
+/** A session the user has to act on before it can continue. */
+export function awaitingSession(sessions: readonly IslandSession[]): IslandSession | undefined {
+  return (
+    sessions.find((session) => session.pending) ??
+    sessions.find((session) => session.status === "needs_approval" || session.status === "needs_answer")
+  )
+}
+
+/**
+ * The view a freshly opened card shows: the blank agent chat, unless something
+ * is waiting on the user — then that session takes over the card, which is how
+ * a permission raised while the notch was closed still gets seen.
+ */
+export function viewForOpen(
+  workspaceAgentEnabled: boolean,
+  sessions: readonly IslandSession[],
+): IslandView {
+  const awaiting = awaitingSession(sessions)
+  return awaiting ? chatViewFor(awaiting) : initialIslandView(workspaceAgentEnabled)
 }
 
 /** Where Back goes from `view`; null means collapse the card. */

@@ -7,9 +7,10 @@ import {
   initialIslandView,
   isWorkspaceAgentChat,
   parentView,
+  viewForOpen,
   type IslandView,
 } from "../island-view"
-import { ISLAND_WORKSPACE_AGENT_ID } from "../types"
+import { ISLAND_WORKSPACE_AGENT_ID, type IslandSession } from "../types"
 
 const projectChat: IslandView = {
   name: "chat",
@@ -80,6 +81,51 @@ describe("isWorkspaceAgentChat", () => {
     expect(isWorkspaceAgentChat(projectChat)).toBe(false)
     expect(isWorkspaceAgentChat({ name: "agent" })).toBe(false)
     expect(isWorkspaceAgentChat({ name: "inbox" })).toBe(false)
+  })
+})
+
+describe("viewForOpen", () => {
+  const pendingSession: IslandSession = {
+    projectId: "p1",
+    projectName: "Website",
+    sessionId: "s1",
+    title: "Fix the header",
+    status: "needs_approval",
+    pending: {
+      kind: "permission",
+      request: { id: "req-1", toolName: "Bash", category: "shell" } as any,
+    },
+  }
+
+  test("opens blank when nothing is waiting on the user", () => {
+    expect(
+      viewForOpen(true, [
+        { projectId: "p1", projectName: "Website", sessionId: "s2", title: "Running", status: "running" },
+      ]),
+    ).toEqual({ name: "agent" })
+  })
+
+  test("a session awaiting the user takes over the open", () => {
+    expect(viewForOpen(true, [pendingSession])).toMatchObject({
+      name: "chat",
+      projectId: "p1",
+      sessionId: "s1",
+    })
+  })
+
+  test("a needs_answer session without a pending payload also takes over", () => {
+    const question: IslandSession = {
+      projectId: "p2",
+      projectName: "Atlas",
+      sessionId: "s3",
+      title: "Which stack?",
+      status: "needs_answer",
+    }
+    expect(viewForOpen(true, [question])).toMatchObject({ name: "chat", sessionId: "s3" })
+  })
+
+  test("the runtime-off fallback stays on the project inbox", () => {
+    expect(viewForOpen(false, [])).toEqual({ name: "inbox" })
   })
 })
 

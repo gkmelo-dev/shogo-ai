@@ -32,7 +32,7 @@ import { ProjectSwitcher, useWorkspaceProjects } from "./ProjectSwitcher"
 import { SessionList, SessionRow } from "./SessionList"
 import { planAddToProject, saveAttachmentsPrompt, type IslandDropAction } from "./island-drop"
 import { inboxSessions, orderIslandSessions, sortIslandProjects, type IslandProjectItem } from "./island-inbox"
-import { initialIslandView, isWorkspaceAgentChat, parentView, type IslandView } from "./island-view"
+import { initialIslandView, isWorkspaceAgentChat, parentView, viewForOpen, type IslandView } from "./island-view"
 import {
   useWorkspaceAgentChats,
   useWorkspaceAgentName,
@@ -232,6 +232,22 @@ export const IslandApp = observer(function IslandApp({
     () => orderedSessions.filter((session) => !isWorkspaceAgentId(session.projectId)),
     [orderedSessions],
   )
+  // Agent chats already carry their status in "Chats with <agent>", so the
+  // Needs-you group is the project sessions that are blocked on the user.
+  const needsYouSessions = useMemo(
+    () =>
+      projectSessions.filter(
+        (session) => session.status === "needs_approval" || session.status === "needs_answer",
+      ),
+    [projectSessions],
+  )
+  const runningSessions = useMemo(
+    () =>
+      projectSessions.filter(
+        (session) => session.status !== "needs_approval" && session.status !== "needs_answer",
+      ),
+    [projectSessions],
+  )
   const agentName = useWorkspaceAgentName(workspaceAgentEnabled ? workspaceId : undefined)
   const [agentChatsTick, setAgentChatsTick] = useState(0)
   const agentChats = useWorkspaceAgentChats(
@@ -246,12 +262,14 @@ export const IslandApp = observer(function IslandApp({
   )
 
   // Each open starts a fresh conversation: the card never resumes whatever it
-  // was showing when it was last dismissed.
+  // was showing when it was last dismissed. A session that is waiting on the
+  // user wins the open — a permission raised while the notch was closed must
+  // not be replaced by a blank chat.
   const wasCardOpen = useRef(cardOpen)
   useEffect(() => {
-    if (cardOpen && !wasCardOpen.current) setView(initialIslandView(workspaceAgentEnabled))
+    if (cardOpen && !wasCardOpen.current) setView(viewForOpen(workspaceAgentEnabled, snapshot.sessions))
     wasCardOpen.current = cardOpen
-  }, [cardOpen, workspaceAgentEnabled])
+  }, [cardOpen, snapshot.sessions, workspaceAgentEnabled])
 
   const currentProjectId =
     view.name === "chat" || view.name === "project"
@@ -856,6 +874,27 @@ export const IslandApp = observer(function IslandApp({
     body = (
       <>
         <ScrollView style={{ flexGrow: 0, flexShrink: 1 }} contentContainerStyle={{ padding: 8 }}>
+          {needsYouSessions.length > 0 ? (
+            <>
+              <Text className="px-2 pb-1 text-[10px] font-semibold uppercase tracking-wide text-amber-400">
+                Needs you
+              </Text>
+              {needsYouSessions.map((session) => (
+                <SessionRow
+                  key={islandSessionKey(session.projectId, session.sessionId)}
+                  row={{
+                    title: session.title,
+                    status: session.status,
+                    activity: session.lastActivityAt ?? 0,
+                    step: session.step,
+                    replyPreview: session.replyPreview,
+                  }}
+                  subtitle={session.projectName}
+                  onPress={() => openChat(session.projectId, session.projectName, session.sessionId, session.title)}
+                />
+              ))}
+            </>
+          ) : null}
           {workspaceAgentEnabled ? (
             <>
               <Text className="px-2 pb-1 text-[10px] font-semibold uppercase tracking-wide text-zinc-500">
@@ -876,12 +915,12 @@ export const IslandApp = observer(function IslandApp({
               ) : null}
             </>
           ) : null}
-          {projectSessions.length > 0 ? (
+          {runningSessions.length > 0 ? (
             <>
               <Text className="px-2 pb-1 pt-2 text-[10px] font-semibold uppercase tracking-wide text-zinc-500">
                 Running
               </Text>
-              {projectSessions.map((session) => (
+              {runningSessions.map((session) => (
                 <SessionRow
                   key={islandSessionKey(session.projectId, session.sessionId)}
                   row={{
