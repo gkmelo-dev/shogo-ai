@@ -260,17 +260,3 @@ e2e/issue-pipeline/results/
 
 # the eng-pod seed lives here, under the generic `demo/` rule above
 !scripts/demo/
-
-# Added by Shogo AI to prevent committing dependency trees
-dist.staging/
-dist.canvas.staging/
-dist.publish.staging/
-dist.prev/
-build/
-.output/
-.nitro/
-.tmp/
-nul
-con
-prn
-aux
