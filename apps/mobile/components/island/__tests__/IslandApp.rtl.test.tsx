@@ -54,7 +54,37 @@ const pendingPermissionSnapshot = {
   updatedAt: 2,
 }
 
-mock.module("react-native", () => createReactNativeMock({}))
+const mixedSnapshot = {
+  sessions: [
+    pendingPermissionSnapshot.sessions[0],
+    {
+      sessionId: "s2",
+      projectId: "p2",
+      projectName: "Atlas",
+      title: "Ship the banner",
+      status: "running",
+      lastActivityAt: 1,
+    },
+  ],
+  recentProjects: [
+    { projectId: "p1", name: "Website" },
+    { projectId: "p2", name: "Atlas" },
+  ],
+  updatedAt: 3,
+}
+
+mock.module("react-native", () =>
+  createReactNativeMock({
+    Pressable: forwardRef(function Pressable(props: any, ref: any) {
+      const { accessibilityLabel, children, onPress, testID, ...rest } = props
+      return createElement(
+        "button",
+        { ...rest, ref, onClick: onPress, "aria-label": accessibilityLabel, "data-testid": testID },
+        children,
+      )
+    }),
+  }),
+)
 mock.module("@legendapp/motion", () => ({
   Motion: {
     View: forwardRef(function MotionView(props: any, ref: any) {
@@ -263,5 +293,23 @@ describe("IslandApp — workspace agent notch", () => {
     })
 
     expect(screen.getByTestId("chat-host").getAttribute("data-session")).toBe("s1")
+  })
+
+  test("the inbox puts a waiting project chat under Needs you, once", () => {
+    snapshotState = mixedSnapshot
+    render(createElement(IslandApp, { workspaceId: "ws-1", userId: "user-1" }))
+    act(() => expand())
+
+    // The open lands on the waiting chat; back out to its project, then to the inbox.
+    act(() => {
+      fireEvent.click(screen.getByLabelText("Back"))
+    })
+    act(() => {
+      fireEvent.click(screen.getByLabelText("Back"))
+    })
+
+    expect(screen.getByText("Needs you")).toBeTruthy()
+    expect(screen.getAllByText("Fix the header")).toHaveLength(1)
+    expect(screen.getByText("Ship the banner")).toBeTruthy()
   })
 })
