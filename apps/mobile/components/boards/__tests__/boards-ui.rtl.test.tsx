@@ -301,6 +301,22 @@ describe('CardPane', () => {
     expect(details.textContent).not.toContain('Summary')
   })
 
+  test('board fields render on Details under their schema labels', async () => {
+    const base = detail({ fields: { area: 'checkout-v2' } })
+    routes['GET /api/work-items/7'] = () => ({
+      ...base,
+      board: { ...base.board, fieldsSchema: [{ key: 'area', label: 'Area', type: 'text' }] },
+    })
+    render(createElement(CardPane, { itemId: '7', workspaceId: 'ws', me: 'u1', mentionables: mentionables as any, conversation, visible: true, onClose: () => {} }))
+    expect(await screen.findByTestId('thread')).toBeTruthy()
+    expect(document.body.textContent).not.toContain('checkout-v2')
+
+    fireEvent.click(screen.getByTestId('card-tab-details'))
+    const details = detailsPane()!
+    expect(details.textContent).toContain('Area')
+    expect(details.textContent).toContain('checkout-v2')
+  })
+
   test('editing the description from Details patches the card', async () => {
     routes['PATCH /api/work-items/7'] = (c) => ({ item: item('7', 'c2', 1, c.body) })
     render(createElement(CardPane, { itemId: '7', workspaceId: 'ws', me: 'u1', mentionables: mentionables as any, conversation, visible: true, onClose: () => {} }))
