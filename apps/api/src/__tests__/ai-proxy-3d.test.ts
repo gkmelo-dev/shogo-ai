@@ -378,7 +378,9 @@ describe('POST /ai/v1/3d/generations — edit ops', () => {
     const wire = mockSubmit({})
     const { data } = await submit({ op: 'rig', input: TASK_ID, rig_type: 'quadruped', out_format: 'fbx' })
     expect(data.estimated_credits).toBe(25)
-    expect(wire).toEqual({ input: TASK_ID, rig_type: 'quadruped', out_format: 'fbx' })
+    // The animations endpoints reject a missing `model`: the route pins the
+    // current rig version so Tripo does not fall back to a retired one.
+    expect(wire).toEqual({ input: TASK_ID, rig_type: 'quadruped', out_format: 'fbx', model: 'v2.5-20260210' })
   })
 
   test('retarget prices per animation and rejects more than five', async () => {
@@ -686,12 +688,15 @@ describe('estimateTripoTaskCost', () => {
     expect(credits({ op: 'texture' })).toBe(10)
     expect(credits({ op: 'texture', textureQuality: 'detailed' })).toBe(20)
     expect(credits({ op: 'texture', textureQuality: 'extreme' })).toBe(30)
-    expect(credits({ op: 'convert' })).toBe(5)
+    // Measured live 2026-10-18: an FBX convert charged 10, not the 5 the
+    // published table implies. Billing uses the reported number; this is the
+    // pre-flight estimate, which errs high on purpose.
+    expect(credits({ op: 'convert' })).toBe(10)
     expect(credits({ op: 'retopology', model: 'v2.0' })).toBe(30)
     expect(credits({ op: 'retopology', model: 'v3.0' })).toBe(35)
     expect(credits({ op: 'retopology', model: 'v3.0', quad: true })).toBe(40)
     expect(credits({ op: 'segment' })).toBe(40)
-    expect(credits({ op: 'complete' })).toBe(40)
+    expect(credits({ op: 'complete' })).toBe(50)
     expect(credits({ op: 'rig_check' })).toBe(0)
     expect(credits({ op: 'rig' })).toBe(25)
     expect(credits({ op: 'retarget', animation: 'preset:walk' })).toBe(10)
