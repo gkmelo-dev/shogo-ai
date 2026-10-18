@@ -20,18 +20,26 @@ export interface ConcurrentChat {
 const MAX_ROWS = 5
 const LABEL_MAX_CHARS = 60
 
+/** Collapse whitespace and cap, so a label can never add its own prompt lines. */
+function normalizeLabelText(text?: string | null): string | undefined {
+  const collapsed = text?.replace(/\s+/g, ' ').trim()
+  return collapsed || undefined
+}
+
+function capLabel(text: string): string {
+  return text.length > LABEL_MAX_CHARS ? `${text.slice(0, LABEL_MAX_CHARS - 1).trimEnd()}…` : text
+}
+
 /** Resolve a chat's display label: title, else first user message, else the id. */
 export function concurrentChatLabel(input: {
   id: string
   title?: string | null
   firstUserText?: string | null
 }): string {
-  const title = input.title?.trim()
-  if (title) return title
-  const first = input.firstUserText?.replace(/\s+/g, ' ').trim()
-  if (first) {
-    return first.length > LABEL_MAX_CHARS ? `${first.slice(0, LABEL_MAX_CHARS - 1).trimEnd()}…` : first
-  }
+  const title = normalizeLabelText(input.title)
+  if (title) return capLabel(title)
+  const first = normalizeLabelText(input.firstUserText)
+  if (first) return capLabel(first)
   return `chat ${input.id.slice(0, 8)}`
 }
 
