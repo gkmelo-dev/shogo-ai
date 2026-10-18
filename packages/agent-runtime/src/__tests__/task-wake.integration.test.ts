@@ -300,6 +300,49 @@ describe('task wake', () => {
     }
   }, 20_000)
 
+  test('a runtime started without credentials sweeps each pending note as its own message, once', async () => {
+    // A genuinely credential-less runtime: the gateway starts with no internal
+    // API client at all, so no task is apiTracked and no wake can ever be
+    // queued. Every finished task must still reach the transcript.
+    const savedSecret = process.env.RUNTIME_AUTH_SECRET
+    delete process.env.RUNTIME_AUTH_SECRET
+    const calls: Message[][] = []
+    try {
+      const gw = await startGateway([
+        buildToolUseResponse([
+          { name: 'exec', arguments: { command: 'sleep 0.2', background: true }, id: 'tc-1' },
+          { name: 'exec', arguments: { command: 'sleep 0.2', background: true }, id: 'tc-2' },
+        ]),
+        buildTextResponse('Both builds are running.'),
+        buildTextResponse('Both builds finished.'),
+        buildTextResponse('Anything else?'),
+      ], (_i, msgs) => calls.push([...msgs]))
+
+      await gw.processChatMessageStream('run two builds', writer() as any, { chatSessionId: 'no-creds-two' })
+      const ids = execTaskIds(calls[1]!)
+      expect(ids).toHaveLength(2)
+
+      await sleep(3_000)
+      expect(apiCalls.filter((c) => c.path === '/api/internal/tasks/notify')).toHaveLength(0)
+
+      await gw.processChatMessageStream('did they finish?', writer() as any, { chatSessionId: 'no-creds-two' })
+      const swept = calls.at(-1)!.filter((m) => m.role === 'user' && textOf(m).includes('[Task update]'))
+      expect(swept).toHaveLength(2)
+      const sweptIds = swept.map((m) => textOf(m).match(/\((t_[^)]+)\) completed/)?.[1])
+      expect(new Set(sweptIds)).toEqual(new Set(ids))
+      // One [Task update] per message: the two are not joined into one note.
+      for (const note of swept) expect((textOf(note).match(/\[Task update\]/g) ?? []).length).toBe(1)
+
+      // Consumed, exactly once: the turn after that repeats neither.
+      await gw.processChatMessageStream('thanks', writer() as any, { chatSessionId: 'no-creds-two' })
+      expect(taskUpdatesIn(calls.at(-1)!)).toHaveLength(0)
+      expect(apiCalls.filter((c) => c.path === '/api/internal/tasks/notify')).toHaveLength(0)
+    } finally {
+      if (savedSecret === undefined) delete process.env.RUNTIME_AUTH_SECRET
+      else process.env.RUNTIME_AUTH_SECRET = savedSecret
+    }
+  }, 20_000)
+
   test('a notify the API refuses is retried and delivered exactly once', async () => {
     notifyFailures = 1
     const calls: Message[][] = []
