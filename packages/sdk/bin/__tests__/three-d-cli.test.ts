@@ -29,6 +29,15 @@ let jobStatuses: string[] = ['success']
 let jobResult: Record<string, unknown> = {}
 let submitStatus = 200
 let submitBody: Record<string, unknown> = {}
+// Mirrors what GET /ai/v1/3d/models returns: price.usd per model,
+// estimated_credits per operation (1 credit = $0.01).
+let modelsResponse: Record<string, unknown> = {
+  models: [{ id: 'tripo-v3.1', price: { usd: 0.24, untextured_usd: 0.12 } }],
+  operations: [
+    { op: 'rig_check', estimated_credits: 0 },
+    { op: 'rig', estimated_credits: 25 },
+  ],
+}
 
 function startStub() {
   server = Bun.serve({
@@ -40,7 +49,7 @@ function startStub() {
         body: req.method === 'POST' ? await req.clone().json().catch(() => undefined) : undefined,
       })
       if (url.pathname === '/v1/3d/files') return Response.json({ file_token: 'file_uploaded' })
-      if (url.pathname === '/v1/3d/models') return Response.json({ models: [{ id: 'tripo-v3.1' }], operations: [] })
+      if (url.pathname === '/v1/3d/models') return Response.json(modelsResponse)
       if (url.pathname === '/v1/3d/generations') {
         if (submitStatus !== 200) return Response.json(submitBody, { status: submitStatus })
         return Response.json({ id: 'gen3d_1', ...submitBody })
@@ -298,6 +307,17 @@ describe('shogo 3d status / upload / models', () => {
     const { deps: d, stdout } = deps()
     expect(await runThreeDCommand(['upload', 'models-src.glb'], {}, d)).toBe(0)
     expect(stdout.join('').trim()).toBe('file_uploaded')
+  })
+
+  test('models prints a price table by default, prices read from the route', async () => {
+    const { deps: d, stdout } = deps()
+    expect(await runThreeDCommand(['models'], {}, d)).toBe(0)
+    const text = stdout.join('')
+    expect(text).toContain('tripo-v3.1')
+    expect(text).toContain('$0.24')
+    expect(text).toContain('$0.12')
+    expect(text).toMatch(/rig_check\s+free/)
+    expect(text).toMatch(/rig\s+25 credits/)
   })
 
   test('models lists the catalog as JSON', async () => {

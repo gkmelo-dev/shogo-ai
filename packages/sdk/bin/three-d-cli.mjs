@@ -210,7 +210,35 @@ export async function runThreeDCommand(args, flags, deps = {}) {
   try {
     if (sub === 'models') {
       const body = await request('/v1/3d/models')
-      out(JSON.stringify(body, null, 2) + '\n')
+      if (json) {
+        out(JSON.stringify(body, null, 2) + '\n')
+        return 0
+      }
+      // The route returns `price.usd` per model and `estimated_credits` per
+      // operation; 1 credit = $0.01.
+      const models = body.models ?? []
+      const operations = body.operations ?? []
+      if (!models.length) {
+        out('No 3D models available: this server has no Tripo key, so nothing can run.\n')
+        return 0
+      }
+      out('Models:\n')
+      for (const model of models) {
+        const usd = model.price?.usd
+        const bare = model.price?.untextured_usd
+        const price = usd === undefined ? '' : `$${Number(usd).toFixed(2)}`
+        const bareLabel = bare === undefined ? '' : ` (untextured $${Number(bare).toFixed(2)})`
+        out(`  ${String(model.id).padEnd(26)} ${price}${bareLabel}${model.name ? `  ${model.name}` : ''}\n`)
+      }
+      if (operations.length) {
+        out('\nOperations:\n')
+        for (const operation of operations) {
+          const credits = operation.estimated_credits
+          const price =
+            credits === 0 ? 'free' : credits === undefined ? 'unknown' : `${credits} credits`
+          out(`  ${String(operation.op).padEnd(18)} ${price}\n`)
+        }
+      }
       return 0
     }
 

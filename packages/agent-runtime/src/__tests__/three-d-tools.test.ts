@@ -22,7 +22,9 @@ import { getBuiltinSubagentConfig } from '../subagent'
 import { MEDIA_TOOL_NAMES, THREE_D_TOOL_NAMES } from '../media-tool-names'
 import { THREE_D_POLL, _testing } from '../three-d-tools'
 
-const TEST_DIR = '/tmp/test-three-d-tools'
+// Inside the repo, not /tmp: macOS realpaths /tmp → /private/tmp, so
+// assertWithinWorkspace rejects every path under the fixture directory.
+const TEST_DIR = join(import.meta.dir, '.three-d-tmp')
 const PROXY = 'http://proxy.test/api/ai/v1'
 const BASE = 'http://proxy.test/api/ai'
 const B64_PNG = Buffer.from([137, 80, 78, 71]).toString('base64')
@@ -248,6 +250,10 @@ describe('edit_3d_model', () => {
     const ok = await run('edit_3d_model', { op: 'complete', input: 'gen3d_1', part_names: ['lid'] })
     expect(ok.error).toBeUndefined()
     expect(submitBodies()[0]).toMatchObject({ op: 'complete', part_names: ['lid'] })
+    // 50 credits of mesh: it has to land on disk, not just report success.
+    expect(ok.path).toBeString()
+    expect(ok.path.endsWith('.glb')).toBe(true)
+    expect(readFileSync(join(TEST_DIR, ok.path))).toEqual(Buffer.from([103, 108, 84, 70]))
   })
 
   test('rig_check reports free and writes no file', async () => {
