@@ -358,6 +358,13 @@ test.describe("server-backed chat queue — local UI", () => {
     await page.waitForTimeout(300)
     await page.reload()
     await expect(queuedRow(page, alpha).first()).toBeVisible()
+    // Part D: a reloaded page shows the queue in the transcript too, and
+    // deleting it there takes the bubble away with the row.
+    await expect.poll(() => transcriptCount(page, alpha)).toBe(1)
+    await queuedRow(page, alpha).first().getByLabel("Delete queued message").click()
+    await expect(queuedRow(page, alpha)).toHaveCount(0)
+    await expect.poll(() => transcriptCount(page, alpha)).toBe(0)
+    expect(state.rows).toHaveLength(0)
   })
 
   test("a still-queued bubble survives the dispatch of the message ahead of it", async ({ page }) => {
