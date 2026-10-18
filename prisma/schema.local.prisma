@@ -2435,6 +2435,48 @@ model LocalConfig {
 }
 
 // =============================================================================
+// LOCAL AGENT-CALL STORE (Desktop/Local mode only)
+//
+// An in-flight tracked `project_call` lives in Redis in the cloud. Local mode
+// has no Redis, so the record and the callee-chat link used to live only in a
+// per-process Map — a desktop API restart (app update, quit/relaunch, the
+// SIGKILL recovery in apps/desktop/src/local-server.ts) lost both, and the
+// caller's long-poll plus the callee chat's repair-on-read went blank. These
+// tables are the durable copy; the Map stays the hot path.
+// =============================================================================
+
+model AgentCall {
+  projectId     String
+  runId         String
+  /// running | completed | failed
+  status        String
+  reply         String?
+  /// JSON-encoded { code?, message }
+  error         String?
+  sessionId     String?
+  chatSessionId String?
+  startedAt     DateTime
+  updatedAt     DateTime @updatedAt
+  expiresAt     DateTime
+
+  @@id([projectId, runId])
+  @@index([status, startedAt])
+  @@index([expiresAt])
+  @@map("agent_calls")
+}
+
+model AgentCallSessionLink {
+  chatSessionId String   @id
+  projectId     String
+  runId         String
+  startedAt     DateTime
+  expiresAt     DateTime
+
+  @@index([expiresAt])
+  @@map("agent_call_session_links")
+}
+
+// =============================================================================
 // MARKETPLACE (Agent Marketplace & Creator Economy)
 // SQLite: enums → String, String[] → String (JSON), Json? → String?, no @db.Text
 // =============================================================================
