@@ -123,7 +123,9 @@ interface CostForecast {
  * events by the desktop backfill migration). They count toward cost and runs
  * but are kept out of every quality rate and the recommendation gate.
  */
-const QUALITY_UNKNOWN_SQL = Prisma.sql`COALESCE(CAST("metadata" AS TEXT), '') LIKE '%"qualityUnknown":%true%'`
+function qualityUnknownSql(): Prisma.Sql {
+  return Prisma.sql`COALESCE(CAST("metadata" AS TEXT), '') LIKE '%"qualityUnknown":%true%'`
+}
 
 function periodToDate(period: CostPeriod): Date {
   const now = new Date()
@@ -258,6 +260,7 @@ export async function getAgentCostBreakdown(
   // do a single raw SQL aggregation alongside. SUM(CASE ...) rather than
   // COUNT(*) FILTER so the same SQL runs on Postgres and local SQLite.
   const projectFilter = projectId ? Prisma.sql`AND "projectId" = ${projectId}` : Prisma.empty
+  const qualityUnknown = qualityUnknownSql()
   const flags = await prisma.$queryRaw<Array<{
     agentType: string
     model: string
@@ -272,19 +275,19 @@ export async function getAgentCostBreakdown(
     SELECT
       "agentType",
       "model",
-      SUM(CASE WHEN "success" AND NOT (${QUALITY_UNKNOWN_SQL}) THEN 1 ELSE 0 END) AS "promiseSuccesses",
+      SUM(CASE WHEN "success" AND NOT (${qualityUnknown}) THEN 1 ELSE 0 END) AS "promiseSuccesses",
       SUM(CASE WHEN "success"
             AND NOT "hitMaxTurns"
             AND NOT "loopDetected"
             AND NOT "escalated"
             AND NOT "responseEmpty"
-            AND NOT (${QUALITY_UNKNOWN_SQL})
+            AND NOT (${qualityUnknown})
           THEN 1 ELSE 0 END)                              AS "qualitySuccesses",
       SUM(CASE WHEN "hitMaxTurns" THEN 1 ELSE 0 END)      AS "hitMaxTurns",
       SUM(CASE WHEN "loopDetected" THEN 1 ELSE 0 END)     AS "loopDetected",
       SUM(CASE WHEN "escalated" THEN 1 ELSE 0 END)        AS "escalated",
       SUM(CASE WHEN "responseEmpty" THEN 1 ELSE 0 END)    AS "responseEmpty",
-      SUM(CASE WHEN ${QUALITY_UNKNOWN_SQL} THEN 1 ELSE 0 END) AS "unscoredRuns"
+      SUM(CASE WHEN ${qualityUnknown} THEN 1 ELSE 0 END) AS "unscoredRuns"
     FROM "agent_cost_metrics"
     WHERE "workspaceId" = ${workspaceId}
       AND "createdAt"   >= ${since}
