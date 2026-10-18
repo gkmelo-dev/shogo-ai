@@ -57,6 +57,7 @@ export default function AnalyticsScreen() {
               key={item.id}
               accessibilityRole="tab"
               accessibilityState={{ selected: active }}
+              aria-selected={active}
               testID={`analytics-view-${item.id}`}
               onPress={() => setView(item.id)}
               className={cn(
