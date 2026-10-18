@@ -317,7 +317,11 @@ test.describe("Stop, then send", () => {
 
     await send(page, `${marker("long", second, 60, { ms: 20 })} ${secondText}`)
     await llm.waitForTurn(second, 60_000).catch(() => undefined)
-    soft(llm.wasCancelled(first), "sending after Stop re-ran the stopped turn instead of starting a new one").toBe(false)
+    // `wasCancelled` is true by definition here: Stop cut the first request
+    // short. What matters is that the send did not start it *again* — one
+    // request for the stopped turn, ever.
+    soft(llm.requestsFor(first).length, "sending after Stop did not start a second run of the stopped turn").toBe(1)
+    soft(llm.requestsFor(second).length, "the message sent after Stop ran exactly once").toBe(1)
 
     // The stale probe has done its job. Leaving it installed would answer the
     // reload's probe with a phantom `active` turn whose id is the stopped one —
