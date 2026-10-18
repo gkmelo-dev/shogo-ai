@@ -206,9 +206,10 @@ export const TRIPO_OPS: Record<TripoOp, {
 
 /** Flat per-task credit prices from the published table. */
 export const TRIPO_FIXED_CREDITS = {
-  // Measured live 2026-10-18: an FBX convert task charged 10, not the 5 the
-  // published table implies. Billing uses the reported number, so the flat
-  // figure here only feeds the pre-flight estimate — err high.
+  // Measured live 2026-10-18: FBX charged 10, USDZ on a small imported GLB
+  // charged 5 — convert is priced by output format/size, so the flat figure
+  // here is an upper bound for the pre-flight estimate. Billing always uses the
+  // number Tripo reports for the finished task.
   convert: 10,
   segment: 40,
   // Measured live: 50, and it took 306s (the slowest op in the matrix).
