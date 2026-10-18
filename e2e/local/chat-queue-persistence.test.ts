@@ -378,6 +378,14 @@ test.describe("server-backed chat queue — local UI", () => {
     const { lead, alpha, beta } = prompts(`dispatch-${Date.now().toString(36)}`)
     await installQueueMock(page, state)
     await openProject(page, page.request)
+    // Acceptance criterion for the bug: attaching a dispatch whose bubble is
+    // already on screen must not reload the history.
+    const historyGets: string[] = []
+    page.on("request", (request) => {
+      if (request.method() !== "GET") return
+      if (new URL(request.url()).pathname !== "/api/chat-messages") return
+      historyGets.push(request.url())
+    })
     await holdATurnWith(page, state, lead)
 
     await projectComposerInput(page).fill(alpha)
@@ -392,11 +400,25 @@ test.describe("server-backed chat queue — local UI", () => {
     state.releaseChat?.()
     await waitForIdle(page)
 
+    // A turn that just finished reconciles the persisted reply with a few
+    // bounded retries (~5 × 400 ms). Let that go quiet first, so a stray fetch
+    // cannot be mistaken for the reload the dispatch used to pay.
+    await expect
+      .poll(
+        async () => {
+          const before = historyGets.length
+          await page.waitForTimeout(700)
+          return historyGets.length - before
+        },
+        { timeout: 20_000 },
+      )
+      .toBe(0)
+
     // The server takes the head of the queue and starts its turn.
+    historyGets.length = 0
     state.rows.splice(0, 1)
     expect(state.rows.map((row) => row.content)).toEqual([beta])
     await expect.poll(() => queuedRow(page, alpha).count(), { timeout: 15_000 }).toBe(0)
-
     // Alpha's bubble is the turn's own message, so it stays on screen; beta is
     // still queued, so its bubble must survive the dispatch too, in order.
     await expect
@@ -406,5 +428,6 @@ test.describe("server-backed chat queue — local UI", () => {
       .poll(() => transcriptCount(page, beta), { timeout: 15_000 })
       .toBe(1)
     await expect.poll(() => transcriptOrder(page, alpha, beta)).toBe(true)
+    expect(historyGets).toEqual([])
   })
 })
