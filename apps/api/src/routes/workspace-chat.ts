@@ -1326,6 +1326,59 @@ export function workspaceChatRoutes(config: WorkspaceChatRoutesConfig): Hono {
     }
   })
 
+  // The tasks a chat still has running. A window polls this to learn that
+  // background work is in flight and, once the list empties, that a
+  // `[Task update]` wake is about to be queued for the session (SHO-31).
+  router.get('/workspaces/:workspaceId/chat/:sessionId/tasks', async (c) => {
+    const auth = await authorize(c)
+    if ('res' in auth) return auth.res
+    const workspaceId = c.req.param('workspaceId')
+    const sessionId = c.req.param('sessionId')
+
+    let attachedProjectIds: string[]
+    let runtimeExtra: { anchorProjectId?: string; localFolders?: string[]; readonlyProjectIds?: string[] } = {}
+    try {
+      const args = await loadRuntimeArgs(workspaceId, sessionId, auth.userId)
+      attachedProjectIds = args.attachedProjectIds
+      runtimeExtra = args.extra
+    } catch (err) {
+      return mapSessionError(c, err)
+    }
+    const runtimeRes = await resolveOr501(c, workspaceId, attachedProjectIds, 'WorkspaceTasks', runtimeExtra, auth.kind)
+    if ('res' in runtimeRes) return runtimeRes.res
+    try {
+      let response = await fetchFromWorkspaceRuntime(
+        workspaceId,
+        attachedProjectIds,
+        `/agent/chat/${encodeURIComponent(sessionId)}/tasks`,
+        { method: 'GET' },
+        runtimeExtra,
+      )
+      // Runtimes that predate tasks only list shell processes.
+      if (response.status === 404) {
+        response = await fetchFromWorkspaceRuntime(
+          workspaceId,
+          attachedProjectIds,
+          `/agent/chat/${encodeURIComponent(sessionId)}/processes`,
+          { method: 'GET' },
+          runtimeExtra,
+        )
+      }
+      if (!response.ok) return c.json({ tasks: [] })
+      const data = await response.json()
+      return c.json(
+        { tasks: Array.isArray(data?.tasks) ? data.tasks : data?.processes ?? [] },
+        200,
+      )
+    } catch (err: any) {
+      console.warn(
+        `[WorkspaceChat] task list proxy error for ${workspaceId}/${sessionId}:`,
+        err?.message || err,
+      )
+      return c.json({ tasks: [] })
+    }
+  })
+
   // "Retry now": skip the rest of the active turn's retry backoff.
   router.post('/workspaces/:workspaceId/chat/retry-now', async (c) => {
     const auth = await authorize(c)
