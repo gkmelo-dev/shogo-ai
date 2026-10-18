@@ -339,4 +339,33 @@ describe('task wake', () => {
     gw.clearSessionHistory('cd-session')
     expect(shellCwd.has('cd-session')).toBe(false)
   })
+
+  /**
+   * `GET /agent/chat/:chatSessionId/tasks` is a thin wrapper over
+   * `listSessionTasks`, so this is the payload the dock seeds from: a task
+   * that settles while the turn runs keeps its row instead of vanishing with
+   * the frame that announced it.
+   */
+  test('the dock payload carries a finished task next to a running one', async () => {
+    const gw = await startGateway([
+      buildToolUseResponse([
+        { name: 'exec', arguments: { command: 'sleep 0.1', background: true }, id: 'tc-1' },
+        { name: 'exec', arguments: { command: 'sleep 30', background: true }, id: 'tc-2' },
+      ]),
+      buildTextResponse('Both started.'),
+    ], () => {})
+
+    await gw.processChatMessageStream('run them', writer() as any, { chatSessionId: 'dock-list' })
+    await sleep(600)
+
+    const tasks = await gw.listSessionTasks('dock-list')
+    expect(tasks.map((t) => t.status).sort()).toEqual(['completed', 'running'])
+    const done = tasks.find((t) => t.status === 'completed')!
+    expect(done.finishedAt).toBeGreaterThan(0)
+    expect(done.elapsedMs).toBeGreaterThanOrEqual(0)
+    expect(done.outputFile).toContain('.shogo/tasks/dock-list/')
+
+    // The agent's own view is unchanged: only running tasks.
+    expect(gw.listSessionProcesses('dock-list').map((t) => t.status)).toEqual(['running'])
+  }, 20_000)
 })
