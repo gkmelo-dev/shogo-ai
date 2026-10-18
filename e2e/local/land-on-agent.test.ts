@@ -52,6 +52,58 @@ async function sendFirstMessage(page: Page, sessionId: string): Promise<void> {
   expect(res.ok(), `could not create a chat message: ${res.status()} ${await res.text()}`).toBe(true)
 }
 
+/** A finished UI message stream, so a send never reaches a model. */
+function completedTurnStream(text: string): string {
+  const frame = (event: Record<string, unknown>) => `data: ${JSON.stringify(event)}\n\n`
+  return [
+    frame({ type: "start", messageId: "msg_landing_e2e" }),
+    frame({ type: "start-step" }),
+    frame({ type: "text-start", id: "text_landing_e2e" }),
+    frame({ type: "text-delta", id: "text_landing_e2e", delta: text }),
+    frame({ type: "text-end", id: "text_landing_e2e" }),
+    frame({ type: "finish-step" }),
+    frame({ type: "finish" }),
+  ].join("")
+}
+
+/**
+ * Answer every workspace chat turn locally, recording the chat each POST was
+ * sent for (`X-Chat-Session-Id`). Nothing reaches a model, so the test can
+ * tell which session a send went to without waiting on a real turn.
+ */
+async function mockChatTurns(page: Page, sentTo: string[]): Promise<void> {
+  await page.route("**/api/workspaces/*/chat", async (route) => {
+    if (route.request().method() !== "POST") {
+      await route.continue()
+      return
+    }
+    const sessionId = route.request().headers()["x-chat-session-id"]
+    if (sessionId) sentTo.push(sessionId)
+    await route.fulfill({
+      status: 200,
+      contentType: "text/event-stream",
+      headers: { "Cache-Control": "no-cache" },
+      body: completedTurnStream("Noted."),
+    })
+  })
+  // The live-turn probe the composer runs before sending.
+  await page.route("**/api/workspaces/*/chat/*/turn", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ status: "completed" }),
+    })
+  })
+}
+
+/** The empty landing chat for this workspace — minted now, or reused from before. */
+async function emptyLandingChat(page: Page, workspaceId: string): Promise<string | null> {
+  const empty = (await sessions(page, workspaceId)).find(
+    (row) => row.inferredName === "Chat" && (row.messageCount ?? 1) === 0,
+  )
+  return empty?.id ?? null
+}
+
 async function personalWorkspaceId(page: Page): Promise<string> {
   const res = await page.request.get(`${LOCAL_API_BASE}/api/workspaces`)
   const json = await res.json()
@@ -110,6 +162,62 @@ test.describe("Landing on the workspace agent (local)", () => {
       timeout: 60_000,
     })
     expect(new URL(page.url()).pathname).toBe("/home")
+  })
+
+  test("the first send from the composer stays in the landing chat", async ({ page }) => {
+    test.setTimeout(180_000)
+    await signIn(page)
+    const workspaceId = await teamWorkspaceId(page)
+    await activateTeamWorkspace(page, workspaceId)
+
+    await page.goto("/")
+    await expect(composer(page)).toBeVisible({ timeout: 90_000 })
+    // The landing either mints its chat or reuses the empty one from before.
+    const afterLanding = await sessionIds(page, workspaceId)
+    const landing = await emptyLandingChat(page, workspaceId)
+    expect(landing, "the landing has no empty chat").not.toBeNull()
+
+    const sentTo: string[] = []
+    await mockChatTurns(page, sentTo)
+
+    const input = composer(page)
+    await input.click()
+    await input.fill("first message from the landing")
+    await page.keyboard.press("Enter")
+    await expect(
+      page
+        .locator('[role="button"][aria-label*="Edit this message"]')
+        .filter({ hasText: "first message from the landing" })
+        .first(),
+    ).toBeVisible({ timeout: 30_000 })
+    await expect.poll(() => sentTo.length, { timeout: 30_000 }).toBeGreaterThan(0)
+
+    // The turn went to the chat the landing opened, and no orphan row appeared.
+    expect(sentTo[0], "the send started a different chat").toBe(landing)
+    expect((await sessionIds(page, workspaceId)).sort()).toEqual([...afterLanding].sort())
+  })
+
+  test("`?initialMessage=` sends into the chat the URL names, minting nothing", async ({ page }) => {
+    test.setTimeout(180_000)
+    await signIn(page)
+    const workspaceId = await teamWorkspaceId(page)
+    await activateTeamWorkspace(page, workspaceId)
+
+    await page.goto("/")
+    await expect(composer(page)).toBeVisible({ timeout: 90_000 })
+    // The landing either mints its chat or reuses the empty one from before.
+    const afterLanding = await sessionIds(page, workspaceId)
+    const landing = await emptyLandingChat(page, workspaceId)
+    expect(landing, "the landing has no empty chat").not.toBeNull()
+
+    const sentTo: string[] = []
+    await mockChatTurns(page, sentTo)
+    const text = encodeURIComponent("bootstrap from the url")
+    await page.goto(`/agent?chatSessionId=${landing}&initialMessage=${text}`)
+    await expect.poll(() => sentTo.length, { timeout: 90_000 }).toBeGreaterThan(0)
+
+    expect(sentTo[0], "the bootstrap message did not go to the named chat").toBe(landing)
+    expect((await sessionIds(page, workspaceId)).sort()).toEqual([...afterLanding].sort())
   })
 
   test("a personal cold start keeps resuming its last chat", async ({ page }) => {
