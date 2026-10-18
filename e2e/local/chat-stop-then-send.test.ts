@@ -319,6 +319,12 @@ test.describe("Stop, then send", () => {
     await llm.waitForTurn(second, 60_000).catch(() => undefined)
     soft(llm.wasCancelled(first), "sending after Stop re-ran the stopped turn instead of starting a new one").toBe(false)
 
+    // The stale probe has done its job. Leaving it installed would answer the
+    // reload's probe with a phantom `active` turn whose id is the stopped one —
+    // and after a reload nothing remembers it was stopped, so the window would
+    // attach to a live turn instead of just loading history.
+    await page.unroute("**/chat/*/turn")
+
     await llm.waitForTokens(second, 60, 90_000).catch(() => undefined)
     await expectComplete(page, second, 60, "after sending")
     await expectIdle(page, "after sending")

@@ -271,10 +271,22 @@ export function useServerMessageQueue({
   const remove = useCallback(
     async (id: string) => {
       userRemovedIdsRef.current.add(id)
+      // Delete is the only other way a row this window enqueued disappears, so
+      // it must stop being tracked here: `drainEnqueued` reads a gone row as the
+      // server having started its turn, and deleting a queued message is not
+      // that.
+      const tracked = enqueuedRef.current.get(id)
+      if (tracked && enqueuedRef.current.delete(id)) {
+        setTrackedCount((count) => Math.max(0, count - 1))
+      }
       try {
         await collection.delete(id)
       } catch (error) {
         userRemovedIdsRef.current.delete(id)
+        if (tracked) {
+          enqueuedRef.current.set(id, tracked)
+          setTrackedCount((count) => count + 1)
+        }
         throw error
       } finally {
         setTimeout(() => userRemovedIdsRef.current.delete(id), 0)

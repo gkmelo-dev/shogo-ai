@@ -140,6 +140,26 @@ describe("useServerMessageQueue", () => {
     expect(turns).toEqual([])
   })
 
+  test("deleting a row this window enqueued is not a turn starting", async () => {
+    reset()
+    render(<Probe isStreaming={false} />)
+
+    await act(async () => {
+      await queueApi!.enqueue({ content: "queued", body: { text: "queued" } })
+    })
+    expect(turns).toEqual([])
+
+    // The trash button and "edit queued message" both call `remove`, which
+    // deletes the row — the same disappearance as a dispatch.
+    const id = collection.all[0]!.id
+    await act(async () => { await queueApi!.remove(id) })
+    expect(turns).toEqual([])
+
+    // And it must not be reported later by the poll either.
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 1700)) })
+    expect(turns).toEqual([])
+  })
+
   test("a turn taken while the previous stream is still open is reported once it closes", () => {
     reset()
     const view = render(<Probe isStreaming />)
