@@ -27,6 +27,27 @@ async function createChannel(name: string) {
   return id as string
 }
 
+/**
+ * Opens the workspace Analytics screen the way a person does — the More tab,
+ * then its Analytics entry. A direct `/analytics` load is not the app screen:
+ * the admin console owns that URL for a super_admin, and the workspace screen
+ * is only reached through the `(app)` route group.
+ */
+async function openAnalytics(target: Page) {
+  await target.goto("/")
+  const rail = target.getByRole("navigation", { name: "Workspace tabs" })
+  const dock = target.getByTestId("team-dock")
+  const moreTab = rail
+    .getByRole("tab", { name: /^More/ })
+    .or(dock.getByRole("tab", { name: /^More/ }))
+    .or(target.getByRole("tab", { name: /^More/ }))
+  await moreTab.first().click({ timeout: 60_000 })
+
+  const analyticsLink = target.getByTestId("more-panel").getByRole("link", { name: "Analytics" })
+  await analyticsLink.first().click({ timeout: 30_000 })
+  await expect(target.getByTestId("analytics-screen")).toBeVisible({ timeout: 60_000 })
+}
+
 test.describe("Analytics channels", () => {
   test.describe.configure({ mode: "serial" })
   test.use({ viewport: { width: 1440, height: 900 } })
@@ -84,9 +105,10 @@ test.describe("Analytics channels", () => {
   })
 
   test("the Channels tab renders the table on desktop", async () => {
-    await page.goto("/analytics?view=channels")
+    await openAnalytics(page)
     const tab = page.getByTestId("analytics-view-channels")
     await expect(tab).toBeVisible({ timeout: 60_000 })
+    await tab.click()
     await expect(tab).toHaveAttribute("aria-selected", "true")
 
     await expect(page.getByText(busyName).first()).toBeVisible({ timeout: 30_000 })
@@ -97,10 +119,11 @@ test.describe("Analytics channels", () => {
 
   test("the table still works on a ~390px phone", async () => {
     await page.setViewportSize({ width: 390, height: 844 })
-    await page.goto("/analytics?view=channels")
+    await openAnalytics(page)
 
     const tab = page.getByTestId("analytics-view-channels")
     await expect(tab).toBeVisible({ timeout: 60_000 })
+    await tab.click()
     // Labels stay readable rather than truncated, and the table scrolls sideways.
     await expect(page.getByText(busyName).first()).toBeVisible({ timeout: 30_000 })
     const scroller = page.locator('[data-testid="channels-table"]').first()
