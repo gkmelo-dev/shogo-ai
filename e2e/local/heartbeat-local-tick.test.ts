@@ -31,9 +31,14 @@ const TICK_DEADLINE_MS = 180_000
 
 function localDbPath(): string | null {
   if (process.env.E2E_LOCAL_DB) return process.env.E2E_LOCAL_DB
+  const bundled = resolve(REPO_ROOT, "test-results/e2e-local.db")
+  // E2E_LOCAL_START_STACK boots the API against this file, and wins over an
+  // inherited DATABASE_URL: an agent shell or a developer's env often exports
+  // the workspace dev DB, and forcing a due row in *that* file matches no
+  // project, so the spec would fail without ever exercising the scheduler.
+  if (process.env.E2E_LOCAL_START_STACK === "1") return bundled
   const fromEnv = process.env.DATABASE_URL
   if (fromEnv?.startsWith("file:")) return fromEnv.slice("file:".length)
-  const bundled = resolve(REPO_ROOT, "test-results/e2e-local.db")
   return existsSync(bundled) ? bundled : null
 }
 
@@ -125,13 +130,17 @@ test("a due heartbeat advances its schedule and records the tick", async () => {
     })
     .not.toBeNull()
 
-  // 2. It rescheduled itself by the configured interval (+ up to 10 % jitter),
-  //    measured from the moment the tick ran.
+  // 2. It rescheduled itself by the configured interval (+ up to 10 % jitter).
+  //    `nextHeartbeatAt` is written from the poll, but `lastHeartbeatAt` comes
+  //    from the runtime's completion report, so the measured gap is the
+  //    interval *minus* however long the trigger took to report — a cold
+  //    runtime start alone costs seconds. Bound it loosely rather than pinning
+  //    it to 0.9x, which fails whenever the tick is slow (SHO-36 QA).
   const after = await heartbeat()
   const last = new Date(after.lastHeartbeatAt)
   const next = new Date(after.nextHeartbeatAt)
   const advancedS = (next.getTime() - last.getTime()) / 1000
-  expect(advancedS).toBeGreaterThan(MIN_INTERVAL_S * 0.9)
+  expect(advancedS).toBeGreaterThan(MIN_INTERVAL_S * 0.5)
   expect(advancedS).toBeLessThan(MIN_INTERVAL_S * 1.1 + 5)
   expect(next.getTime()).toBeGreaterThan(forcedDueAt.getTime())
 
