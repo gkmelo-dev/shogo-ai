@@ -131,6 +131,22 @@ export interface SessionStats {
   createdAt: string
 }
 
+/** A chat session other chats in this workspace may be running. */
+export interface ChatSessionSummary {
+  id: string
+  /** Chat title from the request's `chatSessionName`, when one was sent. */
+  title?: string
+  /** First user message, used as a fallback label. */
+  firstUserText?: string
+  lastActivityAt: number
+  messageCount: number
+}
+
+/** `run:` pipelines and the literal `pipeline` session are not user chats. */
+function isChatSessionId(id: string): boolean {
+  return id !== 'pipeline' && !id.startsWith('run:')
+}
+
 export interface CompactionResult {
   sessionId: string
   messagesBefore: number
@@ -295,6 +311,21 @@ export class SessionManager {
     session.totalMessages += msgs.length
     this.persistSession(session)
     return this.needsCompaction(session)
+  }
+
+  /** Remove these exact message objects (by identity) from a session and persist. */
+  removeMessages(id: string, msgs: Iterable<Message>): number {
+    const session = this.sessions.get(id)
+    if (!session) return 0
+    const drop = new Set(msgs)
+    const before = session.messages.length
+    session.messages = session.messages.filter((m) => !drop.has(m))
+    const removed = before - session.messages.length
+    if (removed > 0) {
+      session.totalMessages = Math.max(0, session.totalMessages - removed)
+      this.persistSession(session)
+    }
+    return removed
   }
 
   /**
@@ -528,6 +559,32 @@ export class SessionManager {
       idleSeconds: Math.floor((now - s.lastActivityAt) / 1000),
       createdAt: new Date(s.createdAt).toISOString(),
     }))
+  }
+
+  /**
+   * Chat sessions active within `sinceMs` — the sessions another turn could
+   * be running in. Skips `run:` project-call/pipeline sessions, which are not
+   * user chats. Reuses `extractText` for the first-user-message fallback label.
+   */
+  listChatSessions(sinceMs: number): ChatSessionSummary[] {
+    const cutoff = Date.now() - sinceMs
+    const chats: ChatSessionSummary[] = []
+    for (const session of this.sessions.values()) {
+      if (!isChatSessionId(session.id)) continue
+      if (session.lastActivityAt < cutoff) continue
+      const cachedTitle = session.metadata?.title
+      const title = typeof cachedTitle === 'string' && cachedTitle.trim() ? cachedTitle.trim() : undefined
+      const firstUser = session.messages.find((msg) => msg.role === 'user')
+      const firstUserText = firstUser ? this.extractText(firstUser).trim() || undefined : undefined
+      chats.push({
+        id: session.id,
+        title,
+        firstUserText,
+        lastActivityAt: session.lastActivityAt,
+        messageCount: session.messages.length,
+      })
+    }
+    return chats.sort((a, b) => b.lastActivityAt - a.lastActivityAt)
   }
 
   /**

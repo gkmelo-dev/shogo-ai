@@ -18,6 +18,7 @@ import { tmpdir } from 'os'
 import { emitLogToSink } from '@shogo-ai/sdk/logger'
 import { sanitizeRuntimeLineForSignoz } from './signoz-safe-log'
 import { createBufferedTurns, type PipelineCallOptions, type PipelineCallResult } from './buffered-turn'
+import { describeTurn } from './turn-status'
 import { shouldFlushGitBeforeExport } from './git-export-policy'
 import {
   existsSync,
@@ -141,7 +142,7 @@ import { computePublishedReadiness } from './published-readiness'
 import { resolveDistFile, staticAssetCacheControl, shouldServeSpaFallback } from './static-asset-cache'
 import { SkillServerManager } from './skill-server-manager'
 import { runtimeTerminalRoutes } from './runtime-terminal-routes'
-import { createPtyWsHandlers, type WsData } from './pty-ws-handler'
+import { createPtyWsHandlers, handlePtyUpgrade } from './pty-ws-handler'
 import {
   parsePortParam,
   proxyPortHttp,
@@ -2130,22 +2131,14 @@ app.get('/agent/chat/:chatSessionId/stream', (c) => {
 // Read-only durable-turn status endpoint. Lets a client poll for the current
 // state of a turn without opening a stream — useful when deciding whether to
 // reconnect. Mirrors the snapshot exposed by the StreamBufferStore.
+//
+// `reply` is the turn's final text once it is terminal. The buffer is evicted
+// 30 s after a turn completes, so the reply is kept separately for an hour —
+// a caller whose stream follower missed the turn (API restart, slow poll) can
+// still persist what the agent said instead of re-running the turn.
 app.get('/agent/chat/:chatSessionId/turn', (c) => {
-  const chatSessionId = c.req.param('chatSessionId')
-  const snapshot = streamBufferStore.snapshot(chatSessionId)
-  if (!snapshot) {
-    return c.json({ status: 'unknown' as const }, 404)
-  }
-  return c.json({
-    chatSessionId,
-    turnId: snapshot.turnId,
-    status: snapshot.status,
-    lastSeq: snapshot.lastSeq,
-    terminal: snapshot.terminal,
-    createdAt: snapshot.createdAt,
-    completedAt: snapshot.completedAt,
-    lastEventAt: snapshot.lastEventAt,
-  })
+  const { status, body } = describeTurn(streamBufferStore, c.req.param('chatSessionId'))
+  return c.json(body, status as 200 | 404)
 })
 
 // Live browser screencast for a running subagent instance.
@@ -3159,7 +3152,7 @@ app.post('/pool/export-repo', async (c) => {
     await flushGitBeforeExport(destinationDir)
     let excludeLfsObjects = false
     if (isLfsActive()) {
-      const lfsCfg = lfsRemoteConfigFromEnv(WORKSPACE_DIR)
+      const lfsCfg = lfsRemoteConfigFromEnv(destinationDir)
       if (lfsCfg) excludeLfsObjects = await lfsPushAll(lfsCfg)
     }
     const packed = await packRepoArchive(destinationDir, tmp, { excludeLfsObjects })
@@ -3282,12 +3275,14 @@ app.post('/pool/export-repo-bundle', async (c) => {
       return s
     })
     await flushGitBeforeExport(destinationDir)
-    if (isLfsActive()) {
-      const lfsCfg = lfsRemoteConfigFromEnv(WORKSPACE_DIR)
-      // Bundles never carry LFS objects. Falling back to a tar that does
-      // would not be an option, so a failed push fails the export.
+    // A workspace runtime keeps its members' repos in subfolders and drops
+    // the root `.git`, so the root can have no repo and nothing to push.
+    if (isLfsActive() && existsSync(join(destinationDir, '.git'))) {
+      const lfsCfg = lfsRemoteConfigFromEnv(destinationDir)
+      // Bundles never carry LFS objects, so a failed push fails the export.
+      // The host keeps an unmigrated project on the tarball, which does.
       if (lfsCfg && !(await lfsPushAll(lfsCfg))) {
-        return c.json({ error: 'lfs push failed; repo bundle not exported' }, 503)
+        return c.json({ error: 'lfs push failed; repo bundle not exported', code: 'lfs-push-failed' }, 503)
       }
     }
 
@@ -7344,9 +7339,6 @@ if (state.isPoolMode && !state.poolAssigned && process.env.SHOGO_POOL_SKIP_PRESE
     })
 }
 
-// Match a path like `/terminal/sessions/<id>/ws`; the id segment is opaque
-// (no slashes) and is whatever PtySessionManager.create() assigned.
-const WS_PATH_RE = /^\/terminal\/sessions\/([^/]+)\/ws$/
 // Raw TCP port-bridge upgrade (Phase 3, Tier 2 plan) — see port-bridge.ts.
 const PORT_WS_PATH_RE = /^\/agent\/ports\/([0-9]+)\/ws$/
 const PORT_HTTP_WS_PATH_RE = /^\/agent\/ports\/([0-9]+)\/http(\/.*)?$/
@@ -7421,21 +7413,8 @@ export default {
       )
     }
     const upgrade = req.headers.get('upgrade')?.toLowerCase()
-    const wsMatch = upgrade === 'websocket' ? WS_PATH_RE.exec(url.pathname) : null
-    if (wsMatch) {
-      const sessionId = wsMatch[1]
-      const since = Number(url.searchParams.get('since')) || 0
-      // Quick existence check pre-upgrade so a missing session returns a
-      // proper 404 rather than a confusing accept-then-immediate-close.
-      // We don't `attach()` here — that happens in the WS open handler.
-      if (!ptyManager.get(sessionId)) {
-        return new Response('Unknown session', { status: 404 })
-      }
-      const data: WsData = { manager: ptyManager, sessionId, since }
-      const upgraded = server.upgrade(req, { data })
-      if (upgraded) return undefined
-      return new Response('WebSocket upgrade failed', { status: 500 })
-    }
+    const ptyUpgrade = handlePtyUpgrade(req, server, ptyManager)
+    if (ptyUpgrade !== null) return ptyUpgrade
     const portWsMatch = upgrade === 'websocket' ? PORT_WS_PATH_RE.exec(url.pathname) : null
     if (portWsMatch) {
       if (!isAuthedForPortBridge(req)) {

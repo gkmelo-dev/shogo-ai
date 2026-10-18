@@ -331,6 +331,23 @@ describe('project_configure', () => {
     expect(out.warning).toBeUndefined()
   })
 
+  test('forwards an explicit workingMode to configureProject, including on its own', async () => {
+    const ctx = baseCtx({ projectId: 'proj-1' })
+    const out = await run(createProjectConfigureTool(ctx), { workingMode: 'external' })
+    expect(out.changed).toBe(true)
+    expect(calls.find((c) => c.fn === 'configureProject')?.args).toEqual([
+      'proj-1',
+      { workingMode: 'external' },
+    ])
+  })
+
+  test('rejects a workingMode outside managed/external before calling the API', async () => {
+    const ctx = baseCtx({ projectId: 'proj-1' })
+    const out = await run(createProjectConfigureTool(ctx), { workingMode: 'cloud' })
+    expect(out.error).toMatch(/managed.*external|external.*managed/)
+    expect(calls.find((c) => c.fn === 'configureProject')).toBeUndefined()
+  })
+
   test('targets another project by manifest key resolved through the lock', async () => {
     api.graph.data = [
       { id: 'caller-1', name: 'Caller', description: null, workingMode: 'managed', settings: null, attachments: [], agent: null },
@@ -809,6 +826,14 @@ describe('capabilities_configure', () => {
     expect(saved.imageGenEnabled).toBe(false)
     expect(saved.webEnabled).toBe(false)
     expect(saved.model).toEqual({ name: 'kept' })
+  })
+
+  test('advertises threeDGenEnabled in the changes schema', () => {
+    const tool = createCapabilitiesConfigureTool(baseCtx())
+    const properties = (tool.parameters as any).properties.changes.properties
+    expect(Object.keys(properties)).toContain('threeDGenEnabled')
+    expect(properties.threeDGenEnabled.description).toBe('3D generation')
+    expect(properties.videoGenEnabled.description).toBe('Video generation')
   })
 
   test('rejects an unknown capability', async () => {

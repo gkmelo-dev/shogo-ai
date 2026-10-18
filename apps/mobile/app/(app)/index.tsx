@@ -34,8 +34,7 @@ import {
 import { ComposerPlusSection } from '../../components/chat/ComposerPlusMenu'
 import {
   ChatInput,
-  DEFAULT_MODEL_PRO,
-  DEFAULT_MODEL_FREE,
+  DEFAULT_MODEL,
   type FileAttachment,
   type InteractionMode,
 } from '../../components/chat/ChatInput'
@@ -52,6 +51,7 @@ import { WorkspaceChromeSkeletonRows } from '../../components/layout/WorkspaceCh
 import { workspaceProjectFilter } from '../../lib/project-load'
 import { useBillingData } from '@shogo/shared-app/hooks'
 import { usePlatformConfig, isWorkspaceRuntimeEnabled } from '../../lib/platform-config'
+import { appHomeSurface } from '../../lib/root-destination'
 import { resolveChatScope } from '../../lib/chat-scope'
 import { api, getOnboardingMessage } from '../../lib/api'
 import { EVENTS, trackEvent } from '../../lib/analytics'
@@ -76,7 +76,6 @@ import { ShogoLogoMark } from '../../components/branding/ShogoLogoMark'
 import { WorkspaceAgentChatScreen } from '../../components/workspace/WorkspaceAgentChatScreen'
 import { MobileHomeFeed } from '../../components/home/MobileHomeFeed'
 import { CreatePersonalSpaceBanner } from '../../components/personal/CreatePersonalSpaceBanner'
-import { GetStartedChecklist, useGettingStarted } from '../../components/onboarding/GetStartedChecklist'
 import { useMobileWorkspaceChrome } from '../../components/layout/MobileWorkspaceChromeContext'
 
 /**
@@ -235,9 +234,12 @@ const styles = StyleSheet.create({
 
 export const HomeScreen = observer(function HomeScreen({
   forceBuilder = false,
+  explicitHome = false,
   originWorkspaceSessionId,
 }: {
   forceBuilder?: boolean
+  /** `/(app)/home`: the pre-landing home, not the landing itself. */
+  explicitHome?: boolean
   originWorkspaceSessionId?: string
 }) {
   const router = useRouter()
@@ -275,7 +277,7 @@ export const HomeScreen = observer(function HomeScreen({
   })
 
   const [interactionMode, setInteractionMode] = useState<InteractionMode>('agent')
-  const [selectedModel, setSelectedModel] = useState<string>(DEFAULT_MODEL_FREE)
+  const [selectedModel, setSelectedModel] = useState<string>(DEFAULT_MODEL)
   // Gate stale-selection reconciliation until the persisted preference has
   // loaded. Otherwise the reconciler runs against the initial slug default
   // (which isn't a catalog UUID id), resets to Auto, and persists that — which
@@ -336,13 +338,17 @@ export const HomeScreen = observer(function HomeScreen({
 
   const currentWorkspace = useActiveWorkspace()
   const currentExperience = useWorkspaceExperience()
-  // Personal (and narrow) surfaces render `WorkspaceAgentChatScreen`, which
-  // mounts its own checklist.
-  const rendersAgentChat =
-    !forceBuilder &&
-    isWorkspaceRuntimeEnabled() &&
-    (isNarrowAgentSurface || currentExperience.kind === 'personal')
-  const gettingStarted = useGettingStarted(!rendersAgentChat)
+  // `/` lands on the workspace agent on an empty chat for every workspace
+  // kind and width; `/(app)/home` keeps the pre-landing layout (phone feed /
+  // wide builder) and `/(app)/new-project` pins the builder.
+  const homeSurface = appHomeSurface({
+    forceBuilder,
+    explicitHome,
+    kind: currentExperience.kind,
+    narrow: isNarrowAgentSurface,
+    runtimeEnabled: isWorkspaceRuntimeEnabled(),
+  })
+  const rendersAgentChat = homeSurface === 'agent'
 
   // Whether the user already has a `kind: 'personal'` workspace. `false`
   // surfaces `CreatePersonalSpaceBanner` below — see that component for why
@@ -399,14 +405,10 @@ export const HomeScreen = observer(function HomeScreen({
 
   useEffect(() => {
     loadModelPreference().then((stored) => {
-      if (stored) {
-        setSelectedModel(stored)
-      } else if (hasAdvancedModelAccess) {
-        setSelectedModel(DEFAULT_MODEL_PRO)
-      }
+      if (stored) setSelectedModel(stored)
       setModelPrefLoaded(true)
     })
-  }, [hasAdvancedModelAccess])
+  }, [])
 
   // Deep-link: auto-install a marketplace listing referred from the
   // marketing site. The storage slot is still named
@@ -465,7 +467,7 @@ export const HomeScreen = observer(function HomeScreen({
   // loads.
   useReconcileStaleModelSelection(
     selectedModel,
-    hasAdvancedModelAccess ? DEFAULT_MODEL_PRO : DEFAULT_MODEL_FREE,
+    DEFAULT_MODEL,
     handleHomeModelChange,
     modelPrefLoaded,
   )
@@ -529,6 +531,7 @@ export const HomeScreen = observer(function HomeScreen({
         void api.prewarmWorkspaceRuntime(http, workspaceId, {
           sessionId: draft.chatSessionId,
           attachProjectIds: [draft.projectId],
+          source: 'home_draft',
         })
       } else {
         void api.prewarmProjectRuntime(http, draft.projectId)
@@ -909,16 +912,19 @@ export const HomeScreen = observer(function HomeScreen({
     )
   }
 
-  // Personal workspaces use the agent chat surface on every platform.
-  // Shared workspaces use it on narrow surfaces while wide web retains the
-  // established builder home.
-  // Team workspaces on a phone open on a work-first feed; the workspace agent
-  // chat is one tap away at `/agent`.
-  if (rendersAgentChat && currentExperience.kind === 'team' && isNarrowAgentSurface) {
+  // `/(app)/home` keeps the pre-landing team home: the work-first feed on a
+  // phone and the "What are we building" builder on wide web. The landing
+  // itself is the workspace agent on an empty chat (see `appHomeSurface`).
+  if (homeSurface === 'feed') {
     return <MobileHomeFeed />
   }
   if (rendersAgentChat) {
-    return <WorkspaceAgentChatScreen key={currentWorkspace?.id ?? 'workspace-loading'} />
+    return (
+      <WorkspaceAgentChatScreen
+        key={currentWorkspace?.id ?? 'workspace-loading'}
+        startNewSession
+      />
+    )
   }
 
   const greeting = (
@@ -929,11 +935,6 @@ export const HomeScreen = observer(function HomeScreen({
             userId={user?.id}
             onCreate={handleCreatePersonalWorkspace}
           />
-        </View>
-      ) : null}
-      {gettingStarted.visible ? (
-        <View className={isNativePhone ? 'mb-6 w-full' : 'mb-8 w-full max-w-2xl'}>
-          <GetStartedChecklist state={gettingStarted} />
         </View>
       ) : null}
       {isNativePhone ? (

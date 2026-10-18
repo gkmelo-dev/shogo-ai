@@ -31,7 +31,9 @@ import { availableModelsHint, isAvailableModel } from './available-models'
 import { createWorkspaceAgentTools } from './workspace-agent-tools'
 import { createTriggerTools } from './trigger-tools'
 import { createMeetingTools } from './meeting-tools'
-import { createChannelTools } from './channel-tools'
+import { createGenerateImageTool, createMediaTools } from './media-tools'
+import { IMAGE_TOOL_NAMES, MEDIA_TOOL_NAMES, THREE_D_TOOL_NAMES } from './media-tool-names'
+import { createAgentRunTools, createChannelTools } from './channel-tools'
 import { createBoardTools } from './board-tools'
 import { BOARD_ADMIN_TOOL_NAMES, BOARD_TOOL_NAMES, CHANNEL_TOOL_NAMES, PROBLEM_TOOL_NAMES } from './work-tool-names'
 import { resolveRuntimeCapabilities } from './capability-status-prompt'
@@ -42,6 +44,7 @@ import { disabledToolNamesForProfile } from './capability-profiles'
 import { Type, type Static } from '@sinclair/typebox'
 import type { AgentTool, AgentToolResult } from '@mariozechner/pi-agent-core'
 import { sandboxExec, sandboxExecAsync, shouldSandbox, type CommandHandle } from './sandbox-exec'
+import { getHomeWatch, homeNotPersistedNote } from './home-state-watch'
 import { commandTargetsGateway, gatewayKillRefusal } from './gateway-self-protect'
 import { checkSelfDetach, selfDetachRefusal } from './exec-detach'
 import { CommandRegistry, type CommandEntry } from './command-registry'
@@ -160,6 +163,7 @@ import {
   getPublishState as apiGetPublishState,
   publishProject as apiPublishProject,
   createSharedFileLink as apiCreateSharedFileLink,
+  createWorkspaceSharedFileLink as apiCreateWorkspaceSharedFileLink,
   createGitHubPullRequest as apiCreateGitHubPullRequest,
   mergeGitHubPullRequest as apiMergeGitHubPullRequest,
   connectGitHubWithToken as apiConnectGitHubWithToken,
@@ -1094,6 +1098,13 @@ function buildCompletedExecResult({ ctx, entry, finalResult }: BuildExecResultOp
   // generators). Re-stat them so the next edit is not rejected as stale.
   ctx.fileStateCache?.resyncMtimes()
   if (entry.backgrounded) ctx.commandRegistry?.markConsumed([entry.id])
+  let homeNotPersisted: string | undefined
+  if (!entry.handle.sandboxed) {
+    try {
+      const fresh = getHomeWatch(ctx.workspaceDir)?.checkNew() ?? []
+      if (fresh.length) homeNotPersisted = homeNotPersistedNote(fresh)
+    } catch {}
+  }
   return textResult({
     cwd: newCwd,
     exitCode: finalResult.exitCode,
@@ -1106,6 +1117,7 @@ function buildCompletedExecResult({ ctx, entry, finalResult }: BuildExecResultOp
     killedReason: finalResult.killReason,
     run_id: entry.runId,
     ...(entry.backgrounded ? { task_id: entry.id, output_file: taskOutputPath(ctx, entry) } : {}),
+    homeNotPersisted,
   })
 }
 
@@ -1292,6 +1304,12 @@ function createExecTool(ctx: ToolContext): AgentTool {
       const githubEnv = await Promise.race([githubCliEnvForProject(ctx.projectId), stoppedBeforeSpawn.promise])
       stoppedBeforeSpawn.dispose()
       if (githubEnv === STOPPED) return textResult({ error: 'Stopped before the command started.' })
+      // The baseline must predate the first command, or what it creates is never reported.
+      if (!isSandboxed) {
+        try {
+          getHomeWatch(ctx.workspaceDir)?.prime()
+        } catch {}
+      }
       const handle = sandboxExecAsync({
         command: wrappedCommand,
         workspaceDir: ctx.workspaceDir,
@@ -3802,13 +3820,20 @@ function createAskUserTool(_ctx: ToolContext): AgentTool {
 // Checkpoint Tool (WS4) — list / diff / rollback project snapshots
 // ---------------------------------------------------------------------------
 
-/** Surface a checkpoint API failure to the model, handling external-mode 409 gracefully. */
+/** Surface a checkpoint API failure to the model, handling "not our repo" 409s gracefully. */
 function checkpointError(res: CheckpointCallResult<unknown>): AgentToolResult<any> {
   if (res.code === 'checkpoints_disabled_in_external_mode') {
     return textResult({
       error: res.error,
       external_mode: true,
       hint: 'This is a folder-linked project — Shogo does not manage its git. Do NOT claim there is no history; tell the user to revert with their own git (e.g. `git reflog` / `git checkout`).',
+    })
+  }
+  if (res.code === 'checkpoints_disabled_foreign_repo') {
+    return textResult({
+      error: res.error,
+      foreign_repo: true,
+      hint: "This project's folder is a checkout of another git repository, so Shogo never commits into it. Do NOT claim there is no history; tell the user to use their own git (e.g. `git reflog` / `git checkout`) in that folder.",
     })
   }
   return textResult({
@@ -4100,7 +4125,7 @@ function createPublishTool(ctx: ToolContext): AgentTool {
         }
         if (res.code === 'plan_not_allowed') {
           return textResult({
-            error: 'Publishing to a subdomain requires a Pro (or higher) plan. Tell the user to upgrade in Settings > Billing to publish.',
+            error: 'Publishing to a subdomain requires a Pro (or higher) plan. The chat now shows the user an Upgrade button. Tell them their work is saved and they can publish again once they upgrade; meanwhile they can use the preview URL.',
             code: res.code,
           })
         }
@@ -4156,8 +4181,9 @@ function createShareFileTool(ctx: ToolContext): AgentTool {
       'Create a short-lived download link for one file in the workspace.',
       'Use this whenever the user asks to download, receive, get, or send a generated file such as a PDF, DOCX, ZIP, EXE, image, or other artifact.',
       'This is for individual files, not web apps. Do not invent a localhost or preview URL, and do not use the publish tool for a file download.',
+      'Never upload the file to a third-party host (filebin, file.io, transfer.sh, tmpfiles, 0x0.st, or similar) with curl or any other tool; this is the only supported way to hand a user a file.',
       'After this succeeds, paste the returned URL verbatim and tell the user when it expires. Do not delete or overwrite the shared file before the user downloads it.',
-      'In a workspace runtime, pass `project_id` for the project that owns the file. It defaults to the current project, the workspace anchor, or the only attached project.',
+      'In a workspace runtime, pass `project_id` for the project that owns the file. It defaults to the current project, the workspace anchor, or the only attached project; with none of those, the link is served from this workspace.',
     ].join(' '),
     label: 'Share file',
     parameters: Type.Object({
@@ -4203,15 +4229,20 @@ function createShareFileTool(ctx: ToolContext): AgentTool {
       }
 
       const projectId = resolveTargetProjectId(ctx, input.project_id)
-      if (!projectId) {
+      const workspaceId = isWorkspaceRuntimeMode()
+        ? ctx.workspaceId || resolveRuntimeIdentity().workspaceId
+        : null
+      if (!projectId && !workspaceId) {
         return textResult({
           error: 'No project selected. Pass project_id for the project that owns this file.',
         })
       }
-      const result = await apiCreateSharedFileLink(projectId, {
-        path,
-        expiresInDays: input.expires_in_days,
-      })
+      const linkOptions = { path, expiresInDays: input.expires_in_days }
+      // With no single owning project, the link is served by this workspace
+      // runtime, which is where the file was just found.
+      const result = projectId
+        ? await apiCreateSharedFileLink(projectId, linkOptions)
+        : await apiCreateWorkspaceSharedFileLink(workspaceId!, linkOptions)
       if (!result.ok || !result.data) {
         return textResult({
           error: result.error ?? 'Failed to create a download link',
@@ -5405,6 +5436,27 @@ export function isDeadBrowserError(message: string | undefined): boolean {
   return !!message && DEAD_BROWSER_ERROR_RE.test(message)
 }
 
+export const BROWSER_VIEWPORT_PRESETS = {
+  mobile: { width: 390, height: 844 },
+  tablet: { width: 768, height: 1024 },
+  desktop: { width: 1440, height: 900 },
+} as const
+
+const BROWSER_LOG_LIMIT = 200
+const BROWSER_LOG_TEXT_LIMIT = 1000
+
+interface BrowserLogEntry {
+  kind: 'console' | 'pageerror' | 'network'
+  level: 'error' | 'warning' | 'info'
+  text: string
+  source?: string
+  ts: string
+}
+
+// Chromium evaluates a string as an expression, so agent code written as a
+// function body (top-level `return` / `await`) fails to parse before running.
+const EVALUATE_STATEMENT_SYNTAX_RE = /Illegal return statement|await is only valid|Unexpected reserved word/i
+
 export function createBrowserTool(ctx: ToolContext): AgentTool {
   let browser: any = null
   let lease: BrowserLease | null = null
@@ -5423,8 +5475,63 @@ export function createBrowserTool(ctx: ToolContext): AgentTool {
   // a run folder (`step-01.png`, `step-02.png`, ...). See screenshot-manager.
   let screenshotCount = 0
   let screenshotHousekeepingDone = false
+  let viewportSize: { width: number; height: number } | null = null
+  let logEntries: BrowserLogEntry[] = []
+  let droppedLogEntries = 0
+  const pagesWithLogListeners = new WeakSet<object>()
 
   scLog(`[screencast] createBrowserTool instanceId=${ctx.subagentInstanceId ?? '<none>'}`)
+
+  function pushLog(entry: Omit<BrowserLogEntry, 'ts'>) {
+    const text = entry.text.length > BROWSER_LOG_TEXT_LIMIT ? `${entry.text.slice(0, BROWSER_LOG_TEXT_LIMIT)}…` : entry.text
+    logEntries.push({ ...entry, text, ts: new Date().toISOString() })
+    if (logEntries.length > BROWSER_LOG_LIMIT) {
+      droppedLogEntries += logEntries.length - BROWSER_LOG_LIMIT
+      logEntries = logEntries.slice(-BROWSER_LOG_LIMIT)
+    }
+  }
+
+  function attachLogListeners(p: any) {
+    if (!p?.on || pagesWithLogListeners.has(p)) return
+    pagesWithLogListeners.add(p)
+    p.on('console', (msg: any) => {
+      try {
+        const type = String(msg.type?.() ?? 'log')
+        const loc = msg.location?.() ?? {}
+        pushLog({
+          kind: 'console',
+          level: type === 'error' ? 'error' : type === 'warning' ? 'warning' : 'info',
+          text: String(msg.text?.() ?? ''),
+          source: loc.url ? `${loc.url}${loc.lineNumber !== undefined ? `:${loc.lineNumber}` : ''}` : undefined,
+        })
+      } catch {}
+    })
+    p.on('pageerror', (err: any) => {
+      pushLog({ kind: 'pageerror', level: 'error', text: String(err?.message ?? err) })
+    })
+    p.on('requestfailed', (req: any) => {
+      try {
+        const reason = req.failure?.()?.errorText ?? 'failed'
+        pushLog({ kind: 'network', level: 'error', text: `${req.method?.() ?? 'GET'} ${req.url?.()} ${reason}` })
+      } catch {}
+    })
+    p.on('response', (res: any) => {
+      try {
+        const status = Number(res.status?.())
+        if (!(status >= 400)) return
+        pushLog({
+          kind: 'network',
+          level: status >= 500 ? 'error' : 'warning',
+          text: `${status} ${res.request?.()?.method?.() ?? 'GET'} ${res.url?.()}`,
+        })
+      } catch {}
+    })
+  }
+
+  async function preparePage(p: any) {
+    attachLogListeners(p)
+    if (viewportSize && p?.setViewportSize) await p.setViewportSize(viewportSize)
+  }
 
   async function ensureScreencast() {
     // Only broadcast when this tool is running inside a spawned subagent
@@ -5558,6 +5665,7 @@ export function createBrowserTool(ctx: ToolContext): AgentTool {
           unregisterSessionCleanup = registerBrowserSessionCleanup(ctx.sessionId, () => cleanup())
         }
       }
+      await preparePage(page)
       await ensureScreencast()
       return page
     } catch (err: any) {
@@ -5632,6 +5740,8 @@ export function createBrowserTool(ctx: ToolContext): AgentTool {
     const currentLease = lease
     const currentBrowser = browser
     const wasExtensionMode = isExtensionMode
+    logEntries = []
+    droppedLogEntries = 0
     page = null
     lease = null
     browser = null
@@ -5674,7 +5784,7 @@ export function createBrowserTool(ctx: ToolContext): AgentTool {
   const tool: AgentTool = {
     name: 'browser',
     description:
-      'Control a browser. MUST snapshot before any interaction to get element refs. Actions: navigate, snapshot, click, fill, select, extract, text, screenshot, evaluate, scroll, wait_for, close. Workflow: navigate → snapshot → use ref numbers → snapshot again after changes. Use read_guide("browser") for details.',
+      'Control a browser. MUST snapshot before any interaction to get element refs. Actions: navigate, snapshot, click, fill, select, extract, text, screenshot, evaluate, scroll, wait_for, viewport, console, close. Workflow: navigate → snapshot → use ref numbers → snapshot again after changes. viewport resizes the page (device: mobile 390x844, tablet 768x1024, desktop 1440x900, or width/height) — use it for mobile checks. console returns console messages, uncaught page errors and failed/4xx/5xx network requests since the last call. Use read_guide("browser") for details.',
     label: 'Browser',
     parameters: Type.Object({
       action: Type.Union(
@@ -5690,9 +5800,23 @@ export function createBrowserTool(ctx: ToolContext): AgentTool {
           Type.Literal('select'),
           Type.Literal('scroll'),
           Type.Literal('wait_for'),
+          Type.Literal('viewport'),
+          Type.Literal('console'),
           Type.Literal('close'),
         ],
         { description: 'Browser action to perform' },
+      ),
+      device: Type.Optional(
+        Type.Union([Type.Literal('mobile'), Type.Literal('tablet'), Type.Literal('desktop')], {
+          description: 'Viewport preset (for viewport action)',
+        }),
+      ),
+      width: Type.Optional(Type.Number({ description: 'Viewport width in px (for viewport action, overrides device)' })),
+      height: Type.Optional(Type.Number({ description: 'Viewport height in px (for viewport action, overrides device)' })),
+      level: Type.Optional(
+        Type.Union([Type.Literal('all'), Type.Literal('error')], {
+          description: 'For console action: "error" returns only errors (default: all)',
+        }),
       ),
       url: Type.Optional(
         Type.String({
@@ -5728,6 +5852,10 @@ export function createBrowserTool(ctx: ToolContext): AgentTool {
         selector,
         value,
         waitMs = 1000,
+        device,
+        width,
+        height,
+        level,
       } = params as {
         action: string
         url?: string
@@ -5735,6 +5863,10 @@ export function createBrowserTool(ctx: ToolContext): AgentTool {
         selector?: string
         value?: string
         waitMs?: number
+        device?: keyof typeof BROWSER_VIEWPORT_PRESETS
+        width?: number
+        height?: number
+        level?: 'all' | 'error'
       }
 
       clearIdleRelease()
@@ -5743,6 +5875,19 @@ export function createBrowserTool(ctx: ToolContext): AgentTool {
         if (action === 'close') {
           await cleanup()
           return textResult({ ok: true, action: 'close' })
+        }
+
+        let requestedViewport: { width: number; height: number } | null = null
+        if (action === 'viewport') {
+          const preset = device ? BROWSER_VIEWPORT_PRESETS[device] : undefined
+          const w = width ?? preset?.width
+          const h = height ?? preset?.height
+          if (!w || !h || w < 200 || h < 200 || w > 3840 || h > 2160) {
+            return textResult({
+              error: 'viewport needs device ("mobile" | "tablet" | "desktop") or width and height between 200 and 3840x2160',
+            })
+          }
+          requestedViewport = { width: Math.round(w), height: Math.round(h) }
         }
 
         const p = await ensureBrowser()
@@ -5905,8 +6050,39 @@ export function createBrowserTool(ctx: ToolContext): AgentTool {
               return textResult({
                 error: 'value (JS code) is required for evaluate',
               })
-            const result = await p.evaluate(value)
+            let result: unknown
+            try {
+              result = await p.evaluate(value)
+            } catch (evalErr: any) {
+              if (!EVALUATE_STATEMENT_SYNTAX_RE.test(evalErr?.message ?? '')) throw evalErr
+              // The syntax error means nothing ran, so retrying is safe.
+              const asBody = `(async () => {\n${value}\n})()`
+              if (/(^|[;{}\n])\s*return\b/.test(value)) {
+                result = await p.evaluate(asBody)
+              } else {
+                try {
+                  result = await p.evaluate(`(async () => { return (\n${value}\n) })()`)
+                } catch (exprErr: any) {
+                  if (!/SyntaxError/i.test(exprErr?.message ?? '')) throw exprErr
+                  result = await p.evaluate(asBody)
+                }
+              }
+            }
             return textResult({ result, url: p.url() })
+          }
+          case 'viewport': {
+            viewportSize = requestedViewport
+            await p.setViewportSize(viewportSize)
+            return textResult({ ok: true, action: 'viewport', viewport: viewportSize, url: p.url() })
+          }
+          case 'console': {
+            const entries = level === 'error' ? logEntries.filter((e) => e.level === 'error') : logEntries
+            const counts = { console: 0, pageerror: 0, network: 0 }
+            for (const e of entries) counts[e.kind]++
+            const dropped = droppedLogEntries
+            logEntries = []
+            droppedLogEntries = 0
+            return textResult({ entries, counts, ...(dropped ? { dropped } : {}), url: p.url() })
           }
           case 'select': {
             const locator = resolveLocator(p, ref, selector)
@@ -8494,6 +8670,7 @@ export function createTools(ctx: ToolContext, extraTools?: AgentTool[]): AgentTo
     createConnectTool(ctx),
     createDisconnectTool(ctx),
     g(createGenerateImageTool(ctx), 'network'),
+    ...createMediaTools(ctx).map((t) => g(t, 'network')),
     g(createTranscribeAudioTool(ctx), 'network'),
     createHeartbeatConfigureTool(ctx),
     createHeartbeatStatusTool(ctx),
@@ -8555,6 +8732,8 @@ export function createTools(ctx: ToolContext, extraTools?: AgentTool[]): AgentTo
     if (ctx.config.capabilityProfile === 'personal') tools.push(...createMeetingTools(ctx))
     else {
       tools.push(...createChannelTools(ctx))
+      // A project-anchored runtime speaks as that project's agent, not the workspace agent.
+      if (!process.env.WORKSPACE_ANCHOR_PROJECT_ID) tools.push(...createAgentRunTools(ctx))
       tools.push(...createBoardTools(ctx))
     }
   }
@@ -9187,7 +9366,14 @@ export function filterDisabledCapabilityTools(tools: AgentTool[], config: import
   if (config.browserEnabled === false) disabled.add('browser')
   if (config.shellEnabled === false) for (const n of TOOL_GROUP_MAP.shell) disabled.add(n)
   if (config.heartbeatToolsEnabled === false) for (const n of TOOL_GROUP_MAP.heartbeat) disabled.add(n)
-  if (config.imageGenEnabled === false) disabled.add('generate_image')
+  if (config.imageGenEnabled === false) for (const n of IMAGE_TOOL_NAMES) disabled.add(n)
+  if (config.videoGenEnabled !== true) disabled.add('generate_video')
+  if (config.threeDGenEnabled !== true) for (const n of THREE_D_TOOL_NAMES) disabled.add(n)
+  // The listing stays available while ANY generation capability is on, so a
+  // 3D-only (or video-only) project can still price a model before spending.
+  const anyGenerationOn =
+    config.imageGenEnabled !== false || config.videoGenEnabled === true || config.threeDGenEnabled === true
+  if (!anyGenerationOn) disabled.add('list_media_models')
   if (config.quickActionsEnabled === false) disabled.add('quick_action')
   if (config.channelsEnabled === false) for (const n of TOOL_GROUP_MAP.messaging) disabled.add(n)
   if (config.integrationsEnabled === false) for (const n of TOOL_GROUP_MAP.integrations) disabled.add(n)
@@ -9219,7 +9405,7 @@ export function filterDisabledCapabilityTools(tools: AgentTool[], config: import
  */
 export const SUBAGENT_ONLY_TOOLS = new Set([
   'browser', // -> browser subagent
-  'generate_image',
+  ...MEDIA_TOOL_NAMES,
   'transcribe_audio', // -> media subagent
   'server_sync', // -> devops subagent
 ])
@@ -9237,7 +9423,7 @@ export const SUBAGENT_ONLY_TOOLS = new Set([
  * only the media tools need this carve-out.
  */
 export function filterSubagentOnlyTools(tools: AgentTool[], config: import('./gateway').GatewayConfig): AgentTool[] {
-  const exempt = config.capabilityProfile === 'personal' ? new Set(['generate_image', 'transcribe_audio']) : new Set<string>()
+  const exempt = config.capabilityProfile === 'personal' ? new Set<string>([...MEDIA_TOOL_NAMES, 'transcribe_audio']) : new Set<string>()
   return tools.filter((t) => exempt.has(t.name) || !SUBAGENT_ONLY_TOOLS.has(t.name))
 }
 
@@ -10223,260 +10409,6 @@ function createTranscribeAudioTool(ctx: ToolContext): AgentTool {
         return textResult({
           error: `Audio transcription failed: ${err.message}`,
         })
-      }
-    },
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Image Generation Tool
-// ---------------------------------------------------------------------------
-
-/**
- * Turn a raw upstream image-generation failure into a short, human-readable
- * message instead of surfacing the raw (sometimes doubly-JSON-nested)
- * provider error body straight into the chat transcript — e.g. the proxy
- * wraps an OpenAI failure as a string like `OpenAI image generation error
- * (400): {"error":{"message":"Unknown parameter: 'response_format'."}}`,
- * which GenerateImageWidget (apps/mobile) used to render verbatim in a
- * "Image generation failed" card. The raw text is still logged server-side
- * (agent-runtime process stdout) for debugging.
- */
-function friendlyImageGenerationError(context: string, status: number, rawErrorText: string): string {
-  console.error(`[${context}] upstream error (${status}):`, rawErrorText)
-  try {
-    const parsed = JSON.parse(rawErrorText)
-    let message: string | undefined = parsed?.error?.message
-    if (typeof message === 'string') {
-      // Unwrap one more level of nested JSON, if the proxy embedded it in
-      // the message text (see the doc comment above).
-      const nestedMatch = message.match(/:\s*(\{[\s\S]*\})\s*$/)
-      if (nestedMatch) {
-        try {
-          const nested = JSON.parse(nestedMatch[1])
-          if (typeof nested?.error?.message === 'string') message = nested.error.message
-        } catch {
-          // Keep the outer message — the embedded text wasn't valid JSON.
-        }
-      }
-      if (message) return message
-    }
-  } catch {
-    // Not JSON at all — fall through to the generic message below.
-  }
-  if (status === 429) return `${context} is rate-limited right now. Please try again in a moment.`
-  if (status >= 500) return `The image provider is temporarily unavailable. Please try again shortly.`
-  return `${context} failed. Please try a different prompt.`
-}
-
-function createGenerateImageTool(ctx: ToolContext): AgentTool {
-  return {
-    name: 'generate_image',
-    description:
-      'Generate one to four image options from a text prompt using AI (GPT Image, Imagen, etc). The images are saved to the agent workspace. Optionally provide a reference_image path to edit/modify an existing workspace image instead of generating from scratch.',
-    label: 'Generate Image',
-    parameters: Type.Object({
-      prompt: Type.String({
-        description: 'Text description of the image to generate, or edit instruction when using reference_image',
-      }),
-      filename: Type.Optional(
-        Type.String({
-          description: 'Destination filename (default: auto-generated). Saved under images/ directory.',
-        }),
-      ),
-      size: Type.Optional(
-        Type.String({
-          description: 'Image size: "1024x1024", "1024x1792", "1792x1024" (default: "1024x1024")',
-        }),
-      ),
-      options: Type.Optional(
-        Type.Integer({
-          minimum: 1,
-          maximum: 4,
-          description: 'Number of image options to generate (1-4, default: 1)',
-        }),
-      ),
-      // OpenAI retired the DALL-E 2/3 models (2026-09) — "dall-e-3" now 400s
-      // with "The model 'dall-e-3' does not exist." `gpt-image-2.5-flare`
-      // is the current default, for both generation and reference_image
-      // edits (edits used to require dall-e-2, which is also retired).
-      model: Type.Optional(
-        Type.String({
-          description: 'Image model: "gpt-image-2.5-flare", "gpt-image-1", "imagen-4", etc. (default: "gpt-image-2.5-flare")',
-        }),
-      ),
-      quality: Type.Optional(
-        Type.String({
-          description: 'Image quality: "standard" or "hd" (default: "standard")',
-        }),
-      ),
-      reference_image: Type.Optional(
-        Type.String({
-          description: 'Path to a workspace image to use as reference for editing (e.g. "images/logo.png")',
-        }),
-      ),
-    }),
-    execute: async (_toolCallId, params) => {
-      const {
-        prompt,
-        filename,
-        size = '1024x1024',
-        model = 'gpt-image-2.5-flare',
-        quality = 'standard',
-        reference_image,
-        options = 1,
-      } = params as {
-        prompt: string
-        filename?: string
-        size?: string
-        model?: string
-        quality?: string
-        reference_image?: string
-        options?: number
-      }
-
-      if (!Number.isInteger(options) || options < 1 || options > 4) {
-        return textResult({
-          error: 'The options parameter must be an integer between 1 and 4.',
-        })
-      }
-
-      const proxyUrl = ctx.aiProxyUrl || process.env.AI_PROXY_URL
-      const proxyToken = ctx.aiProxyToken || process.env.AI_PROXY_TOKEN
-      if (!proxyUrl || !proxyToken) {
-        return textResult({
-          error: 'Image generation is not available: AI proxy not configured.',
-        })
-      }
-
-      const imagesDir = join(ctx.workspaceDir, 'images')
-      mkdirSync(imagesDir, { recursive: true })
-
-      const outputFilename = filename || `generated-${Date.now()}-${Math.random().toString(36).slice(2, 6)}.png`
-      const safeFilename = outputFilename.replace(/[^a-zA-Z0-9._-]/g, '_')
-      const resolvedImagesDir = resolve(imagesDir)
-      const extension = extname(safeFilename) || '.png'
-      const stem = safeFilename.slice(0, -extension.length) || 'generated-image'
-      const outputPathFor = (index: number) => {
-        const candidateFilename = options === 1 ? safeFilename : `${stem}-${index + 1}${extension}`
-        const candidatePath = join(imagesDir, candidateFilename)
-        if (!resolve(candidatePath).startsWith(resolvedImagesDir)) {
-          throw new Error('Invalid filename: path traversal detected.')
-        }
-        return { candidateFilename, candidatePath }
-      }
-
-      try {
-        let responseData: any
-
-        if (reference_image) {
-          const refPath = assertWithinWorkspace(ctx.workspaceDir, reference_image)
-          if (!existsSync(refPath)) {
-            return textResult({
-              error: `Reference image not found: ${reference_image}`,
-            })
-          }
-
-          const imageBuffer = readFileSync(refPath)
-          const refExt = extname(refPath).toLowerCase()
-          const mimeMap: Record<string, string> = {
-            '.png': 'image/png',
-            '.jpg': 'image/jpeg',
-            '.jpeg': 'image/jpeg',
-            '.webp': 'image/webp',
-          }
-          const mimeType = mimeMap[refExt] || 'image/png'
-
-          const formData = new FormData()
-          formData.append('image', new Blob([imageBuffer], { type: mimeType }), `reference${refExt || '.png'}`)
-          formData.append('prompt', prompt)
-          // dall-e-2 (the previous edit model) is retired; the gpt-image
-          // family supports /v1/images/edits too — see the ai-proxy edits
-          // route. Send the resolved `model` (defaults to
-          // gpt-image-2.5-flare) instead of a hardcoded literal so an
-          // explicit model choice is respected for edits too.
-          formData.append('model', model)
-          formData.append('size', size)
-          formData.append('n', String(options))
-
-          const editUrl = proxyUrl.replace(/\/v1$/, '/v1/images/edits')
-          const response = await fetch(editUrl, {
-            method: 'POST',
-            headers: { Authorization: `Bearer ${proxyToken}` },
-            body: formData,
-          })
-
-          if (!response.ok) {
-            const errText = await response.text()
-            return textResult({
-              error: friendlyImageGenerationError('Image edit', response.status, errText),
-            })
-          }
-
-          responseData = await response.json()
-        } else {
-          const genUrl = proxyUrl.replace(/\/v1$/, '/v1/images/generations')
-          const response = await fetch(genUrl, {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              Authorization: `Bearer ${proxyToken}`,
-            },
-            body: JSON.stringify({
-              prompt,
-              model,
-              size,
-              quality,
-              n: options,
-            }),
-          })
-
-          if (!response.ok) {
-            const errText = await response.text()
-            return textResult({
-              error: friendlyImageGenerationError('Image generation', response.status, errText),
-            })
-          }
-
-          responseData = await response.json()
-        }
-
-        if (responseData.error) {
-          return textResult({
-            error: responseData.error.message || 'Image generation failed',
-          })
-        }
-
-        const imageDataList = Array.isArray(responseData.data) ? responseData.data.slice(0, options) : []
-        if (imageDataList.length === 0 || imageDataList.some((item: any) => !item?.b64_json)) {
-          return textResult({ error: 'No image data received from provider' })
-        }
-
-        const paths: string[] = []
-        const revisedPrompts: string[] = []
-        let totalBytes = 0
-        for (const [index, imageData] of imageDataList.entries()) {
-          const imageBuffer = Buffer.from(imageData.b64_json, 'base64')
-          const { candidateFilename, candidatePath } = outputPathFor(index)
-          writeFileSync(candidatePath, imageBuffer)
-          paths.push(`images/${candidateFilename}`)
-          totalBytes += imageBuffer.length
-          revisedPrompts.push(imageData.revised_prompt || prompt)
-        }
-
-        return textResult({
-          path: paths[0],
-          paths,
-          size,
-          model,
-          quality,
-          bytes: totalBytes,
-          revised_prompt: revisedPrompts[0],
-          revised_prompts: revisedPrompts,
-          reference_image: reference_image || undefined,
-        })
-      } catch (err: any) {
-        return textResult({ error: `Image generation error: ${err.message}` })
       }
     },
   }

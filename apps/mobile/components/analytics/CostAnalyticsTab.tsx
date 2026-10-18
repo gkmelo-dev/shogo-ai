@@ -69,6 +69,7 @@ import {
   formatNumber,
   formatDuration,
   formatDollarCost,
+  formatPartialCost,
   getModelColor,
   getModelTextColor,
   getModelDisplayName,
@@ -79,6 +80,7 @@ import { OptimizerInActionSection, type OptimizerInActionData } from './Optimize
 import { RecommendationsSection, type CostRecommendation } from './RecommendationsSection'
 import { BudgetSection, type BudgetAlertItem, type BudgetStatus } from './BudgetSection'
 import { ExperimentsSection, type ExperimentItem } from './ExperimentsSection'
+import { LoadErrorNotice, type LoadErrors } from './LoadErrorNotice'
 
 // =============================================================================
 // Types
@@ -90,6 +92,8 @@ interface AgentBreakdownEntry {
   /** Server-resolved display label for `model` (falls back to client resolution). */
   modelLabel?: string
   totalRuns: number
+  /** Runs with quality signals; backfilled turns count toward cost only. */
+  scoredRuns?: number
   promiseSuccesses?: number
   qualitySuccesses?: number
   hitMaxTurns?: number
@@ -99,8 +103,11 @@ interface AgentBreakdownEntry {
   totalInputTokens: number
   totalOutputTokens: number
   totalCachedInputTokens: number
+  totalCacheWriteTokens?: number
   totalToolCalls: number
   totalCreditCost: number
+  /** Desktop runs recorded without rates for their model; their cost is 0, not a guess. */
+  unpricedRuns?: number
   totalWallTimeMs: number
   avgCostPerRun: number
   avgLatencyMs: number
@@ -112,8 +119,13 @@ interface AgentBreakdownEntry {
 interface BreakdownData {
   breakdown: AgentBreakdownEntry[]
   totals: {
+    /** Raw provider cost. */
     totalCreditCost: number
+    /** Shogo's fee on top of provider cost; 0 on desktop, where usage isn't billed. */
+    shogoFeeUsd?: number
+    totalWithFeeUsd?: number
     totalRuns: number
+    unpricedRuns?: number
     totalInputTokens: number
     totalOutputTokens: number
     totalToolCalls: number
@@ -235,44 +247,60 @@ export function CostAnalyticsTab({
     icon: icons[icon],
   }))
 
+  const [loadErrors, setLoadErrors] = useState<LoadErrors>({})
+  const fetchSection = useCallback(
+    <T,>(label: string, endpoint: string, params?: Record<string, string>) =>
+      fetchCostAnalytics<T>(endpoint, params).then(
+        (data) => {
+          setLoadErrors(({ [label]: _cleared, ...rest }) => rest)
+          return data
+        },
+        (err: any) => {
+          setLoadErrors(errors => ({ ...errors, [label]: err?.message || 'Request failed' }))
+          return null
+        },
+      ),
+    [fetchCostAnalytics],
+  )
+
   // Phase 4.3 — per-section loaders. Each section only fetches the data it
   // actually renders and only when it becomes active. The summary cards still
   // need breakdown + budgetStatus + trends, so those three are loaded eagerly
   // on mount and re-loaded when the period changes.
   const loadBreakdown = useCallback(async () => {
     setBreakdown(s => ({ ...s, loading: true }))
-    const data = await fetchCostAnalytics<BreakdownData>('agent-breakdown', { period }).catch(() => null)
+    const data = await fetchSection<BreakdownData>('agent breakdown', 'agent-breakdown', { period })
     setBreakdown({ data, loading: false })
-  }, [fetchCostAnalytics, period])
+  }, [fetchSection, period])
 
   const loadRecommendations = useCallback(async () => {
     setRecommendations(s => ({ ...s, loading: true }))
-    const data = await fetchCostAnalytics<CostRecommendation[]>('recommendations', { period }).catch(() => null)
+    const data = await fetchSection<CostRecommendation[]>('recommendations', 'recommendations', { period })
     setRecommendations({ data, loading: false })
-  }, [fetchCostAnalytics, period])
+  }, [fetchSection, period])
 
   const loadTrends = useCallback(async () => {
     setTrends(s => ({ ...s, loading: true }))
-    const data = await fetchCostAnalytics<TrendsData>('trends', { period }).catch(() => null)
+    const data = await fetchSection<TrendsData>('trends', 'trends', { period })
     setTrends({ data, loading: false })
-  }, [fetchCostAnalytics, period])
+  }, [fetchSection, period])
 
   const loadBudget = useCallback(async () => {
     setBudgetAlerts(s => ({ ...s, loading: true }))
     setBudgetStatus(s => ({ ...s, loading: true }))
     const [ba, bs] = await Promise.all([
-      fetchCostAnalytics<BudgetAlertItem[]>('budget-alerts').catch(() => null),
-      fetchCostAnalytics<BudgetStatus>('budget-status').catch(() => null),
+      fetchSection<BudgetAlertItem[]>('budget alerts', 'budget-alerts'),
+      fetchSection<BudgetStatus>('budget status', 'budget-status'),
     ])
     setBudgetAlerts({ data: ba, loading: false })
     setBudgetStatus({ data: bs, loading: false })
-  }, [fetchCostAnalytics])
+  }, [fetchSection])
 
   const loadExperiments = useCallback(async () => {
     setExperiments(s => ({ ...s, loading: true }))
-    const data = await fetchCostAnalytics<ExperimentItem[]>('experiments').catch(() => null)
+    const data = await fetchSection<ExperimentItem[]>('experiments', 'experiments')
     setExperiments({ data, loading: false })
-  }, [fetchCostAnalytics])
+  }, [fetchSection])
 
   const loadInAction = useCallback(async () => {
     setInAction(s => ({ ...s, loading: true, error: null }))
@@ -363,6 +391,8 @@ export function CostAnalyticsTab({
         <PeriodSelector value={period} onChange={setPeriod} />
       </View>
 
+      <LoadErrorNotice errors={loadErrors} />
+
       {/* Summary Cards */}
       <SummaryCards
         data={breakdown.data}
@@ -444,18 +474,31 @@ function SummaryCards({
   icons: CostAnalyticsIcons
 }) {
   const totalCost = data?.totals.totalCreditCost ?? 0
+  const shogoFee = data?.totals.shogoFeeUsd ?? 0
+  const totalWithFee = data?.totals.totalWithFeeUsd ?? totalCost + shogoFee
   const totalRuns = data?.totals.totalRuns ?? 0
+  const unpricedRuns = data?.totals.unpricedRuns ?? 0
   const avgCost = totalRuns > 0 ? Math.round((totalCost / totalRuns) * 100) / 100 : 0
   const forecast = trends?.forecast
 
   return (
     <View className="flex-row flex-wrap gap-2">
       <MiniCard
-        label="Total Cost"
-        value={formatDollarCost(totalCost)}
+        label="Provider Cost"
+        value={formatPartialCost(totalCost, unpricedRuns, totalRuns)}
         icon={icons.DollarSign}
         color="text-orange-400"
+        subtitle={unpricedRuns > 0 ? `${formatNumber(unpricedRuns)} runs on models without published rates` : undefined}
       />
+      {shogoFee > 0 && (
+        <MiniCard
+          label={`Shogo Fee (${Math.round((shogoFee / totalCost) * 100)}%)`}
+          value={formatDollarCost(shogoFee)}
+          icon={icons.DollarSign}
+          color="text-orange-400"
+          subtitle={`Total ${formatDollarCost(totalWithFee)}`}
+        />
+      )}
       <MiniCard
         label="Agent Runs"
         value={formatNumber(totalRuns)}
@@ -585,8 +628,9 @@ function AgentBreakdownSection({
       {entries.map((entry, i) => {
         const key = `${entry.agentType}::${entry.model}`
         const isExpanded = expanded === key
-        const promiseSuccesses = entry.promiseSuccesses ?? Math.round((entry.successRate / 100) * entry.totalRuns)
-        const failures = Math.max(0, entry.totalRuns - promiseSuccesses)
+        const scoredRuns = entry.scoredRuns ?? entry.totalRuns
+        const promiseSuccesses = entry.promiseSuccesses ?? Math.round((entry.successRate / 100) * scoredRuns)
+        const failures = Math.max(0, scoredRuns - promiseSuccesses)
         const qualitySuccessRate = entry.qualitySuccessRate ?? entry.successRate
         const costPercent = data!.totals.totalCreditCost > 0
           ? Math.round((entry.totalCreditCost / data!.totals.totalCreditCost) * 100)
@@ -620,7 +664,7 @@ function AgentBreakdownSection({
                   </View>
                   <View className="items-end">
                     <Text className="text-sm font-bold text-foreground">
-                      {formatDollarCost(entry.totalCreditCost)}
+                      {formatPartialCost(entry.totalCreditCost, entry.unpricedRuns, entry.totalRuns)}
                     </Text>
                     <Text className="text-[10px] text-muted-foreground">{costPercent}% of period cost</Text>
                   </View>
@@ -669,7 +713,10 @@ function AgentBreakdownSection({
                         Output: {formatNumber(entry.totalOutputTokens)} tokens
                       </Text>
                       <Text className="text-[10px] text-muted-foreground">
-                        Cached: {formatNumber(entry.totalCachedInputTokens)} tokens
+                        Cache read: {formatNumber(entry.totalCachedInputTokens)} tokens
+                      </Text>
+                      <Text className="text-[10px] text-muted-foreground">
+                        Cache write: {formatNumber(entry.totalCacheWriteTokens ?? 0)} tokens
                       </Text>
                     </View>
                   </View>

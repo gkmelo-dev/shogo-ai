@@ -99,6 +99,7 @@
     "expo-splash-screen": "~57.0.9",
     "expo-status-bar": "~57.0.1",
     "expo-updates": "~57.0.24",
+    "expo-video": "~57.0.5",
     "expo-web-browser": "~57.0.3",
     "expo-widgets": "~57.0.23",
     "html2canvas": "^1.4.1",
@@ -108,7 +109,7 @@
     "mobx-react-lite": "^4.1.1",
     "mobx-state-tree": "^6.0.1",
     "monaco-editor": "^0.55.1",
-    "nativewind": "^4.1.23",
+    "nativewind": "4.2.2",
     "posthog-react-native": "^4.37.2",
     "react": "19.2.3",
     "react-aria": "^3.33.0",
@@ -149,6 +150,7 @@
     }
   },
   "devDependencies": {
+    "@babel/core": "^7.29.0",
     "@babel/plugin-transform-class-static-block": "^7.28.3",
     "@expo/metro-runtime": "~57.0.16",
     "@happy-dom/global-registrator": "^20.9.0",

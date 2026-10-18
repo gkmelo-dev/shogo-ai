@@ -453,7 +453,13 @@ jobs:
           - { name: 'E2E (local mode) (3/3)', shard: '3/3' }
           # chat-resume-on-send needs the API pointed at its fake model, which
           # would change every other spec, so it gets a stack of its own.
-          - { name: 'E2E (chat resume)', spec: chat-resume-on-send }
+          # chat-stop-then-send needs the same stack (stop a turn mid-stream,
+          # then send) and runs in the same job, one worker at a time.
+          # chat-task-resume needs it too: a background exec that finishes has
+          # to wake the chat with no user input.
+          # chat-background-tasks reads the dock a background task left behind
+          # after navigating away, a reload and a restart of the panel.
+          - { name: 'E2E (chat resume)', spec: 'chat-resume-on-send chat-stop-then-send chat-task-resume chat-background-tasks' }
     permissions:
       contents: read
     timeout-minutes: 60
@@ -653,7 +659,7 @@ jobs:
             desktop_bundle: false
             include_e2e: false
           - name: remaining + e2e
-            packages: packages/shared-runtime,packages/model-catalog,packages/authz,packages/sdk,scripts,packages/shared-app,apps/metal-agent,packages/agent,packages/core,packages/email,packages/voice
+            packages: packages/shared-runtime,packages/model-catalog,packages/authz,packages/sdk,scripts,packages/shared-app,apps/metal-agent,packages/agent,packages/core,packages/email,packages/voice,apps/desktop
             shard: ''
             build_templates: true
             desktop_bundle: true
@@ -871,6 +877,20 @@ jobs:
         working-directory: apps/api
         run: |
           for f in src/__tests__/rbac/*.test.ts; do
+            echo "::group::$f"
+            bun --no-env-file test "$f" || exit 1
+            echo "::endgroup::"
+          done
+
+      # Real-Postgres suites that skip themselves elsewhere: the advisory-lock
+      # pool under contention, and the replication monitor script run with
+      # psql (jq/psql ship on the ubuntu runner).
+      - name: Postgres integration suites
+        working-directory: apps/api
+        env:
+          REQUIRE_PG_INTEGRATION: '1'
+        run: |
+          for f in src/__tests__/advisory-lock-pool.integration.test.ts src/__tests__/monitor-rollout-grace.integration.test.ts; do
             echo "::group::$f"
             bun --no-env-file test "$f" || exit 1
             echo "::endgroup::"

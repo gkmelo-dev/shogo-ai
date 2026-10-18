@@ -37,6 +37,7 @@ import type { ToolContext } from './gateway-tools'
 import { createTools, textResult, filterDisabledCapabilityTools, filterSubagentOnlyTools, expectedCoreToolsForAgentMode, createModeUnavailableTool, workspaceAgentToolsRegistered, type RestrictedMode } from './gateway-tools'
 import { DEFAULT_CLOUD_SECURITY_PREFERENCE, PermissionEngine, parseSecurityPolicy } from './permission-engine'
 import { buildExposedPortsPrompt } from './exposed-ports-prompt'
+import { buildConcurrentChatsPrompt, concurrentChatLabel, type ConcurrentChat } from './concurrent-chats-prompt'
 import { HookEmitter, loadAllHooks, workspaceHooksSignature } from './hooks'
 import { parseSlashCommand, type SlashCommandContext } from './slash-commands'
 import { SessionManager, type SessionManagerConfig, applyToolResultBudget, snipConsumedResults } from './session-manager'
@@ -121,7 +122,7 @@ import { buildGuideRegistry, buildCapabilitiesIndex } from './guide-registry'
 import { AgentManager } from './agent-manager'
 import { loadWorkspaceCustomAgents } from './subagent'
 import { TaskRegistry, formatTaskNotification } from './task-registry'
-import { cleanupTaskOutputs, taskOutputDir, taskOutputRoot } from './task-output'
+import { cleanupTaskOutputs, listTaskOutputRows, taskOutputDir, taskOutputRoot } from './task-output'
 import { createApiTaskClient } from './remote-tasks'
 import { releaseSessionBrowsers, reapOrphanChromium } from './browser-pool'
 import { TeamManager } from './team-manager'
@@ -231,6 +232,24 @@ export function isUserStoppedTurn(result: { abortReason?: string }): boolean {
 }
 
 /**
+ * True when a loop ended with nothing to show and no error worth surfacing:
+ * either a clean empty stop or the loop's implicit "no output" error. Real
+ * provider errors were already classified and retried inside the loop.
+ */
+export function isEmptyTurnResult(result: {
+  text?: string
+  toolCalls: unknown[]
+  error?: Error
+  usageLimit?: unknown
+  loopBreak?: unknown
+  abortReason?: string
+}): boolean {
+  if (result.text?.trim() || result.toolCalls.length > 0) return false
+  if (result.usageLimit || result.loopBreak || result.abortReason) return false
+  return !result.error || result.error.message === 'Agent produced no output — possible provider error'
+}
+
+/**
  * Parse the admin-injected `AGENT_SUMMARIZER_MODEL` env var (`{ id, provider }`
  * JSON, resolved by the API server from the `summarizer.model` setting).
  * Falls back to Haiku on Anthropic when unset or malformed — e.g. a desktop
@@ -260,6 +279,12 @@ const AUTO_TIER_ORDER: AutoTierCeiling[] = ['economy', 'standard', 'premium']
 const AUTO_TIER_CEILING_TTL_MS = 5 * 60 * 1000
 /** Finished tasks arriving this close together wake an idle session once. */
 const TASK_WAKE_COALESCE_MS = 2_000
+/**
+ * A wake the API did not accept is retried on these delays. The note stays
+ * unreported until a flush succeeds, so a refused notify cannot silently end
+ * the session's wake.
+ */
+const TASK_WAKE_RETRY_MS = [2_000, 5_000, 15_000, 60_000, 300_000]
 /** How often an idle session polls tasks mirrored from another project's runtime. */
 const REMOTE_TASK_POLL_MS = 10_000
 /** How often a running turn refreshes remote tasks so their results can be injected mid-turn. */
@@ -485,6 +510,10 @@ export interface GatewayConfig {
   // heartbeat tools are gated by heartbeatToolsEnabled (above)
   /** Whether image generation tool is enabled (default: true) */
   imageGenEnabled?: boolean
+  /** Whether the generate_video tool is enabled (default: false — opt-in, billed per second) */
+  videoGenEnabled?: boolean
+  /** Whether the generate_3d_model tool is enabled (default: false — opt-in, billed per task) */
+  threeDGenEnabled?: boolean
   /** Whether memory tools are enabled (default: true) */
   memoryEnabled?: boolean
   /** Whether quick action registration is enabled (default: true) */
@@ -1225,6 +1254,7 @@ export class AgentGateway {
         inputTokens: data.inputTokens,
         outputTokens: data.outputTokens,
         cachedInputTokens: data.cachedInputTokens,
+        cacheWriteTokens: data.cacheWriteTokens,
         toolCalls: data.toolCalls,
         creditCost: data.creditCost,
         wallTimeMs: data.wallTimeMs,
@@ -2187,8 +2217,45 @@ export class AgentGateway {
       registry.onNotification(() => this.scheduleTaskWake(sessionId))
 
       this.commandRegistries.set(sessionId, registry)
+      // `sessionManager.get()` is memory-only: on a cold process the session is
+      // not loaded yet, so the seed above sees nothing. Load it once and retry,
+      // then fall back to the per-task logs when no snapshot survived.
+      this.hydrateCommandRegistry(sessionId, registry).catch(() => {})
     }
     return reg
+  }
+
+  private hydratingRegistries = new Map<string, Promise<void>>()
+
+  /**
+   * Seed a cold registry from the loaded session (or, failing that, the
+   * per-task logs). Returns the in-flight promise so callers that answer a
+   * request can wait for it: `sessionManager.get()` is memory-only, and a
+   * client that receives an empty dock never asks again.
+   */
+  private hydrateCommandRegistry(sessionId: string, registry: TaskRegistry): Promise<void> {
+    const inflight = this.hydratingRegistries.get(sessionId)
+    if (inflight) return inflight
+    const pending = (async () => {
+      try {
+        const session = await this.sessionManager.getOrCreateAsync(sessionId)
+        // Another caller already re-seeded this registry from the loaded session.
+        if (registry.listDock().length > 0) return
+        const persisted = session.metadata?.runningProcesses
+        if (Array.isArray(persisted) && persisted.length > 0) {
+          registry.restoreStale(persisted)
+          return
+        }
+        const rows = listTaskOutputRows(taskOutputDir(this.workspaceDir, sessionId))
+        if (rows.length > 0) registry.restoreFromOutputRows(rows)
+      } catch {
+        // Best effort: a dock that starts empty beats a failed first request.
+      } finally {
+        this.hydratingRegistries.delete(sessionId)
+      }
+    })()
+    this.hydratingRegistries.set(sessionId, pending)
+    return pending
   }
 
   // ---------------------------------------------------------------------------
@@ -2196,12 +2263,14 @@ export class AgentGateway {
   // ---------------------------------------------------------------------------
 
   private taskWakeTimers = new Map<string, ReturnType<typeof setTimeout>>()
+  private taskWakeRetries = new Map<string, { attempts: number; timer: ReturnType<typeof setTimeout> }>()
   private remoteTaskPollers = new Map<string, ReturnType<typeof setInterval>>()
 
   /**
    * Coalesce finished-task notes for an idle session and hand them to the API,
-   * which queues one wake message. While a turn runs, notes are injected into
-   * it instead (takeInjectedMessages) and the turn's end re-schedules this.
+   * which queues one wake message per task. While a turn runs, notes are
+   * injected into it instead (takeInjectedMessages) and the turn's end
+   * re-schedules this.
    * API-tracked tasks are skipped: the API wakes the session for those itself.
    */
   private scheduleTaskWake(sessionId: string): void {
@@ -2218,8 +2287,14 @@ export class AgentGateway {
     const reg = this.commandRegistries.get(sessionId)
     if (!reg || this.turnAbortControllers.has(sessionId)) return
     const notes = reg.peekNotifications().filter((n) => !reg.get(n.taskId)?.apiTracked && !reg.get(n.taskId)?.reported)
-    if (notes.length === 0) return
-    if (!hasInternalApiCredentials()) return
+    if (notes.length === 0) {
+      this.clearTaskWakeRetry(sessionId)
+      return
+    }
+    if (!hasInternalApiCredentials()) {
+      this.scheduleTaskWakeRetry(sessionId)
+      return
+    }
     const res = await notifyTaskCompletions(sessionId, notes.map((n) => ({
       id: n.taskId,
       source: n.source,
@@ -2227,8 +2302,34 @@ export class AgentGateway {
       status: n.status,
       text: formatTaskNotification(n),
     })))
-    if (res.ok) reg.markReported(notes.map((n) => n.taskId))
-    else console.warn(`${this.logPrefix} Task wake for ${sessionId} failed: ${res.error ?? res.status}`)
+    if (res.ok) {
+      reg.markReported(notes.map((n) => n.taskId))
+      this.clearTaskWakeRetry(sessionId)
+    } else {
+      console.warn(`${this.logPrefix} Task wake for ${sessionId} failed: ${res.error ?? res.status}`)
+      this.scheduleTaskWakeRetry(sessionId)
+    }
+  }
+
+  /** Retry a wake the API refused; the note is still unreported, so one more flush delivers it. */
+  private scheduleTaskWakeRetry(sessionId: string): void {
+    const existing = this.taskWakeRetries.get(sessionId)
+    if (existing) clearTimeout(existing.timer)
+    const attempts = existing?.attempts ?? 0
+    const delay = TASK_WAKE_RETRY_MS[Math.min(attempts, TASK_WAKE_RETRY_MS.length - 1)]!
+    const timer = setTimeout(() => {
+      if (this.taskWakeRetries.get(sessionId)?.timer !== timer) return
+      void this.flushTaskWake(sessionId)
+    }, delay)
+    ;(timer as any).unref?.()
+    this.taskWakeRetries.set(sessionId, { attempts: attempts + 1, timer })
+  }
+
+  private clearTaskWakeRetry(sessionId: string): void {
+    const existing = this.taskWakeRetries.get(sessionId)
+    if (!existing) return
+    clearTimeout(existing.timer)
+    this.taskWakeRetries.delete(sessionId)
   }
 
   /**
@@ -2266,11 +2367,15 @@ export class AgentGateway {
     return this.getOrCreateCommandRegistry(sessionId).listVisible()
   }
 
-  /** Running tasks for the dock, with API-tracked ones refreshed first. */
+  /** Tasks for the dock (running + recently finished), remote ones refreshed first. */
   async listSessionTasks(sessionId: string): Promise<import('./task-registry').RunningProcess[]> {
     const reg = this.getOrCreateCommandRegistry(sessionId)
+    // A cold registry is seeded asynchronously; answer from the hydrated list.
+    // The client only polls the seed route while it already has rows, so an
+    // empty first response would never be retried.
+    await this.hydratingRegistries.get(sessionId)
     if (reg.hasRunningRemote()) await reg.refreshRemote()
-    return reg.listVisible()
+    return reg.listDock()
   }
 
   /** Last part of a task's output, for the dock's output viewer. */
@@ -2294,6 +2399,7 @@ export class AgentGateway {
       clearTimeout(timer)
       this.taskWakeTimers.delete(sessionId)
     }
+    this.clearTaskWakeRetry(sessionId)
   }
 
   /**
@@ -3081,18 +3187,20 @@ export class AgentGateway {
       const reg = this.getOrCreateCommandRegistry(sessionId)
       const visibleKey = (tasks: readonly { runId: string; status: string }[]) =>
         tasks.map((task) => `${task.runId}:${task.status}`).join('\0')
-      const writeTasks = (tasks: ReturnType<typeof reg.listVisible>) => {
+      const writeTasks = (tasks: ReturnType<typeof reg.listDock>) => {
         uiWriter.write({ type: 'data-task-update', data: { tasks }, transient: true } as any)
         uiWriter.write({ type: 'data-process-update', data: { processes: tasks }, transient: true } as any)
       }
       // Push the current list immediately so a reconnecting client re-syncs.
-      const initialTasks = reg.listVisible()
+      // `listDock` keeps a settled task as a terminal row, so a row that
+      // finishes during the turn updates in place instead of vanishing.
+      const initialTasks = reg.listDock()
       let lastVisibleKey = visibleKey(initialTasks)
       try {
         writeTasks(initialTasks)
       } catch { /* writer may already be closed */ }
       unsubscribeProcesses = reg.onChange(() => {
-        const tasks = reg.listVisible()
+        const tasks = reg.listDock()
         const nextKey = visibleKey(tasks)
         if (nextKey === lastVisibleKey) return
         lastVisibleKey = nextKey
@@ -3455,6 +3563,12 @@ export class AgentGateway {
       }
 
       const maxIterations = parseInt(process.env.AGENT_MAX_ITERATIONS || '200', 10)
+      // Notes that settled before this turn began already have (or will get)
+      // their own queued wake, whose message carries the task. Injecting them
+      // here would mark them consumed and the dispatcher would drop that wake
+      // as already seen — so only notes that finish *during* the turn are
+      // injected.
+      const turnStartedAt = Date.now()
 
       // --- Prefix-cache debug: turn-start snapshot ---
       // Emits short hashes of the three inputs Anthropic keys its prompt
@@ -3554,14 +3668,17 @@ export class AgentGateway {
           console.log(`${this.logPrefix} Tool call: ${name}`, JSON.stringify(input).substring(0, 20))
         },
         takeInjectedMessages: () => {
-          const notes = commandRegistry?.consumeCompletionNotes() ?? []
-          if (notes.length === 0) return []
-          return [{
+          const notes = commandRegistry?.consumeCompletionNotes(
+            (note) => (note.finishedAt ?? 0) >= turnStartedAt,
+          ) ?? []
+          // One message per finished task: the agent acts on each result as its
+          // own note, not on a batch joined into one message.
+          return notes.map((text) => ({
             role: 'user',
-            content: notes.join('\n\n'),
+            content: text,
             timestamp: Date.now(),
             __shogoBackgroundNote: true,
-          } as unknown as Message]
+          } as unknown as Message))
         },
         onProgress: (progressMessages) => {
           const durableMessages = progressMessages.filter((message) => {
@@ -3849,6 +3966,28 @@ export class AgentGateway {
 
       let result = await runAgentLoop(loopOptions)
 
+      // A turn that produced nothing (no text, no tools) is usually a transient
+      // model or provider hiccup that a manual resend fixes, so resend once
+      // ourselves. Only the prompt and the empty reply were saved so far; drop
+      // them so the retry doesn't record the user's message twice.
+      if (!isHeartbeat && isEmptyTurnResult(result) && !turnAbort.signal.aborted) {
+        this.sessionManager.removeMessages(sessionId, persistedProgressMessages)
+        persistedProgressMessages.clear()
+        console.warn(
+          `${this.logPrefix} Empty model response for session ${sessionId} ` +
+            `(model: ${modelId}, provider: ${provider}, outputTokens: ${result.outputTokens}` +
+            `${result.error ? `, error: ${result.error.message}` : ''}) — retrying once`,
+        )
+        discardFailedStep({ attempt: 1, maxAttempts: 1, reason: 'empty_response', delayMs: 0 })
+        const emptyResult = result
+        result = await runAgentLoop(loopOptions)
+        result.inputTokens += emptyResult.inputTokens
+        result.outputTokens += emptyResult.outputTokens
+        result.cacheReadTokens += emptyResult.cacheReadTokens
+        result.cacheWriteTokens += emptyResult.cacheWriteTokens
+        result.iterations += emptyResult.iterations
+      }
+
       // Defense in depth for stale cloud configuration or a plan change that
       // happens after a runtime was spawned. Auto must not retry the same
       // forbidden model forever: lower the session ceiling once and re-issue
@@ -4093,7 +4232,7 @@ export class AgentGateway {
             // logs above. See describeTurnFailure.
             uiWriter.write({ type: 'error', errorText: describeTurnFailure(msg) } as any)
           }
-        } else if (result.outputTokens === 0 && result.toolCalls.length === 0 && !isHeartbeat && !isUserStoppedTurn(result)) {
+        } else if (result.outputTokens === 0 && result.toolCalls.length === 0 && !result.usageLimit && !isHeartbeat && !isUserStoppedTurn(result)) {
           console.error(
             `${this.logPrefix} Agent returned 0 tokens for session ${sessionId} — possible context corruption (${session.compactionCount} compactions, ${session.messages.length} messages, model: ${modelId}, provider: ${provider})`
           )
@@ -4255,6 +4394,9 @@ export class AgentGateway {
       if (teamCtx) parts.push(teamCtx)
     }
 
+    const concurrentChats = this.buildConcurrentChatsContext(sessionId)
+    if (concurrentChats) parts.push(concurrentChats)
+
     return parts.join('\n\n---\n\n')
   }
 
@@ -4314,6 +4456,9 @@ export class AgentGateway {
       const teamCtx = this.buildTeamContext(sessionId)
       if (teamCtx) parts.push(teamCtx)
     }
+
+    const concurrentChats = this.buildConcurrentChatsContext(sessionId)
+    if (concurrentChats) parts.push(concurrentChats)
 
     return parts.join('\n\n---\n\n')
   }
@@ -4421,7 +4566,7 @@ export class AgentGateway {
     // integration, and heartbeat guidance from the cached prefix.
     const integrationsGuideOn = this.config.integrationsEnabled !== false
     const channelsGuideOn = this.config.channelsEnabled !== false
-    const mediaGuideOn = this.config.imageGenEnabled !== false
+    const mediaGuideOn = this.config.imageGenEnabled !== false || this.config.videoGenEnabled === true
     const devopsGuideOn = this.config.heartbeatToolsEnabled !== false
 
     this.currentGuideRegistry = buildGuideRegistry(this.promptOverrides)
@@ -4430,6 +4575,7 @@ export class AgentGateway {
       integrations: integrationsGuideOn,
       channels: channelsGuideOn,
       media: mediaGuideOn,
+      video: this.config.videoGenEnabled === true,
       // Personal workspaces have no subagent orchestration at all, so
       // generate_image/transcribe_audio are kept directly callable (see the
       // SUBAGENT_ONLY_TOOLS carve-out above) rather than delegated.
@@ -4655,6 +4801,9 @@ export class AgentGateway {
       ...this.buildShellNavLines(),
     ].join('\n'))
 
+    const concurrentChats = this.buildConcurrentChatsContext(sessionId)
+    if (concurrentChats) pushDynamic('concurrent-chats', concurrentChats)
+
     const modeLabel = activeMode === 'none' ? 'chat' : activeMode
     pushDynamic('current-mode', `\n## Current Mode\nActive visual mode: **${modeLabel}**.\n`)
     if (this.viewerContextPrompt) {
@@ -4876,6 +5025,29 @@ export class AgentGateway {
     )
 
     return sections.join('\n')
+  }
+
+  /**
+   * Build a system prompt section listing the other chats live in this
+   * workspace: several chats share one pod, so their turns overlap and their
+   * edits, builds and DB pushes land mid-turn. Excludes the calling session,
+   * and returns null when this chat has the workspace to itself.
+   */
+  private buildConcurrentChatsContext(sessionId?: string): string | null {
+    const others = this.sessionManager
+      .listChatSessions(20 * 60_000)
+      .filter((chat) => chat.id !== sessionId)
+    if (others.length === 0) return null
+
+    const now = Date.now()
+    const chats: ConcurrentChat[] = others.map((chat) => ({
+      id: chat.id,
+      label: concurrentChatLabel({ id: chat.id, title: chat.title, firstUserText: chat.firstUserText }),
+      running: this.turnLocks.has(chat.id),
+      idleSeconds: Math.max(0, Math.floor((now - chat.lastActivityAt) / 1000)),
+    }))
+
+    return buildConcurrentChatsPrompt(chats, { isolatedEdits: this.isWorktreesEnabled() })
   }
 
   /**

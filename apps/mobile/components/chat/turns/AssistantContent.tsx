@@ -41,6 +41,7 @@ import { useChatContextSafe } from "../ChatContext"
 import { resolveChatAttachmentUrl } from "../../../lib/chat-attachment-url"
 import { ChatMarkdown } from "../ChatMarkdown"
 import { GenerateImageWidget } from "./GenerateImageWidget"
+import { GenerateVideoWidget } from "./GenerateVideoWidget"
 import { FileDeliveryWidget } from "./FileDeliveryWidget"
 import { GeneratedImageGallery } from "./GeneratedImageGallery"
 import { BrowserWidget } from "./BrowserWidget"
@@ -49,6 +50,8 @@ import { WriteFileWidget } from "./WriteFileWidget"
 import { EditFileWidget } from "./EditFileWidget"
 import type { PlanData } from "../PlanCard"
 import { PlanReferenceCard } from "./PlanReferenceCard"
+import { PublishUpgradeCard } from "./PublishUpgradeCard"
+import { isPublishPlanGate } from "./publish-plan-gate"
 import { extractPlanFilepath } from "./plan-tool"
 import { useIsNativePhoneLayout } from "../../../lib/native-phone-layout"
 import { subagentStreamStore } from "../../../lib/subagent-stream-store"
@@ -190,10 +193,14 @@ function isItemActive(item: MessagePart): boolean {
   return false
 }
 
+/** Tools whose result card shows the produced image (same result shape as generate_image). */
+const IMAGE_RESULT_TOOL_NAMES = new Set(["generate_image", "upscale_image", "remove_background"])
+
 function isGeneratedImagePart(part: GroupedMessagePart): boolean {
   return (
     part.type === "image-gallery" ||
-    (part.type === "tool" && part.tool.toolName === "generate_image")
+    (part.type === "tool" &&
+      (IMAGE_RESULT_TOOL_NAMES.has(part.tool.toolName) || part.tool.toolName === "generate_video"))
   )
 }
 
@@ -209,6 +216,7 @@ function isPinnedWorkPart(part: GroupedMessagePart): boolean {
     return installResult?.authStatus === "needs_auth" && !!installResult.authUrl
   }
   if (toolName === "ask_user") return askUserStreamVariant(result) === "bar"
+  if (isPublishPlanGate(part.tool)) return true
   return toolName === "create_plan" || toolName === "update_plan"
 }
 
@@ -619,6 +627,7 @@ export const AssistantContent = memo(
             <ChatMarkdown
               isStreaming={part.id === streamingTextPartId}
               onFilePress={chatContext?.openFile}
+              fileExists={chatContext?.fileExists}
             >
               {part.text}
             </ChatMarkdown>
@@ -717,12 +726,20 @@ export const AssistantContent = memo(
           }
         }
 
-        if (part.tool.toolName === "generate_image") {
+        if (IMAGE_RESULT_TOOL_NAMES.has(part.tool.toolName)) {
           return <GenerateImageWidget key={part.id} tool={part.tool} />
+        }
+
+        if (part.tool.toolName === "generate_video") {
+          return <GenerateVideoWidget key={part.id} tool={part.tool} />
         }
 
         if (part.tool.toolName === "share_file") {
           return <FileDeliveryWidget key={part.id} tool={part.tool} />
+        }
+
+        if (isPublishPlanGate(part.tool)) {
+          return <PublishUpgradeCard key={part.id} tool={part.tool} />
         }
 
         if (

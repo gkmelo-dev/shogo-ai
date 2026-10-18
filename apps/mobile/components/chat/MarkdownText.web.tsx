@@ -9,11 +9,15 @@ import { usePhoneLayoutOverride } from "../../lib/native-phone-layout"
 import { normalizeRichTextPaste } from "../../lib/rich-text-paste"
 import {
   FILE_HREF_PREFIX,
+  IMAGE_SRC_PREFIX,
   isMentionHref,
   linkifyBareUrls,
   linkifyFilePaths,
   pathFromFileHref,
+  rewriteWorkspaceMedia,
 } from "./file-links"
+import { MarkdownMedia } from "./MarkdownMedia.web"
+import { FileTypeIcon } from "./FileTypeIcon.web"
 
 export interface MarkdownTextProps {
   children: string
@@ -25,6 +29,8 @@ export interface MarkdownTextProps {
   isStreaming?: boolean
   /** Opens a workspace file when the text mentions its path. */
   onFilePress?: (path: string) => void
+  /** Mentioned paths that pass this check render as file chips. */
+  fileExists?: (path: string) => boolean
 }
 
 const linkSafetyOff = { enabled: false as const }
@@ -40,6 +46,7 @@ function markdownPropsEqual(prev: MarkdownTextProps, next: MarkdownTextProps) {
   if (prev.isStreaming !== next.isStreaming) return false
   if (prev.className !== next.className) return false
   if (prev.onFilePress !== next.onFilePress) return false
+  if (prev.fileExists !== next.fileExists) return false
   const a = prev.children || ""
   const b = next.children || ""
   return a.length === b.length && a === b
@@ -48,13 +55,34 @@ function markdownPropsEqual(prev: MarkdownTextProps, next: MarkdownTextProps) {
 function FileAwareLink({
   href,
   onFilePress,
+  fileExists,
   children,
+  node: _node,
   ...rest
 }: AnchorHTMLAttributes<HTMLAnchorElement> & {
   onFilePress?: (path: string) => void
+  fileExists?: (path: string) => boolean
   node?: unknown
 }) {
   const path = typeof href === "string" ? pathFromFileHref(href) : null
+  if (path && onFilePress && fileExists?.(path)) {
+    const open = onFilePress
+    return (
+      <a
+        href={href}
+        title={path}
+        className="chat-file-chip"
+        data-testid="chat-file-chip"
+        onClick={(event: MouseEvent<HTMLAnchorElement>) => {
+          event.preventDefault()
+          open(path)
+        }}
+      >
+        <FileTypeIcon path={path} size={14} />
+        <span>{path.split("/").pop() || path}</span>
+      </a>
+    )
+  }
   if (path && onFilePress) {
     const open = onFilePress
     return (
@@ -90,7 +118,7 @@ function MentionHighlight({ children }: { children?: ReactNode }) {
 }
 
 export const MarkdownText = memo(
-  function MarkdownText({ children, className, isStreaming, onFilePress }: MarkdownTextProps) {
+  function MarkdownText({ children, className, isStreaming, onFilePress, fileExists }: MarkdownTextProps) {
     const usesMobileWorkspaceChrome = useMobileWorkspaceChrome()
     const phoneLayoutOverride = usePhoneLayoutOverride()
     const { width } = useWindowDimensions()
@@ -105,7 +133,7 @@ export const MarkdownText = memo(
     const cls = className ? `${baseClassName} ${className}` : baseClassName
     const source = children || ""
     const body = useMemo(() => {
-      const normalized = normalizeRichTextPaste(source)
+      const normalized = rewriteWorkspaceMedia(normalizeRichTextPaste(source))
       const fileLinked = onFilePress ? linkifyFilePaths(normalized) : normalized
       return linkifyBareUrls(fileLinked)
     }, [onFilePress, source])
@@ -115,10 +143,13 @@ export const MarkdownText = memo(
           isMentionHref(props.href) ? (
             <MentionHighlight>{props.children}</MentionHighlight>
           ) : (
-            <FileAwareLink {...props} onFilePress={onFilePress} />
+            <FileAwareLink {...props} onFilePress={onFilePress} fileExists={fileExists} />
           ),
+        img: ({ src, alt }: { src?: string | Blob; alt?: string; node?: unknown }) => (
+          <MarkdownMedia src={typeof src === "string" ? src : null} alt={alt} />
+        ),
       }),
-      [onFilePress],
+      [onFilePress, fileExists],
     )
     return (
       <Streamdown
@@ -129,7 +160,7 @@ export const MarkdownText = memo(
         controls={false}
         components={components}
         urlTransform={(url, key, node) =>
-          url.startsWith(FILE_HREF_PREFIX) || isMentionHref(url)
+          url.startsWith(FILE_HREF_PREFIX) || url.startsWith(IMAGE_SRC_PREFIX) || isMentionHref(url)
             ? url
             : defaultUrlTransform(url, key, node)
         }

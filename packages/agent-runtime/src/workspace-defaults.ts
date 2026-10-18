@@ -992,6 +992,8 @@ export interface TechStackMeta {
     shellEnabled?: boolean
     heartbeatToolsEnabled?: boolean
     imageGenEnabled?: boolean
+    videoGenEnabled?: boolean
+    threeDGenEnabled?: boolean
     memoryEnabled?: boolean
     quickActionsEnabled?: boolean
   }

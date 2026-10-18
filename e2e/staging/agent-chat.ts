@@ -2,10 +2,12 @@
 // Copyright (C) 2026 Shogo Technologies, Inc.
 import { expect, type Page } from "@playwright/test"
 import {
+  APP_HOME_PATH,
   homeComposerInput,
   signUpAndOnboard,
   signUpAndUpgradeToPro,
   waitForAgentIdle,
+  waitForProjectChat,
   type TestUser,
 } from "./helpers"
 
@@ -35,7 +37,7 @@ export async function ensureAuthenticated(
   user: TestUser,
   opts: { pro?: boolean } = {},
 ): Promise<void> {
-  await page.goto("/")
+  await page.goto(APP_HOME_PATH)
   const home = page.getByText("What are we building", { exact: false }).first()
   const signUpTab = page.getByRole("tab", { name: "Sign Up" })
   await Promise.race([
@@ -91,7 +93,7 @@ export async function transcript(page: Page): Promise<string> {
 
 /** Creates a project from the home composer, returns its id once it boots. */
 export async function createProject(page: Page, prompt: string): Promise<string> {
-  await page.goto("/")
+  await page.goto(APP_HOME_PATH)
   // 60s matches `ensureAuthenticated`: staging's home can load slowly.
   await page.waitForSelector("text=What are we building", { timeout: 60_000 })
   const input = homeComposerInput(page)
@@ -102,5 +104,6 @@ export async function createProject(page: Page, prompt: string): Promise<string>
   await page.waitForURL(/\/projects\//, { timeout: 60_000 })
   const m = page.url().match(/\/projects\/([^/?#]+)/)
   expect(m, `expected a /projects/<id> URL, got ${page.url()}`).toBeTruthy()
+  await waitForProjectChat(page)
   return m![1]
 }

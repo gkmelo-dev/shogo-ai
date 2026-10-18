@@ -569,7 +569,7 @@ export function runtimeInternalRoutes(opts: RuntimeInternalRoutesOptions): Hono 
   /**
    * POST /api/internal/agent-cost-metrics
    *   body: { workspaceId, projectId?, agentRunId?, agentType, model,
-   *           inputTokens, outputTokens, cachedInputTokens?, toolCalls,
+   *           inputTokens, outputTokens, cachedInputTokens?, cacheWriteTokens?, toolCalls,
    *           creditCost, wallTimeMs, success, hitMaxTurns?, loopDetected?,
    *           escalated?, responseEmpty? }
    *
@@ -612,6 +612,7 @@ export function runtimeInternalRoutes(opts: RuntimeInternalRoutesOptions): Hono 
         inputTokens: numberOr(body.inputTokens, 0),
         outputTokens: numberOr(body.outputTokens, 0),
         cachedInputTokens: numberOr(body.cachedInputTokens, 0),
+        cacheWriteTokens: numberOr(body.cacheWriteTokens, 0),
         toolCalls: numberOr(body.toolCalls, 0),
         creditCost: numberOr(body.creditCost, 0),
         wallTimeMs: numberOr(body.wallTimeMs, 0),
@@ -1029,7 +1030,37 @@ export function runtimeInternalRoutes(opts: RuntimeInternalRoutesOptions): Hono 
     if (!(await validateAuth(c, projectId))) {
       return c.json({ error: 'Unauthorized' }, 401)
     }
+    return mintSharedFileLink(c, projectId, async () => {
+      const project = await prisma.project.findUnique({
+        where: { id: projectId },
+        select: { workspaceId: true },
+      })
+      if (!project) return c.json({ error: { code: 'not_found', message: 'Project not found' } }, 404)
+      return { projectId, workspaceId: project.workspaceId }
+    })
+  })
 
+  /**
+   * POST /api/internal/workspaces/:workspaceId/shared-files
+   *
+   * Same capability for a file in a workspace runtime that has no single
+   * project to own it (e.g. a workspace-agent chat with nothing attached).
+   * The download is served by that workspace's runtime.
+   */
+  app.post('/workspaces/:workspaceId/shared-files', async (c) => {
+    const workspaceId = c.req.param('workspaceId')
+    if (!workspaceId) return c.json({ error: 'Missing workspaceId' }, 400)
+    if (!(await authorizeWorkspaceRuntimeRequest(c, workspaceId))) {
+      return c.json({ error: 'Unauthorized' }, 401)
+    }
+    return mintSharedFileLink(c, `workspace ${workspaceId}`, async () => ({ workspaceId }))
+  })
+
+  async function mintSharedFileLink(
+    c: Context,
+    label: string,
+    loadScope: () => Promise<{ projectId?: string; workspaceId: string } | Response>,
+  ): Promise<Response> {
     const body = await c.req.json().catch(() => null) as {
       path?: unknown
       expiresInDays?: unknown
@@ -1054,15 +1085,11 @@ export function runtimeInternalRoutes(opts: RuntimeInternalRoutesOptions): Hono 
     const now = Math.floor(Date.now() / 1000)
 
     try {
-      const project = await prisma.project.findUnique({
-        where: { id: projectId },
-        select: { workspaceId: true },
-      })
-      if (!project) return c.json({ error: { code: 'not_found', message: 'Project not found' } }, 404)
-
+      const scope = await loadScope()
+      if (scope instanceof Response) return scope
       const token = signSharedFileToken({
-        projectId,
-        workspaceId: project.workspaceId,
+        ...(scope.projectId ? { projectId: scope.projectId } : {}),
+        workspaceId: scope.workspaceId,
         path,
         exp: now + expiresInDays * 24 * 60 * 60,
         now,
@@ -1077,10 +1104,10 @@ export function runtimeInternalRoutes(opts: RuntimeInternalRoutesOptions): Hono 
         path,
       })
     } catch (err: any) {
-      console.error(`[Internal] local shared file token for ${projectId} failed:`, err?.message || err)
+      console.error(`[Internal] shared file token for ${label} failed:`, err?.message || err)
       return c.json({ error: { code: 'shared_file_failed', message: 'Failed to create shared file link' } }, 500)
     }
-  })
+  }
 
   /**
    * POST /api/internal/projects/:projectId/checkpoints/record
@@ -1676,6 +1703,15 @@ export function runtimeInternalRoutes(opts: RuntimeInternalRoutesOptions): Hono 
         newCheckpoint: result.newCheckpoint,
       })
     } catch (err: any) {
+      // The checkpoint service's ownership gate throws a typed error (foreign
+      // repo, or external mode). Surface it as the same 409 the public route
+      // uses so the agent's rollback tool reports "not ours" instead of a 500.
+      if (
+        err?.code === 'checkpoints_disabled_foreign_repo' ||
+        err?.code === 'checkpoints_disabled_in_external_mode'
+      ) {
+        return c.json({ error: { code: err.code, message: err.message } }, 409)
+      }
       console.error(`[Internal] checkpoint rollback for ${projectId} failed:`, err.message)
       return c.json({ error: 'Failed to rollback' }, 500)
     }
@@ -1785,6 +1821,10 @@ export function runtimeInternalRoutes(opts: RuntimeInternalRoutesOptions): Hono 
         : anyErr.code === 'not_found' ? 404
         : anyErr.code === 'instance_too_small' ? 402
         : anyErr.code === 'paywall' ? 402
+        // Working-mode flips conflict with the project's current state: the
+        // repo already has a history we cannot detach, or the direction is
+        // unsupported. 409 so the runtime can tell it apart from a bad body.
+        : anyErr.code === 'working_mode_flip_not_supported' || anyErr.code === 'durable_repo_external_flip' ? 409
         : 400
       return c.json({ error: { code: anyErr.code, message: anyErr.message } }, status)
     }
@@ -2012,7 +2052,7 @@ export function runtimeInternalRoutes(opts: RuntimeInternalRoutesOptions): Hono 
 
   /**
    * PATCH /api/internal/projects/:projectId/config
-   *   body: { name?, description?, settings?, slackEnabled?, agent?: { heartbeat*, model*, quietHours* } }
+   *   body: { name?, description?, settings?, slackEnabled?, workingMode?, agent?: { heartbeat*, model*, quietHours* } }
    */
   app.patch('/projects/:projectId/config', async (c) => {
     const projectId = c.req.param('projectId')
@@ -2020,8 +2060,21 @@ export function runtimeInternalRoutes(opts: RuntimeInternalRoutesOptions): Hono 
     if (!authz) return c.json({ error: 'Unauthorized' }, 401)
     const body = (await c.req.json().catch(() => null)) as Record<string, unknown> | null
     if (!body) return c.json({ error: { code: 'bad_request', message: 'Invalid JSON body' } }, 400)
+    // `workingMode` is one-way (managed → external). Anything else is a caller
+    // bug, so reject it here rather than letting it fall through as undefined.
+    if (body.workingMode !== undefined && body.workingMode !== 'managed' && body.workingMode !== 'external') {
+      return c.json(
+        { error: { code: 'invalid_working_mode', message: 'workingMode must be "managed" or "external"' } },
+        400,
+      )
+    }
     const permissions = new Set<Permission>()
-    if (typeof body.name === 'string' || body.description !== undefined || (body.agent && typeof body.agent === 'object')) {
+    if (
+      typeof body.name === 'string' ||
+      body.description !== undefined ||
+      body.workingMode !== undefined ||
+      (body.agent && typeof body.agent === 'object')
+    ) {
       permissions.add('project:update')
     }
     if ((body.settings && typeof body.settings === 'object') || typeof body.slackEnabled === 'boolean') {
@@ -2039,6 +2092,7 @@ export function runtimeInternalRoutes(opts: RuntimeInternalRoutesOptions): Hono 
       const project = await configureProject(projectId, {
         name: typeof body.name === 'string' ? body.name : undefined,
         description: typeof body.description === 'string' || body.description === null ? (body.description as string | null) : undefined,
+        workingMode: body.workingMode as 'managed' | 'external' | undefined,
         settings: body.settings && typeof body.settings === 'object' ? (body.settings as Record<string, unknown>) : undefined,
         slackEnabled: typeof body.slackEnabled === 'boolean' ? body.slackEnabled : undefined,
         agent: body.agent && typeof body.agent === 'object' ? (body.agent as any) : undefined,

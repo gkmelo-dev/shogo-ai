@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Shogo Technologies, Inc.
 import { request as playwrightRequest, test, type Page } from "@playwright/test"
+import { recordTestUser } from "./test-accounts"
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -14,9 +15,11 @@ export interface TestUser {
 
 export function makeTestUser(prefix: string): TestUser {
   const ts = Date.now()
+  const email = `e2e-${prefix.toLowerCase()}-${ts}@mailnull.com`
+  recordTestUser(email)
   return {
     name: `E2E ${prefix} ${ts}`,
-    email: `e2e-${prefix.toLowerCase()}-${ts}@mailnull.com`,
+    email,
     password: `E2E${prefix}Test2026!`,
   }
 }
@@ -31,10 +34,25 @@ export const STRIPE_CARDS = {
 // ── Core helpers ─────────────────────────────────────────────────────────────
 
 /**
+ * The app's pre-landing home (phone feed / wide "What are we building" builder).
+ *
+ * `/` is the workspace agent chat on an empty session for a team workspace
+ * (SHO-4) — every `page.goto("/")` that then waits for the builder heading has
+ * to come here instead.
+ */
+export const APP_HOME_PATH = "/home"
+
+/** Opens the app home (phone feed / builder) and waits for it to paint. */
+export async function gotoAppHome(page: Page, timeout = 30_000): Promise<void> {
+  await page.goto(APP_HOME_PATH)
+  await page.waitForSelector("text=What are we building", { timeout })
+}
+
+/**
  * Signs up a new account at /sign-in, then walks through the cloud onboarding
  * flow into the Team workspace:
  *
- *   team setup → build prompt (skip) → home
+ *   team setup → build prompt (skip) → app home
  *
  * Leaves the browser on the home screen with "What are we building" visible.
  */
@@ -45,7 +63,9 @@ export async function signUpAndOnboard(page: Page, user: TestUser): Promise<void
   }
 
   // ── Home screen ────────────────────────────────────────────────────────────
-  await page.waitForSelector("text=What are we building", { timeout: 30_000 })
+  // Skipping onboarding lands on `/` (the empty agent chat); the builder is at
+  // `/home` now.
+  await gotoAppHome(page)
 }
 
 /** Signs up a new account at /sign-in and waits to leave the sign-in page. */
@@ -376,11 +396,27 @@ export const MINIMAL_APP_PROMPT =
   "Create the simplest possible starter app: a single page that shows the word Hello. " +
   "Do not add any extra pages, components, features, or backend, and do not run browser QA."
 
+/**
+ * The project page holds a "Starting your project…" gate, with no chat, until
+ * its runtime reports ready. A cold-claimed runtime on staging takes minutes,
+ * and until then there is no stop button for {@link waitForAgentResponse} to
+ * see, so it would return before the first turn even started.
+ */
+export const RUNTIME_READY_TIMEOUT_MS = 300_000
+
+export async function waitForProjectChat(page: Page, timeoutMs = RUNTIME_READY_TIMEOUT_MS) {
+  extendTestTimeout(timeoutMs)
+  await page
+    .getByRole("textbox", { name: "Chat message input" })
+    .filter({ visible: true })
+    .first()
+    .waitFor({ state: "visible", timeout: timeoutMs })
+}
+
 export async function createProjectAndWait(page: Page, prompt: string) {
   extendTestTimeout(90_000)
   watchChatHealth(page)
-  await page.goto("/")
-  await page.waitForSelector("text=What are we building", { timeout: 15_000 })
+  await gotoAppHome(page, 15_000)
 
   const input = homeComposerInput(page)
   await input.click()
@@ -389,6 +425,7 @@ export async function createProjectAndWait(page: Page, prompt: string) {
   await page.keyboard.press("Enter")
 
   await page.waitForURL(/\/projects\//, { timeout: 60_000 })
+  await waitForProjectChat(page)
   await waitForAgentResponse(page)
 }
 
