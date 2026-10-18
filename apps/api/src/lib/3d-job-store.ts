@@ -23,11 +23,15 @@ export interface ThreeDJobRecord {
   chatSessionId?: string | null
   /** Shogo model id (`tripo-v3.1`, `tripo-p1`, ...). */
   model: string
+  /** Which Tripo operation this job submitted (`TRIPO_OPS` key). */
+  op: string
   /** Tripo's own task id (a UUID), used for every status poll. */
   taskId: string
-  input: 'text' | 'image'
-  texture: boolean
+  input: 'text' | 'image' | 'images' | 'model'
+  texture?: boolean
   textureQuality?: string
+  /** Advisory price shown at submit; billing follows `credits_consumed`. */
+  estimatedCredits?: number
   createdAt: number
 }
 

@@ -1,10 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Shogo Technologies, Inc.
 /**
- * Tripo3D 3D generation: the submit route (text-to-model, image-to-model with
- * a data URI upload and with an https URL), the status route (charging from
- * `credits_consumed`, exactly once per job), the model listing and the
- * configured-key / usage-limit gates.
+ * Tripo3D 3D API: submit (generation + post-processing + rigging), status with
+ * charge-once billing, file upload, model listing, and the pricing table.
  *
  * No external network: `globalThis.fetch` is stubbed by URL. Nothing in this
  * file may reach openapi.tripo3d.ai.
@@ -63,9 +61,13 @@ const originalFetch = globalThis.fetch
 let routes: Array<{ match: (url: string) => boolean; handler: Handler }> = []
 let fetchLog: Array<{ url: string; init?: RequestInit }> = []
 
-function on(match: string | RegExp, handler: Handler) {
+function on(match: string | RegExp | ((url: string) => boolean), handler: Handler) {
   routes.push({
-    match: (url) => (typeof match === 'string' ? url === match || url.startsWith(match) : match.test(url)),
+    match: typeof match === 'function'
+      ? match
+      : typeof match === 'string'
+        ? (url) => url === match || url.startsWith(match)
+        : (url) => match.test(url),
     handler,
   })
 }
@@ -100,6 +102,7 @@ const { aiProxyRoutes } = await import('../routes/ai-proxy')
 const { generateProxyToken } = await import('../lib/ai-proxy-token')
 const { _testing: jobStore } = await import('../lib/3d-job-store')
 const { estimateTripoTaskCost, calculate3dUsageCost } = await import('../lib/usage-cost')
+const { TRIPO_OPS } = await import('../lib/tripo-3d')
 
 const app = new Hono()
 app.route('/api', aiProxyRoutes())
@@ -113,7 +116,11 @@ beforeAll(async () => {
 const call = (path: string, init: RequestInit = {}, token = TOKEN) =>
   app.fetch(new Request(`http://x/api${path}`, {
     ...init,
-    headers: { Authorization: `Bearer ${token}`, ...(init.body && typeof init.body === 'string' ? { 'Content-Type': 'application/json' } : {}), ...(init.headers as any) },
+    headers: {
+      Authorization: `Bearer ${token}`,
+      ...(init.body && typeof init.body === 'string' ? { 'Content-Type': 'application/json' } : {}),
+      ...(init.headers as any),
+    },
   }))
 
 /** Billing is fire-and-forget; let the microtasks settle. */
@@ -124,53 +131,57 @@ beforeEach(() => {
   jobStore.charged.clear()
 })
 
-function mockSubmit(taskId = TASK_ID) {
-  let body: any
-  on(`${TRIPO}/generation/text-to-model`, (_url, init) => {
-    body = JSON.parse(String(init?.body))
+/** Route the submit call for `op` and capture the wire body. */
+function mockSubmit(body: Record<string, unknown>, taskId = TASK_ID) {
+  on((url) => url.startsWith(`${TRIPO}/`) && url !== `${TRIPO}/tasks/${taskId}`, (_url, init) => {
+    Object.assign(body, JSON.parse(String(init?.body)))
     expect((init?.headers as any).Authorization).toBe('Bearer tripo-test-key')
     return json({ code: 0, data: { task_id: taskId } })
   })
-  on(`${TRIPO}/generation/image-to-model`, (_url, init) => {
-    body = JSON.parse(String(init?.body))
-    expect((init?.headers as any).Authorization).toBe('Bearer tripo-test-key')
-    return json({ code: 0, data: { task_id: taskId } })
-  })
-  return () => body
+  return body
 }
 
-const submit = async (body: Record<string, unknown>) => {
-  const res = await call('/ai/v1/3d/generations', { method: 'POST', body: JSON.stringify(body) })
+const submit = async (payload: Record<string, unknown>) => {
+  const res = await call('/ai/v1/3d/generations', { method: 'POST', body: JSON.stringify(payload) })
   return { res, data: await res.json() as any }
 }
 
 const poll = (id: string, token = TOKEN) => call(`/ai/v1/3d/${id}`, {}, token)
 
+const success = (data: Record<string, unknown>, credits = 20) =>
+  json({ code: 0, data: { status: 'success', progress: 100, credits_consumed: credits, ...data } })
+
 // =========================================================================
-// Submit
+// Submit — generation ops
 // =========================================================================
 
-describe('POST /ai/v1/3d/generations', () => {
-  test('text-to-model submits with the server key and returns a queued job with an estimate', async () => {
-    const body = mockSubmit()
+describe('POST /ai/v1/3d/generations — generation', () => {
+  test('text-to-model submits with the server key and prices it from the registry', async () => {
+    const wire = mockSubmit({})
     const { res, data } = await submit({ prompt: 'a wooden treasure chest, low poly' })
 
     expect(res.status).toBe(200)
     expect(data.id).toStartWith('gen3d_')
-    expect(data.status).toBe('queued')
-    expect(data.model).toBe('tripo-v3.1')
-    // H-series text-to-model with the default standard texture: 20 credits → $0.24
-    expect(data.estimated_usd).toBeCloseTo(0.24, 4)
+    expect(data).toMatchObject({
+      op: 'text_to_model',
+      status: 'queued',
+      model: 'tripo-v3.1',
+      estimated_credits: 20,
+      estimated_usd: 0.24,
+    })
     // Shogo exposes `tripo-v3.1`; the API only accepts the version string.
-    expect(body()).toMatchObject({ prompt: 'a wooden treasure chest, low poly', model: 'v3.1-20260211' })
+    expect(wire).toEqual({ prompt: 'a wooden treasure chest, low poly', model: 'v3.1-20260211' })
     expect(fetchLog.map((f) => f.url)).toEqual([`${TRIPO}/generation/text-to-model`])
     expect(consumeCalls).toHaveLength(0)
   })
 
   test('forwards the generation options it was given and nothing else', async () => {
-    const body = mockSubmit()
-    await submit({ prompt: 'a chair', model: 'tripo-p1', texture: false, face_limit: 8000, quad: true })
-    expect(body()).toEqual({ prompt: 'a chair', model: 'P1-20260311', texture: false, face_limit: 8000, quad: true })
+    const wire = mockSubmit({})
+    const { data } = await submit({ prompt: 'a chair', model: 'tripo-p1', texture: false, face_limit: 8000, quad: true })
+    expect(wire).toEqual({ prompt: 'a chair', model: 'P1-20260311', texture: false, face_limit: 8000, quad: true })
+    // P-series text-to-model untextured: 30 credits → $0.36
+    expect(data.estimated_credits).toBe(30)
+    expect(data.estimated_usd).toBe(0.36)
   })
 
   test('image-to-model uploads a data URI and forwards the file_token', async () => {
@@ -180,22 +191,51 @@ describe('POST /ai/v1/3d/generations', () => {
       expect((form.get('file') as File).type).toBe('image/png')
       return json({ code: 0, data: { file_token: 'file_abc123' } })
     })
-    const body = mockSubmit()
+    const wire = mockSubmit({})
+    const { res } = await submit({ image: 'data:image/png;base64,iVBORw0KGgo=' })
 
-    const { res, data } = await submit({ image: 'data:image/png;base64,iVBORw0KGgo=' })
     expect(res.status).toBe(200)
-    expect(data.status).toBe('queued')
-    expect(body()).toMatchObject({ input: 'file_abc123', model: 'v3.1-20260211' })
+    expect(wire).toEqual({ input: 'file_abc123', model: 'v3.1-20260211' })
     expect(fetchLog.map((f) => f.url)).toEqual([`${TRIPO}/files`, `${TRIPO}/generation/image-to-model`])
   })
 
   test('an https image URL is forwarded untouched', async () => {
-    const body = mockSubmit()
+    const wire = mockSubmit({})
     const url = 'https://example.com/chair.png'
     const { res } = await submit({ image: url })
     expect(res.status).toBe(200)
-    expect(body()).toMatchObject({ input: url })
+    expect(wire).toEqual({ input: url, model: 'v3.1-20260211' })
     expect(fetchLog.some((f) => f.url === `${TRIPO}/files`)).toBe(false)
+  })
+
+  test('multiview_to_model uploads all four views in order', async () => {
+    let uploads = 0
+    on(`${TRIPO}/files`, () => json({ code: 0, data: { file_token: `file_v${uploads++}` } }))
+    const wire = mockSubmit({})
+    const { res, data } = await submit({
+      op: 'multiview_to_model',
+      images: [
+        'https://example.com/front.png',
+        'data:image/png;base64,AAA',
+        'https://example.com/back.png',
+        'https://example.com/right.png',
+      ],
+    })
+
+    expect(res.status).toBe(200)
+    expect(data.op).toBe('multiview_to_model')
+    expect(wire).toMatchObject({
+      inputs: ['https://example.com/front.png', 'file_v0', 'https://example.com/back.png', 'https://example.com/right.png'],
+      model: 'v3.1-20260211',
+    })
+    expect(uploads).toBe(1)
+  })
+
+  test('multiview with the wrong number of images is rejected before any vendor call', async () => {
+    const { res, data } = await submit({ op: 'multiview_to_model', images: ['https://example.com/a.png'] })
+    expect(res.status).toBe(400)
+    expect(data.error.code).toBe('invalid_images')
+    expect(fetchLog).toHaveLength(0)
   })
 
   test('prompt and image together is rejected before any vendor call', async () => {
@@ -205,16 +245,29 @@ describe('POST /ai/v1/3d/generations', () => {
     expect(fetchLog).toHaveLength(0)
   })
 
-  test('neither prompt nor image is rejected', async () => {
+  test('no input at all is rejected', async () => {
     const { res, data } = await submit({ model: 'tripo-v3.1' })
     expect(res.status).toBe(400)
-    expect(data.error.code).toBe('missing_prompt')
+    expect(data.error.code).toBe('missing_op')
   })
 
   test('an unsupported model is rejected', async () => {
     const { res, data } = await submit({ prompt: 'x', model: 'tripo-v9' })
     expect(res.status).toBe(400)
     expect(data.error.code).toBe('model_not_found')
+  })
+
+  test('an unknown op is rejected', async () => {
+    const { res, data } = await submit({ op: 'make_coffee', prompt: 'x' })
+    expect(res.status).toBe(400)
+    expect(data.error.code).toBe('unknown_op')
+  })
+
+  test('an op parameter that does not belong to the op is rejected', async () => {
+    const { res, data } = await submit({ op: 'convert', input: TASK_ID, format: 'GLB', texture_quality: 'extreme' })
+    expect(res.status).toBe(400)
+    expect(data.error.code).toBe('unsupported_field')
+    expect(data.error.message).toContain('texture_quality')
   })
 
   test('an unsupported texture_quality is rejected', async () => {
@@ -260,13 +313,112 @@ describe('POST /ai/v1/3d/generations', () => {
 })
 
 // =========================================================================
+// Submit — post-processing and rigging
+// =========================================================================
+
+describe('POST /ai/v1/3d/generations — edit ops', () => {
+  test('texture submits against a task id with the right path', async () => {
+    const wire = mockSubmit({})
+    const { res, data } = await submit({
+      op: 'texture',
+      input: TASK_ID,
+      texture_prompt: { text: 'worn leather' },
+      texture_quality: 'detailed',
+    })
+    expect(res.status).toBe(200)
+    expect(data).toMatchObject({ op: 'texture', estimated_credits: 20, estimated_usd: 0.24 })
+    expect(fetchLog[0].url).toBe(`${TRIPO}/models/texture`)
+    expect(wire).toEqual({ input: TASK_ID, texture_prompt: { text: 'worn leather' }, texture_quality: 'detailed' })
+  })
+
+  test('a data URI model input is uploaded and replaced by its token', async () => {
+    on(`${TRIPO}/files`, () => json({ code: 0, data: { file_token: 'file_model1' } }))
+    const wire = mockSubmit({})
+    const { res } = await submit({ op: 'convert', input: 'data:model/gltf-binary;base64,Z2xURg==', format: 'FBX' })
+    expect(res.status).toBe(200)
+    expect(wire).toEqual({ input: 'file_model1', format: 'FBX' })
+  })
+
+  test('convert requires a supported format', async () => {
+    const missing = await submit({ op: 'convert', input: TASK_ID })
+    expect(missing.res.status).toBe(400)
+    expect(missing.data.error.code).toBe('missing_format')
+
+    const bad = await submit({ op: 'convert', input: TASK_ID, format: 'STEP' })
+    expect(bad.res.status).toBe(400)
+    expect(bad.data.error.code).toBe('unsupported_format')
+    expect(fetchLog).toHaveLength(0)
+  })
+
+  test('convert upper-cases the format', async () => {
+    const wire = mockSubmit({})
+    await submit({ op: 'convert', input: TASK_ID, format: 'fbx' })
+    expect(wire.format).toBe('FBX')
+  })
+
+  test('retopology prices by algorithm version and quad', async () => {
+    mockSubmit({})
+    const v3 = await submit({ op: 'retopology', input: TASK_ID, model: 'v3.0', quad: true })
+    expect(v3.data.estimated_credits).toBe(40)
+    const v1 = await submit({ op: 'retopology', input: TASK_ID, model: 'v1.0' })
+    expect(v1.data.estimated_credits).toBe(10)
+    expect(fetchLog[0].url).toBe(`${TRIPO}/mesh/decimate`)
+  })
+
+  test('rig_check is free and still submits', async () => {
+    mockSubmit({})
+    const { res, data } = await submit({ op: 'rig_check', input: TASK_ID })
+    expect(res.status).toBe(200)
+    expect(data.estimated_credits).toBe(0)
+    expect(data.estimated_usd).toBe(0)
+    expect(fetchLog[0].url).toBe(`${TRIPO}/animations/rig-check`)
+  })
+
+  test('rig forwards rig_type and prices at 25 credits', async () => {
+    const wire = mockSubmit({})
+    const { data } = await submit({ op: 'rig', input: TASK_ID, rig_type: 'quadruped', out_format: 'fbx' })
+    expect(data.estimated_credits).toBe(25)
+    expect(wire).toEqual({ input: TASK_ID, rig_type: 'quadruped', out_format: 'fbx' })
+  })
+
+  test('retarget prices per animation and rejects more than five', async () => {
+    const wire = mockSubmit({})
+    const two = await submit({ op: 'retarget', input: TASK_ID, animations: ['preset:walk', 'preset:run'] })
+    expect(two.data.estimated_credits).toBe(20)
+    expect(wire.animations).toEqual(['preset:walk', 'preset:run'])
+
+    const six = await submit({
+      op: 'retarget',
+      input: TASK_ID,
+      animations: ['a', 'b', 'c', 'd', 'e', 'f'],
+    })
+    expect(six.res.status).toBe(400)
+    expect(six.data.error.code).toBe('too_many_animations')
+
+    const both = await submit({ op: 'retarget', input: TASK_ID, animation: 'preset:walk', animations: ['preset:run'] })
+    expect(both.res.status).toBe(400)
+    expect(both.data.error.code).toBe('invalid_animation')
+  })
+
+  test('every registered op has a path under /v3 and a positive or zero price', () => {
+    for (const [op, spec] of Object.entries(TRIPO_OPS)) {
+      expect(spec.path).toStartWith('/')
+      expect(spec.estimateCredits({})).toBeGreaterThanOrEqual(0)
+      expect(Array.isArray(spec.fields)).toBe(true)
+      expect(['model', 'parts']).toContain(spec.produces)
+      expect(op).toBeTypeOf('string')
+    }
+  })
+})
+
+// =========================================================================
 // Status + billing
 // =========================================================================
 
 describe('GET /ai/v1/3d/:id', () => {
-  async function queue() {
-    mockSubmit()
-    const { data } = await submit({ prompt: 'a lighthouse', model: 'tripo-p1' })
+  async function queue(payload: Record<string, unknown> = { prompt: 'a lighthouse', model: 'tripo-p1' }) {
+    mockSubmit({})
+    const { data } = await submit(payload)
     return data.id as string
   }
 
@@ -276,26 +428,22 @@ describe('GET /ai/v1/3d/:id', () => {
 
     const res = await poll(id)
     expect(res.status).toBe(200)
-    expect(await res.json()).toMatchObject({ id, status: 'running', progress: 42 })
+    expect(await res.json()).toMatchObject({ id, op: 'text_to_model', status: 'running', progress: 42 })
     await settle()
     expect(consumeCalls).toHaveLength(0)
   })
 
   test('success returns the model_url and charges credits/100 × markup once', async () => {
     const id = await queue()
-    on(TASK_URL, () => json({
-      code: 0,
-      data: { status: 'success', progress: 100, output: { model_url: 'https://tripo-cdn.example/m.glb' }, credits_consumed: 40 },
-    }))
+    on(TASK_URL, () => success({ output: { model_url: 'https://tripo-cdn.example/m.glb' } }, 40))
 
-    const res = await poll(id)
-    expect(res.status).toBe(200)
-    const data = await res.json() as any
+    const data = await (await poll(id)).json() as any
     expect(data).toMatchObject({
       id,
       status: 'success',
       model_url: 'https://tripo-cdn.example/m.glb',
       credits_consumed: 40,
+      billed_usd: 0.48,
     })
 
     await settle()
@@ -305,6 +453,7 @@ describe('GET /ai/v1/3d/:id', () => {
     expect(consumeCalls[0].billedUsd).toBeCloseTo(0.4 * 1.2, 6)
     expect(consumeCalls[0].actionMetadata).toMatchObject({
       model: 'tripo-p1',
+      op: 'text_to_model',
       taskId: TASK_ID,
       creditsConsumed: 40,
       input: 'text',
@@ -313,18 +462,51 @@ describe('GET /ai/v1/3d/:id', () => {
 
   test('polling a finished job three times charges exactly once, across requests', async () => {
     const id = await queue()
-    on(TASK_URL, () => json({
-      code: 0,
-      data: { status: 'success', progress: 100, output: { model_url: 'https://tripo-cdn.example/m.glb' }, credits_consumed: 20 },
-    }))
+    on(TASK_URL, () => success({ output: { model_url: 'https://tripo-cdn.example/m.glb' } }, 20))
 
     for (let i = 0; i < 3; i++) {
-      const data = await (await poll(id)).json() as any
-      expect(data.status).toBe('success')
+      expect((await (await poll(id)).json() as any).status).toBe('success')
     }
     await settle()
     expect(consumeCalls).toHaveLength(1)
-    expect(consumeCalls[0].rawUsd).toBeCloseTo(0.2, 6)
+  })
+
+  test('a free task (rig_check) writes no wallet row at all', async () => {
+    mockSubmit({})
+    const { data: queued } = await submit({ op: 'rig_check', input: TASK_ID })
+    on(TASK_URL, () => success({ riggable: true, rig_type: 'biped' }, 0))
+
+    const data = await (await poll(queued.id)).json() as any
+    expect(data).toMatchObject({ status: 'success', riggable: true, rig_type: 'biped', credits_consumed: 0, billed_usd: 0 })
+    await settle()
+    expect(consumeCalls).toHaveLength(0)
+    // Not claimed either, so a later poll cannot bill it.
+    expect(jobStore.charged.size).toBe(0)
+  })
+
+  test('segment returns part names and bills its 40 credits', async () => {
+    mockSubmit({})
+    const { data: queued } = await submit({ op: 'segment', input: TASK_ID })
+    expect(queued.estimated_credits).toBe(40)
+    on(TASK_URL, () => success({ output: { part_names: ['head', 'torso', 'arm_l'] } }, 40))
+
+    const data = await (await poll(queued.id)).json() as any
+    expect(data.status).toBe('success')
+    expect(data.parts).toEqual(['head', 'torso', 'arm_l'])
+    await settle()
+    expect(consumeCalls).toHaveLength(1)
+  })
+
+  test('retarget returns every animated model url', async () => {
+    mockSubmit({})
+    const { data: queued } = await submit({ op: 'retarget', input: TASK_ID, animations: ['preset:walk', 'preset:run'] })
+    on(TASK_URL, () => success({
+      output: { model_urls: ['https://tripo-cdn.example/walk.glb', 'https://tripo-cdn.example/run.glb'] },
+    }, 20))
+
+    const data = await (await poll(queued.id)).json() as any
+    expect(data.model_urls).toHaveLength(2)
+    expect(data.billed_usd).toBe(0.24)
   })
 
   test('a failed task surfaces the error and is not charged', async () => {
@@ -344,6 +526,14 @@ describe('GET /ai/v1/3d/:id', () => {
   test('a cancelled task reports failed and is not charged', async () => {
     const id = await queue()
     on(TASK_URL, () => json({ code: 0, data: { status: 'cancelled' } }))
+    expect((await (await poll(id)).json() as any).status).toBe('failed')
+    await settle()
+    expect(consumeCalls).toHaveLength(0)
+  })
+
+  test('success without any output is reported as failed, not billed', async () => {
+    const id = await queue()
+    on(TASK_URL, () => success({}, 20))
     const data = await (await poll(id)).json() as any
     expect(data.status).toBe('failed')
     await settle()
@@ -356,7 +546,7 @@ describe('GET /ai/v1/3d/:id', () => {
     expect((await res.json() as any).error.code).toBe('job_not_found')
   })
 
-  test("another workspace cannot read a job", async () => {
+  test('another workspace cannot read a job', async () => {
     const id = await queue()
     const res = await poll(id, OTHER_WS_TOKEN)
     expect(res.status).toBe(404)
@@ -377,21 +567,65 @@ describe('GET /ai/v1/3d/:id', () => {
 })
 
 // =========================================================================
+// File upload
+// =========================================================================
+
+describe('POST /ai/v1/3d/files', () => {
+  const upload = (body: Record<string, unknown>, token = TOKEN) =>
+    call('/ai/v1/3d/files', { method: 'POST', body: JSON.stringify(body) }, token)
+
+  test('uploads and returns a file_token', async () => {
+    on(`${TRIPO}/files`, (_url, init) => {
+      const form = init?.body as FormData
+      expect((form.get('file') as File).name).toBe('chair.png')
+      return json({ code: 0, data: { file_token: 'file_abc123' } })
+    })
+    const res = await upload({ filename: 'chair.png', contentType: 'image/png', data_base64: 'iVBORw0KGgo=' })
+    expect(res.status).toBe(200)
+    expect(await res.json()).toEqual({ file_token: 'file_abc123', bytes: 8, content_type: 'image/png' })
+  })
+
+  test('a file over the limit is a 413 naming the cap', async () => {
+    const huge = Buffer.alloc(26 * 1024 * 1024).toString('base64')
+    const res = await upload({ filename: 'big.glb', contentType: 'model/gltf-binary', data_base64: huge })
+    expect(res.status).toBe(413)
+    expect((await res.json() as any).error.code).toBe('file_too_large')
+    expect(fetchLog).toHaveLength(0)
+  })
+
+  test('missing data_base64 is a 400', async () => {
+    const res = await upload({ filename: 'chair.png' })
+    expect(res.status).toBe(400)
+    expect((await res.json() as any).error.code).toBe('missing_file')
+  })
+
+  test('bad token answers 401', async () => {
+    const res = await app.fetch(new Request('http://x/api/ai/v1/3d/files', { method: 'POST' }))
+    expect(res.status).toBe(401)
+  })
+})
+
+// =========================================================================
 // Model listing
 // =========================================================================
 
 describe('GET /ai/v1/3d/models', () => {
-  test('lists the runnable models with marked-up prices', async () => {
+  test('lists runnable models, prices and every operation', async () => {
     const res = await call('/ai/v1/3d/models')
     expect(res.status).toBe(200)
     const data = await res.json() as any
     expect(data.currency).toBe('USD')
     expect(data.note).toContain('markup')
+
     const v31 = data.models.find((m: any) => m.id === 'tripo-v3.1')
-    expect(v31).toMatchObject({ text_to_model: true, image_to_model: true, price: { unit: 'model' } })
+    expect(v31).toMatchObject({ text_to_model: true, image_to_model: true, multiview_to_model: true })
     expect(v31.price.usd).toBeCloseTo(0.24, 4)
-    const p1 = data.models.find((m: any) => m.id === 'tripo-p1')
-    expect(p1.price.usd).toBeCloseTo(0.48, 4)
+    expect(v31.price.untextured_usd).toBeCloseTo(0.12, 4)
+    expect(data.models.find((m: any) => m.id === 'tripo-p1').price.usd).toBeCloseTo(0.48, 4)
+
+    expect(data.operations.map((o: any) => o.op).sort()).toEqual(Object.keys(TRIPO_OPS).sort())
+    expect(data.operations.find((o: any) => o.op === 'rig_check').estimated_credits).toBe(0)
+    expect(data.operations.find((o: any) => o.op === 'retarget').estimated_credits).toBe(10)
   })
 
   test('lists nothing when the key is absent', async () => {
@@ -400,6 +634,7 @@ describe('GET /ai/v1/3d/models', () => {
     try {
       const data = await (await call('/ai/v1/3d/models')).json() as any
       expect(data.models).toEqual([])
+      expect(data.operations).toEqual([])
     } finally {
       process.env.TRIPO_API_KEY = saved
     }
@@ -416,35 +651,57 @@ describe('GET /ai/v1/3d/models', () => {
 // =========================================================================
 
 describe('estimateTripoTaskCost', () => {
-  const usd = (p: Parameters<typeof estimateTripoTaskCost>[0]) => estimateTripoTaskCost(p).billedUsd
+  const credits = (p: Parameters<typeof estimateTripoTaskCost>[0]) =>
+    Math.round(estimateTripoTaskCost(p).rawUsd * 100)
 
-  test('H-series text-to-model: 10 / 20 / 30 / 40 credits', () => {
-    expect(usd({ model: 'tripo-v3.1', input: 'text', texture: false })).toBeCloseTo(0.1 * 1.2, 6)
-    expect(usd({ model: 'tripo-v3.1', input: 'text', textureQuality: 'standard' })).toBeCloseTo(0.2 * 1.2, 6)
-    expect(usd({ model: 'tripo-v3.1', input: 'text', textureQuality: 'detailed' })).toBeCloseTo(0.3 * 1.2, 6)
-    expect(usd({ model: 'tripo-v3.1', input: 'text', textureQuality: 'extreme' })).toBeCloseTo(0.4 * 1.2, 6)
+  test('H-series generation: text 10 / 20, image 20 / 30, multiview 20 / 30', () => {
+    expect(credits({ op: 'text_to_model', model: 'tripo-v3.1', texture: false })).toBe(10)
+    expect(credits({ op: 'text_to_model', model: 'tripo-v3.1' })).toBe(20)
+    expect(credits({ op: 'image_to_model', model: 'tripo-v3.1', texture: false })).toBe(20)
+    expect(credits({ op: 'image_to_model', model: 'tripo-v3.1' })).toBe(30)
+    expect(credits({ op: 'multiview_to_model', model: 'tripo-v3.1', texture: false })).toBe(20)
+    expect(credits({ op: 'multiview_to_model', model: 'tripo-v3.1' })).toBe(30)
   })
 
-  test('H-series image-to-model: 20 / 30 / 40 / 50 credits', () => {
-    expect(usd({ model: 'tripo-v3.1', input: 'image', texture: false })).toBeCloseTo(0.2 * 1.2, 6)
-    expect(usd({ model: 'tripo-v3.1', input: 'image', textureQuality: 'standard' })).toBeCloseTo(0.3 * 1.2, 6)
-    expect(usd({ model: 'tripo-v3.1', input: 'image', textureQuality: 'detailed' })).toBeCloseTo(0.4 * 1.2, 6)
-    expect(usd({ model: 'tripo-v3.1', input: 'image', textureQuality: 'extreme' })).toBeCloseTo(0.5 * 1.2, 6)
+  test('P-series adds 20 credits to every generation cell', () => {
+    expect(credits({ op: 'text_to_model', model: 'tripo-p1', texture: false })).toBe(30)
+    expect(credits({ op: 'text_to_model', model: 'tripo-p1' })).toBe(40)
+    expect(credits({ op: 'image_to_model', model: 'tripo-p1', texture: false })).toBe(40)
+    expect(credits({ op: 'image_to_model', model: 'tripo-p1' })).toBe(50)
+    expect(credits({ op: 'multiview_to_model', model: 'tripo-p1' })).toBe(50)
   })
 
-  test('P-series adds 20 credits to every cell', () => {
-    expect(usd({ model: 'tripo-p1', input: 'text', texture: false })).toBeCloseTo(0.3 * 1.2, 6)
-    expect(usd({ model: 'tripo-p1', input: 'text', textureQuality: 'standard' })).toBeCloseTo(0.4 * 1.2, 6)
-    expect(usd({ model: 'tripo-p1', input: 'text', textureQuality: 'detailed' })).toBeCloseTo(0.5 * 1.2, 6)
-    expect(usd({ model: 'tripo-p1', input: 'text', textureQuality: 'extreme' })).toBeCloseTo(0.6 * 1.2, 6)
-    expect(usd({ model: 'tripo-p1', input: 'image', texture: false })).toBeCloseTo(0.4 * 1.2, 6)
-    expect(usd({ model: 'tripo-p1', input: 'image', textureQuality: 'standard' })).toBeCloseTo(0.5 * 1.2, 6)
-    expect(usd({ model: 'tripo-p1', input: 'image', textureQuality: 'detailed' })).toBeCloseTo(0.6 * 1.2, 6)
-    expect(usd({ model: 'tripo-p1', input: 'image', textureQuality: 'extreme' })).toBeCloseTo(0.7 * 1.2, 6)
+  test('texture_quality tiers: standard / detailed / extreme', () => {
+    expect(credits({ op: 'text_to_model', model: 'tripo-v3.1', textureQuality: 'standard' })).toBe(20)
+    expect(credits({ op: 'text_to_model', model: 'tripo-v3.1', textureQuality: 'detailed' })).toBe(30)
+    expect(credits({ op: 'text_to_model', model: 'tripo-v3.1', textureQuality: 'extreme' })).toBe(40)
+    expect(credits({ op: 'image_to_model', model: 'tripo-p1', textureQuality: 'extreme' })).toBe(70)
   })
 
-  test('texture defaults on, so an argument-less call prices the textured task', () => {
-    expect(usd({ model: 'tripo-v3.1' })).toBeCloseTo(0.24, 6)
+  test('pbr counts as textured, since Tripo forces it upstream', () => {
+    expect(credits({ op: 'text_to_model', model: 'tripo-v3.1', texture: false, pbr: true })).toBe(20)
+  })
+
+  test('fixed-price ops match the published table', () => {
+    expect(credits({ op: 'texture' })).toBe(10)
+    expect(credits({ op: 'texture', textureQuality: 'detailed' })).toBe(20)
+    expect(credits({ op: 'texture', textureQuality: 'extreme' })).toBe(30)
+    expect(credits({ op: 'convert' })).toBe(5)
+    expect(credits({ op: 'retopology', model: 'v2.0' })).toBe(30)
+    expect(credits({ op: 'retopology', model: 'v3.0' })).toBe(35)
+    expect(credits({ op: 'retopology', model: 'v3.0', quad: true })).toBe(40)
+    expect(credits({ op: 'segment' })).toBe(40)
+    expect(credits({ op: 'complete' })).toBe(40)
+    expect(credits({ op: 'rig_check' })).toBe(0)
+    expect(credits({ op: 'rig' })).toBe(25)
+    expect(credits({ op: 'retarget', animation: 'preset:walk' })).toBe(10)
+    expect(credits({ op: 'retarget', animations: ['a', 'b', 'c'] })).toBe(30)
+    expect(credits({ op: 'import' })).toBe(0)
+  })
+
+  test('markup is 1.2 on every estimate', () => {
+    const cost = estimateTripoTaskCost({ op: 'text_to_model', model: 'tripo-v3.1' })
+    expect(cost.billedUsd).toBeCloseTo(cost.rawUsd * 1.2, 6)
   })
 
   test('calculate3dUsageCost bills credits at $0.01 with the markup', () => {

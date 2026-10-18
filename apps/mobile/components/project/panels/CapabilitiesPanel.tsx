@@ -9,6 +9,7 @@ import {
   Clock,
   ImageIcon,
   Clapperboard,
+  Box,
   Brain,
   ChevronDown,
   ChevronRight,
@@ -76,6 +77,7 @@ export interface CapabilitySettings {
   heartbeatToolsEnabled: boolean
   imageGenEnabled: boolean
   videoGenEnabled: boolean
+  threeDGenEnabled: boolean
   memoryEnabled: boolean
   quickActionsEnabled: boolean
   sdkGuideEnabled: boolean
@@ -184,6 +186,21 @@ const CAPABILITIES: CapabilityDef[] = [
     examples: [
       '"Animate the hero image into a 5 second loop for the landing page"',
       '"Make three 9:16 product shots for TikTok from these photos"',
+    ],
+  },
+  {
+    key: 'threeDGenEnabled',
+    optIn: true,
+    label: '3D Generation',
+    description: 'Turn a prompt or a still image into a 3D model',
+    detail:
+      'Turn a text prompt or a still image into a 3D model (GLB). Rendered on Tripo and billed per task, roughly $0.12-$0.60 depending on model and texture quality, so this is off until you turn it on.',
+    disabledDescription: 'No 3D model generation',
+    icon: Box,
+    toolNames: ['generate_3d_model'],
+    examples: [
+      '"Make a low-poly game asset of this chair from the product photo"',
+      '"Build a 3D model of a red fox and save it as public/assets/fox.glb"',
     ],
   },
   {
