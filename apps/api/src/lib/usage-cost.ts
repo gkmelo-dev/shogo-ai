@@ -225,6 +225,66 @@ export function calculateVideoUsageCost(rates: VideoRates, seconds: number, audi
 }
 
 // =============================================================================
+// 3D Generation Usage Costs (Tripo3D)
+// =============================================================================
+
+/** Tripo bills in credits; 100 credits = $1.00. */
+export const TRIPO_USD_PER_CREDIT = 0.01
+
+/**
+ * Credits per generation by series and input mode, from the published tables
+ * (`developers.tripo3d.ai/en/models/v3-1`): H-series text 10 / image 20 with
+ * no texture, P-series 30 / 40. Texturing adds the surcharge below.
+ */
+const TRIPO_BASE_CREDITS = {
+  H: { text: 10, image: 20 },
+  P: { text: 30, image: 40 },
+} as const
+
+/** Extra credits for texture generation, relative to the untextured base. */
+const TRIPO_TEXTURE_CREDITS: Record<string, number> = {
+  none: 0,
+  fast: 10,
+  standard: 10,
+  detailed: 20,
+  extreme: 30,
+}
+
+/** A model id starting `tripo-p` is the low-poly P-series; everything else is H. */
+function tripoSeries(model: string | undefined): 'H' | 'P' {
+  return (model ?? '').startsWith('tripo-p') ? 'P' : 'H'
+}
+
+/**
+ * Advisory estimate for the `estimated_usd` on the queued response. Billing is
+ * never driven by this: the status route charges the task's own
+ * `credits_consumed`.
+ */
+export function estimateTripoTaskCost(params: {
+  model?: string
+  texture?: boolean
+  textureQuality?: string
+  input?: 'text' | 'image'
+}): UsageCostResult {
+  const series = tripoSeries(params.model)
+  const mode = params.input === 'image' ? 'image' : 'text'
+  const texture = params.texture !== false
+  const quality = params.textureQuality || 'standard'
+  const credits = TRIPO_BASE_CREDITS[series][mode] + (texture ? (TRIPO_TEXTURE_CREDITS[quality] ?? TRIPO_TEXTURE_CREDITS.standard) : 0)
+  const rawUsd = credits * TRIPO_USD_PER_CREDIT
+  return { rawUsd, billedUsd: rawUsd * MARKUP_MULTIPLIER }
+}
+
+/**
+ * USD for a finished Tripo task, from the credits Tripo reports consuming.
+ * Never estimate what the task itself can tell us.
+ */
+export function calculate3dUsageCost(creditsConsumed: number): UsageCostResult {
+  const rawUsd = Math.max(0, creditsConsumed) * TRIPO_USD_PER_CREDIT
+  return { rawUsd, billedUsd: rawUsd * MARKUP_MULTIPLIER }
+}
+
+// =============================================================================
 // Social lookup usage costs (EnsembleData)
 // =============================================================================
 

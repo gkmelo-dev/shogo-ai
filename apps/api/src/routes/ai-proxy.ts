@@ -81,6 +81,19 @@ import {
   type ImageProcessOperation,
 } from '../lib/fal-media'
 import { putVideoJob, getVideoJob, claimVideoCharge } from '../lib/video-job-store'
+import { put3dJob, get3dJob, claim3dCharge } from '../lib/3d-job-store'
+import {
+  DEFAULT_TRIPO_MODEL,
+  TRIPO_MODELS,
+  TRIPO_TASK_PATHS,
+  getTripoModel,
+  isHttpsUrl,
+  parseDataUri,
+  tripoCreateTask,
+  tripoGetTask,
+  tripoUploadFile,
+  TripoApiError,
+} from '../lib/tripo-3d'
 
 // =============================================================================
 // Types
@@ -2501,7 +2514,7 @@ function normalizeThinkingForModel(parsed: any, apiModel: string): void {
 import { calculateUsageCost, proxyModelToBillingModel, getModelTier } from '../lib/usage-cost'
 import * as billingService from '../services/billing-runtime'
 import { getProjectUser } from '../lib/project-user-context'
-import { accumulateUsage, accumulateImageUsage, accumulateVideoUsage, hasActiveSession } from '../lib/proxy-billing-session-runtime'
+import { accumulateUsage, accumulateImageUsage, accumulateVideoUsage, accumulate3dUsage, hasActiveSession } from '../lib/proxy-billing-session-runtime'
 import { isShogoCloudForwarding } from '../lib/cloud-forwarding'
 import { buildUsageLimitInfo } from '../lib/usage-limit-info'
 export { buildUsageLimitInfo }
@@ -2914,21 +2927,24 @@ import {
   calculateImageProcessUsageCost,
   calculateTranscriptionUsageCost,
   calculateVideoUsageCost,
+  calculate3dUsageCost,
+  estimateTripoTaskCost,
 } from '../lib/usage-cost'
 
 /**
  * One billable media output. Images (including upscale / background removal)
  * fold into the open billing session's image totals; video folds into its
- * video totals. With no session open, it is charged as its own usage event.
+ * video totals; 3D folds into its own. With no session open, it is charged as
+ * its own usage event.
  */
 interface MediaCharge {
-  kind: 'image' | 'video'
+  kind: 'image' | 'video' | '3d'
   model: string
   rawUsd: number
   billedUsd: number
   /** Output seconds (video only). */
   seconds?: number
-  actionType: 'ai_image_generation' | 'ai_image_processing' | 'ai_video_generation'
+  actionType: 'ai_image_generation' | 'ai_image_processing' | 'ai_video_generation' | 'ai_3d_generation'
   metadata: Record<string, unknown>
 }
 
@@ -2948,7 +2964,9 @@ async function recordMediaUsage(tokenPayload: ProxyTokenPayload, charge: MediaCh
     if (billingProjectId) {
       const accumulated = kind === 'video'
         ? await accumulateVideoUsage(billingProjectId, charge.seconds ?? 0, rawUsd, billedUsd, chatSessionId)
-        : await accumulateImageUsage(billingProjectId, model, rawUsd, billedUsd, chatSessionId)
+        : kind === '3d'
+          ? await accumulate3dUsage(billingProjectId, rawUsd, billedUsd, chatSessionId)
+          : await accumulateImageUsage(billingProjectId, model, rawUsd, billedUsd, chatSessionId)
       if (accumulated) {
         console.log(`[AI Proxy] 🎨 Accumulated ${charge.actionType} for session ($${billedUsd.toFixed(4)}, model: ${model}, project: ${billingProjectId}${chatSessionId ? `, chat: ${chatSessionId}` : ''})`)
         return
@@ -3084,6 +3102,32 @@ function recordVideoUsage(
     seconds,
     actionType: 'ai_video_generation',
     metadata: { seconds, audio, ...metadata },
+  }, chatSessionId)
+}
+
+/**
+ * Record billing for a finished Tripo3D task. Charged from the task's own
+ * `credits_consumed` (never the estimate), so a model with a different credit
+ * cost than the published table still bills correctly.
+ */
+function record3dUsage(
+  tokenPayload: ProxyTokenPayload,
+  params: { model: string; taskId: string; creditsConsumed: number; input: 'text' | 'image' },
+  chatSessionId?: string | null,
+) {
+  const cost = calculate3dUsageCost(params.creditsConsumed)
+  return recordMediaUsage(tokenPayload, {
+    kind: '3d',
+    model: params.model,
+    rawUsd: cost.rawUsd,
+    billedUsd: cost.billedUsd,
+    actionType: 'ai_3d_generation',
+    metadata: {
+      model: params.model,
+      taskId: params.taskId,
+      creditsConsumed: params.creditsConsumed,
+      input: params.input,
+    },
   }, chatSessionId)
 }
 
@@ -5248,6 +5292,251 @@ export function aiProxyRoutes() {
       }
       console.error(`[AI Proxy] Video status error for ${id}:`, message)
       return c.json({ error: { message, type: 'server_error', code: 'video_status_error' } }, 502)
+    }
+  })
+
+  // =========================================================================
+  // 3D Generation Endpoints (Tripo3D V3)
+  // =========================================================================
+
+  /** Texture quality levels the generation endpoints accept. */
+  const TRIPO_TEXTURE_QUALITIES = new Set(['fast', 'standard', 'detailed', 'extreme'])
+
+  /**
+   * GET /ai/v1/3d/models - 3D models this server can run, with capabilities
+   * and Shogo (marked-up) price. Models are omitted entirely when no Tripo
+   * key is configured, like the fal entries in `/ai/v1/media/models`.
+   */
+  router.get('/ai/v1/3d/models', async (c) => {
+    const tokenPayload = await validateProxyAuth(c)
+    if (!tokenPayload) {
+      return c.json(
+        { error: { message: 'Invalid or missing proxy token.', type: 'authentication_error', code: 'invalid_api_key' } },
+        401
+      )
+    }
+
+    const configured = !!getNativeProviderApiKeySync('tripo')
+    const models = configured
+      ? Object.values(TRIPO_MODELS).map((entry) => {
+          const textCost = estimateTripoTaskCost({ model: entry.id, input: 'text' })
+          return {
+            id: entry.id,
+            name: entry.name,
+            text_to_model: entry.textToModel,
+            image_to_model: entry.imageToModel,
+            price: { unit: 'model', usd: roundUsd(textCost.billedUsd) },
+          }
+        })
+      : []
+
+    return c.json({
+      models,
+      currency: 'USD',
+      note: 'Prices include the Shogo markup and are what the workspace is charged. Billing follows the credits each finished task reports.',
+    })
+  })
+
+  /**
+   * POST /ai/v1/3d/generations - Submit a Tripo3D job.
+   *
+   * Body: `{ prompt? | image?, model?, texture?, texture_quality?, face_limit?,
+   * pbr?, auto_size?, quad? }`. `image` accepts a data URI (uploaded to Tripo
+   * for a `file_token`) or an https URL (forwarded as-is). Returns
+   * `{ id, status: 'queued', model, estimated_usd }` immediately; poll
+   * `GET /ai/v1/3d/:id`. Nothing is charged until the task succeeds.
+   */
+  router.post('/ai/v1/3d/generations', async (c) => {
+    const tokenPayload = await validateProxyAuth(c)
+    if (!tokenPayload) {
+      return c.json(
+        { error: { message: 'Invalid or missing proxy token.', type: 'authentication_error', code: 'invalid_api_key' } },
+        401
+      )
+    }
+
+    if (!(await isTurnInFlight(c, tokenPayload))) {
+      const balanceCheck = await billingService.checkUsageBalance(tokenPayload.workspaceId)
+      if (!balanceCheck.ok) {
+        const { code, message } = billingService.usageLimitErrorPayload(balanceCheck.reason)
+        const usageLimit = await buildUsageLimitInfo(tokenPayload.workspaceId)
+        return c.json({ error: { message, type: 'billing_error', code, ...usageLimit } }, 402)
+      }
+    }
+
+    const invalid = (message: string, code: string) =>
+      c.json({ error: { message, type: 'invalid_request_error', code } }, 400)
+
+    try {
+      const body = await c.req.json() as {
+        prompt?: string
+        image?: string
+        model?: string
+        texture?: boolean
+        pbr?: boolean
+        face_limit?: number
+        texture_quality?: string
+        auto_size?: boolean
+        quad?: boolean
+      }
+
+      const hasPrompt = typeof body.prompt === 'string' && body.prompt.trim().length > 0
+      const hasImage = typeof body.image === 'string' && body.image.length > 0
+      if (hasPrompt && hasImage) {
+        return invalid('Send either prompt or image, not both.', 'prompt_and_image')
+      }
+      if (!hasPrompt && !hasImage) return invalid('prompt or image is required', 'missing_prompt')
+
+      const modelId = body.model || DEFAULT_TRIPO_MODEL
+      const model = getTripoModel(modelId)
+      if (!model) return invalid(`3D model '${modelId}' is not supported.`, 'model_not_found')
+
+      if (body.texture_quality !== undefined && !TRIPO_TEXTURE_QUALITIES.has(body.texture_quality)) {
+        return invalid(`texture_quality must be one of ${[...TRIPO_TEXTURE_QUALITIES].join(', ')}.`, 'invalid_texture_quality')
+      }
+      if (body.face_limit !== undefined && (!Number.isInteger(body.face_limit) || body.face_limit <= 0)) {
+        return invalid('face_limit must be a positive integer', 'invalid_face_limit')
+      }
+
+      const apiKey = getNativeProviderApiKeySync('tripo')
+      if (!apiKey) {
+        return c.json(
+          { error: { message: "3D provider 'tripo' is not configured on this server.", type: 'server_error', code: 'provider_not_configured' } },
+          503
+        )
+      }
+
+      // Only forward what the caller set: Tripo's own defaults (texture on,
+      // pbr on) are the right ones when a field is absent.
+      const options: Record<string, unknown> = { model: model.apiModel }
+      if (body.texture !== undefined) options.texture = body.texture
+      if (body.pbr !== undefined) options.pbr = body.pbr
+      if (body.face_limit !== undefined) options.face_limit = body.face_limit
+      if (body.texture_quality !== undefined) options.texture_quality = body.texture_quality
+      if (body.auto_size !== undefined) options.auto_size = body.auto_size
+      if (body.quad !== undefined) options.quad = body.quad
+
+      let taskId: string
+      let inputKind: 'text' | 'image'
+      if (hasImage) {
+        let input: string
+        if (body.image!.startsWith('data:')) {
+          const { bytes, contentType } = parseDataUri(body.image!)
+          if (!/^image\/(png|jpeg|webp)$/.test(contentType)) {
+            return invalid('image data URI must be PNG, JPEG or WebP', 'invalid_image')
+          }
+          input = await tripoUploadFile(apiKey, bytes, contentType, c.req.raw.signal)
+        } else if (isHttpsUrl(body.image!)) {
+          input = body.image!
+        } else {
+          return invalid('image must be an image data URI or an https URL', 'invalid_image')
+        }
+        inputKind = 'image'
+        taskId = await tripoCreateTask(apiKey, TRIPO_TASK_PATHS.imageToModel, { input, ...options }, c.req.raw.signal)
+      } else {
+        inputKind = 'text'
+        taskId = await tripoCreateTask(apiKey, TRIPO_TASK_PATHS.textToModel, { prompt: body.prompt, ...options }, c.req.raw.signal)
+      }
+
+      const texture = body.pbr === true ? true : body.texture !== false
+      const id = `gen3d_${randomUUID()}`
+      await put3dJob({
+        id,
+        workspaceId: tokenPayload.workspaceId,
+        projectId: tokenPayload.projectId,
+        userId: tokenPayload.userId,
+        chatSessionId: c.req.header('x-chat-session-id') || null,
+        model: model.id,
+        taskId,
+        input: inputKind,
+        texture,
+        textureQuality: body.texture_quality,
+        createdAt: Date.now(),
+      })
+      console.log(`[AI Proxy] 🧊 3D job ${id}: ${tokenPayload.projectId} → tripo/${model.id} (${inputKind}, task ${taskId})`)
+
+      const estimate = estimateTripoTaskCost({
+        model: model.id,
+        texture,
+        textureQuality: body.texture_quality,
+        input: inputKind,
+      })
+      return c.json({ id, status: 'queued', model: model.id, estimated_usd: roundUsd(estimate.billedUsd) })
+    } catch (error: any) {
+      console.error('[AI Proxy] 3D submit error:', error.message)
+      // A rejected request (bad prompt/params) is the caller's, not ours: pass
+      // Tripo's 4xx through so the runtime sees 400 rather than 502.
+      const upstream: number | undefined = error instanceof TripoApiError ? error.status : undefined
+      const statusCode = upstream === 429 ? 429 : upstream !== undefined && upstream >= 400 && upstream < 500 ? 400 : 502
+      return c.json(
+        { error: { message: error.message || '3D submission failed', type: 'server_error', code: '3d_submit_error' } },
+        statusCode
+      )
+    }
+  })
+
+  /**
+   * GET /ai/v1/3d/:id - Status of a 3D job. `model_url` on success is a
+   * signed Tripo URL that expires after ~5 minutes; the caller downloads it
+   * immediately. Charged exactly once per job id, on any pod.
+   */
+  router.get('/ai/v1/3d/:id', async (c) => {
+    const tokenPayload = await validateProxyAuth(c)
+    if (!tokenPayload) {
+      return c.json(
+        { error: { message: 'Invalid or missing proxy token.', type: 'authentication_error', code: 'invalid_api_key' } },
+        401
+      )
+    }
+
+    const id = c.req.param('id')
+    const job = await get3dJob(id)
+    if (!job || job.workspaceId !== tokenPayload.workspaceId) {
+      return c.json({ error: { message: `3D job '${id}' not found.`, type: 'invalid_request_error', code: 'job_not_found' } }, 404)
+    }
+
+    const apiKey = getNativeProviderApiKeySync('tripo')
+    if (!apiKey) {
+      return c.json(
+        { error: { message: "3D provider 'tripo' is not configured on this server.", type: 'server_error', code: 'provider_not_configured' } },
+        503
+      )
+    }
+
+    try {
+      const task = await tripoGetTask(apiKey, job.taskId, c.req.raw.signal)
+
+      if (task.status === 'queued' || task.status === 'running') {
+        return c.json({
+          id,
+          status: task.status,
+          ...(task.progress !== undefined ? { progress: task.progress } : {}),
+        })
+      }
+
+      if (task.status === 'failed') {
+        const detail = task.errorMessage || (task.errorCode !== undefined ? `Tripo error ${task.errorCode}` : 'Task failed')
+        return c.json({ id, status: 'failed', error: detail })
+      }
+
+      const modelUrl = task.output?.model_url
+      if (!modelUrl) return c.json({ id, status: 'failed', error: 'Tripo reported success without a model_url' })
+
+      const creditsConsumed = task.creditsConsumed ?? 0
+      if (await claim3dCharge(id)) {
+        record3dUsage(
+          tokenPayload,
+          { model: job.model, taskId: job.taskId, creditsConsumed, input: job.input },
+          c.req.header('x-chat-session-id') || job.chatSessionId || null,
+        )
+      }
+      return c.json({ id, status: 'success', progress: 100, model_url: modelUrl, credits_consumed: creditsConsumed })
+    } catch (error: any) {
+      console.error(`[AI Proxy] 3D status error for ${id}:`, error.message)
+      return c.json(
+        { error: { message: error.message || '3D status check failed', type: 'server_error', code: '3d_status_error' } },
+        502
+      )
     }
   })
 
