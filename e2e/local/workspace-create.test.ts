@@ -119,6 +119,10 @@ test.describe("More than one workspace (local mode)", () => {
 
   test("the local API creates, renames and guards workspaces", async () => {
     test.setTimeout(60_000)
+    // `page.request` shares this page's cookie jar, and local mode signs the
+    // user in on the first page load — so land on the shell before calling the
+    // API directly, or every request is a 401.
+    await goHome(page)
     const name = `E2E API ${Date.now()}`
     const res = await page.request.post(`${LOCAL_API_BASE}/api/workspaces`, { data: { name } })
     expect(res.status()).toBe(201)
@@ -183,6 +187,50 @@ test.describe("More than one workspace (local mode)", () => {
     const rows = (await listWorkspaces(page)).filter((w) => w.name === name)
     expect(rows).toHaveLength(1)
     created.push(rows[0].id)
+
+    // …and the shell actually switched into it: the persisted active id is the
+    // new workspace's, and it starts empty (the seeded workspace's projects
+    // must not follow the switch).
+    await expect
+      .poll(() => page.evaluate(() => localStorage.getItem("shogo:active-workspace-id")), {
+        timeout: 30_000,
+      })
+      .toBe(rows[0].id)
+    const projects = await page.request.get(
+      `${LOCAL_API_BASE}/api/projects?workspaceId=${rows[0].id}`,
+    )
+    expect(projects.ok()).toBeTruthy()
+    const projectBody = await projects.json()
+    expect((projectBody?.items ?? projectBody?.data ?? []) as unknown[]).toHaveLength(0)
+  })
+
+  test("narrow web (390px): the same create works from the /account Workspaces section", async () => {
+    test.setTimeout(90_000)
+    await page.setViewportSize({ width: 390, height: 844 })
+    const name = `E2E Narrow ${Date.now()}`
+
+    await page.goto("/account")
+    await page
+      .getByText("Workspaces", { exact: true })
+      .first()
+      .waitFor({ state: "visible", timeout: 20_000 })
+    await page.getByLabel("Create new workspace").first().click()
+
+    expect(page.url()).not.toContain("/new-workspace")
+    const dialog = page.getByPlaceholder("e.g. My Team, Acme Corp")
+    await expect(dialog).toBeVisible({ timeout: 10_000 })
+    await dialog.fill(name)
+    await page.getByText("Create workspace", { exact: true }).click()
+
+    await expect
+      .poll(async () => (await listWorkspaces(page)).filter((w) => w.name === name).length, {
+        timeout: 30_000,
+      })
+      .toBe(1)
+    const createdRow = (await listWorkspaces(page)).find((w) => w.name === name)!
+    expect(createdRow.kind).toBe("team")
+    created.push(createdRow.id)
+    await page.setViewportSize({ width: 1280, height: 800 })
   })
 
   test("wide desktop: settings shows the deletion preview and deletes the workspace", async () => {
