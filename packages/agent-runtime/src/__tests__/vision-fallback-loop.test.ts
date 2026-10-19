@@ -23,7 +23,14 @@ const IMAGE: ImageContent = { type: 'image', data: FIXTURE.toString('base64'), m
 const SCREENSHOT_PATH = '.shogo/screenshots/run-1/step-01.png'
 const DESCRIPTION = 'A white page with the heading SHOGO-VISION-FIXTURE and a green rectangle.'
 
-const EMPTY_USAGE: Usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
+const EMPTY_USAGE: Usage = {
+  input: 0,
+  output: 0,
+  cacheRead: 0,
+  cacheWrite: 0,
+  totalTokens: 0,
+  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+}
 
 /** A turn where the `browser` tool already took a screenshot; its result carries the PNG. */
 function screenshotHistory(): Message[] {
@@ -175,7 +182,10 @@ describe('vision fallback on a text-only model', () => {
 
     const promptParts = captured[0].filter((m) => m.role === 'user')
     const promptBlocks = promptParts.flatMap((m) =>
-      Array.isArray(m.content) ? m.content : [{ type: 'text', text: String(m.content) }],
+      (Array.isArray(m.content) ? m.content : [{ type: 'text', text: String(m.content) }]) as Array<{
+        type: string
+        text?: string
+      }>,
     )
     expect(promptBlocks.some((b) => b.type === 'image')).toBe(false)
     const promptText = promptBlocks
