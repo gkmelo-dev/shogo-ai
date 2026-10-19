@@ -274,6 +274,26 @@ describe('proxy route parity', () => {
     expect(ungated).toEqual([])
   })
 
+  test('no router keeps a private copy of the cloud gate', async () => {
+    // Russell, 2026-10-19: tools always use the relay while we are cloud
+    // authed, so the condition lives once. Both `tools-proxy` and
+    // `integrations` had grown their own `!!SHOGO_API_KEY` predicate, which also
+    // fired on the cloud itself and disagreed with the AI proxy about BYOK.
+    const problems: string[] = []
+    for (const spec of ROUTERS) {
+      const text = await readRouter(spec.file)
+      const own = text.match(/(?:export )?function (isShogoCloud[A-Za-z]*|shouldForwardToCloud)\s*\(/)
+      if (own) {
+        problems.push(`${spec.name} defines ${own[1]}() locally — import the gate from lib/cloud-forwarding.ts`)
+      }
+      const forwards = /\b(forwardToShogoCloud|forwardToCloud|forwardIntegrationsToCloud)\s*\(/.test(text)
+      if (forwards && !/from '\.\.\/lib\/cloud-forwarding'/.test(text)) {
+        problems.push(`${spec.name} forwards without importing a gate from lib/cloud-forwarding.ts`)
+      }
+    }
+    expect(problems).toEqual([])
+  })
+
   test('a new local-only route is reported by name (the guard is not a no-op)', async () => {
     // A plausible next route on a router whose routes all forward today.
     const tools = ROUTERS.find((spec) => spec.name === 'tools-proxy')!
