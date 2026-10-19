@@ -618,6 +618,16 @@ export const AppSidebar = observer(function AppSidebar({
   const { instance: activeRemoteInstance, setInstance: setActiveInstance } = useActiveInstance();
   // A paired desktop's own workspaces, listed under "This Mac" (SHO-54).
   const { machines: machineWorkspaces } = useMachineWorkspaces();
+  // The machine workspace in view, if any — its name and live presence feed
+  // the "Connected to …" strip below. Undefined for a legacy remote-control
+  // instance, which keeps the plain "Controlling:" strip.
+  const activeMachine =
+    activeRemoteInstance?.source === "machine"
+      ? machineWorkspaces.find((m) => m.id === activeRemoteInstance.instanceId)
+      : undefined;
+  const activeMachineWorkspace = activeMachine?.workspaces.find(
+    (w) => w.id === activeRemoteInstance?.localWorkspaceId,
+  );
 
   let allWorkspaces: any[];
   try {
@@ -1423,7 +1433,11 @@ export const AppSidebar = observer(function AppSidebar({
               )}
               numberOfLines={1}
             >
-              Controlling: {activeRemoteInstance.name}
+              {activeMachine
+                ? `Connected to ${activeRemoteInstance.name}${
+                    activeMachineWorkspace ? ` · ${activeMachineWorkspace.name}` : ""
+                  } · ${activeMachine.status}`
+                : `Controlling: ${activeRemoteInstance.name}`}
             </Text>
           </View>
         </View>

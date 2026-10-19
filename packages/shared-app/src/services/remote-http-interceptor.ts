@@ -156,6 +156,21 @@ export function rewriteMachineWorkspaceParam(path: string, localWorkspaceId: str
   return `${pathname}?${params.toString()}`
 }
 
+/**
+ * Point a machine-workspace request body at the machine's own workspace id.
+ *
+ * Creates carry `workspaceId` in the body while the UI still holds the cloud
+ * id it was showing; leaving it means the desktop cannot resolve the id and
+ * files the project or folder into whichever workspace happens to be first.
+ * Only plain JSON objects are touched — files, strings and arrays pass through.
+ */
+export function rewriteMachineWorkspaceBody<T>(body: T, localWorkspaceId: string): T {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return body
+  const record = body as Record<string, unknown>
+  if (typeof record.workspaceId !== 'string' || record.workspaceId === localWorkspaceId) return body
+  return { ...record, workspaceId: localWorkspaceId } as T
+}
+
 // ─── Path Routing Logic ─────────────────────────────────────────────────────
 
 /**
@@ -258,6 +273,12 @@ export function createRemoteAwareHttpClient(
         const rewrittenPath = rewritePathForRemote(path, config.remoteProxyBaseUrl)
         const newArgs = [...args]
         newArgs[0] = rewrittenPath
+
+        // A create still carries the cloud workspaceId in its body; point it at
+        // the machine's own workspace so the record lands where the user is.
+        if (config.machineWorkspaceId && (prop === 'post' || prop === 'patch')) {
+          newArgs[1] = rewriteMachineWorkspaceBody(newArgs[1], config.machineWorkspaceId)
+        }
 
         // Build the common header bag once
         const remoteHeaders: Record<string, string> = {

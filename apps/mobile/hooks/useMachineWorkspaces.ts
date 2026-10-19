@@ -9,11 +9,20 @@
  * `/api/local/machine`. The list response already carries the last heartbeat
  * snapshot, so an offline machine still renders its last-known workspaces
  * instead of the group vanishing.
+ *
+ * Presence changes on the server without any event reaching the client, so the
+ * list re-reads itself once per heartbeat window — otherwise the row keeps
+ * whatever status it had when the switcher first mounted, and a machine that
+ * was asleep at mount never gets its live workspaces.
  */
 
-import { useCallback, useEffect, useMemo, useState } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
+import { AppState } from "react-native"
 import { API_URL } from "../lib/api"
 import type { MachineGroupData, MachinePresence } from "../components/layout/sidebar/MachineWorkspacesGroup"
+
+/** Cloud presence is heartbeat-driven; one read per window keeps it inside 60 s. */
+const POLL_MS = 30_000
 
 interface MachineListItem {
   id: string
@@ -43,28 +52,45 @@ export function useMachineWorkspaces(): UseMachineWorkspacesResult {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [nonce, setNonce] = useState(0)
+  /** Polls must not flash the group's spinner — only the first load does. */
+  const loadedOnce = useRef(false)
 
   const refresh = useCallback(() => setNonce((n) => n + 1), [])
 
   useEffect(() => {
     if (!API_URL) return
-    let cancelled = false
+
+    let live = true
+    let appState = AppState.currentState
+    let pollTimer: ReturnType<typeof setTimeout> | null = null
+    // React Native can report null briefly during launch; treat that as foreground.
+    const foreground = () => appState === "active" || appState === null
+
+    const clearPoll = () => {
+      if (pollTimer) clearTimeout(pollTimer)
+      pollTimer = null
+    }
+    const schedulePoll = () => {
+      clearPoll()
+      if (!live || !foreground()) return
+      pollTimer = setTimeout(() => void poll(), POLL_MS)
+    }
 
     const load = async () => {
-      setLoading(true)
+      if (!loadedOnce.current) setLoading(true)
       setError(null)
       try {
         const res = await fetch(`${API_URL}/api/machines`, { credentials: "include" })
         const body = await res.json().catch(() => ({}))
         if (!res.ok) {
-          if (!cancelled) {
+          if (live) {
             setMachines([])
             setError((body as any)?.error?.message ?? `Could not load your machines (HTTP ${res.status})`)
           }
           return
         }
         const list = ((body as any)?.machines ?? []) as MachineListItem[]
-        if (cancelled) return
+        if (!live) return
 
         // Render the cached snapshot immediately — an offline machine keeps its
         // rows (greyed) instead of disappearing from the switcher.
@@ -78,7 +104,7 @@ export function useMachineWorkspaces(): UseMachineWorkspacesResult {
         }))
         setMachines(seeded)
 
-        const live = await Promise.all(
+        const resolved = await Promise.all(
           seeded.map(async (machine) => {
             try {
               const wsRes = await fetch(`${API_URL}/api/machines/${machine.id}/workspaces`, {
@@ -97,20 +123,35 @@ export function useMachineWorkspaces(): UseMachineWorkspacesResult {
             }
           }),
         )
-        if (!cancelled) setMachines(live)
+        if (live) setMachines(resolved)
       } catch (err: any) {
-        if (!cancelled) {
+        if (live) {
           setMachines([])
           setError(err?.message ?? "Could not reach Shogo Cloud")
         }
       } finally {
-        if (!cancelled) setLoading(false)
+        loadedOnce.current = true
+        if (live) setLoading(false)
       }
     }
 
-    void load()
+    const poll = async () => {
+      if (!live || !foreground()) return
+      await load()
+      schedulePoll()
+    }
+
+    void poll()
+    const appStateSubscription = AppState.addEventListener("change", (next) => {
+      appState = next
+      if (next === "active") void poll()
+      else clearPoll()
+    })
+
     return () => {
-      cancelled = true
+      live = false
+      clearPoll()
+      appStateSubscription.remove()
     }
   }, [nonce])
 

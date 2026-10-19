@@ -307,7 +307,6 @@ describe('machine workspace relay', () => {
     expect(seen.path).toBe('/api/projects?includeHidden=true')
     expect(seen.method).toBe('GET')
     expect(seen.headers['x-tunnel-auth-user-id']).toBe('u-1')
-    expect(seen.headers['x-machine-workspace-id']).toBe('lw-1')
     expect(auditRows.at(-1)).toMatchObject({ instanceId: 'i-1', path: 'lw-1:/api/projects?includeHidden=true' })
   })
 

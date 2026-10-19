@@ -140,7 +140,6 @@ export function machineRoutes() {
 
     const forwardHeaders: Record<string, string> = {
       accept: 'application/json',
-      'x-machine-workspace-id': '',
     }
     const auth = c.get('auth') as any
     forwardHeaders['x-tunnel-auth-user-id'] = auth.userId
@@ -230,7 +229,6 @@ export function machineRoutes() {
     }
 
     const forwardHeaders: Record<string, string> = {
-      'x-machine-workspace-id': localWorkspaceId,
       'x-tunnel-auth-user-id': auth.userId,
     }
     if (auth.email) forwardHeaders['x-tunnel-auth-email'] = auth.email
