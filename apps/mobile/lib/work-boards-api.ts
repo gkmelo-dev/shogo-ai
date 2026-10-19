@@ -71,6 +71,8 @@ export interface CardPullRequest {
   ok: boolean
   /** A blocking check is red. */
   red: boolean
+  /** Armed while its column does not allow arming — reported, never un-armed. */
+  armingWarning?: boolean
   syncedAt: string | null
 }
 

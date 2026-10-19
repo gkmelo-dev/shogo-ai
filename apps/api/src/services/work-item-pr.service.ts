@@ -51,6 +51,13 @@ export interface PrMetadata {
   queued: boolean
   /** A blocking check failed on `headSha` and the card was already sent back. */
   regressedFor?: string | null
+  /**
+   * Armed while its column does not allow arming (a `gh pr merge --auto` or a
+   * click on GitHub, neither of which passes through the merge route). The PR
+   * is left armed — a person may have armed it deliberately — and the card
+   * reports it instead (Planner, SHO-64: never auto-unarm).
+   */
+  armingWarning?: boolean
 }
 
 /** The `pr` block a card payload carries, so an agent reads state instead of `gh`. */
@@ -130,6 +137,7 @@ export function prBlock(link: any): PrBlock | null {
     ...rest,
     ok: metadata.state === 'open' || metadata.merged,
     red: metadata.state === 'open' && isRed(metadata),
+    armingWarning: metadata.armingWarning === true,
     syncedAt: link.syncedAt ? new Date(link.syncedAt).toISOString() : null,
   }
 }
@@ -270,6 +278,8 @@ function metadataFromSnapshot(snapshot: PullRequestSnapshot, repo: string, previ
     armed: snapshot.state === 'open' && (snapshot.autoMerge || queued),
     queued,
     regressedFor: previous?.regressedFor ?? null,
+    // Recomputed by `applyPrRules` against the card's current column.
+    armingWarning: previous?.armingWarning ?? false,
   }
 }
 
@@ -340,34 +350,6 @@ function blockingColumns(board: any): string[] {
 const SYSTEM_ACTOR = { userId: null, agentRef: null, sessionId: null } as const
 
 /**
- * Disarm a PR that was armed from a column that does not allow it. The merge
- * tool is guarded at its route, but `gh pr merge --auto` and GitHub's own UI
- * never pass through our routes, so the board enforces the rule on the way
- * back in. Returns false when the repo cannot be written — the card keeps the
- * state it has rather than claiming a disarm that did not happen.
- */
-async function disarmPullRequest(link: any, metadata: PrMetadata): Promise<boolean> {
-  const repo = repoOf(link)
-  if (!repo) return false
-  const connection = await connectionForRepo(link.workspaceId, repo.repo)
-  const auth = connection ? await authOf(connection) : null
-  if (!auth) return false
-  const github = await cloudGitHub()
-  if (!github || typeof github.disablePullRequestAutoMerge !== 'function') return false
-  try {
-    await github.disablePullRequestAutoMerge(auth, repo.owner, repo.name, Number(link.refId))
-  } catch (err: any) {
-    console.warn(`[WorkItemPR] Could not disarm #${link.refId}:`, err?.message ?? err)
-    return false
-  }
-  await db.workItemLink.update({
-    where: { id: link.id },
-    data: { metadata: { ...metadata, armed: false, queued: false } },
-  })
-  return true
-}
-
-/**
  * Apply a card's PR state to the board: back to the first active column on a
  * newly red blocking check, to `done` on a merge, and a comment either way.
  * Runs only on the transition that matters, so repeat webhooks are no-ops.
@@ -398,24 +380,31 @@ export async function applyPrRules(link: any, metadata: PrMetadata, previous: Pr
     return 'closed'
   }
 
-  const red = metadata.state === 'open' && isRed(metadata)
-
-  // A board enforces the arming rule once one of its columns opts in. Until
-  // then every column is still allowed, so a rollout does not silently disarm
-  // a pipeline that has not configured the rule yet.
+  // Detection, not interception. `gh pr merge --auto` and GitHub's own UI never
+  // pass through the merge route, so a PR can be armed from a column that does
+  // not allow it. The board reports that once and flags the card; it never
+  // un-arms — a person may have armed deliberately, and silently cancelling
+  // someone's merge is worse than the hole (Planner, SHO-64).
   const armingColumns = blockingColumns(board)
-  if (metadata.state === 'open' && metadata.armed && previous?.armed !== true && !columnAllowsAutoMerge(column) && armingColumns.length) {
-    if (await disarmPullRequest(link, metadata)) {
-      const allowed = armingColumns.map((c) => `"${c}"`).join(' or ')
-      await commentWorkItem(
-        item,
-        `${label} was armed from "${column.name}", which does not allow auto-merge. Disarmed — move ${item.key} to ${allowed} first.`,
-        SYSTEM_ACTOR,
-        { system: true },
-      )
-    }
+  const armingWarning =
+    metadata.state === 'open' && metadata.armed && !columnAllowsAutoMerge(column) && armingColumns.length > 0
+  if (armingWarning !== (previous?.armingWarning === true)) {
+    await db.workItemLink.update({
+      where: { id: link.id },
+      data: { metadata: { ...metadata, armingWarning } },
+    })
+  }
+  if (armingWarning && previous?.armingWarning !== true) {
+    const allowed = armingColumns.map((c) => `"${c}"`).join(' or ')
+    await commentWorkItem(
+      item,
+      `${label} is armed from "${column.name}", which does not allow auto-merge. Left armed — move ${item.key} to ${allowed} before arming it.`,
+      SYSTEM_ACTOR,
+      { system: true },
+    )
   }
 
+  const red = metadata.state === 'open' && isRed(metadata)
   if (!red) return 'none'
   if (previous && isRed(previous) && previous.headSha === metadata.headSha) return 'none'
   if (metadata.regressedFor && metadata.regressedFor === metadata.headSha) return 'none'
@@ -602,12 +591,56 @@ export function topUpStalePrLinks(links: any[], maxAgeMs = 60_000): void {
 }
 
 /**
- * Fallback sweep: refresh a workspace's PR links that have gone stale (a
- * dropped webhook, a repo connected without the App). Returns how many links
- * were read.
+ * Link cards that already carry their PR in `fields.pr` but have no `pr` link —
+ * every card that existed before PR links did. Without this the sweep skips
+ * exactly the cards it was added for: the ones with a PR nobody is watching.
+ */
+export async function adoptPrLinksForWorkspace(workspaceId: string, limit = 50): Promise<number> {
+  const items = (await db.workItem.findMany({
+    where: { workspaceId, archivedAt: null },
+    include: { column: true },
+    orderBy: { lastActivityAt: 'desc' },
+    take: 200,
+  })) as any[]
+  // A finished card's PR has nothing left to report, and adopting it would
+  // replay a merge comment on an old card.
+  const open = items.filter((i) => i.column?.category !== 'done' && i.column?.category !== 'dismissed')
+  if (!open.length) return 0
+
+  const linked = (await db.workItemLink.findMany({
+    where: { workspaceId, kind: 'pr', workItemId: { in: open.map((i) => i.id) } },
+    select: { workItemId: true },
+  })) as Array<{ workItemId: string }>
+  const hasLink = new Set(linked.map((l) => l.workItemId))
+
+  let adopted = 0
+  for (const item of open) {
+    if (adopted >= limit) break
+    if (hasLink.has(item.id)) continue
+    const parsed = parsePullRequestUrl(typeof item.fields?.pr === 'string' ? item.fields.pr : null)
+    if (!parsed) continue
+    const result = await linkPullRequestToCard({
+      workspaceId,
+      repoFullName: parsed.repo,
+      number: parsed.number,
+      url: item.fields.pr,
+      workItem: item.key,
+    })
+    if (result) adopted += 1
+  }
+  return adopted
+}
+
+/**
+ * Fallback sweep: adopt cards whose PR is only in `fields.pr`, then refresh a
+ * workspace's PR links that have gone stale (a dropped webhook, a repo
+ * connected without the App). Returns how many links were read.
  */
 export async function syncPrLinksForWorkspace(workspaceId: string, opts: { staleMs?: number; limit?: number } = {}): Promise<number> {
   const staleMs = opts.staleMs ?? 15 * 60_000
+  await adoptPrLinksForWorkspace(workspaceId).catch((err: any) =>
+    console.warn(`[WorkItemPR] Could not adopt PR links for ${workspaceId}:`, err?.message ?? err),
+  )
   const cutoff = new Date(Date.now() - staleMs)
   const links = await db.workItemLink.findMany({
     where: {

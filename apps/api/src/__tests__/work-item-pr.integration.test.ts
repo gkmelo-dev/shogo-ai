@@ -45,22 +45,11 @@ interface StubPr {
 
 let stub: StubPr = { number: 1519 }
 const fetchCalls: string[] = []
-/** PR numbers GitHub was asked to disarm, in order. */
-const disarmCalls: number[] = []
 
 function stubFetch() {
   globalThis.fetch = (async (input: any, init?: any) => {
     const url = String(input?.url ?? input)
     fetchCalls.push(url)
-    if (url.endsWith('/graphql')) {
-      const id = JSON.parse(String(init?.body ?? '{}'))?.variables?.id
-      const number = Number(String(id ?? '').replace(/\D/g, ''))
-      disarmCalls.push(number)
-      return new Response(JSON.stringify({ data: { disablePullRequestAutoMerge: { pullRequest: { number } } } }), {
-        status: 200,
-        headers: { 'Content-Type': 'application/json' },
-      })
-    }
     const prMatch = url.match(/\/repos\/([^/]+)\/([^/]+)\/pulls\/(\d+)$/)
     if (prMatch) {
       return new Response(JSON.stringify({
@@ -138,9 +127,14 @@ afterAll(async () => {
   rmSync(dir, { recursive: true, force: true })
 })
 
-async function makeCard(column = 'In Development', title = 'Cards that know their PR') {
+async function makeCard(column = 'In Development', extra: { title?: string; fields?: Record<string, any> } = {}) {
   cardCounter += 1
-  return boards.createWorkItem(board, { title: `${title} ${cardCounter}`, column }, { userId: seed.member })
+  const title = extra.title ?? 'Cards that know their PR'
+  return boards.createWorkItem(
+    board,
+    { title: `${title} ${cardCounter}`, column, ...(extra.fields ? { fields: extra.fields } : {}) },
+    { userId: seed.member },
+  )
 }
 
 async function freshBoard() {
@@ -327,7 +321,10 @@ describe('the link keeps GitHub’s own state', () => {
     expect(block?.checks.failing).toBe(2)
   })
 
-  test('a PR armed from a column that does not allow it is disarmed and commented', async () => {
+  test('a PR armed from a column that does not allow it is reported, never un-armed', async () => {
+    // `gh pr merge --auto` and GitHub's UI never pass through the merge route.
+    // The board reports the stray arm once and flags the card; a person may
+    // have armed deliberately, so cancelling it would be worse than the hole.
     const card = await makeCard('In Development')
     const linked = await pr.linkPullRequestToCard({
       workspaceId: seed.workspaceId,
@@ -340,24 +337,32 @@ describe('the link keeps GitHub’s own state', () => {
       number: 1537,
       mergeable_state: 'clean',
       head_sha: 'armed1',
-      auto_merge: { enabled_by: { login: 'shogoagent' } },
+      auto_merge: { enabled_by: { login: 'russell' } },
       checks: [{ name: 'Lint, Typecheck, Test', conclusion: 'success' }],
     }
-    disarmCalls.length = 0
     const refreshed = await pr.refreshPrLink(linked!.link)
     expect(await pr.applyPrRules(refreshed!.link, refreshed!.metadata, refreshed!.previous)).toBe('none')
 
-    expect(disarmCalls).toEqual([1537])
+    // Never a write to GitHub from the sync.
+    expect(fetchCalls.some((u) => u.endsWith('/graphql'))).toBe(false)
     const link = await db.workItemLink.findUnique({ where: { id: linked!.link.id } })
-    expect(link.metadata.armed).toBe(false)
+    expect(link.metadata.armed).toBe(true)
+    expect(link.metadata.armingWarning).toBe(true)
+    expect(pr.prBlock(link)?.armingWarning).toBe(true)
+
     const comment = await db.workItemEvent.findFirst({ where: { workItemId: card.id, type: 'commented' } })
-    expect(comment.eventData.text).toContain('Disarmed')
+    expect(comment.eventData.text).toContain('Left armed')
     expect(comment.eventData.text).toContain('"PR Open"')
     // It stays where it is: a stray arm is not a reason to yank the card.
     expect((await cardRow(card.id)).column.name).toBe('In Development')
+
+    // A second sync reports it once, not again.
+    const again = await pr.refreshPrLink(await db.workItemLink.findUnique({ where: { id: linked!.link.id } }))
+    await pr.applyPrRules(again!.link, again!.metadata, again!.previous)
+    expect(await db.workItemEvent.count({ where: { workItemId: card.id, type: 'commented' } })).toBe(1)
   })
 
-  test('a PR armed from PR Open stays armed', async () => {
+  test('a PR armed from PR Open is not flagged', async () => {
     const card = await makeCard('PR Open')
     const linked = await pr.linkPullRequestToCard({
       workspaceId: seed.workspaceId,
@@ -373,11 +378,29 @@ describe('the link keeps GitHub’s own state', () => {
       auto_merge: { enabled_by: { login: 'shogoagent' } },
       checks: [{ name: 'Lint, Typecheck, Test', conclusion: 'success' }],
     }
-    disarmCalls.length = 0
     const refreshed = await pr.refreshPrLink(linked!.link)
     expect(await pr.applyPrRules(refreshed!.link, refreshed!.metadata, refreshed!.previous)).toBe('none')
-    expect(disarmCalls).toEqual([])
-    expect((await db.workItemLink.findUnique({ where: { id: linked!.link.id } })).metadata.armed).toBe(true)
+    const link = await db.workItemLink.findUnique({ where: { id: linked!.link.id } })
+    expect(link.metadata.armed).toBe(true)
+    expect(link.metadata.armingWarning).toBe(false)
+    expect(pr.prBlock(link)?.armingWarning).toBe(false)
+  })
+
+  test('the sweep adopts a card that only carries its PR in fields.pr', async () => {
+    // Every card that existed before PR links has `fields.pr` and no link, so
+    // the sweep has to link them before it can keep them current.
+    const card = await makeCard('PR Open', { fields: { pr: 'https://github.com/shogo-labs/shogo-ai/pull/1700' } })
+    expect(await db.workItemLink.count({ where: { workItemId: card.id, kind: 'pr' } })).toBe(0)
+    stubFetch()
+    stub = { number: 1700, mergeable_state: 'clean', head_sha: 'adopted1', checks: [{ name: 'Lint, Typecheck, Test', conclusion: 'success' }] }
+
+    const { runSyncPrLinks } = await import('../jobs/sync-pr-links')
+    await runSyncPrLinks()
+
+    const link = await db.workItemLink.findFirst({ where: { workItemId: card.id, kind: 'pr' } })
+    expect(link).toBeTruthy()
+    expect(link.refId).toBe('1700')
+    expect(link.syncedAt).toBeTruthy()
   })
 
   test('a merge moves the card to Done and comments the merge', async () => {

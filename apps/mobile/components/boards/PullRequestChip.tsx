@@ -8,7 +8,7 @@
  */
 import { useState } from 'react'
 import { Linking, Pressable, Text, TextInput, View } from 'react-native'
-import { CircleAlert, CircleCheck, GitMerge, GitPullRequest, Link2 } from 'lucide-react-native'
+import { CircleAlert, CircleCheck, GitMerge, GitPullRequest, Link2, TriangleAlert } from 'lucide-react-native'
 import { cn } from '@shogo/shared-ui/primitives'
 import type { CardPullRequest } from '../../lib/work-boards-api'
 
@@ -32,10 +32,12 @@ export function prChipText(pr: CardPullRequest): string {
   return parts.join(' · ')
 }
 
-type Tone = 'red' | 'green' | 'muted'
+type Tone = 'red' | 'warning' | 'green' | 'muted'
 
 export function prTone(pr: CardPullRequest): Tone {
   if (hasFailingChecks(pr)) return 'red'
+  // Armed where the board does not allow arming: left alone, but flagged.
+  if (pr.armed && pr.armingWarning) return 'warning'
   if (pr.merged) return 'green'
   if (pr.state === 'open' && pr.checks.total > 0 && pr.checks.passing === pr.checks.total) return 'green'
   return 'muted'
@@ -43,12 +45,14 @@ export function prTone(pr: CardPullRequest): Tone {
 
 const TONE_STYLE: Record<Tone, { box: string; text: string }> = {
   red: { box: 'bg-destructive/10', text: 'text-destructive' },
+  warning: { box: 'bg-amber-500/15', text: 'text-amber-700 dark:text-amber-400' },
   green: { box: 'bg-emerald-500/10', text: 'text-emerald-700 dark:text-emerald-400' },
   muted: { box: 'bg-muted', text: 'text-muted-foreground' },
 }
 
 function PrIcon({ pr, size = 10, className }: { pr: CardPullRequest; size?: number; className?: string }) {
   if (hasFailingChecks(pr)) return <CircleAlert size={size} className={className} />
+  if (pr.armed && pr.armingWarning) return <TriangleAlert size={size} className={className} />
   if (pr.merged) return <GitMerge size={size} className={className} />
   if (pr.state === 'open' && pr.checks.total > 0 && pr.checks.passing === pr.checks.total) return <CircleCheck size={size} className={className} />
   return <GitPullRequest size={size} className={className} />
@@ -90,6 +94,7 @@ function describe(pr: CardPullRequest): string {
   if (pr.red) return 'A required check is failing'
   if (pr.checks.failing > 0) return `${pr.checks.failing} check${pr.checks.failing === 1 ? '' : 's'} failing, none required — the card stays put`
   if (pr.queued) return 'In the merge queue'
+  if (pr.armed && pr.armingWarning) return 'Armed outside the guard — this column may not arm'
   if (pr.armed) return 'Armed — merges when the required checks pass'
   if (pr.draft) return 'Draft'
   if (pr.checks.total && pr.checks.passing === pr.checks.total && !pr.checks.pending) return 'All checks passing'

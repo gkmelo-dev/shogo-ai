@@ -394,6 +394,30 @@ describe('cards that know their PR (SHO-64)', () => {
     expect(screen.getByTestId('board-card-SUP-4').textContent).not.toContain('#')
   })
 
+  test('an arm that happened outside the guard shows in a warning tone', async () => {
+    // Armed in a column that may not arm: the board reports it, the PR stays
+    // armed, and the chip stops looking green.
+    routes['GET /api/boards/b1'] = () => ({
+      board,
+      items: [item('6', 'c1', 6, {
+        pr: prBlock({
+          number: 1700,
+          armed: true,
+          armingWarning: true,
+          mergeableState: 'clean',
+          checks: { total: 4, passing: 4, failing: 0, pending: 0 },
+        }),
+      })],
+      health: { issues: [] },
+    })
+    render(createElement(BoardKanban, { boardId: 'b1', workspaceId: 'ws', mentionables: mentionables as any, onOpenCard: () => {} }))
+    const chip = await screen.findByTestId('board-card-pr-1700')
+    expect(chip.textContent).toContain('#1700 · 4/4 checks · armed')
+    const { prTone } = await import('../PullRequestChip')
+    expect(prTone(prBlock({ number: 1700, armed: true, armingWarning: true }) as any)).toBe('warning')
+    expect(prTone(prBlock({ number: 1700, armed: true }) as any)).not.toBe('warning')
+  })
+
   test('a failing check that is not required still shows on the tile', async () => {
     // #1533's shape: `unstable`, only `cla` + `Android (emulator)` red. The card
     // says so, but the board does not treat it as blocked.
