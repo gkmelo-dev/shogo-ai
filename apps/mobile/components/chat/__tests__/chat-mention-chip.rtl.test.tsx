@@ -227,6 +227,42 @@ describe("chat mention chip", () => {
     expect(container.textContent).toBe("@Deploy notes · queued")
   })
 
+  test("a delivered handoff keeps its state when the target's turn never answers", () => {
+    const { container } = render(
+      <ChatMentionChip
+        id="chat-b"
+        meta={{ id: "chat-b", title: "Deploy notes", workspaceId: "ws-b" }}
+        status={{
+          queued: 0,
+          working: false,
+          deliveredAt: "2026-10-19T12:02:00.000Z",
+          repliedAt: null,
+        }}
+      />,
+    )
+
+    // No queue row and no reply left: without the durable state the chip would
+    // be bare, which reads exactly like "the tag did nothing".
+    expect(container.textContent).toBe("@Deploy notes · delivered")
+  })
+
+  test("a reply still outranks the delivered state", () => {
+    const { container } = render(
+      <ChatMentionChip
+        id="chat-b"
+        meta={{ id: "chat-b", title: "Deploy notes", workspaceId: "ws-b" }}
+        status={{
+          queued: 0,
+          working: false,
+          deliveredAt: "2026-10-19T12:02:00.000Z",
+          repliedAt: "2026-10-19T12:05:00.000Z",
+        }}
+      />,
+    )
+
+    expect(container.textContent).toMatch(/^@Deploy notes · replied/)
+  })
+
   test("a message body renders one chip per distinct tag", () => {
     // Ids no other case in this file resolves, so the chips fall back to their
     // id-derived labels and the assertion does not depend on cache order.

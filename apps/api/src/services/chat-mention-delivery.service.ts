@@ -121,12 +121,11 @@ export async function handOffToChat(input: {
   const content = `${origin}\n\n${body}`
   const scope = chatScopeOf(target)
   const messageId = randomUUID()
-  const parts = JSON.stringify([{ type: 'text', text: content }])
-  // The source chat rides along as a context reference so the receiving agent
-  // can read what was being discussed instead of guessing from the excerpt.
   const source = input.sourceSessionId
     ? await resolveChatForUser(input.actingUserId, input.sourceSessionId)
     : null
+  // The source chat rides along as a context reference so the receiving agent
+  // can read what was being discussed instead of guessing from the excerpt.
   const references = source
     ? [{ type: 'chat', id: source.id, name: chatTitleOf(source) }]
     : input.references ?? []
@@ -135,6 +134,12 @@ export async function handOffToChat(input: {
     handoffFromUserId: input.actingUserId,
     handoffAt: new Date().toISOString(),
   }
+  // The origin also rides on the text part, not just on the queue row's body:
+  // `dispatchRow` deletes the queue row, and `ChatMessage` has no free column
+  // for it, so this is what makes "delivered" durable for the source chip after
+  // the turn starts (or fails). Every parts consumer filters on
+  // `type === 'text'` and reads `.text`, so the key is inert everywhere else.
+  const parts = JSON.stringify([{ type: 'text', text: content, handoff }])
 
   await (prisma as any).chatQueuedMessage.create({
     data: {

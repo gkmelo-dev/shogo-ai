@@ -52,6 +52,8 @@ export function chatMentionHref(meta: {
 interface ChatMentionStatus {
   queued: number
   working: boolean
+  /** Set once the message is persisted in the target chat — survives a failed turn. */
+  deliveredAt?: string | null
   repliedAt: string | null
 }
 
@@ -136,6 +138,9 @@ function statusLabel(status?: ChatMentionStatus): string | null {
       : `replied ${date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}`
   }
   if (status.working) return "working"
+  // Durable: the message is in the target chat even if its turn never answers.
+  // Without it a failed turn makes the tag look like it did nothing.
+  if (status.deliveredAt) return "delivered"
   if (status.queued > 0) return "queued"
   return null
 }

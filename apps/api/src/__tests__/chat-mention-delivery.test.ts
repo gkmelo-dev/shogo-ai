@@ -226,6 +226,13 @@ describe('deliverChatMentions', () => {
     expect(body.references).toEqual([
       { type: 'chat', id: 'chat-source', name: 'Billing bug' },
     ])
+    // The origin also rides on the text part, because the queue row is deleted
+    // on dispatch and the persisted ChatMessage is what the chip's durable
+    // `delivered` state reads afterwards.
+    const parts = JSON.parse(row.parts)
+    expect(parts[0]).toMatchObject({ type: 'text', text: row.content })
+    expect(parts[0].handoff.handoffFromChatId).toBe('chat-source')
+    expect(parts[0].handoff.handoffFromUserId).toBe('user-1')
     // No transcript bubble while it is only queued: the dispatcher persists
     // this same row id when it takes the row and the turn starts (SHO-45).
     expect(persisted).toEqual([])

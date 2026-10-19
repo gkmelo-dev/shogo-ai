@@ -7,7 +7,11 @@
  *                           belong to (the "@" menu's Chats section, chip
  *                           titles, and `ids=` lookups for reloaded messages).
  *   GET /chat-mention-status  per-chat delivery state for a source chip:
- *                           queued, working, or replied since a timestamp.
+ *                           queued, delivered, working, or replied since a
+ *                           timestamp. `delivered` is durable — it comes from
+ *                           the target's persisted handoff message, so it
+ *                           survives dispatch even when the target's turn
+ *                           fails and no reply is ever written.
  *
  * Both are access-checked per chat here, on the server, so a chat the caller
  * cannot open is never offered or described.
@@ -22,6 +26,28 @@ export interface ChatMentionRoutesConfig {
 }
 
 const ACTIVE_TURN_STALE_AFTER_MS = 10 * 60 * 1000
+
+/**
+ * Whether a stored message is a chat handoff. `handOffToChat` puts the origin on
+ * the text part because the queue row that carries it is deleted on dispatch and
+ * `ChatMessage` has no column for it; every other consumer filters on
+ * `type === 'text'` and reads `.text`, so the key is inert there.
+ */
+function isPersistedHandoff(parts: unknown): boolean {
+  let parsed: any = parts
+  if (typeof parts === 'string') {
+    try {
+      parsed = JSON.parse(parts)
+    } catch {
+      return false
+    }
+  }
+  if (!Array.isArray(parsed)) return false
+  return parsed.some((part: any) => {
+    const from = part?.handoff?.handoffFromChatId
+    return typeof from === 'string' && from.length > 0
+  })
+}
 
 export function chatMentionRoutes(config: ChatMentionRoutesConfig): Hono {
   const router = new Hono()
@@ -61,7 +87,7 @@ export function chatMentionRoutes(config: ChatMentionRoutesConfig): Hono {
     }
     if (!accessible.length) return c.json({ statuses: {} })
 
-    const [sessions, pending, replies] = await Promise.all([
+    const [sessions, pending, replies, delivered] = await Promise.all([
       (prisma as any).chatSession.findMany({
         where: { id: { in: accessible } },
         select: { id: true, activeTurnId: true, activeTurnHeartbeatAt: true },
@@ -79,6 +105,16 @@ export function chatMentionRoutes(config: ChatMentionRoutesConfig): Hono {
         orderBy: { createdAt: 'desc' },
         select: { sessionId: true, createdAt: true },
       }),
+      (prisma as any).chatMessage.findMany({
+        where: {
+          sessionId: { in: accessible },
+          role: 'user',
+          createdAt: { gte: sinceDate },
+        },
+        orderBy: { createdAt: 'desc' },
+        take: 200,
+        select: { sessionId: true, createdAt: true, parts: true },
+      }),
     ])
 
     const queued = new Map<string, number>()
@@ -88,8 +124,18 @@ export function chatMentionRoutes(config: ChatMentionRoutesConfig): Hono {
       const id = row.sessionId as string
       if (!repliedAt.has(id)) repliedAt.set(id, new Date(row.createdAt).toISOString())
     }
+    // Newest first, so the first handoff row seen per chat is the one that counts.
+    const deliveredAt = new Map<string, string>()
+    for (const row of delivered) {
+      const id = row.sessionId as string
+      if (deliveredAt.has(id) || !isPersistedHandoff(row.parts)) continue
+      deliveredAt.set(id, new Date(row.createdAt).toISOString())
+    }
 
-    const statuses: Record<string, { queued: number; working: boolean; repliedAt: string | null }> = {}
+    const statuses: Record<
+      string,
+      { queued: number; working: boolean; deliveredAt: string | null; repliedAt: string | null }
+    > = {}
     const now = Date.now()
     for (const session of sessions) {
       const heartbeat = session.activeTurnHeartbeatAt
@@ -99,6 +145,7 @@ export function chatMentionRoutes(config: ChatMentionRoutesConfig): Hono {
       statuses[session.id] = {
         queued: queued.get(session.id) ?? 0,
         working,
+        deliveredAt: deliveredAt.get(session.id) ?? null,
         repliedAt: repliedAt.get(session.id) ?? null,
       }
     }

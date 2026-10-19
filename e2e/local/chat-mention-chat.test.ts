@@ -38,8 +38,9 @@ type WorkspaceRow = { id: string; name?: string; kind?: string }
 type SessionRow = { id: string; workspaceId: string }
 
 // `statusLabel()` renders these lower-case ("replied 3:42 PM"); match either
-// case so a copy change does not silently skip the assertion.
-const TAG_LINE = /(queued|working|replied)/i
+// case so a copy change does not silently skip the assertion. `delivered` is
+// the durable one — it survives a target turn that never answers.
+const TAG_LINE = /(queued|delivered|working|replied)/i
 
 /** Local mode auto-signs in; onboarding has to be complete before workspaces list. */
 async function establishLocalSession(page: Page): Promise<void> {
@@ -120,7 +121,7 @@ async function chipShowsStatus(page: Page, title: string): Promise<boolean> {
     .some((line) => line.includes(`@${title}`) && TAG_LINE.test(line))
 }
 
-type TagStatus = { queued: number; working: boolean; replied: number }
+type TagStatus = { queued: number; working: boolean; delivered: boolean; replied: number }
 
 /** What the chip's suffix is derived from, read from the same route it uses. */
 async function chatMentionStatus(
@@ -138,7 +139,8 @@ async function chatMentionStatus(
     return {
       queued: Number(status.queued ?? 0),
       working: Boolean(status.working),
-      replied: Number(status.replied ?? 0),
+      delivered: Boolean(status.deliveredAt),
+      replied: status.repliedAt ? 1 : 0,
     }
   }, { apiBase: API, id: sessionId, since: new Date(sinceMs).toISOString() })
 }
@@ -220,7 +222,7 @@ test.describe("SHO-52 — a chat tag is an address", () => {
       // The suffix mirrors `/api/chat-mention-status`: whatever state the
       // server reports, the chip has to be showing it.
       const status = await chatMentionStatus(page, targetChat.id, stamp)
-      if (status.queued > 0 || status.working || status.replied > 0) {
+      if (status.queued > 0 || status.working || status.delivered || status.replied > 0) {
         await expect.poll(() => chipShowsStatus(page, title), { timeout: 30_000 }).toBe(true)
       }
 

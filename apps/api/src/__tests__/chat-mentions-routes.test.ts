@@ -31,6 +31,18 @@ mock.module('../lib/chat-mentionables', () => ({
     openable.has(chatId) ? { id: chatId } : null,
 }))
 
+const handoffParts = JSON.stringify([
+  {
+    type: 'text',
+    text: 'From @me in "Deploy notes" (Acme):\n\nthe handoff',
+    handoff: {
+      handoffFromChatId: 'chat-a',
+      handoffFromUserId: 'user-1',
+      handoffAt: '2026-10-19T12:02:00.000Z',
+    },
+  },
+])
+
 mock.module('../lib/prisma', () => ({
   prisma: {
     chatSession: {
@@ -43,7 +55,19 @@ mock.module('../lib/prisma', () => ({
       findMany: async () => [{ sessionId: 'chat-b' }],
     },
     chatMessage: {
-      findMany: async () => [{ sessionId: 'chat-a', createdAt: new Date('2026-10-19T12:05:00Z') }],
+      findMany: async (args: any) =>
+        args?.where?.role === 'user'
+          ? [
+              // A delivered handoff (its origin rides on the text part).
+              { sessionId: 'chat-b', createdAt: new Date('2026-10-19T12:02:00Z'), parts: handoffParts },
+              // A message a person typed in the target chat is not a delivery.
+              {
+                sessionId: 'chat-a',
+                createdAt: new Date('2026-10-19T12:03:00Z'),
+                parts: JSON.stringify([{ type: 'text', text: 'just typing' }]),
+              },
+            ]
+          : [{ sessionId: 'chat-a', createdAt: new Date('2026-10-19T12:05:00Z') }],
     },
   },
 }))
@@ -97,6 +121,19 @@ describe('GET /api/chat-mention-status', () => {
     expect(body.statuses['chat-a']).toMatchObject({ working: true, queued: 0 })
     expect(body.statuses['chat-a'].repliedAt).toBeTruthy()
     expect(body.statuses['chat-b']).toMatchObject({ working: false, queued: 1, repliedAt: null })
+  })
+
+  test('keeps a durable delivered state once the handoff is persisted', async () => {
+    const response = await appFor('user-1').request(
+      '/api/chat-mention-status?ids=chat-a,chat-b&since=2026-10-19T12:00:00.000Z',
+    )
+    const body = await response.json()
+    // chat-b's turn never answered (no reply, nothing queued any more) — the
+    // persisted handoff message is what still proves delivery.
+    expect(body.statuses['chat-b'].deliveredAt).toBe('2026-10-19T12:02:00.000Z')
+    expect(body.statuses['chat-b'].repliedAt).toBeNull()
+    // A message the person typed in the chat is not a handoff.
+    expect(body.statuses['chat-a'].deliveredAt).toBeNull()
   })
 
   test('returns nothing for ids the caller cannot open', async () => {
