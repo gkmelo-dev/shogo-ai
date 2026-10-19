@@ -372,6 +372,26 @@ export async function updatePost(
   if (patch.tags !== undefined) data.tags = stringList(patch.tags, 'tags')
 
   if (Object.keys(data).length === 0) return post
+
+  // Zernio already holds the scheduled time — patching only our row would let it
+  // publish at the old one. Update the provider first, then the row.
+  if (post.zernioPostId && post.status === 'scheduled') {
+    const providerPatch: Record<string, unknown> = {}
+    if (data.content !== undefined) providerPatch.content = data.content
+    if (data.scheduledFor !== undefined) {
+      providerPatch.scheduledFor = data.scheduledFor ? (data.scheduledFor as Date).toISOString() : null
+    }
+    if (Object.keys(providerPatch).length) {
+      const stamp = data.scheduledFor ? (data.scheduledFor as Date).getTime() : 'cleared'
+      await getSocialClient().request({
+        method: 'PATCH',
+        path: `/posts/${encodeURIComponent(post.zernioPostId)}`,
+        body: providerPatch,
+        idempotencyKey: `social-post-update-${post.id}-${stamp}`,
+      })
+    }
+  }
+
   await db.socialPost.update({ where: { id: post.id }, data })
   return getPost(workspaceId, post.id)
 }
@@ -382,6 +402,16 @@ export async function deletePost(workspaceId: string, postId: string): Promise<{
   if (post.status === 'published' || post.status === 'partial' || post.status === 'publishing') {
     throw new SocialError(409, 'post_immutable', 'A published post cannot be deleted')
   }
+
+  // A scheduled post lives at Zernio too: dropping only our row leaves it
+  // queued and it still ships. Cancel there first; keep our row if that fails.
+  if (post.zernioPostId) {
+    await getSocialClient().request({
+      method: 'DELETE',
+      path: `/posts/${encodeURIComponent(post.zernioPostId)}`,
+    })
+  }
+
   await db.socialPost.delete({ where: { id: post.id } })
   return { deleted: true }
 }

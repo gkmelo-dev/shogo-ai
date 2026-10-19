@@ -99,6 +99,13 @@ const dbMock = {
       Object.assign(post, data)
       return post
     },
+    delete: async ({ where }: any) => {
+      const index = store.posts.findIndex((row) => matches(row, where))
+      if (index === -1) throw new Error('post not found')
+      const [removed] = store.posts.splice(index, 1)
+      store.targets = store.targets.filter((target) => target.postId !== removed.id)
+      return removed
+    },
   },
   socialPostTarget: {
     updateMany: async ({ where, data }: any) => {
@@ -123,7 +130,7 @@ const dbMock = {
 
 mock.module('../../../lib/prisma', () => ({ prisma: dbMock }))
 
-const { createPost, calendar, postIdempotencyKey } = await import('../publishing.service')
+const { createPost, updatePost, deletePost, calendar, postIdempotencyKey } = await import('../publishing.service')
 const { setSocialClient } = await import('../client')
 
 const calls: any[] = []
@@ -138,6 +145,7 @@ function useFakeClient() {
       calls.push(req)
       if (req.path === '/profiles') return { id: 'zernio_profile_1' }
       if (req.path === '/posts') return providerReply
+      if (req.path.startsWith('/posts/')) return {}
       throw new Error(`unexpected ${req.path}`)
     },
   })
@@ -286,6 +294,61 @@ describe('publishing fan-out', () => {
     const post = await createPost('ws_1', 'Acme', { content: 'Idea', accountIds: [], draft: true })
     expect(post.status).toBe('draft')
     expect(calls.filter((call) => call.path === '/posts')).toHaveLength(0)
+  })
+
+  test('rescheduling a scheduled post updates it at Zernio, not just locally', async () => {
+    providerReply = { id: 'zernio_post_9', status: 'scheduled' }
+    const post = await createPost('ws_1', 'Acme', {
+      content: 'Later',
+      accountIds: ['acct_ig'],
+      scheduledFor: new Date(Date.now() + 3_600_000).toISOString(),
+    })
+    calls.length = 0
+
+    const when = new Date(Date.now() + 7_200_000)
+    await updatePost('ws_1', post.id, { scheduledFor: when.toISOString() })
+
+    const patch = calls.find((call) => call.method === 'PATCH')
+    expect(patch.path).toBe('/posts/zernio_post_9')
+    expect(patch.body.scheduledFor).toBe(when.toISOString())
+    expect(store.posts[0].scheduledFor).toEqual(when)
+  })
+
+  test('deleting a scheduled post cancels it at Zernio before dropping the row', async () => {
+    providerReply = { id: 'zernio_post_10', status: 'scheduled' }
+    const post = await createPost('ws_1', 'Acme', {
+      content: 'Cancel me',
+      accountIds: ['acct_ig'],
+      scheduledFor: new Date(Date.now() + 3_600_000).toISOString(),
+    })
+    calls.length = 0
+
+    await deletePost('ws_1', post.id)
+
+    expect(calls.find((call) => call.method === 'DELETE')?.path).toBe('/posts/zernio_post_10')
+    expect(store.posts).toHaveLength(0)
+  })
+
+  test('a failed cancel keeps the post so it can be retried', async () => {
+    providerReply = { id: 'zernio_post_11', status: 'scheduled' }
+    const post = await createPost('ws_1', 'Acme', {
+      content: 'Keep me',
+      accountIds: ['acct_ig'],
+      scheduledFor: new Date(Date.now() + 3_600_000).toISOString(),
+    })
+    setSocialClient({
+      mode: 'cloud',
+      async request(req: any) {
+        if (req.method === 'DELETE') {
+          const { SocialError } = await import('../client')
+          throw new SocialError(502, 'zernio_unreachable', 'Could not reach Zernio.')
+        }
+        return {}
+      },
+    })
+
+    await expect(deletePost('ws_1', post.id)).rejects.toThrow('Could not reach Zernio')
+    expect(store.posts).toHaveLength(1)
   })
 
   test('calendar returns only scheduled or published posts in the window', async () => {

@@ -17,6 +17,7 @@ import { Hono } from 'hono'
 import { prisma } from '../lib/prisma'
 import { getFrontendUrl } from '../lib/cloud-urls'
 import { getWorkspaceRole } from '../services/conversation.service'
+import { relayOperation } from '../services/social/relay.service'
 import {
   SocialError,
   calendar,
@@ -28,7 +29,6 @@ import {
   ensureProfile,
   getPost,
   getProfile,
-  getSocialClient,
   listAccounts,
   listPosts,
   socialMode,
@@ -277,10 +277,10 @@ export function socialRoutes(config: SocialRoutesConfig): Hono {
     const workspaceId = c.req.param('workspaceId')
     const userId = await requireMember(c, workspaceId)
     if (userId instanceof Response) return userId
-    const now = new Date()
-    const from = parseDateParam(c.req.query('from'), new Date(now.getTime() - 7 * 86_400_000))
-    const to = parseDateParam(c.req.query('to'), new Date(now.getTime() + 30 * 86_400_000))
     try {
+      const now = new Date()
+      const from = parseDateParam(c.req.query('from'), new Date(now.getTime() - 7 * 86_400_000))
+      const to = parseDateParam(c.req.query('to'), new Date(now.getTime() + 30 * 86_400_000))
       return c.json({ from: from.toISOString(), to: to.toISOString(), posts: await calendar(workspaceId, from, to) })
     } catch (err) {
       return errorResponse(c, err)
@@ -383,10 +383,10 @@ export function agentSocialRoutes(config: AgentSocialRoutesConfig): Hono {
   router.get('/workspaces/:workspaceId/social/calendar', async (c) => {
     const auth = await authorize(c)
     if (auth instanceof Response) return auth
-    const now = new Date()
-    const from = parseDateParam(c.req.query('from'), new Date(now.getTime() - 7 * 86_400_000))
-    const to = parseDateParam(c.req.query('to'), new Date(now.getTime() + 30 * 86_400_000))
     try {
+      const now = new Date()
+      const from = parseDateParam(c.req.query('from'), new Date(now.getTime() - 7 * 86_400_000))
+      const to = parseDateParam(c.req.query('to'), new Date(now.getTime() + 30 * 86_400_000))
       return c.json({ from: from.toISOString(), to: to.toISOString(), posts: await calendar(auth.workspaceId, from, to) })
     } catch (err) {
       return errorResponse(c, err)
@@ -405,55 +405,51 @@ export function agentSocialRoutes(config: AgentSocialRoutesConfig): Hono {
 export function socialRelayRoutes(): Hono {
   const router = new Hono()
 
-  async function requireCaller(c: any): Promise<Response | null> {
-    const header = c.req.header('authorization') ?? ''
-    const token = header.startsWith('Bearer ') ? header.slice(7) : ''
-    if (!token) return c.json({ error: { code: 'unauthorized', message: 'Missing relay token' } }, 401)
-    if (process.env.SHOGO_API_KEY && token === process.env.SHOGO_API_KEY) return null
-    if (token.startsWith('shogo_sk_')) {
-      try {
-        const { resolveApiKey } = await import('./api-keys')
-        if (await resolveApiKey(token)) return null
-      } catch {
-        // fall through to the rejection below
-      }
-    }
-    return c.json({ error: { code: 'unauthorized', message: 'Invalid relay token' } }, 401)
-  }
-
+  /**
+   * The caller is a desktop forwarding with its Shogo key: `authMiddleware`
+   * has already resolved the linked cloud workspace, and that workspace — not
+   * anything in the request — decides which profile the operation may touch.
+   */
   router.all('/social-relay/*', async (c) => {
-    const denied = await requireCaller(c)
-    if (denied) return denied
+    const auth = (c.get('auth') ?? {}) as any
+    const workspaceId = typeof auth.workspaceId === 'string' ? auth.workspaceId : ''
+    if (!workspaceId) {
+      return c.json(
+        { error: { code: 'unauthorized', message: 'The relay needs a workspace-scoped Shogo key' } },
+        401,
+      )
+    }
 
     const prefix = '/api/social-relay'
     const rawPath = c.req.path.startsWith(prefix) ? c.req.path.slice(prefix.length) : ''
     if (!rawPath.startsWith('/')) {
       return c.json({ error: { code: 'invalid_path', message: 'Relay needs a Zernio path' } }, 400)
     }
-    // The relay only ever speaks to the fixed Zernio base; a caller-supplied
-    // absolute URL can never redirect the master key elsewhere.
+
     const query: Record<string, string> = {}
     for (const [key, value] of new URL(c.req.url).searchParams) query[key] = value
 
-    const method = c.req.method as 'GET' | 'POST' | 'PATCH' | 'DELETE'
-    if (!['GET', 'POST', 'PATCH', 'DELETE'].includes(method)) {
-      return c.json({ error: { code: 'invalid_method', message: `${method} is not relayed` } }, 405)
+    const method = c.req.method.toUpperCase()
+    const bodyText = method === 'GET' || method === 'DELETE' ? '' : await c.req.text()
+    let body: unknown
+    if (bodyText) {
+      try {
+        body = JSON.parse(bodyText)
+      } catch {
+        return c.json({ error: { code: 'invalid_body', message: 'Relay body must be JSON' } }, 400)
+      }
     }
 
-    const bodyText = method === 'GET' || method === 'DELETE' ? '' : await c.req.text()
-    const client = getSocialClient()
-    if (client.mode === 'relay') {
-      return c.json({ error: { code: 'relay_loop', message: 'The relay host is itself in relay mode' } }, 500)
-    }
     try {
-      const result = await client.request({
+      const outcome = await relayOperation({
+        workspaceId,
         method,
         path: rawPath,
         query,
-        body: bodyText ? JSON.parse(bodyText) : undefined,
+        body,
         idempotencyKey: c.req.header('idempotency-key') ?? undefined,
       })
-      return c.json((result ?? {}) as any)
+      return c.json(outcome.body as any, outcome.status as any)
     } catch (err) {
       return errorResponse(c, err)
     }

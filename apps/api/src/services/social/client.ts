@@ -64,12 +64,14 @@ export class SocialError extends Error {
     this.name = 'SocialError'
   }
 
+  /** The API's error shape: `{ error: { code, message, ...details } }`. */
   toJSON() {
     return {
-      error: this.message,
-      code: this.code,
-      status: this.status,
-      ...this.details,
+      error: {
+        code: this.code,
+        message: this.message,
+        ...this.details,
+      },
     }
   }
 }
@@ -149,11 +151,18 @@ async function parseErrorBody(res: Response): Promise<SocialErrorBody> {
 function normalizeError(status: number, body: SocialErrorBody): SocialError {
   const platform = typeof body.platform === 'string' ? body.platform : undefined
   const platformError = typeof body.platformError === 'string' ? body.platformError : undefined
+  // Zernio answers with a string `error`; our own relay (and the rest of the
+  // API) answers with `error: { code, message }`. Read both.
+  const nested = body.error && typeof body.error === 'object' ? (body.error as any) : null
   const message =
     (typeof body.error === 'string' && body.error) ||
+    (typeof nested?.message === 'string' && nested.message) ||
     platformError ||
     `Zernio request failed (${status})`
-  const code = typeof body.type === 'string' && body.type ? body.type : `zernio_${status}`
+  const code =
+    (typeof body.type === 'string' && body.type) ||
+    (typeof nested?.code === 'string' && nested.code) ||
+    `zernio_${status}`
   const details: Record<string, unknown> = {}
   if (platform) details.platform = platform
   if (platformError) details.platformError = platformError

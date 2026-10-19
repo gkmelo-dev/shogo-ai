@@ -59,6 +59,12 @@ export async function ensureProfile(
 
   const client = getSocialClient()
   let zernioProfileId: string | null = null
+  /**
+   * The routing id Zernio will echo on every webhook. Usually our workspace id,
+   * but through the relay the cloud forces the *cloud* workspace id (the one
+   * that holds the key and bills), so trust the provider's echo over ours.
+   */
+  let externalId = workspaceId
   try {
     const created = await client.request<any>({
       method: 'POST',
@@ -67,6 +73,7 @@ export async function ensureProfile(
       idempotencyKey: `social-profile-${workspaceId}`,
     })
     zernioProfileId = pickProfileId(created)
+    if (typeof created?.externalId === 'string' && created.externalId) externalId = created.externalId
   } catch (err) {
     if (!(err instanceof SocialError) || (err.status !== 409 && err.status !== 422)) throw err
   }
@@ -75,10 +82,11 @@ export async function ensureProfile(
     const found = await client.request<any>({
       method: 'GET',
       path: '/profiles',
-      query: { externalId: workspaceId },
+      query: { externalId },
     })
-    const profile = profileFromList(found, workspaceId)
+    const profile = profileFromList(found, externalId)
     zernioProfileId = profile?.id ?? profile?.profileId ?? null
+    if (typeof profile?.externalId === 'string' && profile.externalId) externalId = profile.externalId
   }
 
   if (!zernioProfileId) {
@@ -87,7 +95,7 @@ export async function ensureProfile(
 
   try {
     return await db.socialProfile.create({
-      data: { workspaceId, zernioProfileId, externalId: workspaceId, name: workspaceName },
+      data: { workspaceId, zernioProfileId, externalId, name: workspaceName },
     })
   } catch (err: any) {
     if (err?.code === 'P2002') {
@@ -96,6 +104,28 @@ export async function ensureProfile(
     }
     throw err
   }
+}
+
+/**
+ * Record which Zernio profile a workspace owns. The cloud relay calls this
+ * when it forces a desktop's `POST /profiles`, so the cloud always has the
+ * row its webhook routing (P3) and per-account metering (P6) resolve against.
+ */
+export async function recordProfileMapping(args: {
+  workspaceId: string
+  zernioProfileId: string
+}): Promise<SocialProfileRow> {
+  const name = await workspaceName(args.workspaceId)
+  return db.socialProfile.upsert({
+    where: { workspaceId: args.workspaceId },
+    create: {
+      workspaceId: args.workspaceId,
+      zernioProfileId: args.zernioProfileId,
+      externalId: args.workspaceId,
+      name,
+    },
+    update: { zernioProfileId: args.zernioProfileId, name },
+  })
 }
 
 /** Keep the Zernio profile's name in step with the workspace name. */

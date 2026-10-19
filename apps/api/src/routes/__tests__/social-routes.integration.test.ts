@@ -198,6 +198,24 @@ describe('social routes', () => {
     expect(body.posts[0].content).toBe('Launch day')
   })
 
+  test('a bad calendar date is a 400 in the API error shape', async () => {
+    const res = await request(`/api/workspaces/${workspaceId}/social/calendar?from=not-a-date`, owner)
+    expect(res.status).toBe(400)
+    const body = await res.json()
+    expect(body.error.code).toBe('invalid_range')
+    expect(typeof body.error.message).toBe('string')
+  })
+
+  test('a validation failure uses the API error shape', async () => {
+    const res = await request(`/api/workspaces/${workspaceId}/social/posts`, owner, {
+      method: 'POST',
+      body: JSON.stringify({ content: 'No targets', accountIds: [] }),
+    })
+    expect(res.status).toBe(400)
+    const body = await res.json()
+    expect(body.error).toEqual({ code: 'no_targets', message: 'Pick at least one account to publish to' })
+  })
+
   test('a published post cannot be edited or deleted', async () => {
     const post = await db.socialPost.findFirst({ where: { workspaceId } })
     const patch = await request(`/api/workspaces/${workspaceId}/social/posts/${post.id}`, owner, {
