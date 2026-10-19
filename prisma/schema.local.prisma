@@ -1586,7 +1586,13 @@ model AgentWake {
   /// Chain state to resume with, so a queued hand-off keeps its place.
   /// (SQLite has no Json: JSON-encoded here.)
   chain            String?
-  /// pending | claimed | done | failed
+  /// Why the row exists: `wake` (behind a live run) or `move_nudge` (a move
+  /// into a column that binds no agent — a hint, debounced by `notBefore`, that
+  /// the tag following it supersedes).
+  reason           String    @default("wake")
+  /// Earliest time the drain may start this row. Null runs as soon as it can.
+  notBefore        DateTime?
+  /// pending | claimed | done | failed | superseded
   status           String    @default("pending")
   attempts         Int       @default(0)
   claimedAt        DateTime?
@@ -1597,6 +1603,7 @@ model AgentWake {
   @@unique([triggerMessageId, agentRef])
   @@index([conversationId, threadRootId, agentRef, status])
   @@index([status, createdAt])
+  @@index([status, notBefore])
   @@map("agent_wakes")
 }
 

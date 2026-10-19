@@ -551,9 +551,14 @@ describe('waking the agent that owns a card', () => {
   const tag = (projectId: string) => `<@a:p:${projectId}>`
   let calls: Array<{ projectId: string | null; prompt: string; release: (text: string) => void }> = []
 
-  beforeEach(() => {
+  /** The runs one card's wake produced, whatever else in the file is in flight. */
+  const runsOf = (key: string) => calls.filter((c) => c.prompt.includes(`work_item_get("${key}")`))
+
+  beforeEach(async () => {
     calls = []
     dispatcher._resetDispatcherForTests()
+    // An earlier test's deferred nudge would otherwise fire into this one's log.
+    await db.agentWake.deleteMany({})
     dispatcher.configureConversationAgentDispatcher({
       retryDelaysMs: [0],
       retryBudgetMs: 60_000,
@@ -572,6 +577,23 @@ describe('waking the agent that owns a card', () => {
   })
 
   afterAll(() => { dispatcher._resetDispatcherForTests() })
+
+  /**
+   * A card created with an owner is itself a wake ("assigned"), so settle that
+   * run before a test starts counting: `calls` is empty on return and the card's
+   * thread has no live reply.
+   */
+  async function cardOwnedByAgent(board: any, title: string): Promise<any> {
+    const card = (await call(seed.member, 'POST', `/boards/${board.id}/items`, { title, assigneeAgentRef: seed.projectId })).json.item
+    await waitFor(() => runsOf(card.key).length === 1, 5000)
+    runsOf(card.key)[0]!.release('Assigned to me.')
+    await waitFor(async () => {
+      const rows = await db.conversationMessage.findMany({ where: { threadRootId: card.threadRootMessageId } })
+      return rows.some((r: any) => r.authorType === 'agent' && r.agentStatus === 'done') ? true : null
+    }, 5000)
+    calls = []
+    return card
+  }
 
   test('a move into an agent column while that agent is live in the card thread queues the wake', async () => {
     const board = await createBoard({ conversationId: channelId, name: 'Wake queue' })
@@ -610,15 +632,61 @@ describe('waking the agent that owns a card', () => {
     await waitFor(() => db.agentWake.findFirst({ where: { conversationId: channelId, status: 'done' } }), 5000)
   })
 
-  test('a move into a column that binds no agent wakes the card’s developer exactly once', async () => {
+  test('a move into a column that binds no agent wakes the card’s developer once, after the hint window', async () => {
     const board = await createBoard({ conversationId: channelId, name: 'Handback' })
-    const card = (await call(seed.member, 'POST', `/boards/${board.id}/items`, { title: 'Back to you', assigneeAgentRef: seed.projectId })).json.item
+    const card = await cardOwnedByAgent(board, 'Back to you')
     const before = await db.workItemEvent.count({ where: { workItemId: card.id, type: 'agent_woken' } })
 
-    // 'In progress' binds no agent, so the card's own developer is the one who acts on it.
+    // 'In progress' binds no agent, so the card's own developer is the one who
+    // acts on it — as a hint first: the move records it, and nothing runs yet.
     expect((await call(seed.member, 'POST', `/work-items/${card.id}/move`, { column: 'In progress' })).status).toBe(200)
-    await waitFor(async () => (await db.workItemEvent.count({ where: { workItemId: card.id, type: 'agent_woken' } })) === before + 1)
-    await new Promise((r) => setTimeout(r, 100))
+    expect(await db.workItemEvent.count({ where: { workItemId: card.id, type: 'agent_wake_deferred' } })).toBe(1)
+    await new Promise((r) => setTimeout(r, 500))
+    expect(runsOf(card.key)).toHaveLength(0)
+    expect(await db.workItemEvent.count({ where: { workItemId: card.id, type: 'agent_woken' } })).toBe(before)
+
+    // Nobody tagged it, so when the window closes the developer is woken — once.
+    await waitFor(async () => (await db.workItemEvent.count({ where: { workItemId: card.id, type: 'agent_woken' } })) === before + 1, 9000)
+    await waitFor(() => runsOf(card.key).length === 1, 5000)
+    runsOf(card.key)[0]!.release('Picked it back up.')
+    await new Promise((r) => setTimeout(r, 500))
+    expect(runsOf(card.key)).toHaveLength(1)
     expect(await db.workItemEvent.count({ where: { workItemId: card.id, type: 'agent_woken' } })).toBe(before + 1)
-  })
+
+    // A second bounce of the same card re-arms the same row instead of being
+    // swallowed by the unique key — the hint has to work every time.
+    expect((await call(seed.member, 'POST', `/work-items/${card.id}/move`, { column: 'Backlog' })).status).toBe(200)
+    await waitFor(async () => (await db.workItemEvent.count({ where: { workItemId: card.id, type: 'agent_wake_deferred' } })) === 2, 3000)
+    await waitFor(() => runsOf(card.key).length === 2, 9000)
+    runsOf(card.key)[1]!.release('Back in the backlog.')
+    await new Promise((r) => setTimeout(r, 500))
+    expect(runsOf(card.key)).toHaveLength(2)
+  }, 40_000)
+
+  test('a tag in the same breath supersedes the move hint, so one bounce is one run', async () => {
+    const board = await createBoard({ conversationId: channelId, name: 'Bounce' })
+    const card = await cardOwnedByAgent(board, 'Bounce me')
+    const before = await db.workItemEvent.count({ where: { workItemId: card.id, type: 'agent_woken' } })
+
+    // The way a bounce really happens: move it back, then say why in a comment.
+    expect((await call(seed.member, 'POST', `/work-items/${card.id}/move`, { column: 'In progress' })).status).toBe(200)
+    await call(seed.member, 'POST', `/conversations/${channelId}/messages`, {
+      text: `${tag(seed.projectId)} the citation on line 586 is wrong`,
+      threadRootId: card.threadRootMessageId,
+    })
+    // The tag's own run — the hint must not add a second one.
+    const tagged = () => calls.filter((c) => c.prompt.includes('citation on line 586'))
+    await waitFor(() => tagged().length === 1, 5000)
+
+    const nudge = await db.agentWake.findFirst({ where: { threadRootId: card.threadRootMessageId, agentRef: `project:${seed.projectId}` } })
+    expect(nudge.reason).toBe('move_nudge')
+    expect(nudge.status).toBe('superseded')
+
+    // The hint is dead, so the window closing does not run the agent a second time.
+    tagged()[0]!.release('Fixed it.')
+    await new Promise((r) => setTimeout(r, 6_000))
+    expect(tagged()).toHaveLength(1)
+    expect(runsOf(card.key)).toHaveLength(0)
+    expect(await db.workItemEvent.count({ where: { workItemId: card.id, type: 'agent_woken' } })).toBe(before + 1)
+  }, 30_000)
 })

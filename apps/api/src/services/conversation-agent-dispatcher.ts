@@ -518,9 +518,9 @@ async function queueWake(args: QueuedWake): Promise<void> {
         triggerMessageId: args.trigger.id,
         agentRef,
         userId: args.userId,
-        // JSON text on both tracks: SQLite has no Json column, and `readChain`
-        // parses a string either way.
-        chain: JSON.stringify(args.chain),
+        // The object on Postgres, JSON text on SQLite (`create-prisma-client`
+        // stringifies it there); `readChain` parses either shape.
+        chain: args.chain,
         status: 'pending',
       },
       select: { id: true },
@@ -553,7 +553,15 @@ async function drainWakes(conversationId: string, threadRootId: string | null, a
   let ran = 0
   for (;;) {
     const next = await db.agentWake.findFirst({
-      where: { conversationId, threadRootId, agentRef, status: 'pending' },
+      // A row inside its debounce window is not ready yet; anything else pending
+      // goes now, so a waiting nudge cannot hold a real wake back.
+      where: {
+        conversationId,
+        threadRootId,
+        agentRef,
+        status: 'pending',
+        OR: [{ notBefore: null }, { notBefore: { lte: new Date() } }],
+      },
       orderBy: { createdAt: 'asc' },
       select: { id: true },
     })
@@ -581,6 +589,18 @@ async function drainWakes(conversationId: string, threadRootId: string | null, a
 
 /** Post the wake's trigger again, now that nothing else is running in the thread. */
 async function runWake(wake: any): Promise<void> {
+  if (wake.reason === MOVE_NUDGE_REASON) {
+    // A move nudge has no message of its own: the window passed with nothing to
+    // supersede it, so the board posts the wake now and the agent runs on it.
+    const { fireMoveNudge } = await import('./work-boards.service')
+    await fireMoveNudge({
+      threadRootId: wake.threadRootId,
+      agentRef: wake.agentRef,
+      userId: wake.userId,
+      chain: readChain(wake.chain),
+    })
+    return
+  }
   const [conversation, trigger] = await Promise.all([
     db.conversation.findUnique({ where: { id: wake.conversationId } }),
     db.conversationMessage.findUnique({ where: { id: wake.triggerMessageId } }),
@@ -603,6 +623,8 @@ async function runWake(wake: any): Promise<void> {
 /** How long a queued wake waits for the run in front of it to end before the sweep steps in. */
 const WAKE_SWEEP_MIN_AGE_MS = 60_000
 const WAKE_MAX_ATTEMPTS = 3
+/** A move's hint at the card's own agent; the row is debounced by `notBefore`. */
+const MOVE_NUDGE_REASON = 'move_nudge'
 
 /** Is a reply for this agent still running in that thread (any process, per the DB)? */
 async function agentRunningInThread(conversationId: string, threadRootId: string | null, agentRef: string): Promise<boolean> {
@@ -622,6 +644,61 @@ async function agentRunningInThread(conversationId: string, threadRootId: string
 }
 
 /**
+ * A wake that arrives on its own — a person's tag, a chained tag, an assign, an
+ * explicit column hand-off — carries the instruction, so a move nudge still
+ * waiting out its window is redundant: mark it superseded rather than waking the
+ * agent a second time for the same bounce. A nudge that is already claimed (its
+ * own drain) is untouched.
+ */
+async function supersedePendingMoveNudges(threadRootId: string | null, agentRef: string): Promise<void> {
+  if (!threadRootId) return
+  await db.agentWake.updateMany({
+    where: { threadRootId, agentRef, status: 'pending', reason: MOVE_NUDGE_REASON },
+    data: { status: 'superseded' },
+  }).catch((err: Error) => console.warn('[ChannelAgent] superseding a move nudge failed:', err.message))
+}
+
+/**
+ * Start this (agent, thread)'s pending wakes if nothing is running. One entry
+ * point for the settle drain, the post-enqueue timer and the 15s sweep, so two
+ * of them can never start the same queue twice. The run itself is detached:
+ * `true` means "a drain started", not "a turn finished".
+ */
+async function startDrainIfIdle(row: { conversationId: string; threadRootId: string | null; agentRef: string }): Promise<boolean> {
+  const key = runKey(row.conversationId, row.threadRootId, targetForAgentRef(row.agentRef))
+  if (liveRuns.has(key) || draining.has(key)) return false
+  draining.add(key)
+  let started = false
+  try {
+    if (!(await agentRunningInThread(row.conversationId, row.threadRootId, row.agentRef))) {
+      started = true
+      void drainWakes(row.conversationId, row.threadRootId, row.agentRef)
+        .catch((err: Error) => console.error('[ChannelAgent] draining queued wakes failed:', err.message))
+        .finally(() => draining.delete(key))
+    }
+    return started
+  } finally {
+    if (!started) draining.delete(key)
+  }
+}
+
+/**
+ * A debounced row is not left to the 15s sweep: the board's timer fires just
+ * after its window closes, so a bounce nobody tagged wakes its developer in
+ * ~5s. The sweep stays the backstop for a process that restarted.
+ */
+export function scheduleAgentWakeDrain(
+  row: { conversationId: string; threadRootId: string | null; agentRef: string },
+  delayMs: number,
+): void {
+  const timer = setTimeout(() => {
+    void startDrainIfIdle(row).catch((err: Error) => console.error('[ChannelAgent] draining a deferred wake failed:', err.message))
+  }, Math.max(0, delayMs))
+  // Never hold the process open for a hint.
+  timer.unref?.()
+}
+
+/**
  * Drain wakes nothing else will: a queue written by a pod that has since
  * restarted, or one whose run ended while its process was dying. Every 15s
  * tick of the chat-queue job calls this, so a queued wake is never stranded.
@@ -629,6 +706,7 @@ async function agentRunningInThread(conversationId: string, threadRootId: string
  * so one long reply cannot stall the rest of the tick.
  */
 export async function sweepPendingAgentWakes(minAgeMs = WAKE_SWEEP_MIN_AGE_MS): Promise<number> {
+  const now = new Date()
   const cutoff = new Date(Date.now() - minAgeMs)
   // A wake claimed by a run that died with its process is claimable again.
   await db.agentWake.updateMany({
@@ -637,24 +715,23 @@ export async function sweepPendingAgentWakes(minAgeMs = WAKE_SWEEP_MIN_AGE_MS): 
   }).catch(() => {})
   // Finished rows are history, not state: keep a week of it.
   await db.agentWake.deleteMany({
-    where: { status: { in: ['done', 'failed'] }, updatedAt: { lt: new Date(Date.now() - 7 * 24 * 3_600_000) } },
+    where: { status: { in: ['done', 'failed', 'superseded'] }, updatedAt: { lt: new Date(Date.now() - 7 * 24 * 3_600_000) } },
   }).catch(() => {})
   const rows = await db.agentWake.findMany({
-    where: { status: 'pending', createdAt: { lt: cutoff }, attempts: { lt: WAKE_MAX_ATTEMPTS } },
+    where: {
+      status: 'pending',
+      createdAt: { lt: cutoff },
+      attempts: { lt: WAKE_MAX_ATTEMPTS },
+      // A debounced row still inside its window waits for its own timer.
+      OR: [{ notBefore: null }, { notBefore: { lte: now } }],
+    },
     orderBy: { createdAt: 'asc' },
     take: 20,
     select: { conversationId: true, threadRootId: true, agentRef: true },
   })
   let started = 0
   for (const row of rows) {
-    const key = runKey(row.conversationId, row.threadRootId, targetForAgentRef(row.agentRef))
-    if (liveRuns.has(key) || draining.has(key)) continue
-    if (await agentRunningInThread(row.conversationId, row.threadRootId, row.agentRef)) continue
-    draining.add(key)
-    started++
-    void drainWakes(row.conversationId, row.threadRootId, row.agentRef)
-      .catch((err: Error) => console.error('[ChannelAgent] draining queued wakes failed:', err.message))
-      .finally(() => draining.delete(key))
+    if (await startDrainIfIdle(row)) started++
   }
   return started
 }
@@ -1286,6 +1363,9 @@ async function workspaceFileFetcher(input: { workspaceId: string; projectId: str
 export async function runAgentReply(args: RunAgentReplyArgs, opts: { drained?: boolean } = {}): Promise<string | null> {
   const { conversation, trigger, target, userId } = args
   const threadRootId = replyThreadRoot(conversation, trigger)
+  // Any wake that reaches this point carries its own instruction, so a move
+  // hint still waiting out its window for this agent is now redundant.
+  await supersedePendingMoveNudges(threadRootId, agentRefForTarget(target))
   const key = runKey(conversation.id, threadRootId, target)
   const holder = liveRuns.get(key)
   if (holder) {
