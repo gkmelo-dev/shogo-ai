@@ -267,6 +267,31 @@ test.describe("Workspace switching (local mode)", () => {
       page.off("request", onRequest)
       await page.keyboard.press("Escape")
     }
+
+    // …and the badge itself renders there. Staging a real agent turn in another
+    // workspace is out of scope for a local spec, so answer the activity call
+    // with one busy workspace and assert the label the user actually sees.
+    await page.route("**/api/workspaces/activity", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          ok: true,
+          items: [{ workspaceId: "qa-other-workspace", inFlight: true }],
+        }),
+      }),
+    )
+    try {
+      await page.goto("/")
+      const trigger = await goHome(page)
+      await openAccountPopover(page, trigger)
+      await expect(page.getByLabel("Working in 1 other workspace")).toBeVisible({
+        timeout: 15_000,
+      })
+    } finally {
+      await page.unroute("**/api/workspaces/activity")
+      await page.keyboard.press("Escape")
+    }
   })
 
   test("narrow web (390×844): switches both directions via the /account screen", async () => {
