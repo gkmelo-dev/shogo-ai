@@ -24,7 +24,10 @@ export type ProjectPackResult =
   | { status: 'ok'; pack: SystemManifest }
 
 /** Parse `pack.yaml` from a project root. `none` means this is not a pack. */
-export function readProjectPack(projectId: string): ProjectPackResult {
+export function readProjectPack(projectId: string | null | undefined): ProjectPackResult {
+  // A listing row may predate `projectId` (or be a bare snapshot); there is no
+  // root to read, so it is simply not a pack rather than a crash.
+  if (!projectId) return { status: 'none' }
   const abs = join(getWorkspacesDir(), projectId, PACK_FILE)
   if (!existsSync(abs)) return { status: 'none' }
   let source: string

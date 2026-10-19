@@ -67,6 +67,7 @@ import {
 } from './internal-api'
 import {
   applyAnswersToManifest,
+  cardToWorkItemTarget,
   computeSystemDiff,
   diffSchedules,
   fileSkipWarning,
@@ -209,7 +210,6 @@ function toLive(nodes: ProjectGraphNode[]): LiveProject[] {
 
 /** Manifest trigger → the triggers API body. */
 function triggerBody(spec: TriggerSpec, idOf: (key: string) => string | null) {
-  const card = spec.card
   return {
     name: spec.name,
     filter: spec.filter ?? null,
@@ -217,27 +217,7 @@ function triggerBody(spec: TriggerSpec, idOf: (key: string) => string | null) {
     notifyConversationId: spec.notify ?? null,
     enabled: spec.enabled,
     ...(spec.target === 'project' ? { targetProjectId: spec.project ? idOf(spec.project) ?? undefined : undefined, targetMode: spec.mode ?? 'agent' } : {}),
-    ...(card ? {
-      workItemTarget: {
-        board: card.board,
-        channel: card.channel,
-        column: card.column,
-        dedupeKey: card.dedupeKey,
-        mapping: {
-          title: card.title,
-          description: card.description,
-          message: card.description,
-          priority: card.priority,
-          externalRef: card.externalRef,
-          dueAt: card.dueAt,
-          fields: card.fields,
-          stack: card.stack,
-          environment: card.environment,
-          release: card.release,
-          url: card.url,
-        },
-      },
-    } : {}),
+    ...(spec.card ? { workItemTarget: cardToWorkItemTarget(spec.card) } : {}),
   }
 }
 

@@ -254,6 +254,27 @@ export default observer(function MarketplaceDetailScreen() {
   const [packError, setPackError] = useState<string | null>(null)
   const [packAnswers, setPackAnswers] = useState<Record<string, unknown> | null>(null)
 
+  // The preview is a dry run of the real apply, so re-running it with the
+  // person's answers is what makes the plan say `Review time 18:00` instead of
+  // "the default 07:00 is used". Advisory: a failure leaves the last plan.
+  const refreshPackPreview = useCallback(
+    async (answers: Record<string, unknown>) => {
+      if (!listing?.id || !activeWorkspace?.id) return
+      try {
+        const next = await http.post<PackPreviewResponse>(`/api/marketplace/listings/${listing.id}/install-preview`, {
+          workspaceId: activeWorkspace.id,
+          answers,
+        })
+        if (next.data?.plan) {
+          setPackPreview((prev) => (prev ? { ...prev, plan: next.data!.plan, conflicts: next.data!.conflicts } : next.data))
+        }
+      } catch {
+        // Advisory only.
+      }
+    },
+    [listing?.id, activeWorkspace?.id, http],
+  )
+
   const [userInstall, setUserInstall] = useState<UserInstall | null>(null)
   const [showReviewForm, setShowReviewForm] = useState(false)
   const [reviewRating, setReviewRating] = useState(5)
@@ -1225,6 +1246,7 @@ export default observer(function MarketplaceDetailScreen() {
         installing={installing}
         error={packError}
         onCancel={() => setPackOpen(false)}
+        onAnswersChange={(answers) => void refreshPackPreview(answers)}
         onInstall={(answers) => {
           setPackAnswers(answers)
           setPackOpen(false)

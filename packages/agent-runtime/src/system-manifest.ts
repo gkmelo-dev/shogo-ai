@@ -321,6 +321,7 @@ export type AgentContextMode = z.infer<typeof AgentContextModeSchema>
 export type BoardSpec = z.infer<typeof BoardSpecSchema>
 export type BoardColumnSpec = z.infer<typeof BoardColumnSpecSchema>
 export type TriggerSpec = z.infer<typeof TriggerSpecSchema>
+export type TriggerCardSpec = z.infer<typeof TriggerCardSpecSchema>
 export type ScheduleSpec = z.infer<typeof ScheduleSpecSchema>
 export type SetupSpec = z.infer<typeof SetupSpecSchema>
 export type SetupQuestion = z.infer<typeof SetupQuestionSchema>
@@ -1528,6 +1529,30 @@ export function resolveScheduleValues(
     enabled: spec.enabled,
     channel: spec.channel ?? null,
     ...(timing.error ? { error: timing.error } : {}),
+  }
+}
+
+/**
+ * A card spec → the `workItemTarget` the triggers API validates: the card's
+ * placements at the top, its templates under `mapping`. Both `system_apply` and
+ * the marketplace apply engine build it here, so a `work_item` trigger installs
+ * the same way whichever path ran it.
+ */
+export function cardToWorkItemTarget(card: TriggerCardSpec): Record<string, unknown> {
+  const mapping: Record<string, unknown> = { title: card.title }
+  if (card.description !== undefined) {
+    mapping.description = card.description
+    mapping.message = card.description
+  }
+  for (const key of ['priority', 'externalRef', 'dueAt', 'fields', 'stack', 'environment', 'release', 'url'] as const) {
+    if (card[key] !== undefined) mapping[key] = card[key]
+  }
+  return {
+    board: card.board,
+    ...(card.channel ? { channel: card.channel } : {}),
+    ...(card.column ? { column: card.column } : {}),
+    ...(card.dedupeKey ? { dedupeKey: card.dedupeKey } : {}),
+    mapping,
   }
 }
 

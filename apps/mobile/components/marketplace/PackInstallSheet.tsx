@@ -11,7 +11,7 @@
  * performs.
  */
 
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { ActivityIndicator, Modal, Pressable, ScrollView, Text, TextInput, View } from 'react-native'
 import { X } from 'lucide-react-native'
 
@@ -41,6 +41,7 @@ export function PackInstallSheet({
   error,
   onCancel,
   onInstall,
+  onAnswersChange,
 }: {
   visible: boolean
   packName: string
@@ -50,6 +51,8 @@ export function PackInstallSheet({
   error?: string | null
   onCancel: () => void
   onInstall: (answers: Record<string, unknown>) => void
+  /** Called with the answers so the plan can show what they actually fill in. */
+  onAnswersChange?: (answers: Record<string, unknown>) => void
 }) {
   const questions = preview?.questions ?? []
   const [answers, setAnswers] = useState<Record<string, unknown>>({})
@@ -68,6 +71,25 @@ export function PackInstallSheet({
     }
     setAnswers(defaults)
   }, [visible, questions.length])
+
+  // The plan is rendered from the answers by the same apply engine that will
+  // run, so a changed answer refetches it — otherwise it keeps saying "the
+  // default is used" after the person picked something else. The opening
+  // preview already reflects the defaults, which is why the first pass is not
+  // sent back.
+  const settled = useRef(false)
+  useEffect(() => {
+    if (!visible || !onAnswersChange) return
+    if (!settled.current) {
+      settled.current = true
+      return
+    }
+    const timer = setTimeout(() => onAnswersChange(answers), 400)
+    return () => clearTimeout(timer)
+  }, [answers, visible])
+  useEffect(() => {
+    if (!visible) settled.current = false
+  }, [visible])
 
   const set = (key: string, value: unknown) => setAnswers((prev) => ({ ...prev, [key]: value }))
 

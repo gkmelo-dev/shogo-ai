@@ -23,6 +23,7 @@ import { dirname, join, resolve } from 'node:path'
 import {
   answerLookup,
   applyAnswersToManifest,
+  cardToWorkItemTarget,
   diffSchedules,
   mergeProfileSection,
   normalizeAnswers,
@@ -562,7 +563,7 @@ export async function applySystemPack(args: ApplyPackArgs): Promise<ApplyPackRes
   // 6. Triggers.
   for (const spec of manifest.triggers) {
     try {
-      const resolvedPrompt = spec.prompt ? substituteTemplates(spec.prompt, { bindings: bindings.projects, answers: args.answers }) : null
+      const resolvedPrompt = spec.prompt ? substituteTemplates(spec.prompt, { bindings: bindings.projects, answers }) : null
       const targetProjectId = spec.target === 'project' && spec.project ? bindings.projects[spec.project] ?? null : null
       const created = await createSubscription({
         workspaceId,
@@ -578,26 +579,7 @@ export async function applySystemPack(args: ApplyPackArgs): Promise<ApplyPackRes
         triggerConfig: spec.config,
         enabled: spec.enabled,
         policyEditor: actorUserId,
-        ...(spec.target === 'work_item' && spec.card
-          ? {
-              workItemTarget: {
-                board: spec.card.board,
-                channel: spec.card.channel,
-                column: spec.card.column,
-                title: spec.card.title,
-                description: spec.card.description,
-                priority: spec.card.priority,
-                externalRef: spec.card.externalRef,
-                dueAt: spec.card.dueAt,
-                fields: spec.card.fields,
-                stack: spec.card.stack,
-                environment: spec.card.environment,
-                release: spec.card.release,
-                url: spec.card.url,
-                dedupeKey: spec.card.dedupeKey,
-              },
-            }
-          : {}),
+        ...(spec.target === 'work_item' && spec.card ? { workItemTarget: cardToWorkItemTarget(spec.card) } : {}),
       })
       bindings.triggers[spec.key] = created.subscription.id
       result.applied.push(`create trigger ${spec.key}`)
