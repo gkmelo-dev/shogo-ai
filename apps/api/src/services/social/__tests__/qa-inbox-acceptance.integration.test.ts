@@ -15,9 +15,15 @@ setupChannelsTestDb()
 const { prisma } = await import('../../../lib/prisma')
 const { setSocialClient } = await import('../client')
 const { applySocialEvent } = await import('../webhooks')
-const { getConversation, listComments, listConversations, replyToComment, replyToConversation } = await import(
-  '../inbox.service'
-)
+const {
+  backfillInbox,
+  getConversation,
+  listComments,
+  listConversations,
+  markConversationRead,
+  replyToComment,
+  replyToConversation,
+} = await import('../inbox.service')
 
 const db = prisma as any
 const suffix = crypto.randomUUID().slice(0, 8)
@@ -198,5 +204,80 @@ describe('a long thread', () => {
     // The newest message must be in the window — a chat UI that opens on
     // message 1 of 121 can never show the reply someone is answering.
     expect(view.messages.at(-1)?.text).toBe('message 121')
+  })
+})
+
+describe('the unread badge', () => {
+  test('a sweep never hides a message the reader has not seen', async () => {
+    const conversationId = `conv_late_${suffix}`
+    const ingestAt = (id: string, text: string, sentAt: string, eventId: string) =>
+      ingest(workspaceA, { zernioAccountId: `acc_qa_a_${suffix}` }, {
+        eventId,
+        type: 'message.received',
+        body: {
+          conversation: { id: conversationId, platform: 'instagram', status: 'active' },
+          message: {
+            id,
+            conversationId,
+            direction: 'incoming',
+            text,
+            createdAt: sentAt,
+            sender: { name: 'Late Person' },
+          },
+        },
+      })
+
+    await ingestAt(`late_1_${suffix}`, 'first question', '2026-10-19T11:00:00.000Z', `evt_late1_${suffix}`)
+    const thread = await db.socialConversation.findUnique({ where: { zernioConversationId: conversationId } })
+    expect(thread.unreadCount).toBe(1)
+
+    // Someone reads the thread while there is nothing new in it.
+    await markConversationRead(workspaceA, thread.id)
+
+    // A message the provider only tells us about afterwards, but which was sent
+    // before that read: the reader has never seen it, so it is unread.
+    await ingestAt(`late_2_${suffix}`, 'second question', '2026-10-19T11:05:00.000Z', `evt_late2_${suffix}`)
+    expect(
+      (await db.socialConversation.findUnique({ where: { zernioConversationId: conversationId } })).unreadCount,
+    ).toBe(1)
+
+    // The desktop comes back from offline and sweeps. The sweep brings in one
+    // more message nobody has seen, and recomputes the badge.
+    setSocialClient({
+      mode: 'cloud',
+      async request(req: any) {
+        if (req.path === '/inbox/conversations') {
+          return {
+            data: [
+              {
+                id: conversationId,
+                accountId: `acc_qa_a_${suffix}`,
+                platform: 'instagram',
+                status: 'active',
+                unreadCount: 2,
+                updatedTime: '2026-10-19T11:06:00.000Z',
+              },
+            ],
+          }
+        }
+        return {
+          messages: [
+            { id: `late_1_${suffix}`, direction: 'incoming', text: 'first question', createdAt: '2026-10-19T11:00:00.000Z' },
+            { id: `late_2_${suffix}`, direction: 'incoming', text: 'second question', createdAt: '2026-10-19T11:05:00.000Z' },
+            { id: `late_3_${suffix}`, direction: 'incoming', text: 'third question', createdAt: '2026-10-19T11:06:00.000Z' },
+          ],
+        }
+      },
+    })
+    try {
+      await backfillInbox(workspaceA)
+    } finally {
+      setSocialClient(null)
+    }
+
+    const swept = await db.socialConversation.findUnique({ where: { zernioConversationId: conversationId } })
+    // Both late messages are unseen; a read that happened before they arrived
+    // must not be able to clear them.
+    expect(swept.unreadCount).toBe(2)
   })
 })
