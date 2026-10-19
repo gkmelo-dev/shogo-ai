@@ -44,9 +44,14 @@ mock.module('../../lib/tunnel-relay', () => ({
 const { setupChannelsTestDb } = await import('../../__tests__/helpers/channels-test-db')
 const { dir } = setupChannelsTestDb()
 
+// The helper flags local mode so `lib/prisma` builds a SQLite client; bind it
+// first, then clear the flag so the service below exercises its cloud branches
+// (the resolver/tunnel mocks in this file) rather than the local one.
+const { prisma: callDb } = await import('../../lib/prisma')
+delete process.env.SHOGO_LOCAL_MODE
+
 const svc = await import('../agent-call.service')
 const agentCallStore = await import('../../lib/agent-call-store')
-const { prisma: callDb } = await import('../../lib/prisma')
 const db = callDb as any
 
 // ─── fixtures ────────────────────────────────────────────────────────────────

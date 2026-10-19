@@ -90,6 +90,9 @@ mock.module('../../lib/project-runtime-token', () => ({
 const { setupChannelsTestDb } = await import('../../__tests__/helpers/channels-test-db')
 const { dir } = setupChannelsTestDb()
 const { prisma: realPrisma } = await import('../../lib/prisma')
+// Bound to SQLite above; drop the helper's local-mode flag so the routes below
+// take their cloud branches (the resolver/tunnel mocks) instead of the local one.
+delete process.env.SHOGO_LOCAL_MODE
 
 mock.module('../../lib/prisma', () => ({
   prisma: {

@@ -135,6 +135,55 @@ describe('agent-call store across a restart', () => {
     expect(await assistantRows(chatSessionId)).toHaveLength(1)
   })
 
+  test('the caller long-polls across the restart and sees the callee finish afterwards', async () => {
+    const projectId = seed.projectId
+    const runId = 'run-restart-poll'
+    const chatSessionId = `chat-restart-poll-${crypto.randomUUID().slice(0, 8)}`
+    const startedAt = Date.now()
+
+    await seedCallChat(chatSessionId, projectId, runId)
+    await store.putAgentCall(projectId, {
+      status: 'running',
+      runId,
+      sessionId: chatSessionId,
+      chatSessionId,
+      startedAt,
+      updatedAt: startedAt,
+    })
+    await store.linkAgentCallSession(chatSessionId, { projectId, runId, startedAt })
+
+    // The process that started the call is gone; a fresh one has no memory of it.
+    simulateRestart()
+    expect((await store.getAgentCall(projectId, runId))?.status).toBe('running')
+
+    // The callee is still working (it outlived the caller's API) and finishes
+    // while the caller is mid-poll.
+    const finishing = (async () => {
+      await new Promise((resolve) => setTimeout(resolve, 150))
+      await store.putAgentCall(projectId, {
+        status: 'completed',
+        runId,
+        sessionId: chatSessionId,
+        chatSessionId,
+        reply: 'PONG',
+        startedAt,
+        updatedAt: Date.now(),
+      })
+    })()
+
+    const settled = await store.waitForAgentCall(projectId, runId, 5_000, { pollIntervalMs: 50 })
+    await finishing
+
+    // The poll settled on the answer instead of timing out on an empty record.
+    expect(settled).toMatchObject({ status: 'completed', reply: 'PONG' })
+
+    // And the late reply still reaches the chat.
+    expect(await reconcileCallReplyOnRead(db, chatSessionId)).toBe(true)
+    const rows = await assistantRows(chatSessionId)
+    expect(rows).toHaveLength(1)
+    expect(rows[0]).toMatchObject({ agent: 'technical', content: 'PONG' })
+  })
+
   test('a call whose owner died ends as an explicit failure row once it is stale', async () => {
     const projectId = seed.projectId
     const runId = 'run-restart-2'
@@ -253,18 +302,44 @@ describe('agent-call store across a restart', () => {
     expect(await db.agentCallSessionLink.count({ where: { chatSessionId } })).toBe(0)
   })
 
-  test('a call is scoped to its project and carries a 7-day expiry', async () => {
+  test('every write refreshes the 7-day expiry, and a call is scoped to its project', async () => {
     const projectId = seed.projectId
     const runId = 'run-scoped'
-    const startedAt = Date.now()
+    const ttlMs = store.AGENT_CALL_TTL_SECONDS * 1000
+    // Started six days ago: measured from `startedAt` this record would have a
+    // single day left, so the assertion below can only pass if the expiry is
+    // recomputed from the write.
+    const startedAt = Date.now() - 6 * 24 * 60 * 60_000
+    const chatSessionId = `chat-ttl-${crypto.randomUUID().slice(0, 8)}`
+    const callRow = () => db.agentCall.findUnique({ where: { projectId_runId: { projectId, runId } } })
+    const linkRow = () => db.agentCallSessionLink.findUnique({ where: { chatSessionId } })
+    const expiryOf = (row: any) => new Date(row.expiresAt).getTime()
 
-    await store.putAgentCall(projectId, { status: 'completed', runId, reply: 'PONG', startedAt, updatedAt: startedAt })
+    await store.putAgentCall(projectId, { status: 'running', runId, sessionId: chatSessionId, chatSessionId, startedAt, updatedAt: startedAt })
+    await store.linkAgentCallSession(chatSessionId, { projectId, runId, startedAt })
+
+    const first = await callRow()
+    expect(expiryOf(first)).toBeGreaterThan(Date.now() + ttlMs - 60_000)
+    expect(expiryOf(first)).toBeLessThanOrEqual(Date.now() + ttlMs)
+    expect(expiryOf(await linkRow())).toBeGreaterThan(Date.now() + ttlMs - 60_000)
 
     expect(await store.getAgentCall(seed.foreignProjectId, runId)).toBeUndefined()
 
-    const row = await db.agentCall.findUnique({ where: { projectId_runId: { projectId, runId } } })
-    const ttlMs = new Date(row.expiresAt).getTime() - Date.now()
-    expect(ttlMs).toBeGreaterThan(store.AGENT_CALL_TTL_SECONDS * 1000 - 60_000)
-    expect(ttlMs).toBeLessThanOrEqual(store.AGENT_CALL_TTL_SECONDS * 1000)
+    // Each later write (a status change, then a heartbeat) pushes the expiry out
+    // again, so a long call never expires out from under its own reader.
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    await store.putAgentCall(projectId, { status: 'running', runId, sessionId: chatSessionId, chatSessionId, startedAt, updatedAt: Date.now() })
+    const second = await callRow()
+    expect(expiryOf(second)).toBeGreaterThan(expiryOf(first))
+
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    await store.touchAgentCall(projectId, runId)
+    expect(expiryOf(await callRow())).toBeGreaterThan(expiryOf(second))
+
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    await store.putAgentCall(projectId, { status: 'completed', runId, reply: 'PONG', startedAt, updatedAt: Date.now() })
+    const done = await callRow()
+    expect(expiryOf(done)).toBeGreaterThan(expiryOf(second))
+    expect(done.status).toBe('completed')
   })
 })
