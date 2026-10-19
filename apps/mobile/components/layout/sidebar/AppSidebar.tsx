@@ -58,6 +58,8 @@ import { cn } from "@shogo/shared-ui/primitives";
 import type { PrimaryNavId, SidebarTabId } from "@shogo/shared-app";
 import { CommandPalette, useCommandPalette } from "../CommandPalette";
 import { useActiveInstance } from "../../../contexts/active-instance";
+import { useMachineWorkspaces } from "../../../hooks/useMachineWorkspaces";
+import type { MachineGroupData, MachineWorkspaceRow } from "./MachineWorkspacesGroup";
 import { ShogoWordmark } from "../../branding/ShogoWordmark";
 import { useAuth } from "../../../contexts/auth";
 import {
@@ -613,7 +615,9 @@ export const AppSidebar = observer(function AppSidebar({
   const [createWorkspaceOpen, setCreateWorkspaceOpen] = useState(false);
   const { open: commandPaletteOpen, setOpen: setCommandPaletteOpen } =
     useCommandPalette();
-  const { instance: activeRemoteInstance } = useActiveInstance();
+  const { instance: activeRemoteInstance, setInstance: setActiveInstance } = useActiveInstance();
+  // A paired desktop's own workspaces, listed under "This Mac" (SHO-54).
+  const { machines: machineWorkspaces } = useMachineWorkspaces();
 
   let allWorkspaces: any[];
   try {
@@ -700,6 +704,32 @@ export const AppSidebar = observer(function AppSidebar({
       scheduleWorkspaceSwitch(workspaceId, projects, reloadAfterWorkspaceSwitch);
     },
     [projects, posthog],
+  );
+
+  /**
+   * Enter one of this machine's own workspaces: the desktop is the source of
+   * truth for its projects, chats and tool-call logs, so selecting a row
+   * points the domain store at that machine's relay and drops the user on the
+   * projects view. Nothing is scoped to the cloud workspace that happens to be
+   * selected — a machine row survives a cloud workspace switch.
+   */
+  const handleOpenMachineWorkspace = useCallback(
+    (machine: MachineGroupData, workspace: MachineWorkspaceRow) => {
+      setActiveInstance({
+        instanceId: machine.id,
+        name: machine.name,
+        hostname: machine.name,
+        workspaceId: currentWorkspace?.id ?? "",
+        kind: "desktop",
+        source: "machine",
+        localWorkspaceId: workspace.id,
+      });
+      if (activeRemoteInstance?.source === "machine" && activeRemoteInstance.localWorkspaceId === workspace.id) {
+        return;
+      }
+      router.push("/(app)" as any);
+    },
+    [activeRemoteInstance, currentWorkspace?.id, router, setActiveInstance],
   );
 
   const handleCreateWorkspace = useCallback(() => {
@@ -1241,6 +1271,8 @@ export const AppSidebar = observer(function AppSidebar({
     hasPersonalWorkspace={hasPersonalWorkspace}
     onCreatePersonalWorkspace={handleCreatePersonalWorkspace}
     localMode={localMode}
+    machineWorkspaces={machineWorkspaces}
+    onOpenMachineWorkspace={handleOpenMachineWorkspace}
     {...extra}
   />
   );
@@ -1293,6 +1325,8 @@ export const AppSidebar = observer(function AppSidebar({
             hasPersonalWorkspace={hasPersonalWorkspace}
             onCreatePersonalWorkspace={handleCreatePersonalWorkspace}
             localMode={localMode}
+            machineWorkspaces={machineWorkspaces}
+            onOpenMachineWorkspace={handleOpenMachineWorkspace}
           />
           <View className="flex-row items-center gap-1">
             {tab === "projects" && (

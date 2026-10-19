@@ -51,6 +51,7 @@ import { localUserRoutes } from '../routes/local-user'
 import { localProjectsRoutes } from '../routes/local-projects'
 import { localRemoteHostsRoutes } from '../routes/local-remote-hosts'
 import { localLogsRoutes } from '../routes/local-logs'
+import { localMachineRoutes } from '../routes/local-machine'
 import { meetingRoutes } from '../routes/meetings'
 import { historyRoutes } from '../routes/history'
 import { scopedAnalyticsRoutes } from '../routes/scoped-analytics'
@@ -122,6 +123,7 @@ export function createLocalApp(): LocalAppBundle {
     }),
   )
   app.route('/api/local', localLogsRoutes())
+  app.route('/api/local', localMachineRoutes())
   app.route('/api/local', localRemoteHostsRoutes({ runtimeManager }))
   app.route('/api', localAuthRoutes())
   app.route('/api', localUserRoutes())

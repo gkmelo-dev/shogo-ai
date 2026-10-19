@@ -127,6 +127,33 @@ export interface RemoteInterceptorConfig {
    * The UI can show a fallback banner or auto-switch to local mode.
    */
   onRemoteError?: (error: Error, path: string) => void
+
+  /**
+   * Set when `remoteProxyBaseUrl` targets one of a paired desktop's own
+   * workspaces (`/api/machines/<id>/w/<localWorkspaceId>`). Cloud and machine
+   * workspace ids come from different databases, so a `workspaceId` the UI
+   * sends along (the cloud one that happens to be selected) is rewritten to
+   * the machine's own id — otherwise the desktop filters its projects by an
+   * id it has never heard of and answers `200 []`, which reads as "my
+   * projects vanished".
+   */
+  machineWorkspaceId?: string | null
+}
+
+/**
+ * Point a machine-workspace request at the machine's own workspace id.
+ *
+ * Only the query string is touched: routing decisions and the path itself are
+ * workspace-agnostic, and the relay already carries the local workspace id.
+ */
+export function rewriteMachineWorkspaceParam(path: string, localWorkspaceId: string): string {
+  const queryStart = path.indexOf('?')
+  if (queryStart === -1) return path
+  const pathname = path.slice(0, queryStart)
+  const params = new URLSearchParams(path.slice(queryStart + 1))
+  if (!params.has('workspaceId') || params.get('workspaceId') === localWorkspaceId) return path
+  params.set('workspaceId', localWorkspaceId)
+  return `${pathname}?${params.toString()}`
 }
 
 // ─── Path Routing Logic ─────────────────────────────────────────────────────
@@ -214,7 +241,11 @@ export function createRemoteAwareHttpClient(
         }
 
         // Extract path from arguments
-        const path: string = args[0]
+        const originalPath: string = args[0]
+        const path =
+          config.machineWorkspaceId
+            ? rewriteMachineWorkspaceParam(originalPath, config.machineWorkspaceId)
+            : originalPath
 
         // Check if this path should be routed to remote
         const shouldRoute = shouldRouteToRemote(path)
