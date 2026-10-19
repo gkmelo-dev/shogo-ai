@@ -34,6 +34,11 @@ import { isGitAvailable } from "../services/git.service"
 import { setProjectUser } from "../lib/project-user-context"
 import { openSession, closeSession, setQualitySignals, recordTurnUsage } from "../lib/proxy-billing-session-runtime"
 import { enrichWorkspaceReferences, enrichProjectReferences, enrichChatReferences } from "../lib/chat-references"
+import {
+  chatHandoffText,
+  deliverChatMentions,
+  isChatHandoff,
+} from "../services/chat-mention-delivery.service"
 import { trackEvent } from "../services/loops.service"
 import { parseProjectSettings } from "../lib/project-settings"
 import { recordClientTurn, isRecentClientTurn } from "../lib/chat-turn-idempotency"
@@ -1427,7 +1432,6 @@ export function projectChatRoutes(config: ProjectChatRoutesConfig) {
         const historyChanged = await enrichChatReferences(
           parsedBody,
           verifiedUserId,
-          projectId,
           project.workspaceId,
         )
         if (wsChanged || projectRefs.changed || historyChanged) {
@@ -1466,6 +1470,25 @@ export function projectChatRoutes(config: ProjectChatRoutesConfig) {
           },
           400
         )
+      }
+
+      // A `<@c:CHAT_ID>` in the message addresses another chat (SHO-52): the
+      // message is delivered there with a one-line origin and that chat's turn
+      // starts. A message that arrived as a handoff never fans out again.
+      if (verifiedUserId && !isChatHandoff(parsedBody)) {
+        const handoffText = chatHandoffText(parsedBody)
+        if (handoffText.includes('<@c:')) {
+          try {
+            await deliverChatMentions({
+              text: handoffText,
+              actingUserId: verifiedUserId,
+              sourceSessionId: incomingChatSessionId,
+              references: parsedBody?.references,
+            })
+          } catch (err: any) {
+            console.warn('[ProjectChat] Chat handoff failed:', err?.message ?? err)
+          }
+        }
       }
 
       // Turn idempotency: a `clientTurnId` that matches the most recently

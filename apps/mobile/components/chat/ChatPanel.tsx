@@ -201,6 +201,7 @@ import {
   type FileAttachment,
   type ChatReference,
   type ProjectMentionOption,
+  type ChatMentionable,
   type RestoreDraftRequest,
 } from "./ChatInput"
 import type { AgentHistoryResult } from "@shogo-ai/sdk/agent"
@@ -1174,6 +1175,37 @@ const ChatPanelContent = observer(function ChatPanelContent({
       }
     },
     [workspaceId, chatSessionId, nativeHeaders, expoFetch],
+  )
+
+  /**
+   * Chats the user can hand this message to, from every workspace they belong
+   * to. The server filters by access; this composer only excludes the chat we
+   * are already in (tagging yourself is a no-op).
+   */
+  const chatMentionables = useCallback(
+    async (query: string): Promise<ChatMentionable[]> => {
+      try {
+        const fetchFn = expoFetch ?? globalThis.fetch
+        const headers: Record<string, string> = nativeHeaders
+          ? nativeHeaders()
+          : {}
+        const params = new URLSearchParams({ q: query, limit: "8" })
+        if (chatSessionId) params.set("exclude", chatSessionId)
+        const response = await fetchFn(
+          `${API_URL}/api/chat-mentionables?${params}`,
+          {
+            headers,
+            credentials: Platform.OS === "web" ? "include" : undefined,
+          } as any,
+        )
+        if (!response.ok) return []
+        const data = await response.json()
+        return Array.isArray(data?.chats) ? data.chats : []
+      } catch {
+        return []
+      }
+    },
+    [chatSessionId, nativeHeaders, expoFetch],
   )
 
   // Quick actions state
@@ -8638,6 +8670,7 @@ const ChatPanelContent = observer(function ChatPanelContent({
                     projects={projectMentionOptions}
                     chatSessionId={currentSessionId}
                     workspaceHistorySearch={workspaceHistorySearch}
+                    chatMentionables={chatMentionables}
                     ideMode={ideMode}
                     ideContext={ideBridge.context}
                     ideFileSearch={ideBridge.listFiles}
