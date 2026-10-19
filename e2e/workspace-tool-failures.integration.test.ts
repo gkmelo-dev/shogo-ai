@@ -314,6 +314,7 @@ describe('workspace tools talk to a real API with a real project id', () => {
     })
     expect(result.details.path).toBe('summary.csv')
     expect(result.details.projectId).toBeUndefined()
+    expect(result.details.note).toContain('not inside any mounted project')
     const workspaceHit = hits.find((h) => h.url === '/api/internal/workspaces/ws-int/shared-files')
     expect(workspaceHit?.body.path).toBe('summary.csv')
     expect(hits.some((h) => h.url.includes('/projects/') && h.url.includes('/shared-files'))).toBe(false)

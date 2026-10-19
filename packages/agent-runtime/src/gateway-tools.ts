@@ -4350,7 +4350,7 @@ function createShareFileTool(ctx: ToolContext): AgentTool {
       project_id: Type.Optional(
         Type.String({
           description:
-            'Project that owns the file. Required in a workspace runtime when more than one project is attached and none is the current or anchor project.',
+            'Optional tiebreaker. The project that owns the file is taken from the path itself (a file under `<projectId>/…` belongs to that project); pass this only when the path sits at the workspace root and you want a particular project named, or to be explicit. A value that contradicts where the file actually lives is ignored and reported in the result.',
         }),
       ),
     }),
@@ -4430,7 +4430,9 @@ function createShareFileTool(ctx: ToolContext): AgentTool {
         ...(projectId ? { projectId } : {}),
         ...(target.ignoredProjectId
           ? {
-              note: `The file lives in project ${projectId ?? 'the workspace root'}, so the link was minted there instead of ${target.ignoredProjectId}. Path signed: ${target.linkPath}`,
+              note: projectId
+                ? `The file lives in project ${projectId}, so the link was minted there instead of ${target.ignoredProjectId}. Path signed: ${target.linkPath}`
+                : `The file is not inside any mounted project, so the link was minted as a workspace link instead of under ${target.ignoredProjectId}. Path signed: ${target.linkPath}`,
             }
           : {}),
       })
