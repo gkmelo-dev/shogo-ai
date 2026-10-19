@@ -185,6 +185,7 @@ import {
   type CheckpointCallResult,
 } from './internal-api'
 import { clearGitHubCliEnvCache, githubCliEnvForProject } from './github-cli-credentials'
+import { resolveShareFileLinkTarget } from './share-file-path'
 import { approvalOutcomeResult, waitForCredentialApproval, withCredentialApproval } from './integration-credentials'
 import { checkServerTsxDrift, healServerTsxDrift } from './server-tsx-drift'
 import { getCanvasRuntimeErrors, clearCanvasRuntimeErrors } from './canvas-runtime-errors'
@@ -4335,12 +4336,13 @@ function createShareFileTool(ctx: ToolContext): AgentTool {
       'This is for individual files, not web apps. Do not invent a localhost or preview URL, and do not use the publish tool for a file download.',
       'Never upload the file to a third-party host (filebin, file.io, transfer.sh, tmpfiles, 0x0.st, or similar) with curl or any other tool; this is the only supported way to hand a user a file.',
       'After this succeeds, paste the returned URL verbatim and tell the user when it expires. Do not delete or overwrite the shared file before the user downloads it.',
-      'In a workspace runtime, pass `project_id` for the project that owns the file. It defaults to the current project, the workspace anchor, or the only attached project; with none of those, the link is served from this workspace.',
+      'In a workspace runtime the file decides where the link points: a file inside a mounted project gets a project link, anything else gets a workspace link. `project_id` only picks the project when the path alone is ambiguous.',
     ].join(' '),
     label: 'Share file',
     parameters: Type.Object({
       path: Type.String({
-        description: 'Workspace-relative path of the file to share.',
+        description:
+          'Workspace-relative path of the file to share (the same path read_file uses). In a workspace runtime a mounted project\'s files are at `<projectId>/…`; the link is minted under whichever project actually owns the file.',
       }),
       expires_in_days: Type.Optional(Type.Number({
         description: 'How many days the link should work, from 1 to 7. Defaults to 7.',
@@ -4380,16 +4382,29 @@ function createShareFileTool(ctx: ToolContext): AgentTool {
         })
       }
 
-      const projectId = resolveTargetProjectId(ctx, input.project_id)
+      const requestedProjectId = resolveTargetProjectId(ctx, input.project_id)
       const workspaceId = isWorkspaceRuntimeMode()
         ? ctx.workspaceId || resolveRuntimeIdentity().workspaceId
         : null
+
+      // The file's real location decides the scope and the signed path: a
+      // project link is resolved against the project root, which is
+      // `<workspaceDir>/<projectId>/…`, not against the workspace root.
+      const target = resolveShareFileLinkTarget({
+        workspaceDir: ctx.workspaceDir,
+        resolvedPath: resolved,
+        path,
+        requestedProjectId,
+        mountedProjectIds: workspaceAttachedProjectIds(),
+        workspaceRuntime: isWorkspaceRuntimeMode(),
+      })
+      const projectId = target.projectId
       if (!projectId && !workspaceId) {
         return textResult({
           error: 'No project selected. Pass project_id for the project that owns this file.',
         })
       }
-      const linkOptions = { path, expiresInDays: input.expires_in_days }
+      const linkOptions = { path: target.linkPath, expiresInDays: input.expires_in_days }
       // With no single owning project, the link is served by this workspace
       // runtime, which is where the file was just found.
       const result = projectId
@@ -4403,14 +4418,21 @@ function createShareFileTool(ctx: ToolContext): AgentTool {
         })
       }
 
-      const filename = path.split('/').pop() || path
+      const filename = target.linkPath.split('/').pop() || target.linkPath
       return textResult({
         ok: true,
         url: result.data.url,
         filename,
         size: fileSize,
         expiresAt: result.data.expiresAt,
-        path,
+        path: target.linkPath,
+        linkPath: target.linkPath,
+        ...(projectId ? { projectId } : {}),
+        ...(target.ignoredProjectId
+          ? {
+              note: `The file lives in project ${projectId ?? 'the workspace root'}, so the link was minted there instead of ${target.ignoredProjectId}. Path signed: ${target.linkPath}`,
+            }
+          : {}),
       })
     },
   }
