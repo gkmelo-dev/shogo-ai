@@ -158,24 +158,10 @@ export async function handOffToChat(input: {
     },
   })
 
-  // Persist the user message now so the target chat shows the handoff as soon
-  // as someone opens it, even while it waits in the queue. The dispatcher
-  // upserts the same id when it takes the row.
-  await (prisma as any).chatMessage
-    .upsert({
-      where: { id: messageId },
-      create: {
-        id: messageId,
-        sessionId: target.id,
-        role: 'user',
-        content,
-        parts,
-        agent: 'technical',
-      },
-      update: {},
-    })
-    .catch((err: any) => console.warn('[ChatMention] Failed to persist handoff message:', err?.message))
-
+  // No ChatMessage is written here on purpose: a queued handoff shows only in
+  // the target's composer dock (SHO-45, "queued ⇒ dock only"). `dispatchRow`
+  // persists this same row id when it takes the queue row, which is the moment
+  // the turn actually starts.
   const started = !(target as any).activeTurnId
   if (started) {
     // Fire and forget: dispatchNext streams the target's whole turn, and the

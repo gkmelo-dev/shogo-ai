@@ -226,9 +226,9 @@ describe('deliverChatMentions', () => {
     expect(body.references).toEqual([
       { type: 'chat', id: 'chat-source', name: 'Billing bug' },
     ])
-    // The receiving chat sees the handoff immediately, before its turn starts.
-    expect(persisted[0].id).toBe(row.id)
-    expect(persisted[0].sessionId).toBe('chat-target')
+    // No transcript bubble while it is only queued: the dispatcher persists
+    // this same row id when it takes the row and the turn starts (SHO-45).
+    expect(persisted).toEqual([])
   })
 
   test('queues instead of starting a turn when the target is mid-turn', async () => {
@@ -240,6 +240,10 @@ describe('deliverChatMentions', () => {
     })
     expect(delivered?.started).toBe(false)
     expect(queued).toHaveLength(1)
+    // Queued ⇒ dock only: the target's transcript stays empty until its
+    // dispatcher takes the row, so a busy chat is not shown a message it has
+    // not started on.
+    expect(persisted).toEqual([])
     // The row is drained by the target's own queue when its turn ends.
     expect(dispatched).toEqual([])
   })

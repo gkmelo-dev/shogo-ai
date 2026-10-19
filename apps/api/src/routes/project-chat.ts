@@ -1472,25 +1472,6 @@ export function projectChatRoutes(config: ProjectChatRoutesConfig) {
         )
       }
 
-      // A `<@c:CHAT_ID>` in the message addresses another chat (SHO-52): the
-      // message is delivered there with a one-line origin and that chat's turn
-      // starts. A message that arrived as a handoff never fans out again.
-      if (verifiedUserId && !isChatHandoff(parsedBody)) {
-        const handoffText = chatHandoffText(parsedBody)
-        if (handoffText.includes('<@c:')) {
-          try {
-            await deliverChatMentions({
-              text: handoffText,
-              actingUserId: verifiedUserId,
-              sourceSessionId: incomingChatSessionId,
-              references: parsedBody?.references,
-            })
-          } catch (err: any) {
-            console.warn('[ProjectChat] Chat handoff failed:', err?.message ?? err)
-          }
-        }
-      }
-
       // Turn idempotency: a `clientTurnId` that matches the most recently
       // started turn for this chat session means this POST is a retry of an
       // already-in-flight-or-recently-finished send — most commonly the
@@ -1503,7 +1484,11 @@ export function projectChatRoutes(config: ProjectChatRoutesConfig) {
         c.req.header('X-Client-Turn-Id') ||
         (typeof parsedBody?.clientTurnId === 'string' ? parsedBody.clientTurnId : null)
 
-      if (clientTurnId && isRecentClientTurn(incomingChatSessionId, clientTurnId)) {
+      const isRetriedTurn = Boolean(
+        clientTurnId && isRecentClientTurn(incomingChatSessionId, clientTurnId),
+      )
+
+      if (isRetriedTurn) {
         console.log(
           `[ProjectChat] X-Client-Turn-Id ${clientTurnId} matches a recent turn for session ` +
             `${incomingChatSessionId} — attaching to the existing buffer instead of starting a new turn`,
@@ -1550,6 +1535,32 @@ export function projectChatRoutes(config: ProjectChatRoutesConfig) {
       if (clientTurnId) {
         recordClientTurn(incomingChatSessionId, clientTurnId)
       }
+
+      // A `<@c:CHAT_ID>` in the message addresses another chat (SHO-52): the
+      // message is delivered there with a one-line origin and that chat's turn
+      // starts. A message that arrived as a handoff never fans out again.
+      //
+      // This runs *after* the idempotency gate on purpose: the offline send
+      // queue re-POSTs a send that may already have landed, and delivering
+      // before the gate would enqueue the same handoff twice. `isRetriedTurn`
+      // is recorded before the delivery, so a retry that arrives while the
+      // handoff is still being written also skips it.
+      if (!isRetriedTurn && verifiedUserId && !isChatHandoff(parsedBody)) {
+        const handoffText = chatHandoffText(parsedBody)
+        if (handoffText.includes('<@c:')) {
+          try {
+            await deliverChatMentions({
+              text: handoffText,
+              actingUserId: verifiedUserId,
+              sourceSessionId: incomingChatSessionId,
+              references: parsedBody?.references,
+            })
+          } catch (err: any) {
+            console.warn('[ProjectChat] Chat handoff failed:', err?.message ?? err)
+          }
+        }
+      }
+
       let activityTurnId: string | null = null
 
       // Open a billing session so the AI proxy accumulates tokens across

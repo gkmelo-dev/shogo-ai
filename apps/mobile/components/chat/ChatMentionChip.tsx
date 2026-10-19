@@ -16,14 +16,29 @@ import { Platform, Pressable, Text, type StyleProp, type TextStyle } from "react
 import { useRouter } from "expo-router"
 import { API_URL } from "../../lib/api-url"
 import { authClient } from "../../lib/auth-client"
-import { openActiveChat } from "../../lib/open-active-chat"
+import { useProjectCollection } from "../../contexts/domain"
+import { useActiveWorkspace } from "../../hooks/useActiveWorkspace"
+import { openInWorkspace } from "../../lib/switch-workspace"
 import { chatIdsIn } from "../../lib/chat-mention-text"
 
 export interface ChatMentionMeta {
   id: string
   title: string
   projectId?: string | null
+  workspaceId?: string
   workspaceName?: string
+}
+
+/**
+ * Where a chip opens. Workspace-agent chats belong to the workspace agent,
+ * project chats to the project surface — and both carry the session id, so the
+ * screen lands on the conversation rather than the workspace's current one.
+ */
+export function chatMentionHref(meta: { id: string; projectId?: string | null }): string {
+  const chatSessionId = encodeURIComponent(meta.id)
+  return meta.projectId
+    ? `/(app)/projects/${meta.projectId}?chatSessionId=${chatSessionId}`
+    : `/(app)/agent?chatSessionId=${chatSessionId}`
 }
 
 interface ChatMentionStatus {
@@ -63,6 +78,7 @@ async function fetchMeta(ids: string[]) {
       id: chat.id,
       title: chat.title,
       projectId: chat.projectId,
+      workspaceId: chat.workspaceId,
       workspaceName: chat.workspaceName,
     })
   }
@@ -188,14 +204,22 @@ export function ChatMentionChip({
   inverted?: boolean
 }) {
   const router = useRouter()
+  const projects = useProjectCollection()
+  const activeWorkspace = useActiveWorkspace() as { id?: string } | null
   const label = meta?.title ?? `chat ${id.slice(0, 8)}`
   const state = statusLabel(status)
   const open = useCallback(() => {
-    openActiveChat(router, {
-      chatSessionId: id,
-      projectId: meta?.projectId ?? null,
-    } as any)
-  }, [router, id, meta?.projectId])
+    // A chat tagged from another workspace must switch to it first: the chat
+    // screens read the active workspace, and sending from the wrong one is
+    // rejected server-side (`session_not_in_workspace`).
+    openInWorkspace(
+      router,
+      meta?.workspaceId,
+      chatMentionHref({ id, projectId: meta?.projectId ?? null }),
+      activeWorkspace?.id,
+      projects,
+    )
+  }, [router, id, meta?.projectId, meta?.workspaceId, activeWorkspace?.id, projects])
 
   return (
     <Text
