@@ -19,6 +19,7 @@ import { getSyncEngine } from '../../lib/sync-engine'
 import { emitWorkspaceEvent } from '../workspace-events'
 import { SocialError } from './client'
 import { ingestSocialEvent } from './inbox.service'
+import { recordAutomationRun } from './automations.service'
 import { enqueueRelayedEvent } from './relay-events.service'
 import { getProfileByExternalId, type SocialProfileRow } from './profiles.service'
 import {
@@ -128,6 +129,24 @@ export async function applySocialEvent(input: ApplySocialEventInput): Promise<Ap
   }
 
   await fixAccountRow({ workspaceId: input.workspaceId, type, account: input.account })
+
+  // Automation runs are counted from the provider's own run events, one row per
+  // execution id, so `analytics.engagement.automationRuns` is a fact rather than
+  // a counter that only goes up.
+  if (type === 'social.automation.run.completed' || type === 'social.automation.run.failed') {
+    await recordAutomationRun({
+      workspaceId: input.workspaceId,
+      detail: input.detail,
+      failed: type === 'social.automation.run.failed',
+    }).catch((err) => {
+      // A run row is reporting, not delivery: never turn it into a retryable
+      // error the provider would redeliver the whole event for.
+      console.error('[SocialWebhooks] automation run not recorded', {
+        workspaceId: input.workspaceId,
+        error: (err as any)?.message ?? err,
+      })
+    })
+  }
 
   const payload: Record<string, unknown> = { externalId: input.externalId }
   if (input.account) payload.account = input.account

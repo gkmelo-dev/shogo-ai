@@ -178,9 +178,17 @@ describe('relay tenant scoping', () => {
 
   test('paths outside the allowlist never reach the provider', async () => {
     calls.length = 0
-    const res = await relay('/workflows', own, { method: 'POST', body: JSON.stringify({}) })
+    const res = await relay('/analytics', own, { method: 'POST', body: JSON.stringify({}) })
     expect(res.status).toBe(403)
     expect((await res.json()).error.code).toBe('relay_path_not_allowed')
+    expect(calls).toHaveLength(0)
+  })
+
+  test('an automation create with no account never reaches the provider', async () => {
+    calls.length = 0
+    const res = await relay('/comment-automations', own, { method: 'POST', body: JSON.stringify({}) })
+    expect(res.status).toBe(400)
+    expect((await res.json()).error.code).toBe('invalid_body')
     expect(calls).toHaveLength(0)
   })
 

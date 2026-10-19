@@ -215,10 +215,13 @@ export async function meterOutboundMessage(
   const used = await db.socialMessage.count({
     where: { workspaceId, direction: 'outgoing', metered: true, sentAt: { gte: monthStart } },
   })
-  const billableUnits = Math.max(0, used - SOCIAL_DM_FREE_UNITS_PER_MONTH)
-  if (billableUnits <= 0) return NOTHING
+  // This message is the marginal unit, so it costs one unit or nothing. Billing
+  // `used - allowance` here would charge the month's running total again on every
+  // message: the third DM past the allowance would take three units, and the
+  // overcharge grows quadratically.
+  if (used <= SOCIAL_DM_FREE_UNITS_PER_MONTH) return NOTHING
 
-  const rawUsd = round6(billableUnits * SOCIAL_DM_PROVIDER_USD)
+  const rawUsd = SOCIAL_DM_PROVIDER_USD
   try {
     await recordCharge({
       workspaceId,
@@ -226,7 +229,7 @@ export async function meterOutboundMessage(
       rawUsd,
       metadata: {
         messageId,
-        units: billableUnits,
+        units: 1,
         usedThisMonth: used,
         freeUnitsThisMonth: SOCIAL_DM_FREE_UNITS_PER_MONTH,
       },

@@ -306,6 +306,18 @@ const ACCEPTED_UNIQUE_KEYS: UniqueKeyRule[] = [
       '`zernio:<provider event id>` is assigned by Zernio and is the same string on every region; the webhook ingress writes it once and a provider retry re-reads that row instead of inserting.',
   },
   {
+    key: 'SocialAutomation.zernioResourceId',
+    category: 'external_global_id',
+    reason:
+      'Zernio assigns a comment-automation id (or a workflow id) globally and echoes it on every `workflow.run.*` webhook, so the row the relay records on create and the row the run webhook resolves are the same one; ownership is still checked against the row\'s workspaceId before any write.',
+  },
+  {
+    key: 'SocialAutomationRun.zernioExecutionId',
+    category: 'external_global_id',
+    reason:
+      'One provider execution has one id on every region, so a redelivered run webhook updates its row instead of counting the run twice — which is what makes `automationRuns` a fact rather than a counter.',
+  },
+  {
     key: 'SocialConversation.zernioConversationId',
     category: 'external_global_id',
     reason:

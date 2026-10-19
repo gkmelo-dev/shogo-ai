@@ -40,6 +40,8 @@ const ARRAY_FIELDS = new Set([
   'schemas', 'affectedPackages', 'applicablePatterns', 'acceptanceCriteria',
   'given', 'then', 'completedTasks', 'failedTasks', 'tags', 'supportedConfig',
   'screenshotUrls',
+  // Social automation keywords (String[] on PG, JSON String on SQLite)
+  'keywords',
   // ProjectAuthConfig allowlist fields
   'allowedEmails', 'allowedDomains',
   // ModelDefinition alias list (Json? on PG, String? JSON on SQLite)

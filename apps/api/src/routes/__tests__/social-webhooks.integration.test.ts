@@ -700,3 +700,71 @@ describe('relayed delivery: a local-scope DM lands in the desktop inbox once', (
     expect(conversation.unreadCount).toBe(1)
   })
 })
+
+/**
+ * Automation runs arrive as provider events, not as a poll: the same signed
+ * ingress that carries a comment carries the run that an automation did or did
+ * not complete, and the run row is what analytics counts.
+ */
+describe('an automation run lands on the row the relay recorded', () => {
+  const resourceId = `wf_${suffix}`
+  const executionId = `exec_${suffix}`
+  let automationId = ''
+
+  beforeAll(async () => {
+    // The cloud scope already has exactly one profile (one workspace, one brand),
+    // so reuse it rather than trying to insert a second.
+    const profile =
+      (await db.socialProfile.findFirst({
+        where: { workspaceId: cloudWorkspace, localWorkspaceId: '' },
+      })) ??
+      (await db.socialProfile.create({
+        data: {
+          workspaceId: cloudWorkspace,
+          localWorkspaceId: '',
+          zernioProfileId: `zp_runs_${suffix}`,
+          externalId: `ws_${cloudWorkspace}`,
+          name: 'Runs',
+        },
+      }))
+    const account = await db.socialAccount.create({
+      data: {
+        workspaceId: cloudWorkspace,
+        profileId: profile.id,
+        zernioAccountId: `zacc_runs_${suffix}`,
+        platform: 'instagram',
+        username: `runs_${suffix}`,
+        isActive: true,
+      },
+    })
+    const automation = await db.socialAutomation.create({
+      data: {
+        workspaceId: cloudWorkspace,
+        accountId: account.id,
+        kind: 'sequence',
+        zernioResourceId: resourceId,
+        platform: 'instagram',
+        name: 'Merge funnel',
+        mode: 'static',
+        status: 'active',
+        keywords: ['merge'],
+      },
+    })
+    automationId = automation.id
+  })
+
+  const runEvent = () =>
+    zernioEvent(`ws_${cloudWorkspace}`, 'workflow.run.completed', {
+      run: { executionId, workflowId: resourceId, status: 'completed' },
+    })
+
+  test('a completed run is counted once, and a redelivery does not count it again', async () => {
+    await signedHook(runEvent(), `evt_run_${suffix}`)
+    await signedHook(runEvent(), `evt_run_${suffix}`)
+
+    expect(await db.socialAutomationRun.count({ where: { workspaceId: cloudWorkspace, automationId } })).toBe(1)
+    const automation = await db.socialAutomation.findUnique({ where: { id: automationId } })
+    expect(automation.runCount).toBe(1)
+    expect(automation.lastRunAt).not.toBeNull()
+  })
+})

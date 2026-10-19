@@ -19,6 +19,7 @@ import { SocialError, getSocialClient, type SocialClient } from './client'
 import { externalIdFor, getProfile, recordProfileMapping, type SocialProfileRow } from './profiles.service'
 import { planRelayRequest } from './relay-plan'
 import { normalizeZernioAccount, upsertAccount } from './accounts.service'
+import { storeAutomation } from './automations.service'
 import {
   assertSocialBudget,
   meterXPost,
@@ -52,6 +53,17 @@ async function postBelongsToWorkspace(workspaceId: string, zernioPostId: string)
   return !!row
 }
 
+/** An automation or workflow id we recorded for this workspace (see `recordAutomation`). */
+async function automationBelongsToWorkspace(
+  workspaceId: string,
+  zernioResourceId: string,
+): Promise<boolean> {
+  const row = await db.socialAutomation.findFirst({
+    where: { workspaceId, zernioResourceId },
+  })
+  return !!row
+}
+
 async function recordAccounts(workspaceId: string, profileId: string, payload: any): Promise<void> {
   const list = Array.isArray(payload) ? payload : (payload?.accounts ?? payload?.data ?? [])
   for (const raw of list) {
@@ -76,9 +88,16 @@ async function recordPost(
 ): Promise<void> {
   const zernioPostId = typeof payload?.id === 'string' ? payload.id : null
   if (!zernioPostId) return
-  const scheduledFor = typeof body?.scheduledFor === 'string' ? new Date(body.scheduledFor) : null
+  const parsedSchedule = typeof body?.scheduledFor === 'string' ? new Date(body.scheduledFor) : null
+  const scheduledFor =
+    parsedSchedule && !Number.isNaN(parsedSchedule.getTime()) ? parsedSchedule : null
   const mediaUrls = Array.isArray(body?.mediaUrls) ? body.mediaUrls : []
-  const publishNow = body?.publishNow === true
+  // Mirrors `createPost`: a draft publishes nothing, a schedule publishes later,
+  // and anything else publishes now. `willPublish` is the billing condition —
+  // only a leg the provider will actually put out is one X charges us for.
+  const isDraft = body?.draft === true
+  const publishNow = body?.publishNow === true || (!isDraft && !scheduledFor)
+  const willPublish = publishNow || scheduledFor !== null
 
   // The relay is where a broadcast is billed, so the cloud keeps the same
   // per-account legs the desktop wrote locally: without them the `social_x_api`
@@ -115,10 +134,10 @@ async function recordPost(
     created = await db.socialPost.create({
       data: {
         workspaceId,
-        status: publishNow ? 'published' : 'scheduled',
+        status: isDraft ? 'draft' : publishNow ? 'published' : 'scheduled',
         content: typeof body?.content === 'string' ? body.content : '',
         mediaJson: mediaUrls.length ? mediaUrls : null,
-        scheduledFor: Number.isNaN(scheduledFor?.getTime() ?? NaN) ? null : scheduledFor,
+        scheduledFor,
         publishedAt: publishNow ? new Date() : null,
         zernioPostId,
         // Already unique per tenant; the prefix keeps a desktop's hash from
@@ -134,9 +153,68 @@ async function recordPost(
     return
   }
 
+  if (!willPublish) return
   for (const target of created?.targets ?? []) {
     if (target.platform !== 'x') continue
     await meterXPost(workspaceId, target.id)
+  }
+}
+
+/**
+ * Record the automation the desktop just created at Zernio.
+ *
+ * Same reason `recordPost` exists: the cloud is where the run webhooks land, so
+ * without the row a relayed automation's executions would arrive with a
+ * `workflowId` nothing here recognises — and the ownership check that stops a
+ * caller editing someone else's automation has nothing to check against.
+ */
+async function recordAutomation(
+  workspaceId: string,
+  path: string,
+  body: any,
+  payload: any,
+  localWorkspaceId: string,
+): Promise<void> {
+  const resource =
+    payload?.automation ?? payload?.workflow ?? payload?.data ?? null
+  const zernioResourceId =
+    typeof resource?.id === 'string' ? resource.id : typeof payload?.id === 'string' ? payload.id : null
+  if (!zernioResourceId) return
+
+  const sequence = path.startsWith('/workflows')
+  const zernioAccountId = typeof body?.accountId === 'string' ? body.accountId : ''
+  const account = zernioAccountId
+    ? await db.socialAccount.findFirst({
+        where: { workspaceId, zernioAccountId },
+        select: { id: true, platform: true },
+      })
+    : null
+  if (!account) return
+
+  const kind = sequence ? 'sequence' : body?.dmMessage ? 'comment_dm' : 'keyword_reply'
+  const keywords = Array.isArray(body?.keywords)
+    ? body.keywords.filter((value: unknown): value is string => typeof value === 'string')
+    : []
+  const status =
+    (typeof resource?.status === 'string' && resource.status) ||
+    (body?.isActive === false ? 'draft' : 'active')
+
+  try {
+    await storeAutomation({
+      workspaceId,
+      accountId: account.id,
+      kind,
+      platform: account.platform,
+      name: typeof body?.name === 'string' && body.name ? body.name : 'Automation',
+      mode: 'static',
+      status,
+      keywords,
+      zernioResourceId,
+      config: { ...(body ?? {}), localWorkspaceId },
+    })
+  } catch (err: any) {
+    // The provider already created it; a duplicate relay collapses onto one row.
+    if (err?.code !== 'P2002') throw err
   }
 }
 
@@ -198,6 +276,16 @@ export async function relayOperation(args: {
     }
   }
 
+  if (
+    plan.verifyAutomationId &&
+    !(await automationBelongsToWorkspace(args.workspaceId, plan.verifyAutomationId))
+  ) {
+    return {
+      status: 403,
+      body: new SocialError(403, 'automation_out_of_scope', 'That automation belongs to another workspace.').toJSON(),
+    }
+  }
+
   // The wallet is asked before the provider is: a connect adds a monthly account
   // charge and a broadcast can carry X's per-post charge. `402` here costs the
   // user nothing; a call we then have to collect on costs us the provider bill.
@@ -211,15 +299,24 @@ export async function relayOperation(args: {
       const body: any = plan.body ?? {}
       const content = typeof body.content === 'string' ? body.content : ''
       const platforms: any[] = Array.isArray(body.platforms) ? body.platforms : []
-      await assertSocialBudget(
-        args.workspaceId,
-        projectedPublishRawUsd(
-          platforms.map((platform: any) => ({
-            platform: typeof platform?.platform === 'string' ? platform.platform : '',
-            content: typeof platform?.customContent === 'string' ? platform.customContent : content,
-          })),
-        ),
-      )
+      // A draft is never published, so it is never billed — asking the wallet
+      // first would refuse to save a draft on a workspace that cannot afford a
+      // post.
+      const isDraft = body.draft === true
+      const scheduled =
+        typeof body.scheduledFor === 'string' && !Number.isNaN(new Date(body.scheduledFor).getTime())
+      const publishNow = body.publishNow === true || (!isDraft && !scheduled)
+      if (publishNow || scheduled) {
+        await assertSocialBudget(
+          args.workspaceId,
+          projectedPublishRawUsd(
+            platforms.map((platform: any) => ({
+              platform: typeof platform?.platform === 'string' ? platform.platform : '',
+              content: typeof platform?.customContent === 'string' ? platform.customContent : content,
+            })),
+          ),
+        )
+      }
     }
   } catch (err) {
     if (err instanceof SocialError) return { status: err.status, body: err.toJSON() }
@@ -249,6 +346,8 @@ export async function relayOperation(args: {
     await recordAccounts(args.workspaceId, profile.id, result)
   } else if (plan.record === 'post-created') {
     await recordPost(args.workspaceId, localWorkspaceId, plan.body, result, args.idempotencyKey)
+  } else if (plan.record === 'automation-created') {
+    await recordAutomation(args.workspaceId, plan.path, plan.body, result, localWorkspaceId)
   }
 
   return { status: 200, body: result ?? {} }

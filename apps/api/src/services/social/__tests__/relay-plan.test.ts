@@ -106,12 +106,38 @@ describe('relay scoping', () => {
   })
 
   test('anything outside the allowlist is denied by default', () => {
-    for (const path of ['/analytics', '/workflows', '/webhooks/settings', '/', '/profiles/1/2']) {
+    for (const path of ['/analytics', '/webhooks/settings', '/', '/profiles/1/2']) {
       expect(plan({ path, method: 'POST' })).toMatchObject({
         kind: 'deny',
         code: expect.stringMatching(/relay_path_not_allowed|method_not_allowed|invalid_path/),
       })
     }
+  })
+
+  test('an automation create is pinned to the caller’s profile and account', () => {
+    const result = plan({
+      path: '/comment-automations',
+      method: 'POST',
+      body: { accountId: 'zernio_acc_1', profileId: 'zernio_profile_other', name: 'Merge', dmMessage: 'x' },
+    })
+    expect(result).toMatchObject({
+      kind: 'forward',
+      record: 'automation-created',
+      verifyAccountId: 'zernio_acc_1',
+    })
+    expect((result as any).body.profileId).toBe('zernio_profile_1')
+  })
+
+  test('an automation mutation must name an id the route can verify', () => {
+    expect(plan({ path: '/comment-automations/ca_9', method: 'PATCH', body: { isActive: false } })).toMatchObject({
+      kind: 'forward',
+      verifyAutomationId: 'ca_9',
+    })
+    expect(plan({ path: '/workflows/wf_9/activate', method: 'POST' })).toMatchObject({
+      kind: 'forward',
+      path: '/workflows/wf_9/activate',
+      verifyAutomationId: 'wf_9',
+    })
   })
 
   test('operations that need a profile are refused before the provider is called', () => {

@@ -39,8 +39,9 @@ export interface SocialAnalytics {
     comments: number
     awaitingReply: number
     replied: number
-    /** Comment→DM automations are P5; until then this is always 0. */
+    /** Automation executions recorded in the range (one row per provider run). */
     automationRuns: number
+    automations: { active: number; paused: number; failedRuns: number }
   }
   inbox: {
     conversations: number
@@ -155,6 +156,15 @@ export async function socialAnalytics(
     where: { workspaceId, isActive: true, needsReconnect: true },
   })
 
+  // Automation runs are counted from one row per provider execution, so the
+  // window is a real range question rather than a lifetime counter.
+  const [automationRuns, failedRuns, automationsActive, automationsPaused] = await Promise.all([
+    db.socialAutomationRun.count({ where: { workspaceId, startedAt: inRange } }),
+    db.socialAutomationRun.count({ where: { workspaceId, startedAt: inRange, status: 'failed' } }),
+    db.socialAutomation.count({ where: { workspaceId, status: 'active' } }),
+    db.socialAutomation.count({ where: { workspaceId, status: 'paused' } }),
+  ])
+
   return {
     from: from.toISOString(),
     to: to.toISOString(),
@@ -170,7 +180,8 @@ export async function socialAnalytics(
       comments: (commentStatus.get('new') ?? 0) + (commentStatus.get('read') ?? 0) + (commentStatus.get('replied') ?? 0),
       awaitingReply: (commentStatus.get('new') ?? 0) + (commentStatus.get('read') ?? 0),
       replied: commentStatus.get('replied') ?? 0,
-      automationRuns: 0,
+      automationRuns,
+      automations: { active: automationsActive, paused: automationsPaused, failedRuns },
     },
     inbox: {
       conversations,

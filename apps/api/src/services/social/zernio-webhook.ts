@@ -102,7 +102,10 @@ export function parseZernioEvent(rawBody: string, eventIdHeader: string | null |
     ''
   if (!type || !externalId || !id) return null
 
-  const detailKey = type.split('.')[0] ?? ''
+  // A `workflow.run.*` event carries its execution under `run`, not under the
+  // event's own first segment — reading `payload.workflow` there would hand the
+  // run recorder `null` and every automation would silently count zero runs.
+  const detailKey = type.startsWith('workflow.run') ? 'run' : (type.split('.')[0] ?? '')
   const detail = detailKey && payload[detailKey] !== undefined ? payload[detailKey] : (payload.data ?? null)
   return { id, type, externalId, account: accountFromPayload(payload), detail, payload }
 }

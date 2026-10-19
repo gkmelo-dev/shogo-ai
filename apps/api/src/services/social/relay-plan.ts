@@ -16,10 +16,12 @@ export type RelayPlan =
       query: Record<string, string>
       body?: unknown
       /** Post-forward bookkeeping the cloud needs to own: routing + billing. */
-      record?: 'profile-created' | 'accounts-listed' | 'post-created'
+      record?: 'profile-created' | 'accounts-listed' | 'post-created' | 'automation-created'
       /** Resource id the route must prove belongs to the caller first. */
       verifyAccountId?: string
       verifyPostId?: string
+      /** An automation/workflow id this workspace already recorded. */
+      verifyAutomationId?: string
     }
   | { kind: 'deny'; status: number; code: string; message: string }
 
@@ -271,6 +273,99 @@ export function planRelayRequest(args: {
       return { kind: 'forward', path, query: {}, body, verifyAccountId: accountId }
     }
     return deny(405, 'method_not_allowed', `${method} ${args.path} is not relayed`)
+  }
+
+  // ── automations: comment→DM and DM sequences ────────────────────────────
+  //
+  // Same rule as posts: the profile is forced onto the caller's own, an account
+  // in the body has to be proved, and a resource id has to be one we recorded
+  // for this workspace — an automation sends DMs, so a cross-tenant id would be
+  // sending messages as somebody else.
+  if (seg[0] === 'comment-automations' && seg.length === 1) {
+    const missing = needsProfile(args.profile)
+    if (missing) return missing
+    if (method === 'GET') {
+      return {
+        kind: 'forward',
+        path: '/comment-automations',
+        query: { profileId: args.profile!.zernioProfileId },
+      }
+    }
+    if (method === 'POST') {
+      const accountId = typeof args.body?.accountId === 'string' ? args.body.accountId : ''
+      if (!accountId) return deny(400, 'invalid_body', 'accountId is required for an automation')
+      return {
+        kind: 'forward',
+        path: '/comment-automations',
+        query: {},
+        body: { ...(args.body ?? {}), profileId: args.profile!.zernioProfileId },
+        record: 'automation-created',
+        verifyAccountId: accountId,
+      }
+    }
+    return deny(405, 'method_not_allowed', `${method} /comment-automations is not relayed`)
+  }
+
+  if (seg[0] === 'comment-automations' && seg.length === 2) {
+    const missing = needsProfile(args.profile)
+    if (missing) return missing
+    if (!['GET', 'PATCH', 'DELETE'].includes(method)) {
+      return deny(405, 'method_not_allowed', `${method} /comment-automations/:id is not relayed`)
+    }
+    return {
+      kind: 'forward',
+      path: `/comment-automations/${encodeURIComponent(seg[1]!)}`,
+      query: {},
+      body: method === 'PATCH' ? { ...(args.body ?? {}) } : undefined,
+      verifyAutomationId: seg[1]!,
+    }
+  }
+
+  if (seg[0] === 'workflows' && seg.length === 1) {
+    const missing = needsProfile(args.profile)
+    if (missing) return missing
+    if (method === 'GET') {
+      return {
+        kind: 'forward',
+        path: '/workflows',
+        query: { profileId: args.profile!.zernioProfileId },
+      }
+    }
+    if (method === 'POST') {
+      const accountId = typeof args.body?.accountId === 'string' ? args.body.accountId : ''
+      if (!accountId) return deny(400, 'invalid_body', 'accountId is required for a workflow')
+      return {
+        kind: 'forward',
+        path: '/workflows',
+        query: {},
+        body: { ...(args.body ?? {}), profileId: args.profile!.zernioProfileId },
+        record: 'automation-created',
+        verifyAccountId: accountId,
+      }
+    }
+    return deny(405, 'method_not_allowed', `${method} /workflows is not relayed`)
+  }
+
+  if (seg[0] === 'workflows' && (seg.length === 2 || (seg.length === 3 && seg[2] === 'activate'))) {
+    const missing = needsProfile(args.profile)
+    if (missing) return missing
+    const activation = seg.length === 3
+    if (activation) {
+      if (method !== 'POST') {
+        return deny(405, 'method_not_allowed', `${method} /workflows/:id/activate is not relayed`)
+      }
+    } else if (!['GET', 'PATCH', 'DELETE'].includes(method)) {
+      return deny(405, 'method_not_allowed', `${method} /workflows/:id is not relayed`)
+    }
+    return {
+      kind: 'forward',
+      path: activation
+        ? `/workflows/${encodeURIComponent(seg[1]!)}/activate`
+        : `/workflows/${encodeURIComponent(seg[1]!)}`,
+      query: {},
+      body: method === 'PATCH' ? { ...(args.body ?? {}) } : undefined,
+      verifyAutomationId: seg[1]!,
+    }
   }
 
   return deny(403, 'relay_path_not_allowed', `The relay does not serve ${method} ${args.path}.`)

@@ -202,6 +202,8 @@ model Workspace {
   socialConversations    SocialConversation[]
   socialMessages         SocialMessage[]
   socialComments         SocialComment[]
+  socialAutomations      SocialAutomation[]
+  socialAutomationRuns   SocialAutomationRun[]
 
   @@index([parentWorkspaceId])
   @@map("workspaces")
@@ -3985,6 +3987,7 @@ model SocialAccount {
   targets   SocialPostTarget[]
   conversations SocialConversation[]
   comments  SocialComment[]
+  automations SocialAutomation[]
 
   @@unique([workspaceId, platform, username])
   @@index([workspaceId, platform])
@@ -4175,4 +4178,69 @@ model SocialComment {
   @@index([workspaceId, status])
   @@index([zernioPostId])
   @@map("social_comments")
+}
+
+/// A ManyChat-style automation the workspace runs on one connected account.
+///
+/// Zernio owns the execution: a `comment_dm`/`keyword_reply` row mirrors a
+/// comment automation (`POST /v1/comment-automations`), and a `sequence` row
+/// mirrors a workflow graph (`POST /v1/workflows`). This table is what we bill,
+/// count and show — never a second scheduler. `runCount`/`lastRunAt` are moved
+/// by the automation webhooks, not by a sweep.
+model SocialAutomation {
+  id               String    @id @default(uuid())
+  workspaceId      String
+  accountId        String?
+  /// comment_dm | keyword_reply | sequence
+  kind             String    @default("comment_dm")
+  /// The provider's own id: a comment automation id or a workflow id.
+  zernioResourceId String?   @unique
+  platform         String
+  name             String
+  /// static (fixed copy) | agent (the agent writes the DM)
+  mode             String    @default("static")
+  /// draft | active | paused
+  status           String    @default("active")
+  /// JSON-encoded string[]: SQLite has no list type.
+  keywords         String    @default("[]")
+  /// The provider request this row mirrors, so a later edit can be replayed.
+  config           Json?
+  runCount         Int       @default(0)
+  lastRunAt        DateTime?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  workspace Workspace             @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  account   SocialAccount?        @relation(fields: [accountId], references: [id], onDelete: SetNull)
+  runs      SocialAutomationRun[]
+
+  @@index([workspaceId, status])
+  @@index([workspaceId, kind])
+  @@map("social_automations")
+}
+
+/// One execution of an automation, from the provider's own run webhooks.
+///
+/// A row per execution (not a counter on the automation) is what lets analytics
+/// answer "how many runs in this range" honestly; the provider's execution id is
+/// globally unique, so a redelivered `workflow.run.completed` collapses onto the
+/// same row instead of inflating the count.
+model SocialAutomationRun {
+  id                String    @id @default(uuid())
+  workspaceId       String
+  automationId      String?
+  zernioExecutionId String    @unique
+  /// running | completed | exited | failed
+  status            String    @default("running")
+  error             String?
+  startedAt         DateTime  @default(now())
+  endedAt           DateTime?
+  createdAt         DateTime  @default(now())
+
+  workspace  Workspace         @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  automation SocialAutomation? @relation(fields: [automationId], references: [id], onDelete: SetNull)
+
+  @@index([workspaceId, startedAt])
+  @@index([automationId])
+  @@map("social_automation_runs")
 }

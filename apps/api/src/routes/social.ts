@@ -39,6 +39,13 @@ import {
 } from '../services/social/inbox.service'
 import { LOCAL_SCOPE_HEADER } from '../services/social/client'
 import { socialAnalytics } from '../services/social/analytics.service'
+import {
+  createAutomation,
+  deleteAutomation,
+  getAutomation,
+  listAutomations,
+  setAutomationStatus,
+} from '../services/social/automations.service'
 import { isScopeId, localScopeFor } from '../services/social/local-scope'
 import {
   ZERNIO_EVENT_ID_HEADER,
@@ -499,6 +506,69 @@ export function socialRoutes(config: SocialRoutesConfig): Hono {
     }
   })
 
+  // ── automations: comment→DM and DM sequences ────────────────────────────
+  router.get('/workspaces/:workspaceId/social/automations', async (c) => {
+    const workspaceId = c.req.param('workspaceId')
+    const userId = await requireMember(c, workspaceId)
+    if (userId instanceof Response) return userId
+    return c.json({
+      automations: await listAutomations(workspaceId, {
+        status: c.req.query('status') ?? null,
+        kind: c.req.query('kind') ?? null,
+        limit: Number(c.req.query('limit') ?? 50),
+      }),
+    })
+  })
+
+  router.post('/workspaces/:workspaceId/social/automations', async (c) => {
+    const workspaceId = c.req.param('workspaceId')
+    const userId = await requireMember(c, workspaceId)
+    if (userId instanceof Response) return userId
+    const body = await readJson(c)
+    try {
+      return c.json({ automation: await createAutomation(workspaceId, body) }, 201)
+    } catch (err) {
+      return errorResponse(c, err)
+    }
+  })
+
+  router.get('/workspaces/:workspaceId/social/automations/:automationId', async (c) => {
+    const workspaceId = c.req.param('workspaceId')
+    const userId = await requireMember(c, workspaceId)
+    if (userId instanceof Response) return userId
+    try {
+      return c.json({ automation: await getAutomation(workspaceId, c.req.param('automationId')) })
+    } catch (err) {
+      return errorResponse(c, err)
+    }
+  })
+
+  router.patch('/workspaces/:workspaceId/social/automations/:automationId', async (c) => {
+    const workspaceId = c.req.param('workspaceId')
+    const userId = await requireMember(c, workspaceId)
+    if (userId instanceof Response) return userId
+    const body = await readJson(c)
+    try {
+      return c.json({
+        automation: await setAutomationStatus(workspaceId, c.req.param('automationId'), body.status),
+      })
+    } catch (err) {
+      return errorResponse(c, err)
+    }
+  })
+
+  router.delete('/workspaces/:workspaceId/social/automations/:automationId', async (c) => {
+    const workspaceId = c.req.param('workspaceId')
+    const userId = await requireMember(c, workspaceId)
+    if (userId instanceof Response) return userId
+    try {
+      await deleteAutomation(workspaceId, c.req.param('automationId'))
+      return c.json({ ok: true })
+    } catch (err) {
+      return errorResponse(c, err)
+    }
+  })
+
   return router
 }
 
@@ -667,6 +737,57 @@ export function agentSocialRoutes(config: AgentSocialRoutesConfig): Hono {
         },
         201,
       )
+    } catch (err) {
+      return errorResponse(c, err)
+    }
+  })
+
+  router.get('/workspaces/:workspaceId/social/automations', async (c) => {
+    const auth = await authorize(c)
+    if (auth instanceof Response) return auth
+    return c.json({
+      automations: await listAutomations(auth.workspaceId, {
+        status: c.req.query('status') ?? null,
+        kind: c.req.query('kind') ?? null,
+        limit: Number(c.req.query('limit') ?? 50),
+      }),
+    })
+  })
+
+  router.post('/workspaces/:workspaceId/social/automations', async (c) => {
+    const auth = await authorize(c)
+    if (auth instanceof Response) return auth
+    const body = await readJson(c)
+    try {
+      return c.json({ automation: await createAutomation(auth.workspaceId, body) }, 201)
+    } catch (err) {
+      return errorResponse(c, err)
+    }
+  })
+
+  router.patch('/workspaces/:workspaceId/social/automations/:automationId', async (c) => {
+    const auth = await authorize(c)
+    if (auth instanceof Response) return auth
+    const body = await readJson(c)
+    try {
+      return c.json({
+        automation: await setAutomationStatus(
+          auth.workspaceId,
+          c.req.param('automationId'),
+          body.status,
+        ),
+      })
+    } catch (err) {
+      return errorResponse(c, err)
+    }
+  })
+
+  router.delete('/workspaces/:workspaceId/social/automations/:automationId', async (c) => {
+    const auth = await authorize(c)
+    if (auth instanceof Response) return auth
+    try {
+      await deleteAutomation(auth.workspaceId, c.req.param('automationId'))
+      return c.json({ ok: true })
     } catch (err) {
       return errorResponse(c, err)
     }

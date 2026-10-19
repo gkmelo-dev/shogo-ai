@@ -72,6 +72,8 @@ const EXEMPT: Record<string, string> = {
   socialMessage: 'Written by the webhook ingress and the backfill sweep under its conversation, and by the reply route /api/workspaces/:workspaceId/social/inbox/conversations/:id/messages — resolved by path workspaceId.',
   socialComment: 'Written by the webhook ingress and the backfill sweep (keyed on the provider comment id), replied to only via /api/workspaces/:workspaceId/social/comments/:id/reply — resolved by path workspaceId.',
   socialRelayedEvent: 'No REST row route: written only by the verified Zernio webhook ingress, keyed on the globally unique `zernio:<provider event id>` (see the external_global_id rule in check-multiregion-cron-locks.ts), and read/acked only via /api/social-relay/events*, which is scoped by the caller\'s workspace key (auth.workspaceId).',
+  socialAutomation: 'Mutated only via /api/workspaces/:workspaceId/social/automations* (create, pause/resume, delete) — resolved by path workspaceId; the relay records a desktop-created row and verifies ownership of it by zernioResourceId.',
+  socialAutomationRun: 'Append-only execution rows written as a side effect of the provider run webhook (keyed on the globally unique execution id) — never mutated via REST.',
   chatInstallation: 'Mutated via /api/workspaces/:workspaceId/chat-installations routes (path workspaceId, admin-gated), the Slack OAuth callback (workspaceId from signed OAuth state), and the `connect <code>` chat command (workspaceId from a signed connect code).',
   chatReminder: 'Mutated via workspace-scoped chat reminder routes — resolved by path workspaceId.',
   chatUserSettings: 'Mutated via workspace-scoped chat settings routes — resolved by path workspaceId.',
