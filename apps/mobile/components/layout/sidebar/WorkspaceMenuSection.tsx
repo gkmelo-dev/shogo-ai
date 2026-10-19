@@ -18,7 +18,7 @@ import { AccountSettingsGroup } from "./AccountSettingsGroup";
 import { isCloudWorkspace, useCloudWorkspaces } from "../../../lib/workspace-route";
 import { workspaceColor, workspaceInitial } from "../../../lib/workspace-color";
 import { useCloudSession } from "../../../hooks/useCloudSession";
-import { useDomainHttpOptional } from "../../../contexts/domain";
+import { getDomainHttpClient, useDomainHttpOptional } from "../../../contexts/domain";
 import { isPhoneLayout } from "../../../lib/native-phone-layout";
 
 export interface WorkspaceMenuSectionProps {
@@ -117,10 +117,12 @@ export function WorkspaceMenuSection({
   // Switching workspaces deliberately leaves runtimes warm, so an agent can be
   // mid-turn in a workspace the user just left. Say so here instead of letting
   // that work look like it vanished (Decision 3).
-  // Rendered outside SDKDomainProvider on desktop (the popover hangs off the
-  // rail), so this must be the non-throwing accessor: no provider just means
-  // no badge.
-  const http = useDomainHttpOptional();
+  // The wide-web popover renders through a portal outside `SDKDomainProvider`,
+  // so a context read gives nothing there. Fall back to the provider's own
+  // singleton client (same instance, no context needed) — the badge has to work
+  // on desktop, which is where it matters.
+  const contextHttp = useDomainHttpOptional();
+  const http = contextHttp ?? getDomainHttpClient();
   const [busyElsewhere, setBusyElsewhere] = useState(0);
   useEffect(() => {
     setBusyElsewhere(0);

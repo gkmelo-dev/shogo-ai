@@ -4,6 +4,7 @@ export {
   SDKDomainProvider,
   useSDKDomain,
   useSDKDomains,
+  getSDKHttpClient,
   useSDKHttp,
   useSDKHttpOptional,
   useSDKReady,

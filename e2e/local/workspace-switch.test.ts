@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Shogo Technologies, Inc.
-import { test, expect, type Page, type Locator } from "@playwright/test"
+import { test, expect, type Page, type Locator, type Request as PlaywrightRequest } from "@playwright/test"
 import { LOCAL_API_BASE } from "./helpers"
 
 /**
@@ -240,6 +240,33 @@ test.describe("Workspace switching (local mode)", () => {
     await switchWorkspaceWide(page, WORKSPACE_A)
     await switchWorkspaceWide(page, WORKSPACE_B)
     await switchWorkspaceWide(page, WORKSPACE_A)
+  })
+
+  test("wide desktop (1280×800): the switcher asks for workspace activity", async () => {
+    test.setTimeout(60_000)
+    await page.setViewportSize({ width: 1280, height: 800 })
+
+    // "Working in N other workspaces" (Decision 3) is fed by
+    // /api/workspaces/activity. The popover renders through a portal outside
+    // SDKDomainProvider, so a context-only client silently skipped the request
+    // and the badge never appeared on the surface this card is about (QA round
+    // 2). Count the request rather than staging a live agent turn.
+    const activityRequests: string[] = []
+    const onRequest = (request: PlaywrightRequest) => {
+      if (new URL(request.url()).pathname === "/api/workspaces/activity") {
+        activityRequests.push(request.url())
+      }
+    }
+    page.on("request", onRequest)
+    try {
+      const trigger = await goHome(page)
+      await openAccountPopover(page, trigger)
+      await expect(page.getByLabel("Sign in to Shogo Cloud")).toBeVisible({ timeout: 10_000 })
+      await expect.poll(() => activityRequests.length, { timeout: 10_000 }).toBeGreaterThan(0)
+    } finally {
+      page.off("request", onRequest)
+      await page.keyboard.press("Escape")
+    }
   })
 
   test("narrow web (390×844): switches both directions via the /account screen", async () => {
