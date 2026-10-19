@@ -3940,17 +3940,19 @@ model ProblemOccurrence {
 // Json? columns are stored as JSON strings; String[] as JSON-encoded String.
 
 model SocialProfile {
-  id              String   @id @default(uuid())
-  workspaceId     String   @unique
-  zernioProfileId String   @unique
-  externalId      String   @unique
-  name            String
-  createdAt       DateTime @default(now())
-  updatedAt       DateTime @updatedAt
+  id               String   @id @default(uuid())
+  workspaceId      String
+  localWorkspaceId String   @default("")
+  zernioProfileId  String   @unique
+  externalId       String   @unique
+  name             String
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
 
   workspace Workspace       @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
   accounts  SocialAccount[]
 
+  @@unique([workspaceId, localWorkspaceId])
   @@map("social_profiles")
 }
 

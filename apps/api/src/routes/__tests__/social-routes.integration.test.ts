@@ -63,7 +63,8 @@ beforeAll(async () => {
     mode: 'cloud',
     async request(req: any) {
       calls.push(req)
-      if (req.path === '/profiles') return { id: 'zernio_profile_1', externalId: workspaceId }
+      // Zernio echoes the routing id we created the profile with.
+      if (req.path === '/profiles') return { id: 'zernio_profile_1', externalId: req.body?.externalId ?? workspaceId }
       if (req.path === '/connect/instagram') return { url: 'https://zernio.com/connect/ig?state=abc' }
       if (req.path === '/accounts' && req.method === 'GET') {
         return {
@@ -128,9 +129,9 @@ describe('social routes', () => {
     expect(res.status).toBe(200)
     expect((await res.json()).url).toBe('https://zernio.com/connect/ig?state=abc')
 
-    const profile = await db.socialProfile.findUnique({ where: { workspaceId } })
-    expect(profile.externalId).toBe(workspaceId)
-    expect(calls.find((call) => call.path === '/profiles').body.externalId).toBe(workspaceId)
+    const profile = await db.socialProfile.findUnique({ where: { workspaceId_localWorkspaceId: { workspaceId, localWorkspaceId: '' } } })
+    expect(profile.externalId).toBe(`ws_${workspaceId}`)
+    expect(calls.find((call) => call.path === '/profiles').body.externalId).toBe(`ws_${workspaceId}`)
   })
 
   test('sync stores the accounts and an unknown platform is refused', async () => {

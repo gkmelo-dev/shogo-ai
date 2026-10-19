@@ -59,7 +59,7 @@ beforeAll(async () => {
   await db.socialAccount.create({
     data: {
       workspaceId: own,
-      profileId: (await db.socialProfile.findUnique({ where: { workspaceId: own } })).id,
+      profileId: (await db.socialProfile.findUnique({ where: { workspaceId_localWorkspaceId: { workspaceId: own, localWorkspaceId: '' } } })).id,
       zernioAccountId: 'acct_own',
       platform: 'instagram',
       username: 'own.ig',
@@ -68,7 +68,7 @@ beforeAll(async () => {
   await db.socialAccount.create({
     data: {
       workspaceId: other,
-      profileId: (await db.socialProfile.findUnique({ where: { workspaceId: other } })).id,
+      profileId: (await db.socialProfile.findUnique({ where: { workspaceId_localWorkspaceId: { workspaceId: other, localWorkspaceId: '' } } })).id,
       zernioAccountId: 'acct_other',
       platform: 'instagram',
       username: 'other.ig',
@@ -108,7 +108,7 @@ describe('relay tenant scoping', () => {
     calls.length = 0
     const res = await relay('/profiles?externalId=victim', own)
     expect(res.status).toBe(200)
-    expect(calls[0].query).toEqual({ externalId: own })
+    expect(calls[0].query).toEqual({ externalId: `ws_${own}` })
   })
 
   test('creating a profile forces the caller’s external id and records the mapping', async () => {
@@ -118,9 +118,9 @@ describe('relay tenant scoping', () => {
       body: JSON.stringify({ name: 'Hijack', externalId: other }),
     })
     expect(res.status).toBe(200)
-    expect(calls[0].body.externalId).toBe(own)
+    expect(calls[0].body.externalId).toBe(`ws_${own}`)
 
-    const created = await db.socialProfile.findUnique({ where: { workspaceId: own } })
+    const created = await db.socialProfile.findUnique({ where: { workspaceId_localWorkspaceId: { workspaceId: own, localWorkspaceId: '' } } })
     expect(created.zernioProfileId).toBe('zernio_created')
   })
 
@@ -146,7 +146,7 @@ describe('relay tenant scoping', () => {
       body: JSON.stringify({ content: 'mine', profileId: 'zernio_other', platforms: [] }),
     })
     expect(res.status).toBe(200)
-    const profile = await db.socialProfile.findUnique({ where: { workspaceId: own } })
+    const profile = await db.socialProfile.findUnique({ where: { workspaceId_localWorkspaceId: { workspaceId: own, localWorkspaceId: '' } } })
     expect(calls[0].body.profileId).toBe(profile.zernioProfileId)
     expect(calls[0].body.profileId).not.toBe('zernio_other')
   })
@@ -274,7 +274,7 @@ describe('relay through the real auth chain (AC7)', () => {
       headers: { authorization: `Bearer ${ownKey}` },
     })
     expect(res.status).toBe(200)
-    const ownProfile = await db.socialProfile.findUnique({ where: { workspaceId: own } })
+    const ownProfile = await db.socialProfile.findUnique({ where: { workspaceId_localWorkspaceId: { workspaceId: own, localWorkspaceId: '' } } })
     expect(calls[0].query).toEqual({ profileId: ownProfile.zernioProfileId })
 
     // And the other tenant's key is scoped to its own profile, not this one.
@@ -282,7 +282,7 @@ describe('relay through the real auth chain (AC7)', () => {
     await chainApp.request('/api/social-relay/accounts', {
       headers: { authorization: `Bearer ${otherKey}` },
     })
-    const otherProfile = await db.socialProfile.findUnique({ where: { workspaceId: other } })
+    const otherProfile = await db.socialProfile.findUnique({ where: { workspaceId_localWorkspaceId: { workspaceId: other, localWorkspaceId: '' } } })
     expect(calls[0].query.profileId).not.toBe(ownProfile.zernioProfileId)
     expect(calls[0].query.profileId).toBe(otherProfile.zernioProfileId)
   })

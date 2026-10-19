@@ -4995,21 +4995,28 @@ model AgentCallSessionLink {
 // workspace. Agencies that manage several client brands use one workspace per
 // client — see the "one idea = one card" note in the channel doc.
 
-/// The workspace's Zernio profile. `externalId` is the workspace id, which is
-/// what Zernio echoes back on every webhook, so the webhook resolves straight
-/// to a workspace and drops ids that have no profile row.
+/// The Zernio profile for one *scope* of a workspace: `localWorkspaceId = ""`
+/// is the workspace itself, and a desktop's local-only workspace carries its
+/// own id so a machine can run several brands without them colliding.
+///
+/// `externalId` is derived and stable — `ws_<workspaceId>` for the cloud scope,
+/// `lws_<localWorkspaceId>` for a desktop scope. It is the only key Zernio
+/// echoes back on a webhook, so a webhook resolves straight to a scope and ids
+/// with no profile row are dropped.
 model SocialProfile {
-  id              String   @id @default(uuid())
-  workspaceId     String   @unique
-  zernioProfileId String   @unique
-  externalId      String   @unique
-  name            String
-  createdAt       DateTime @default(now())
-  updatedAt       DateTime @updatedAt
+  id               String   @id @default(uuid())
+  workspaceId      String
+  localWorkspaceId String   @default("")
+  zernioProfileId  String   @unique
+  externalId       String   @unique
+  name             String
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
 
   workspace Workspace       @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
   accounts  SocialAccount[]
 
+  @@unique([workspaceId, localWorkspaceId])
   @@map("social_profiles")
 }
 

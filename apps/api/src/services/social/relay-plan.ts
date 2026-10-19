@@ -43,8 +43,13 @@ function needsProfile(profile: SocialProfileRow | null): RelayPlan | null {
 }
 
 /**
- * Decide what the relay may do for `workspaceId`, and rewrite the operation so
- * it can only ever touch that workspace's Zernio profile.
+ * Decide what the relay may do for one *scope* of a workspace, and rewrite the
+ * operation so it can only ever touch that scope's Zernio profile.
+ *
+ * `externalId` is the derived routing id for the scope (`ws_<workspaceId>` or
+ * `lws_<localWorkspaceId>`), never a value from the request: a desktop's local
+ * workspaces each own a profile, so the caller's own local scope is the only
+ * thing that may select one.
  */
 export function planRelayRequest(args: {
   method: string
@@ -52,6 +57,9 @@ export function planRelayRequest(args: {
   query: Record<string, string>
   body: any
   workspaceId: string
+  localWorkspaceId?: string
+  /** Derived routing id for the scope; never read from the request. */
+  externalId: string
   profile: SocialProfileRow | null
 }): RelayPlan {
   const method = args.method.toUpperCase()
@@ -64,7 +72,7 @@ export function planRelayRequest(args: {
   if (seg[0] === 'profiles' && seg.length === 1) {
     if (method === 'GET') {
       // Only ever the caller's own profile, resolved by the routing id we own.
-      return { kind: 'forward', path: '/profiles', query: { externalId: args.workspaceId } }
+      return { kind: 'forward', path: '/profiles', query: { externalId: args.externalId } }
     }
     if (method === 'POST') {
       return {
@@ -73,7 +81,7 @@ export function planRelayRequest(args: {
         query: {},
         body: {
           name: typeof args.body?.name === 'string' && args.body.name ? args.body.name : (args.profile?.name ?? 'Shogo workspace'),
-          externalId: args.workspaceId,
+          externalId: args.externalId,
         },
         record: 'profile-created',
       }

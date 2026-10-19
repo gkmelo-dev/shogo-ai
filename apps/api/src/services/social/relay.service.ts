@@ -16,7 +16,7 @@
 
 import { prisma } from '../../lib/prisma'
 import { SocialError, getSocialClient, type SocialClient } from './client'
-import { getProfile, recordProfileMapping, type SocialProfileRow } from './profiles.service'
+import { externalIdFor, getProfile, recordProfileMapping, type SocialProfileRow } from './profiles.service'
 import { planRelayRequest } from './relay-plan'
 import { normalizeZernioAccount, upsertAccount } from './accounts.service'
 
@@ -61,7 +61,13 @@ async function recordAccounts(workspaceId: string, profileId: string, payload: a
   }
 }
 
-async function recordPost(workspaceId: string, body: any, payload: any, key: string | undefined): Promise<void> {
+async function recordPost(
+  workspaceId: string,
+  localWorkspaceId: string,
+  body: any,
+  payload: any,
+  key: string | undefined,
+): Promise<void> {
   const zernioPostId = typeof payload?.id === 'string' ? payload.id : null
   if (!zernioPostId) return
   const scheduledFor = typeof body?.scheduledFor === 'string' ? new Date(body.scheduledFor) : null
@@ -77,7 +83,7 @@ async function recordPost(workspaceId: string, body: any, payload: any, key: str
         zernioPostId,
         // Already unique per tenant; the prefix keeps a desktop's hash from
         // colliding with a cloud-composed post.
-        idempotencyKey: `relay:${workspaceId}:${key ?? zernioPostId}`,
+        idempotencyKey: `relay:${workspaceId}:${localWorkspaceId}:${key ?? zernioPostId}`,
       },
     })
     .catch((err: any) => {
@@ -91,20 +97,30 @@ export interface RelayOutcome {
 }
 
 /**
- * Run one relayed operation for `workspaceId`. Resolves the caller's profile,
- * scopes the operation to it, verifies any resource id it names, performs the
- * call and records what the cloud needs for routing and billing.
+ * Run one relayed operation for one scope of `workspaceId`. Resolves the
+ * scope's profile, scopes the operation to it, verifies any resource id it
+ * names, performs the call and records what the cloud needs for routing and
+ * billing.
+ *
+ * `localWorkspaceId` comes from the caller's `X-Shogo-Local-Workspace` header
+ * and is always read together with the workspace the key resolved to, so a
+ * desktop's second local workspace gets its own profile instead of colliding
+ * with the first. Resource ownership is still proved against the whole cloud
+ * workspace: every local scope of a tenant belongs to that tenant.
  */
 export async function relayOperation(args: {
   workspaceId: string
+  localWorkspaceId?: string
   method: string
   path: string
   query: Record<string, string>
   body: any
   idempotencyKey?: string
 }): Promise<RelayOutcome> {
-  const profile = await getProfile(args.workspaceId)
-  const plan = planRelayRequest({ ...args, profile })
+  const localWorkspaceId = args.localWorkspaceId ?? ''
+  const externalId = externalIdFor(args.workspaceId, localWorkspaceId)
+  const profile = await getProfile(args.workspaceId, localWorkspaceId)
+  const plan = planRelayRequest({ ...args, localWorkspaceId, externalId, profile })
 
   if (plan.kind === 'deny') {
     const error = new SocialError(plan.status, plan.code, plan.message)
@@ -134,6 +150,7 @@ export async function relayOperation(args: {
   }
 
   const result = await client.request<any>({
+    workspaceId: args.workspaceId,
     method: args.method as any,
     path: plan.path,
     query: plan.query,
@@ -143,11 +160,18 @@ export async function relayOperation(args: {
 
   if (plan.record === 'profile-created') {
     const zernioProfileId = typeof result?.id === 'string' ? result.id : null
-    if (zernioProfileId) await recordProfileMapping({ workspaceId: args.workspaceId, zernioProfileId })
+    if (zernioProfileId) {
+      await recordProfileMapping({
+        workspaceId: args.workspaceId,
+        localWorkspaceId,
+        zernioProfileId,
+        externalId: typeof result?.externalId === 'string' && result.externalId ? result.externalId : externalId,
+      })
+    }
   } else if (plan.record === 'accounts-listed' && profile) {
     await recordAccounts(args.workspaceId, profile.id, result)
   } else if (plan.record === 'post-created') {
-    await recordPost(args.workspaceId, plan.body, result, args.idempotencyKey)
+    await recordPost(args.workspaceId, localWorkspaceId, plan.body, result, args.idempotencyKey)
   }
 
   return { status: 200, body: result ?? {} }

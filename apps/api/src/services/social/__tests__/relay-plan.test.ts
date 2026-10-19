@@ -8,12 +8,15 @@
 import { describe, expect, test } from 'bun:test'
 import { planRelayRequest } from '../relay-plan'
 
-const workspaceId = 'ws_own'
+const workspaceId = '11111111-1111-4111-8111-111111111111'
+/** The routing id the cloud derives for the cloud scope. */
+const externalId = `ws_${workspaceId}`
 const profile = {
   id: 'profile_1',
   workspaceId,
+  localWorkspaceId: '',
   zernioProfileId: 'zernio_profile_1',
-  externalId: workspaceId,
+  externalId,
   name: 'Acme',
 }
 
@@ -24,6 +27,7 @@ const plan = (args: Partial<Parameters<typeof planRelayRequest>[0]> = {}) =>
     query: {},
     body: undefined,
     workspaceId,
+    externalId,
     profile,
     ...args,
   })
@@ -31,7 +35,7 @@ const plan = (args: Partial<Parameters<typeof planRelayRequest>[0]> = {}) =>
 describe('relay scoping', () => {
   test('the caller can only ever read its own profile', () => {
     const result = plan({ path: '/profiles', query: { externalId: 'someone_else' } })
-    expect(result).toMatchObject({ kind: 'forward', query: { externalId: workspaceId } })
+    expect(result).toMatchObject({ kind: 'forward', query: { externalId } })
   })
 
   test('a profile create is rewritten onto the caller’s workspace', () => {
@@ -41,7 +45,22 @@ describe('relay scoping', () => {
       body: { name: 'Acme', externalId: 'victim_workspace' },
     })
     expect(result).toMatchObject({ kind: 'forward', record: 'profile-created' })
-    expect((result as any).body).toEqual({ name: 'Acme', externalId: workspaceId })
+    expect((result as any).body).toEqual({ name: 'Acme', externalId })
+  })
+
+  test('each local workspace derives its own routing id, never the request’s', () => {
+    const localScope = '22222222-2222-4222-8222-222222222222'
+    const localPlan = plan({
+      method: 'POST',
+      path: '/profiles',
+      body: { name: 'Acme', externalId: 'ws_victim' },
+      externalId: `lws_${localScope}`,
+      profile: { ...profile, localWorkspaceId: localScope, externalId: `lws_${localScope}` },
+    })
+    expect((localPlan as any).body).toEqual({ name: 'Acme', externalId: `lws_${localScope}` })
+
+    const read = plan({ path: '/profiles', query: { externalId: 'lws_other' }, externalId: `lws_${localScope}` })
+    expect(read).toMatchObject({ kind: 'forward', query: { externalId: `lws_${localScope}` } })
   })
 
   test('another workspace’s profile id is refused', () => {

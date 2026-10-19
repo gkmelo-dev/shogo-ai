@@ -77,6 +77,9 @@ const REQUIRED_LOCAL_ROUTES = [
   'PATCH /api/workspaces/:workspaceId/social/posts/:postId',
   'DELETE /api/workspaces/:workspaceId/social/posts/:postId',
   'GET /api/workspaces/:workspaceId/social/calendar',
+  // The desktop half of webhook routing: a verified event for one of this
+  // machine's local scopes is applied here, in its own DB.
+  'POST /api/social/events',
   // Called by the local agent-runtime; "Trust folder" is dead without it.
   'GET /api/internal/projects/:projectId/trust',
   'GET /api/local/remote-hosts',

@@ -112,6 +112,7 @@ export async function upsertAccount(workspaceId: string, profileId: string, acco
 export async function syncAccounts(workspaceId: string, workspaceName: string): Promise<any[]> {
   const profile = await ensureProfile(workspaceId, workspaceName)
   const payload = await getSocialClient().request<any>({
+    workspaceId,
     method: 'GET',
     path: '/accounts',
     query: { profileId: profile.zernioProfileId },
@@ -154,6 +155,7 @@ export async function connectUrl(args: {
   const profile = await ensureProfile(args.workspaceId, args.workspaceName)
 
   const payload = await getSocialClient().request<any>({
+    workspaceId: args.workspaceId,
     method: 'GET',
     path: `/connect/${platform}`,
     query: { profileId: profile.zernioProfileId, redirect_url: args.redirectUrl },
@@ -205,6 +207,7 @@ export async function disconnectAccount(workspaceId: string, accountRowId: strin
 
   if (row.isActive) {
     await getSocialClient().request({
+      workspaceId,
       method: 'DELETE',
       path: `/accounts/${encodeURIComponent(row.zernioAccountId)}`,
     })

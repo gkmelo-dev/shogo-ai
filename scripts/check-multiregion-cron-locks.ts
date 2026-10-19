@@ -852,10 +852,10 @@ const ACCEPTED_UNIQUE_KEYS: UniqueKeyRule[] = [
       'Reaction toggle under /api/conversation-messages/:id/reactions by the reacting user only; create-or-ignore / deleteMany on the same triple.',
   },
   {
-    key: 'SocialProfile.workspaceId',
+    key: 'SocialProfile.(localWorkspaceId,workspaceId)',
     category: 'single_tenant_upsert',
     reason:
-      'One Zernio profile per workspace, created on the workspace\'s first connect under /api/workspaces/:workspaceId/social/connect (home region) and adopted by externalId if the create raced.',
+      'One Zernio profile per (workspace, local workspace) scope, created on that scope\'s first connect under /api/workspaces/:workspaceId/social/connect (home region) and adopted by externalId if the create raced.',
   },
   {
     key: 'SocialProfile.zernioProfileId',
@@ -867,7 +867,7 @@ const ACCEPTED_UNIQUE_KEYS: UniqueKeyRule[] = [
     key: 'SocialProfile.externalId',
     category: 'external_global_id',
     reason:
-      'The routing key handed to Zernio is the workspace id, so a duplicate means the same workspace created two profiles — the create path resolves it by re-reading the profile for that externalId.',
+      'The routing key handed to Zernio is derived from the scope (ws_<workspaceId> / lws_<localWorkspaceId>), so a duplicate means the same scope created two profiles — the create path resolves it by re-reading the profile for that externalId.',
   },
   {
     key: 'SocialAccount.zernioAccountId',

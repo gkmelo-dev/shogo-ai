@@ -424,7 +424,7 @@ describe('delete removes the Zernio profile (social)', () => {
     const res = await request(`/api/workspaces/${id}`, owner, { method: 'DELETE' })
     expect(res.status).toBe(200)
     expect(deleted).toEqual([`/profiles/zp_${id}`])
-    expect(await db.socialProfile.findUnique({ where: { workspaceId: id } })).toBeNull()
+    expect(await db.socialProfile.findUnique({ where: { workspaceId_localWorkspaceId: { workspaceId: id, localWorkspaceId: '' } } })).toBeNull()
     expect(await db.workspace.findUnique({ where: { id } })).toBeNull()
   })
 
@@ -443,7 +443,7 @@ describe('delete removes the Zernio profile (social)', () => {
       const body: any = await res.json()
       expect(body.warnings.join(' | ')).toContain('social profile: provider_unreachable: Zernio is down')
       // The workspace still goes; only the charge is left behind, and loudly.
-      expect(await db.socialProfile.findUnique({ where: { workspaceId: id } })).toBeNull()
+      expect(await db.socialProfile.findUnique({ where: { workspaceId_localWorkspaceId: { workspaceId: id, localWorkspaceId: '' } } })).toBeNull()
       expect(await db.workspace.findUnique({ where: { id } })).toBeNull()
     } finally {
       setSocialClient(fake)

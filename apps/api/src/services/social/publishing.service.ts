@@ -246,6 +246,7 @@ export async function dispatchPost(
   }
 
   const result = await getSocialClient().request<any>({
+    workspaceId,
     method: 'POST',
     path: '/posts',
     body,
@@ -384,6 +385,7 @@ export async function updatePost(
     if (Object.keys(providerPatch).length) {
       const stamp = data.scheduledFor ? (data.scheduledFor as Date).getTime() : 'cleared'
       await getSocialClient().request({
+        workspaceId,
         method: 'PATCH',
         path: `/posts/${encodeURIComponent(post.zernioPostId)}`,
         body: providerPatch,
@@ -407,6 +409,7 @@ export async function deletePost(workspaceId: string, postId: string): Promise<{
   // queued and it still ships. Cancel there first; keep our row if that fails.
   if (post.zernioPostId) {
     await getSocialClient().request({
+      workspaceId,
       method: 'DELETE',
       path: `/posts/${encodeURIComponent(post.zernioPostId)}`,
     })

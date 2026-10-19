@@ -3,6 +3,7 @@
 
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
 import {
+  LOCAL_SCOPE_HEADER,
   SOCIAL_RELAY_PATH,
   SocialError,
   getSocialClient,
@@ -142,6 +143,42 @@ describe('social client requests', () => {
     expect(seen!.init.headers.Authorization).toBe('Bearer zernio_master')
     expect(seen!.init.headers['Idempotency-Key']).toBe('abc123')
     expect(JSON.parse(seen!.init.body)).toEqual({ content: 'hello' })
+  })
+
+  test('relays the local workspace scope so the cloud can keep one profile per scope', async () => {
+    process.env.SHOGO_LOCAL_MODE = '1'
+    process.env.SHOGO_API_KEY = 'shogo_sk_desktop'
+    process.env.SOCIAL_MODE = 'relay'
+    delete process.env.ZERNIO_API_KEY
+
+    const localWorkspaceId = crypto.randomUUID()
+    let seen: any = null
+    globalThis.fetch = mock(async (_url: any, init: any) => {
+      seen = init
+      return jsonResponse({ profiles: [] })
+    }) as any
+
+    await getSocialClient().request({ method: 'GET', path: '/profiles', workspaceId: localWorkspaceId })
+
+    // The cloud reads this together with the key: this desktop's own workspace
+    // is a scope of its own, not the cloud workspace the key belongs to.
+    expect(seen.headers[LOCAL_SCOPE_HEADER]).toBe(localWorkspaceId)
+  })
+
+  test('a call with no workspace scope sends no scope header', async () => {
+    process.env.SHOGO_LOCAL_MODE = '1'
+    process.env.SHOGO_API_KEY = 'shogo_sk_desktop'
+    process.env.SOCIAL_MODE = 'relay'
+    delete process.env.ZERNIO_API_KEY
+
+    let seen: any = null
+    globalThis.fetch = mock(async (_url: any, init: any) => {
+      seen = init
+      return jsonResponse({ id: 'post_1' })
+    }) as any
+
+    await getSocialClient().request({ method: 'GET', path: '/profiles' })
+    expect(seen.headers[LOCAL_SCOPE_HEADER]).toBeUndefined()
   })
 
   test('an unreachable provider is a 502, not a thrown fetch error', async () => {

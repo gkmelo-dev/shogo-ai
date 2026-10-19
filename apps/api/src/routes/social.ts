@@ -18,6 +18,14 @@ import { prisma } from '../lib/prisma'
 import { getFrontendUrl } from '../lib/cloud-urls'
 import { getWorkspaceRole } from '../services/conversation.service'
 import { relayOperation } from '../services/social/relay.service'
+import { LOCAL_SCOPE_HEADER } from '../services/social/client'
+import { isScopeId, localScopeFor } from '../services/social/local-scope'
+import {
+  ZERNIO_EVENT_ID_HEADER,
+  ZERNIO_SIGNATURE_HEADER,
+  applySocialEvent,
+  handleZernioWebhook,
+} from '../services/social/webhooks'
 import {
   SocialError,
   calendar,
@@ -109,8 +117,9 @@ export function socialRoutes(config: SocialRoutesConfig): Hono {
     const workspaceId = c.req.param('workspaceId')
     const userId = await requireMember(c, workspaceId)
     if (userId instanceof Response) return userId
+    // A desktop stores this workspace's profile under its own local scope.
     const [profile, accounts] = await Promise.all([
-      getProfile(workspaceId),
+      getProfile(workspaceId, await localScopeFor(workspaceId)),
       listAccounts(workspaceId),
     ])
     let mode: string = 'unavailable'
@@ -291,7 +300,7 @@ export function socialRoutes(config: SocialRoutesConfig): Hono {
     const workspaceId = c.req.param('workspaceId')
     const userId = await requireMember(c, workspaceId)
     if (userId instanceof Response) return userId
-    const profile = await getProfile(workspaceId)
+    const profile = await getProfile(workspaceId, await localScopeFor(workspaceId))
     return c.json({ profile: profile ? { externalId: profile.externalId, name: profile.name } : null })
   })
 
@@ -409,6 +418,10 @@ export function socialRelayRoutes(): Hono {
    * The caller is a desktop forwarding with its Shogo key: `authMiddleware`
    * has already resolved the linked cloud workspace, and that workspace — not
    * anything in the request — decides which profile the operation may touch.
+   *
+   * `X-Shogo-Local-Workspace` narrows it to one local workspace of that tenant
+   * (each owns its own Zernio profile). A value that is not a workspace id is a
+   * caller bug and refused before any provider call.
    */
   router.all('/social-relay/*', async (c) => {
     const auth = (c.get('auth') ?? {}) as any
@@ -417,6 +430,19 @@ export function socialRelayRoutes(): Hono {
       return c.json(
         { error: { code: 'unauthorized', message: 'The relay needs a workspace-scoped Shogo key' } },
         401,
+      )
+    }
+
+    const localWorkspaceId = (c.req.header(LOCAL_SCOPE_HEADER) ?? '').trim()
+    if (localWorkspaceId && !isScopeId(localWorkspaceId)) {
+      return c.json(
+        {
+          error: {
+            code: 'invalid_local_workspace',
+            message: `${LOCAL_SCOPE_HEADER} must be a local workspace id`,
+          },
+        },
+        400,
       )
     }
 
@@ -443,6 +469,7 @@ export function socialRelayRoutes(): Hono {
     try {
       const outcome = await relayOperation({
         workspaceId,
+        localWorkspaceId,
         method,
         path: rawPath,
         query,
@@ -450,6 +477,91 @@ export function socialRelayRoutes(): Hono {
         idempotencyKey: c.req.header('idempotency-key') ?? undefined,
       })
       return c.json(outcome.body as any, outcome.status as any)
+    } catch (err) {
+      return errorResponse(c, err)
+    }
+  })
+
+  return router
+}
+
+/**
+ * Cloud-only ingress for Zernio's webhooks (`POST /api/webhooks/zernio`).
+ *
+ * One team-level endpoint serves every workspace: the signature is checked
+ * against the raw body, and the profile `externalId` the provider echoes is
+ * what decides which workspace (and which of its local scopes) the event
+ * belongs to. A webhook that names nothing we own is accepted and dropped —
+ * Zernio retries a non-2xx seven times, and "not ours" will never become ours.
+ */
+export function socialWebhookRoutes(): Hono {
+  const router = new Hono()
+
+  router.post('/webhooks/zernio', async (c) => {
+    const rawBody = await c.req.text()
+    try {
+      const result = await handleZernioWebhook({
+        rawBody,
+        signature: c.req.header(ZERNIO_SIGNATURE_HEADER),
+        eventId: c.req.header(ZERNIO_EVENT_ID_HEADER),
+      })
+      return c.json(result.body as any, result.status as any)
+    } catch (err) {
+      return errorResponse(c, err)
+    }
+  })
+
+  return router
+}
+
+export interface SocialEventRoutesConfig {
+  /**
+   * The runtime token (or local session) the desktop shell presents. When it
+   * names a workspace, the body's workspace must be that one.
+   */
+  authorize: (c: any) => Promise<{ workspaceId?: string } | null>
+}
+
+/**
+ * Desktop half of the relay for a *local* scope: the cloud verified the event
+ * and routed it here, and this applies it in the local DB with the same
+ * handler and the same dedupe key (`zernio:<event id>`), so a duplicate
+ * delivery — or a retried webhook — lands as one event.
+ *
+ * Mounted on the desktop composer only: a local scope has no rows in the
+ * cloud, so nowhere else can apply it.
+ */
+export function socialEventRoutes(config: SocialEventRoutesConfig): Hono {
+  const router = new Hono()
+
+  router.post('/social/events', async (c) => {
+    const identity = await config.authorize(c)
+    if (!identity) {
+      return c.json({ error: { code: 'unauthorized', message: 'This endpoint is for the local runtime' } }, 401)
+    }
+    const body = await readJson(c)
+    try {
+      const workspaceId = requireString(body.workspaceId, 'workspaceId')
+      if (identity.workspaceId && identity.workspaceId !== workspaceId) {
+        throw new SocialError(403, 'workspace_out_of_scope', 'That event belongs to another workspace')
+      }
+      const localWorkspaceId = typeof body.localWorkspaceId === 'string' ? body.localWorkspaceId.trim() : ''
+      if (localWorkspaceId && !isScopeId(localWorkspaceId)) {
+        throw new SocialError(400, 'invalid_local_workspace', 'localWorkspaceId must be a workspace id')
+      }
+      const account = body.account && typeof body.account === 'object'
+        ? (body.account as any)
+        : null
+      const applied = await applySocialEvent({
+        workspaceId,
+        externalId: requireString(body.externalId, 'externalId'),
+        localWorkspaceId,
+        eventId: requireString(body.eventId, 'eventId'),
+        type: requireString(body.type, 'type'),
+        account,
+        detail: body.detail ?? null,
+      })
+      return c.json(applied.body as any, applied.status as any)
     } catch (err) {
       return errorResponse(c, err)
     }

@@ -87,7 +87,7 @@ import { createChatMessageFeedbackRoutes, createChatSessionFeedbackRoutes } from
 import { createChatSessionForkRoutes } from './routes/chat-session-fork'
 import { chatQueuedMessageActionsRoutes } from './routes/chat-queued-message-actions'
 import { toolsProxyRoutes } from './routes/tools-proxy'
-import { socialRelayRoutes, socialRoutes } from './routes/social'
+import { socialRelayRoutes, socialRoutes, socialWebhookRoutes } from './routes/social'
 import {
   generateTitleCompletion,
   setTitleGenerationModelId,
@@ -8592,6 +8592,9 @@ app.route('/api', toolsProxy)
 // the master Zernio key is used.
 app.route('/api', socialRoutes({ resolveUserId: getAuthUserId }))
 app.route('/api', socialRelayRoutes())
+// Zernio's webhooks (comments, DMs, account health). Cloud only: the desktop
+// half of the relay applies local-scope events in its own DB.
+app.route('/api', socialWebhookRoutes())
 
 // EZ Mode / voice translator routes (session-auth'd via authMiddleware
 // above). Keeps ELEVENLABS_API_KEY on the server and serves the shared

@@ -23,6 +23,11 @@ import { getShogoCloudUrl } from '../../lib/cloud-urls'
 
 export const ZERNIO_API_BASE = 'https://zernio.com/api/v1'
 export const SOCIAL_RELAY_PATH = '/api/social-relay'
+/**
+ * The scope a relayed call belongs to. The desktop sends it so the cloud keeps
+ * one Zernio profile per local workspace; absent/empty for the cloud scope.
+ */
+export const LOCAL_SCOPE_HEADER = 'x-shogo-local-workspace'
 const REQUEST_TIMEOUT_MS = 15_000
 const MAX_RETRY_AFTER_MS = 5_000
 
@@ -32,6 +37,8 @@ export interface ZernioRequest {
   method: 'GET' | 'POST' | 'PATCH' | 'DELETE'
   /** Path under the Zernio base, e.g. `/profiles` or `/accounts/acc_1`. */
   path: string
+  /** The workspace the call belongs to; scopes the relay and derives routing ids. */
+  workspaceId?: string
   query?: Record<string, string | number | boolean | undefined | null>
   body?: unknown
   /** Sent as `Idempotency-Key`; Zernio dedupes same-key writes. */
@@ -180,6 +187,11 @@ function createHttpSocialClient(config: SocialClientConfig): SocialClient {
       }
       if (req.body !== undefined) headers['Content-Type'] = 'application/json'
       if (req.idempotencyKey) headers['Idempotency-Key'] = req.idempotencyKey
+      if (config.mode !== 'cloud' && req.workspaceId) {
+        const { localScopeFor } = await import('./local-scope')
+        const scope = await localScopeFor(req.workspaceId)
+        if (scope) headers[LOCAL_SCOPE_HEADER] = scope
+      }
 
       const url = buildUrl(config.baseUrl, req)
 
