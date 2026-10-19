@@ -5,7 +5,7 @@
  * popover share this tree; `isNative` only switches density and grouping.
  */
 
-import { useCallback, type ReactNode } from "react";
+import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { Linking, Platform, Pressable, Text, View } from "react-native";
 import { Check, Cloud, CloudOff, ExternalLink, LogIn, LogOut, Plus, Settings, Sparkles, Users, Zap } from "lucide-react-native";
 import { cn } from "@shogo/shared-ui/primitives";
@@ -18,6 +18,7 @@ import { AccountSettingsGroup } from "./AccountSettingsGroup";
 import { isCloudWorkspace, useCloudWorkspaces } from "../../../lib/workspace-route";
 import { workspaceColor, workspaceInitial } from "../../../lib/workspace-color";
 import { useCloudSession } from "../../../hooks/useCloudSession";
+import { useDomainHttp } from "../../../contexts/domain";
 
 export interface WorkspaceMenuSectionProps {
   workspaces: any[];
@@ -102,6 +103,30 @@ export function WorkspaceMenuSection({
   const density = densityFor(isNative);
   const cloud = useCloudWorkspaces();
   const currentIsCloud = !!localMode && isCloudWorkspace(currentWorkspace?.id);
+
+  // Switching workspaces deliberately leaves runtimes warm, so an agent can be
+  // mid-turn in a workspace the user just left. Say so here instead of letting
+  // that work look like it vanished (Decision 3).
+  const http = useDomainHttp();
+  const [busyElsewhere, setBusyElsewhere] = useState(0);
+  useEffect(() => {
+    setBusyElsewhere(0);
+    if (!localMode || !http) return;
+    let cancelled = false;
+    http
+      .get<{ items?: Array<{ workspaceId: string; inFlight?: boolean }> }>("/api/workspaces/activity")
+      .then((res) => {
+        if (cancelled) return;
+        const items = res.data?.items ?? [];
+        setBusyElsewhere(
+          items.filter((item) => item.inFlight && item.workspaceId !== currentWorkspace?.id).length,
+        );
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [http, localMode, currentWorkspace?.id]);
 
   const wsInitial = currentWorkspace?.name?.[0]?.toUpperCase() ?? "W";
   const resolvedPlanId =
@@ -363,23 +388,30 @@ export function WorkspaceMenuSection({
       {localMode && (
         <CloudSessionRow isNative={isNative} />
       )}
-      {!localMode && (
-        <Pressable
-          onPress={() => {
-            onClose();
-            onCreateWorkspace();
-          }}
-          className={cn(
-            "flex-row items-center gap-2 px-4 active:bg-muted",
-            isNative ? "py-3.5" : "py-2",
-            !isNative && "rounded-md",
-          )}
+      <Pressable
+        onPress={() => {
+          onClose();
+          onCreateWorkspace();
+        }}
+        accessibilityLabel="Create new workspace"
+        className={cn(
+          "flex-row items-center gap-2 px-4 active:bg-muted",
+          isNative ? "py-3.5" : "py-2",
+          !isNative && "rounded-md",
+        )}
+      >
+        <Plus size={isNative ? 18 : 16} className="text-muted-foreground" />
+        <Text className={cn("text-foreground", density.text.body)}>
+          Create new workspace
+        </Text>
+      </Pressable>
+      {busyElsewhere > 0 && (
+        <Text
+          className={cn(density.text.caption, "px-4 pb-1 text-muted-foreground")}
+          accessibilityLabel={`Working in ${busyElsewhere} other ${busyElsewhere === 1 ? "workspace" : "workspaces"}`}
         >
-          <Plus size={isNative ? 18 : 16} className="text-muted-foreground" />
-          <Text className={cn("text-foreground", density.text.body)}>
-            Create new workspace
-          </Text>
-        </Pressable>
+          Working in {busyElsewhere} other {busyElsewhere === 1 ? "workspace" : "workspaces"}
+        </Text>
       )}
     </>
   );
@@ -456,24 +488,50 @@ export function WorkspaceMenuSection({
         </Pressable>
       )}
       {localMode && <CloudSessionRow isNative={false} />}
-      {!localMode && (
-        <Pressable
-          onPress={() => {
-            onClose();
-            onCreateWorkspace();
-          }}
-          accessibilityLabel="Create new workspace"
-          className="flex-row items-center gap-3 rounded-lg px-2 py-1.5 active:bg-muted"
-        >
-          <View className="h-11 w-11 items-center justify-center">
-            <View className="h-9 w-9 items-center justify-center rounded-lg bg-muted">
-              <Plus size={18} className="text-foreground" />
-            </View>
+      <Pressable
+        onPress={() => {
+          onClose();
+          onCreateWorkspace();
+        }}
+        accessibilityLabel="Create new workspace"
+        className="flex-row items-center gap-3 rounded-lg px-2 py-1.5 active:bg-muted"
+      >
+        <View className="h-11 w-11 items-center justify-center">
+          <View className="h-9 w-9 items-center justify-center rounded-lg bg-muted">
+            <Plus size={18} className="text-foreground" />
           </View>
-          <Text className="text-sm font-semibold text-foreground" numberOfLines={1}>
-            Create new workspace
-          </Text>
-        </Pressable>
+        </View>
+        <Text className="text-sm font-semibold text-foreground" numberOfLines={1}>
+          Create new workspace
+        </Text>
+      </Pressable>
+      {/* Rename/delete live in Settings; this is only a signpost to them that
+          works at every width and on native, so the switcher doesn't grow a
+          second copy of the management UI. */}
+      <Pressable
+        onPress={() => {
+          onClose();
+          onNavigate("/(app)/account");
+        }}
+        accessibilityLabel="Manage workspaces"
+        className="flex-row items-center gap-3 rounded-lg px-2 py-1.5 active:bg-muted"
+      >
+        <View className="h-11 w-11 items-center justify-center">
+          <View className="h-9 w-9 items-center justify-center rounded-lg bg-muted">
+            <Settings size={18} className="text-foreground" />
+          </View>
+        </View>
+        <Text className="text-sm font-semibold text-foreground" numberOfLines={1}>
+          Manage workspaces
+        </Text>
+      </Pressable>
+      {busyElsewhere > 0 && (
+        <Text
+          className="px-2 pb-1 text-xs text-muted-foreground"
+          accessibilityLabel={`Working in ${busyElsewhere} other ${busyElsewhere === 1 ? "workspace" : "workspaces"}`}
+        >
+          Working in {busyElsewhere} other {busyElsewhere === 1 ? "workspace" : "workspaces"}
+        </Text>
       )}
     </View>
   );

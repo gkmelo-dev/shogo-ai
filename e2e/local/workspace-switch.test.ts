@@ -6,24 +6,19 @@ import { LOCAL_API_BASE } from "./helpers"
 /**
  * Workspace switching — local/desktop E2E test.
  *
- * Local counterpart to `e2e/staging/workspace-switch.test.ts`. A *second*
- * workspace can't be reached the same way in local mode, so this test both
- * exercises and depends on a different pair of things than the staging one:
+ * Local counterpart to `e2e/staging/workspace-switch.test.ts`. Both suites
+ * exercise the same thing (switch between two workspaces and check the shell
+ * follows), but local mode gets there differently:
  *
- *   - `create-local-app.ts` deliberately doesn't mount the generic
- *     workspace CRUD routes (`workspace.routes.ts` / `workspaceHooks`) —
- *     desktop only needs a narrow route surface (`local-workspaces.ts`) —
- *     so there's no `POST /api/workspaces` for a second workspace to go
- *     through, and no "Create new workspace" entry in the sidebar/account
- *     menu (`!localMode` gate in `AppSidebar.tsx` / `account.tsx`).
- *   - Instead, `bootstrapLocalDatabase` (apps/api/src/lib/local-bootstrap.ts)
- *     seeds the single local user with one free workspace of *each* kind up
- *     front — a `personal` one via the normal signup hook, and a `team`
- *     one via an explicit backfill — mirroring the cloud "every account
- *     gets one free `personal` + one free `team`" rule
- *     (`workspaceHooks.beforeCreate`) without needing a creation UI. That
- *     backfill runs on every boot (not just fresh installs), so this test
- *     works against any local dev DB, however old.
+ *   - `bootstrapLocalDatabase` (apps/api/src/lib/local-bootstrap.ts) seeds the
+ *     single local user with one free workspace of *each* kind up front — a
+ *     `personal` one via the normal signup hook, and a `team` one via an
+ *     explicit backfill — so any local DB, however old, has at least two
+ *     workspaces to switch between without the test creating one.
+ *   - Since SHO-43 a local user can also create workspaces themselves
+ *     (`workspace-create.test.ts` covers that path); this spec deliberately
+ *     still only switches between the seeded ones, so a failure here never
+ *     leaves a workspace behind in the developer's DB.
  *
  * Workspace *names* aren't asserted — a pre-existing local DB may already
  * have owned a team (or extra personal) workspace under some other name
