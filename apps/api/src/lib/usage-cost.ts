@@ -171,10 +171,10 @@ export const IMAGE_USD_CONFIG: Record<string, { base: number; hdMultiplier: numb
   'flux-pro-ultra':  { base: 0.06,   hdMultiplier: 1.0, largeSizeMultiplier: 1.0 },
   'ideogram-3':      { base: 0.06,   hdMultiplier: 1.5, largeSizeMultiplier: 1.0 },
   'recraft-3':       { base: 0.04,   hdMultiplier: 1.0, largeSizeMultiplier: 1.0 },
-  // Higgsfield fallbacks. Billing normally uses the `/estimate` captured at
-  // submit; these are the display/fallback list prices (docs snapshot).
-  'hf-soul-v2':       { base: 0.094, hdMultiplier: 1.0, largeSizeMultiplier: 1.0 },
-  'hf-ideogram-4':    { base: 0.06,  hdMultiplier: 1.0, largeSizeMultiplier: 1.0 },
+  // Higgsfield fallbacks, only for displaying a price when `/estimate` is
+  // unavailable — a request that cannot be priced is refused, never billed from
+  // these numbers. SOUL V2 is $0.004 at 720p and $0.006 at 1080p.
+  'hf-soul-v2':      { base: 0.004,  hdMultiplier: 1.5, largeSizeMultiplier: 1.0 },
 }
 
 const LARGE_IMAGE_SIZES = new Set(['1792x1024', '1024x1792', '1536x1024', '1024x1536'])
@@ -257,13 +257,30 @@ export function calculateVideoUsageCost(rates: VideoRates, seconds: number, audi
 }
 
 /**
- * USD for one Higgsfield request: the free `/estimate` captured at submit time,
+ * USD for a Higgsfield request: the free `/estimate` captured at submit time,
  * marked up exactly like every other media charge. Never used for a request
  * that ended `failed`, `nsfw` or `canceled` — those are refunded upstream, so
  * billing them would overcharge.
  */
 export function calculateHiggsfieldUsageCost(estimate: { rawUsd: number }): UsageCostResult {
   const rawUsd = Math.max(0, estimate.rawUsd)
+  return { rawUsd, billedUsd: rawUsd * MARKUP_MULTIPLIER }
+}
+
+/**
+ * USD for a Genjutsu edit: the vendor's per-source-second rate for the chosen
+ * resolution times the clip's length, marked up. Returns `null` when the model
+ * has no rate for that resolution or the duration is unknown — callers must
+ * then refuse the job, because running it unpriced means billing zero.
+ */
+export function calculateGenjutsuUsageCost(
+  rates: Record<string, number> | undefined,
+  resolution: string,
+  seconds: number,
+): UsageCostResult | null {
+  const perSecond = rates?.[resolution]
+  if (perSecond === undefined || !Number.isFinite(seconds) || seconds <= 0) return null
+  const rawUsd = seconds * perSecond
   return { rawUsd, billedUsd: rawUsd * MARKUP_MULTIPLIER }
 }
 

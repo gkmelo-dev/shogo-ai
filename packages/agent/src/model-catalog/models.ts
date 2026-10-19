@@ -170,6 +170,13 @@ export interface VideoModelEntry {
   usdPerSecondWithAudio?: number
   /** Upstream list price for one clip, in USD (per-request priced providers: Higgsfield). */
   usdPerRequest?: number
+  /**
+   * Price per source second by resolution tier (Genjutsu). These workflows
+   * quote no `usd` from `/estimate` — the vendor answers with a prose
+   * description of the rate card — so the numbers here are the vendor's
+   * published rates and the proxy bills `rate(resolution) × source seconds`.
+   */
+  usdPerSecondByResolution?: Record<string, number>
   /** Most reference images (character/object elements) one request accepts. */
   maxReferenceImages: number
   bestFor?: string
@@ -686,11 +693,14 @@ const GPT_IMAGE = { textToImage: true, imageToImage: true, maxReferenceImages: 1
 export const IMAGE_MODEL_CATALOG = {
   // Higgsfield — the default image provider. Every call is asynchronous
   // (submit → poll), so the proxy polls inside the OpenAI-shaped route.
-  // Prices are the documented approximate list price; the exact amount billed
-  // is the `/estimate` captured at submit time (see docs/vendors/higgsfield).
+  // `usdPerRequest` is the 720p list price, used only for display/fallback:
+  // the amount billed is always the `/estimate` captured before submit, and a
+  // request that cannot be priced is refused rather than run for free.
+  // (SOUL V2: $0.004 at 720p, $0.006 at 1080p — measured on the live account,
+  // which is 23× below the worked example in the vendor's prose.)
   'hf-soul-v2': {
     id: 'hf-soul-v2', provider: 'higgsfield', apiModel: 'higgsfield-ai/soul/v2/standard',
-    displayName: 'SOUL V2', capabilities: TEXT_ONLY, usdPerRequest: 0.094,
+    displayName: 'SOUL V2', capabilities: TEXT_ONLY, usdPerRequest: 0.004,
     bestFor: 'General-purpose default: fast, cheap editorial and product images',
   },
   'hf-ideogram-4': {
@@ -751,6 +761,20 @@ export type ImageModelId = keyof typeof IMAGE_MODEL_CATALOG
 // Video Model Catalog
 // ---------------------------------------------------------------------------
 
+/**
+ * Genjutsu's published rate card, per source second, in USD.
+ *
+ * `/estimate` answers these three endpoints with a prose description of the
+ * rate card (`{"type":"description", …$0.318/s at 480p…}`) instead of a `usd`
+ * value, so there is nothing to parse: the proxy bills this table × the source
+ * clip's length and refuses a job whose length it was not told.
+ */
+export const GENJUTSU_USD_PER_SECOND: Record<string, number> = {
+  '480p': 0.318,
+  '720p': 0.681,
+  '1080p': 1.632,
+}
+
 export const VIDEO_MODEL_CATALOG = {
   // Higgsfield — the default video provider. Priced per clip (`usdPerRequest`,
   // approximate) rather than per second; the proxy captures the free
@@ -796,13 +820,17 @@ export const VIDEO_MODEL_CATALOG = {
     bestFor: 'The one Higgsfield text-to-video that takes an aspect_ratio, and generates audio',
   },
   // Genjutsu — video editing. Source video is a public URL the proxy uploads
-  // to; duration follows the source (4 s minimum, trimmed to 30 s).
+  // to; duration follows the source (4 s minimum, trimmed to 30 s). These
+  // endpoints quote a prose rate card instead of a `usd` figure, so billing
+  // uses `usdPerSecondByResolution` × source seconds and refuses to run a job
+  // whose source duration it was not told.
   'hf-genjutsu-motion-transfer': {
     id: 'hf-genjutsu-motion-transfer', provider: 'higgsfield', displayName: 'Genjutsu Motion Transfer',
     textToVideoApiModel: 'higgsfield/genjutsu/motion-transfer/v1.0',
     durations: [], defaultDuration: 4,
     aspectRatios: [],
     resolutions: ['480p', '720p', '1080p'], defaultResolution: '720p',
+    usdPerSecondByResolution: GENJUTSU_USD_PER_SECOND,
     maxReferenceImages: 8, sourceVideo: true, genjutsu: 'motion_transfer',
     minSourceSeconds: 4, maxSourceSeconds: 30,
     bestFor: 'Drive a photo or character image with the motion of an existing clip',
@@ -813,6 +841,7 @@ export const VIDEO_MODEL_CATALOG = {
     durations: [], defaultDuration: 4,
     aspectRatios: [],
     resolutions: ['480p', '720p', '1080p'], defaultResolution: '720p',
+    usdPerSecondByResolution: GENJUTSU_USD_PER_SECOND,
     maxReferenceImages: 8, sourceVideo: true, genjutsu: 'object_swap',
     minSourceSeconds: 4, maxSourceSeconds: 30, minSourcePixels: 409_600,
     bestFor: 'Replace an object in a clip with a product or prop from a reference image',
@@ -823,9 +852,7 @@ export const VIDEO_MODEL_CATALOG = {
     durations: [], defaultDuration: 4,
     aspectRatios: [],
     resolutions: ['480p', '720p', '1080p'], defaultResolution: '720p',
-    // Restyle prices per source second (480p $0.318, 720p $0.681, 1080p $1.632);
-    // this is the 4 s / 480p floor, kept only as a display fallback.
-    usdPerRequest: 1.272,
+    usdPerSecondByResolution: GENJUTSU_USD_PER_SECOND,
     maxReferenceImages: 5, sourceVideo: true, genjutsu: 'restyle',
     minSourceSeconds: 4, maxSourceSeconds: 30, maxSourceBytes: 200 * 1024 * 1024,
     bestFor: 'Restyle a clip into another look while keeping its motion and audio (needs a preset_id)',

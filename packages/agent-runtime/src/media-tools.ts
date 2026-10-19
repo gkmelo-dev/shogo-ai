@@ -91,15 +91,52 @@ function toDataUri(image: LoadedImage): string {
 export const MAX_SOURCE_VIDEO_BYTES = 200 * 1024 * 1024
 
 /**
+ * Duration of an MP4, read from its `mvhd` box — the only reliable way to know
+ * how many source seconds a Genjutsu edit will be billed for without shelling
+ * out to ffprobe. Returns null when the box can't be read (fragmented or
+ * non-standard files), and the caller then refuses the edit.
+ */
+export function readMp4DurationSeconds(buffer: Buffer): number | null {
+  const findBox = (type: string, from: number, to: number): { payload: number; end: number } | null => {
+    let offset = from
+    while (offset + 8 <= to) {
+      const size = buffer.readUInt32BE(offset)
+      if (size < 8) return null
+      const kind = buffer.toString('ascii', offset + 4, offset + 8)
+      const end = Math.min(offset + size, to)
+      if (kind === type) return { payload: offset + 8, end }
+      offset = end
+    }
+    return null
+  }
+
+  const moov = findBox('moov', 0, buffer.length)
+  if (!moov) return null
+  const mvhd = findBox('mvhd', moov.payload, moov.end)
+  if (!mvhd) return null
+
+  const version = buffer[mvhd.payload]
+  const timescale = version === 1
+    ? buffer.readUInt32BE(mvhd.payload + 20)
+    : buffer.readUInt32BE(mvhd.payload + 12)
+  const duration = version === 1
+    ? Number(buffer.readBigUInt64BE(mvhd.payload + 24))
+    : buffer.readUInt32BE(mvhd.payload + 16)
+  if (!timescale || !duration) return null
+  const seconds = duration / timescale
+  return Number.isFinite(seconds) && seconds > 0 ? seconds : null
+}
+
+/**
  * Read a workspace clip for a Genjutsu edit. Only MP4 is accepted (the provider
- * documents `video/mp4`), and the size is checked before anything is uploaded
- * so an oversize file fails without a round trip or a charge.
+ * documents `video/mp4`), the size is checked before anything is uploaded, and
+ * the duration is measured because the edit is billed per source second.
  */
 function loadWorkspaceVideo(
   ctx: ToolContext,
   workspacePath: string,
   maxBytes = MAX_SOURCE_VIDEO_BYTES,
-): { buffer: Buffer; workspacePath: string } | { error: string } {
+): { buffer: Buffer; workspacePath: string; durationSeconds: number } | { error: string } {
   const resolved = assertWithinWorkspace(ctx.workspaceDir, workspacePath)
   if (!existsSync(resolved)) return { error: `Source video not found: ${workspacePath}` }
   if (extname(resolved).toLowerCase() !== '.mp4') {
@@ -111,7 +148,14 @@ function loadWorkspaceVideo(
     const sizeMb = (buffer.byteLength / (1024 * 1024)).toFixed(1)
     return { error: `Source video is ${sizeMb} MB; the limit is ${limitMb} MB. Trim or compress it first.` }
   }
-  return { buffer, workspacePath }
+  const durationSeconds = readMp4DurationSeconds(buffer)
+  if (durationSeconds === null) {
+    return { error: `Could not read the duration of ${workspacePath}. Re-export it as a standard MP4 (H.264) and try again.` }
+  }
+  if (durationSeconds < 4) {
+    return { error: `Source video is ${durationSeconds.toFixed(1)} s; Genjutsu needs at least 4 s.` }
+  }
+  return { buffer, workspacePath, durationSeconds }
 }
 
 /**
@@ -236,7 +280,7 @@ export function friendlyMediaError(context: string, status: number, rawErrorText
 // ---------------------------------------------------------------------------
 
 const IMAGE_MODEL_GUIDE =
-  'Image model id (default "hf-soul-v2", a cheap Higgsfield model). Call list_media_models for the full list with prices. ' +
+  'Image model id. Omit it to use the workspace default (SOUL V2 on Higgsfield; gpt-image-2.5-flare when only OpenAI is configured). Call list_media_models for the full list with prices. ' +
   'Rough guide: "hf-soul-v2" for general editorial/product images, "hf-ideogram-4" for text in images (posters, logos), ' +
   '"gpt-image-2.5-flare"/"gpt-image-2" for OpenAI prompt following, "imagen-4" for Google text-to-image. ' +
   'fal ids ("nano-banana-pro", "seedream-5-pro", "flux-pro-ultra", ...) still work but are deprecated — prefer a Higgsfield model.'
@@ -308,7 +352,10 @@ export function createGenerateImageTool(ctx: ToolContext): AgentTool {
         reference_image?: string
         options?: number
       }
-      const { prompt, size = '1024x1024', model = 'hf-soul-v2', quality = 'standard', options = 1 } = p
+      // With no explicit model the proxy picks the workspace's configured
+      // default provider (Higgsfield when its key is set, fal otherwise), so a
+      // keyless install still works instead of 503-ing on a hardcoded id.
+      const { prompt, size = '1024x1024', model, quality = 'standard', options = 1 } = p
 
       if (!Number.isInteger(options) || options < 1 || options > 4) {
         return textResult({ error: 'The options parameter must be an integer between 1 and 4.' })
@@ -352,7 +399,7 @@ export function createGenerateImageTool(ctx: ToolContext): AgentTool {
             formData.append('image', new Blob([new Uint8Array(image.buffer)], { type: image.mimeType }), `reference-${i + 1}${image.ext}`)
           }
           formData.append('prompt', prompt)
-          formData.append('model', model)
+          if (model) formData.append('model', model)
           formData.append('size', size)
           formData.append('quality', quality)
           formData.append('n', String(options))
@@ -747,10 +794,11 @@ function jobResult(job: TrackedVideoJob, extra: Record<string, unknown> = {}) {
   })
 }
 
-/** Default video model for the tool: the cheapest Higgsfield clip. */
-export const DEFAULT_VIDEO_TOOL_MODEL = 'hf-hailuo-2.3'
-
-/** `genjutsu` mode → model id, so a caller can ask for the workflow by name. */
+/**
+ * `genjutsu` mode → model id, so a caller can ask for the workflow by name.
+ * Everything else passes no model at all: the proxy's default follows whichever
+ * provider is configured.
+ */
 export const GENJUTSU_MODEL_BY_MODE = {
   motion_transfer: 'hf-genjutsu-motion-transfer',
   object_swap: 'hf-genjutsu-object-swap',
@@ -771,7 +819,7 @@ function createGenerateVideoTool(ctx: ToolContext): AgentTool {
       model: Type.Optional(
         Type.String({
           description:
-            'Video model id (default "hf-hailuo-2.3", the cheapest Higgsfield clip). "hf-kling-2.5-pro" for fluid motion, "hf-wan-2.6" for stylized looks up to 15 s, "hf-ltx-2.5-fast" for the only text-to-video that takes an aspect_ratio, "hf-genjutsu-*" to edit a clip. fal ids still work but are deprecated. See list_media_models.',
+            'Video model id. Omit it to use the workspace default (hf-hailuo-2.3 on Higgsfield; kling-2.5-turbo-pro when only fal is configured). "hf-kling-2.5-pro" for fluid motion, "hf-wan-2.6" for stylized looks up to 15 s, "hf-ltx-2.5-fast" for the only text-to-video that takes an aspect_ratio, "hf-genjutsu-*" to edit a clip. fal ids still work but are deprecated. See list_media_models.',
         }),
       ),
       duration: Type.Optional(Type.Integer({ minimum: 1, maximum: 20, description: 'Clip length in seconds; each model allows specific values (see list_media_models). A Genjutsu edit follows its source clip.' })),
@@ -829,11 +877,12 @@ function createGenerateVideoTool(ctx: ToolContext): AgentTool {
       if (!p.prompt && !p.source_video) {
         return textResult({ error: 'prompt is required (or pass source_video for a Genjutsu edit, or job_id to check an earlier job).' })
       }
-      const model = p.model ?? (p.genjutsu ? GENJUTSU_MODEL_BY_MODE[p.genjutsu] : DEFAULT_VIDEO_TOOL_MODEL)
+      const model = p.model ?? (p.genjutsu ? GENJUTSU_MODEL_BY_MODE[p.genjutsu] : undefined)
 
       let target: OutputTarget
       let startImage: string | undefined
       let sourceVideoUrl: string | undefined
+      let sourceDurationSeconds: number | undefined
       const references: string[] = []
       try {
         if ((p.reference_images?.length ?? 0) > MAX_REFERENCE_IMAGES) {
@@ -855,6 +904,9 @@ function createGenerateVideoTool(ctx: ToolContext): AgentTool {
           const uploaded = await uploadSourceVideo(proxy, video.buffer, signal)
           if ('error' in uploaded) return textResult({ error: uploaded.error })
           sourceVideoUrl = uploaded.url
+          // The edit is billed per source second; the proxy refuses the job if
+          // it isn't told the length, so measure it here rather than guess.
+          sourceDurationSeconds = video.durationSeconds
         } else if (p.genjutsu) {
           return textResult({ error: `genjutsu "${p.genjutsu}" edits an existing clip: pass source_video (a workspace .mp4).` })
         }
@@ -884,6 +936,7 @@ function createGenerateVideoTool(ctx: ToolContext): AgentTool {
             start_image: startImage,
             reference_images: references.length > 0 ? references : undefined,
             source_video_url: sourceVideoUrl,
+            source_duration_seconds: sourceDurationSeconds,
             preset_id: p.preset_id,
           }),
           signal,

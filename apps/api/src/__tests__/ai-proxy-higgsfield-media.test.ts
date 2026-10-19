@@ -320,6 +320,7 @@ describe('image generation', () => {
   })
 
   test('a concurrency 400 surfaces as 429 so the caller backs off', async () => {
+    mockEstimate('higgsfield-ai/soul/v2/standard', '0.0040')
     on(SUBMIT_URL, () => json({ detail: 'Maximum number of concurrent requests' }, 400))
 
     const res = await call('/ai/v1/images/generations', {
@@ -507,13 +508,14 @@ describe('video routes', () => {
     expect(consumeCalls).toHaveLength(0)
   })
 
-  test('a failed estimate falls back to the catalog price and says so', async () => {
+  test('a failed estimate refuses the job instead of running it unpriced', async () => {
     on('https://hf.test/estimate/minimax/hailuo-2.3/standard/text-to-video', () => json({ detail: 'nope' }, 500))
-    mockGeneration({ endpoint: 'minimax/hailuo-2.3/standard/text-to-video', videoUrl: 'https://cdn.test/out.mp4' })
 
-    const { data } = await submit()
-    expect(data.price_source).toBe('catalog')
-    expect(data.estimated_usd).toBeCloseTo(0.07 * 1.2, 4)
+    const { res, data } = await submit()
+    expect(res.status).toBe(503)
+    expect(data.error.code).toBe('estimate_unavailable')
+    // Nothing was submitted, so nothing can be billed.
+    expect(fetchLog.some((f) => f.url === 'https://hf.test/minimax/hailuo-2.3/standard/text-to-video' && f.init?.method === 'POST')).toBe(false)
   })
 
   test('rejects an aspect_ratio on a model that has none', async () => {
@@ -544,35 +546,52 @@ describe('video routes', () => {
     expect(JSON.parse(String(submitCall!.init?.body)).image_url).toBe('https://cdn.test/first.png')
   })
 
-  test('genjutsu motion transfer needs a source clip and at least one reference', async () => {
+  test('genjutsu motion transfer needs a source clip, its length, and a reference', async () => {
     const missingSource = await submit({ genjutsu: 'motion_transfer' } as any)
     expect(missingSource.res.status).toBe(400)
     expect(missingSource.data.error.code).toBe('missing_source_video')
 
-    const missingRef = await submit({
+    const missingDuration = await submit({
       model: 'hf-genjutsu-motion-transfer',
       source_video_url: 'https://cdn.test/in.mp4',
     })
+    expect(missingDuration.res.status).toBe(400)
+    expect(missingDuration.data.error.code).toBe('missing_source_duration')
+
+    const missingRef = await submit({
+      model: 'hf-genjutsu-motion-transfer',
+      source_video_url: 'https://cdn.test/in.mp4',
+      source_duration_seconds: 8,
+    })
     expect(missingRef.res.status).toBe(400)
     expect(missingRef.data.error.code).toBe('missing_reference_images')
+
+    const tooShort = await submit({
+      model: 'hf-genjutsu-motion-transfer',
+      source_video_url: 'https://cdn.test/in.mp4',
+      source_duration_seconds: 2,
+      reference_images: [`data:image/png;base64,${Buffer.from('ref').toString('base64')}`],
+    })
+    expect(tooShort.res.status).toBe(400)
+    expect(tooShort.data.error.code).toBe('source_too_short')
   })
 
   test('genjutsu restyle requires a preset_id', async () => {
     const { res, data } = await submit({
       model: 'hf-genjutsu-restyle',
       source_video_url: 'https://cdn.test/in.mp4',
+      source_duration_seconds: 8,
       duration: undefined,
     })
     expect(res.status).toBe(400)
     expect(data.error.code).toBe('missing_preset_id')
   })
 
-  test('a genjutsu edit submits video_url + image_urls + preset_id and does not send duration', async () => {
+  test('a genjutsu edit bills the source-second rate card, not a flat clip price', async () => {
     on('https://hf.test/files/generate-upload-url', () => json({
       public_url: 'https://cdn.test/ref.png', upload_url: 'https://s3.test/put', upload_headers: {},
     }))
     on('https://s3.test/put', () => new Response('', { status: 200 }))
-    mockEstimate('higgsfield/genjutsu/restyle/v1.0', '1.2720')
     mockGeneration({ endpoint: 'higgsfield/genjutsu/restyle/v1.0', videoUrl: 'https://cdn.test/out.mp4' })
 
     const ref = `data:image/png;base64,${Buffer.from('style-ref').toString('base64')}`
@@ -580,12 +599,19 @@ describe('video routes', () => {
       model: 'hf-genjutsu-restyle',
       prompt: undefined,
       source_video_url: 'https://cdn.test/in.mp4',
+      source_duration_seconds: 8,
       preset_id: 'preset-1',
       resolution: '480p',
       reference_images: [ref],
     })
     expect(res.status).toBe(200)
-    expect(data.estimated_usd).toBeCloseTo(1.272 * 1.2, 3)
+    // 8 s at $0.318/s = $2.544 raw, marked up 1.2×.
+    expect(data.estimated_usd).toBeCloseTo(0.318 * 8 * 1.2, 4)
+    expect(data.price_source).toBe('rate_card')
+    expect(data.duration).toBe(8)
+
+    // Genjutsu quotes prose, not a `usd` figure, so no /estimate call is made.
+    expect(fetchLog.some((f) => f.url.startsWith('https://hf.test/estimate/'))).toBe(false)
 
     const submitCall = fetchLog.find((f) => f.url === 'https://hf.test/higgsfield/genjutsu/restyle/v1.0')
     expect(JSON.parse(String(submitCall!.init?.body))).toEqual({
@@ -594,6 +620,13 @@ describe('video routes', () => {
       preset_id: 'preset-1',
       resolution: '480p',
     })
+
+    const statusRes = await call(`/ai/v1/videos/${data.id}`)
+    expect((await statusRes.json() as any).status).toBe('completed')
+    await settle()
+    expect(consumeCalls).toHaveLength(1)
+    expect(consumeCalls[0].rawUsd).toBeCloseTo(0.318 * 8, 4)
+    expect(consumeCalls[0].billedUsd).toBeCloseTo(0.318 * 8 * 1.2, 4)
   })
 })
 
@@ -611,9 +644,17 @@ describe('estimate route', () => {
     expect(data).toMatchObject({ provider: 'higgsfield', unit: 'clip', source: 'estimate' })
     expect(data.usd).toBeCloseTo(0.084, 4)
     expect(fetchLog.some((f) => f.url === 'https://hf.test/minimax/hailuo-2.3/standard/text-to-video')).toBe(false)
+
+    // The vendor's schema requires a prompt even to quote a price; sending
+    // none is what broke this route the first time.
+    const estimateCall = fetchLog.find((f) => f.url.startsWith('https://hf.test/estimate/minimax/hailuo-2.3'))
+    const sent = JSON.parse(String(estimateCall!.init?.body))
+    expect(typeof sent.prompt).toBe('string')
+    expect(sent.prompt.length).toBeGreaterThan(0)
+    expect(sent.duration).toBe(10)
   })
 
-  test('prices a fal model from the catalog, and a Genjutsu edit is refused', async () => {
+  test('prices a fal model from the catalog, and a Genjutsu edit needs a length', async () => {
     const fal = await call('/ai/v1/media/estimate', {
       method: 'POST',
       body: JSON.stringify({ model: 'kling-3-pro', duration: 5 }),
@@ -627,30 +668,30 @@ describe('estimate route', () => {
     })
     const data = await genjutsu.json() as any
     expect(genjutsu.status).toBe(400)
-    expect(data.error.code).toBe('estimate_needs_source')
+    expect(data.error.code).toBe('missing_source_duration')
   })
 
-  test('prices a Genjutsu edit once the source clip and preset are named', async () => {
-    mockEstimate('higgsfield/genjutsu/restyle/v1.0', '1.2720')
-    const res = await call('/ai/v1/media/estimate', {
-      method: 'POST',
-      body: JSON.stringify({
-        model: 'hf-genjutsu-restyle',
-        source_video_url: 'https://cdn.test/in.mp4',
-        preset_id: 'preset-1',
-        resolution: '480p',
-      }),
-    })
-    const data = await res.json() as any
-    expect(res.status).toBe(200)
-    expect(data.usd).toBeCloseTo(1.272 * 1.2, 3)
+  test('Genjutsu prices off the source-second rate card', async () => {
+    const at = async (resolution: string, seconds: number) => {
+      const res = await call('/ai/v1/media/estimate', {
+        method: 'POST',
+        body: JSON.stringify({ model: 'hf-genjutsu-motion-transfer', source_duration_seconds: seconds, resolution }),
+      })
+      expect(res.status).toBe(200)
+      return await res.json() as any
+    }
 
-    const estimateCall = fetchLog.find((f) => f.url === 'https://hf.test/estimate/higgsfield/genjutsu/restyle/v1.0')
-    expect(JSON.parse(String(estimateCall!.init?.body))).toMatchObject({
-      video_url: 'https://cdn.test/in.mp4',
-      preset_id: 'preset-1',
-      resolution: '480p',
-    })
+    const draft = await at('480p', 4)
+    expect(draft).toMatchObject({ unit: 'second', duration: 4, resolution: '480p', source: 'rate_card' })
+    expect(draft.usd).toBeCloseTo(0.318 * 4 * 1.2, 3)
+
+    const hero = await at('1080p', 8)
+    expect(hero.usd).toBeCloseTo(1.632 * 8 * 1.2, 2)
+
+    // The provider trims anything over 30 s, so 45 s bills as 30 s.
+    const trimmed = await at('720p', 45)
+    expect(trimmed.duration).toBe(30)
+    expect(trimmed.usd).toBeCloseTo(0.681 * 30 * 1.2, 2)
   })
 
   test('an unknown model is a clear 400', async () => {
@@ -688,12 +729,14 @@ describe('list_media_models', () => {
     expect(hailuo.price.usd).toBeCloseTo(0.07 * 1.2, 4)
     expect(hailuo.price.source).toBe('estimate')
 
-    // Genjutsu prices depend on the source clip, so no price is invented.
+    // Genjutsu bills per source second, so it lists a rate, not a clip total.
     const restyle = data.videos.find((m: any) => m.id === 'hf-genjutsu-restyle')
-    expect(restyle.price.usd).toBeCloseTo(1.272 * 1.2, 3)
+    expect(restyle.price.unit).toBe('second')
+    expect(restyle.price.usd).toBeCloseTo(0.681 * 1.2, 3)
+    expect(restyle.price.by_resolution['480p']).toBeCloseTo(0.318 * 1.2, 3)
     const motion = data.videos.find((m: any) => m.id === 'hf-genjutsu-motion-transfer')
-    expect(motion.price.usd).toBeNull()
-    expect(motion.price.unit).toBe('clip')
+    expect(motion.price.unit).toBe('second')
+    expect(motion.price.usd).toBeCloseTo(0.681 * 1.2, 3)
   })
 
   test('the listing is cached so a page of models does not hammer /estimate', async () => {

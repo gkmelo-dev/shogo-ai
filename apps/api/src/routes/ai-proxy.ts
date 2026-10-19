@@ -2811,72 +2811,62 @@ const HIGGSFIELD_IMAGE_POLL_DEADLINE_MS = 5 * 60_000
 
 /**
  * Charge for one Higgsfield request: the estimate captured at submit, marked
- * up. Falls back to the catalog's per-request list price if `/estimate` did
- * not answer; never invents a number, and never bills a request that did not
- * complete.
+ * up. Returns `null` when no estimate came back — the caller then refuses the
+ * request instead of running it unpriced, because a catalog guess is off by up
+ * to 23× and "no price" must never mean "free".
  */
 function higgsfieldCharge(
-  entry: { usdPerRequest?: number },
   estimateRawUsd: number | null,
-): { rawUsd: number; billedUsd: number; source: 'estimate' | 'catalog' | 'none' } {
-  if (estimateRawUsd !== null) {
-    const cost = calculateHiggsfieldUsageCost({ rawUsd: estimateRawUsd })
-    return { ...cost, source: 'estimate' }
-  }
-  if (entry.usdPerRequest !== undefined) {
-    const cost = calculateHiggsfieldUsageCost({ rawUsd: entry.usdPerRequest })
-    return { ...cost, source: 'catalog' }
-  }
-  return { rawUsd: 0, billedUsd: 0, source: 'none' }
+): { rawUsd: number; billedUsd: number } | null {
+  if (estimateRawUsd === null) return null
+  return calculateHiggsfieldUsageCost({ rawUsd: estimateRawUsd })
 }
 
 function recordHiggsfieldImageUsage(
   tokenPayload: ProxyTokenPayload,
   entry: ImageModelEntry,
-  estimateRawUsd: number | null,
+  charge: { rawUsd: number; billedUsd: number },
   n: number,
   chatSessionId?: string | null,
 ) {
-  const cost = higgsfieldCharge(entry, estimateRawUsd)
-  if (cost.source === 'none') {
-    console.warn(`[AI Proxy] ⚠️ No price for Higgsfield image model ${entry.id} — not charged`)
-    return
-  }
   return recordMediaUsage(tokenPayload, {
     kind: 'image',
     model: entry.id,
-    rawUsd: cost.rawUsd,
-    billedUsd: cost.billedUsd,
+    rawUsd: charge.rawUsd,
+    billedUsd: charge.billedUsd,
     actionType: 'ai_image_generation',
-    metadata: { n, provider: 'higgsfield', priceSource: cost.source },
+    metadata: { n, provider: 'higgsfield', priceSource: 'estimate' },
   }, chatSessionId)
 }
 
 /**
- * Run a Higgsfield image model: submit one request per output image, poll each
- * to a terminal state, then download the outputs. A `failed`, `nsfw` or
- * `canceled` request surfaces a readable error and contributes nothing to the
- * estimate, so it is never billed.
+ * Run a Higgsfield image model: price it, submit one request per output image,
+ * poll each to a terminal state, then download the outputs. Pricing happens
+ * *before* submitting, so a model whose price we cannot get never runs. A
+ * `failed`, `nsfw` or `canceled` request surfaces a readable error and is never
+ * billed.
  */
 async function generateImageHiggsfield(
   apiKey: string,
   entry: ImageModelEntry,
   params: { prompt: string; size?: string; quality?: string; n?: number; referenceImages?: string[] },
   signal?: AbortSignal,
-): Promise<{ result: ImageGenerationResponse; estimateRawUsd: number | null }> {
+): Promise<{ result: ImageGenerationResponse; charge: { rawUsd: number; billedUsd: number } }> {
   const n = Math.max(1, Math.min(4, params.n || 1))
   const referenceUrls = await Promise.all(
     (params.referenceImages ?? []).map((ref) => higgsfieldEnsurePublicUrl(apiKey, ref, signal)),
   )
   const request = buildHiggsfieldImageRequest(entry, { ...params, referenceUrls })
 
-  let estimate: HiggsfieldEstimate | null = null
-  try {
-    estimate = await higgsfieldEstimate(apiKey, request.endpoint, request.input, signal)
-  } catch (err: any) {
-    // Estimation is free but not load-bearing: a failed estimate falls back to
-    // the catalog price at billing time.
-    console.warn(`[AI Proxy] Higgsfield estimate failed for ${entry.id}: ${err?.message}`)
+  const estimate = await higgsfieldEstimate(apiKey, request.endpoint, request.input, signal).catch((err) => {
+    throw new HiggsfieldError(
+      `Could not get a price for this image (${err?.message ?? 'no estimate'}). Nothing was generated or charged; try again.`,
+      'unavailable',
+    )
+  })
+  const charge = higgsfieldCharge(estimate.rawUsd * n)
+  if (!charge) {
+    throw new HiggsfieldError('Higgsfield returned no price for this image. Nothing was generated or charged; try again.', 'unavailable')
   }
 
   const submissions = await Promise.all(
@@ -2925,7 +2915,7 @@ async function generateImageHiggsfield(
 
   return {
     result: { created: Math.floor(Date.now() / 1000), data },
-    estimateRawUsd: estimate ? estimate.rawUsd * n : null,
+    charge,
   }
 }
 
@@ -3054,6 +3044,7 @@ async function generateImageLocal(
 }
 
 import {
+  calculateGenjutsuUsageCost,
   calculateHiggsfieldUsageCost,
   calculateImageUsageCost,
   calculateImageProcessUsageCost,
@@ -3330,24 +3321,42 @@ export async function listMediaModels(signal?: AbortSignal) {
         ...(entry.deprecated ? { deprecated: true, replacement: entry.replacement } : {}),
       }
       if (entry.provider === 'higgsfield' && higgsfieldKey) {
-        const estimate = entry.sourceVideo
-          ? null
-          : await cachedHiggsfieldEstimate(
-              higgsfieldKey,
-              entry,
-              buildHiggsfieldVideoRequest(entry, {
-                prompt: 'a product rotating on a table, soft studio light',
-                duration: entry.defaultDuration,
-                resolution: entry.defaultResolution,
-              }),
-              signal,
-            )
+        // Genjutsu bills per source second, so its price is a rate, not a clip
+        // total: show the marked-up per-second rate for each resolution.
+        if (entry.usdPerSecondByResolution) {
+          const byResolution: Record<string, number> = {}
+          for (const resolution of Object.keys(entry.usdPerSecondByResolution).sort()) {
+            const rate = calculateGenjutsuUsageCost(entry.usdPerSecondByResolution, resolution, 1)
+            if (rate) byResolution[resolution] = roundUsd(rate.billedUsd)
+          }
+          const at = entry.defaultResolution ?? Object.keys(byResolution)[0]
+          return {
+            ...base,
+            price: {
+              unit: 'second',
+              usd: byResolution[at] ?? null,
+              by_resolution: byResolution,
+              source: 'rate_card',
+            },
+          }
+        }
+        const estimate = await cachedHiggsfieldEstimate(
+          higgsfieldKey,
+          entry,
+          buildHiggsfieldVideoRequest(entry, {
+            prompt: 'a product rotating on a table, soft studio light',
+            duration: entry.defaultDuration,
+            resolution: entry.defaultResolution,
+          }),
+          signal,
+        )
         const rawUsd = estimate?.rawUsd ?? entry.usdPerRequest
         return {
           ...base,
           price: {
             unit: 'clip',
             usd: rawUsd !== undefined ? roundUsd(calculateHiggsfieldUsageCost({ rawUsd }).billedUsd) : null,
+            ...(estimate?.rawUsd !== undefined ? { default_clip_usd: roundUsd(calculateHiggsfieldUsageCost({ rawUsd: estimate.rawUsd }).billedUsd), default_duration: entry.defaultDuration } : {}),
             source: estimate ? 'estimate' : rawUsd !== undefined ? 'catalog' : 'unknown',
           },
         }
@@ -5173,7 +5182,7 @@ export function aiProxyRoutes() {
         recordHiggsfieldImageUsage(
           tokenPayload,
           imageModel.entry,
-          generated.estimateRawUsd,
+          generated.charge,
           body.n || 1,
           c.req.header('x-chat-session-id') || null,
         )
@@ -5331,7 +5340,7 @@ export function aiProxyRoutes() {
         recordHiggsfieldImageUsage(
           tokenPayload,
           imageModel.entry!,
-          generated.estimateRawUsd,
+          generated.charge,
           n,
           c.req.header('x-chat-session-id') || null,
         )
@@ -5461,6 +5470,7 @@ export function aiProxyRoutes() {
         quality?: string
         prompt?: string
         source_video_url?: string
+        source_duration_seconds?: number
         preset_id?: string
       }
       const videoEntry = body.kind !== 'image' && body.model ? getVideoModelEntry(body.model) : undefined
@@ -5482,35 +5492,45 @@ export function aiProxyRoutes() {
           return c.json({ model: videoEntry.id, provider: 'fal', unit: 'second', duration, raw_usd: roundUsd(charge.rawUsd), usd: roundUsd(charge.billedUsd), source: 'catalog' })
         }
         if (videoEntry.sourceVideo) {
-          // Genjutsu is priced per source second, so the clip has to be named
-          // before the vendor can quote it.
-          if (!body.source_video_url) {
+          // Genjutsu quotes a prose rate card rather than a `usd` figure, so
+          // price it from the vendor's per-second table times the clip length.
+          const seconds = body.source_duration_seconds
+          if (typeof seconds !== 'number' || !Number.isFinite(seconds) || seconds <= 0) {
             return invalid(
-              `${videoEntry.displayName} is priced from its source clip: pass source_video_url (the uploaded clip's public URL).`,
-              'estimate_needs_source',
+              `${videoEntry.displayName} is billed per source second: pass source_duration_seconds (the clip's length).`,
+              'missing_source_duration',
             )
           }
-          const sourceRequest = buildHiggsfieldVideoRequest(videoEntry, {
-            prompt: body.prompt,
-            resolution: body.resolution,
-            sourceVideoUrl: body.source_video_url,
-            presetId: body.preset_id,
-          })
-          const sourceEstimate = await higgsfieldEstimate(apiKey, sourceRequest.endpoint, sourceRequest.input, c.req.raw.signal)
-          const sourceCharge = higgsfieldCharge(videoEntry, sourceEstimate.rawUsd)
+          const resolution = body.resolution ?? videoEntry.defaultResolution ?? '720p'
+          const billedSeconds = Math.min(seconds, videoEntry.maxSourceSeconds ?? 30)
+          const charge = calculateGenjutsuUsageCost(videoEntry.usdPerSecondByResolution, resolution, billedSeconds)
+          if (!charge) {
+            return invalid(`Cannot price ${videoEntry.displayName} at ${resolution}.`, 'estimate_unavailable')
+          }
           return c.json({
             model: videoEntry.id,
             provider: 'higgsfield',
-            unit: 'clip',
-            raw_usd: roundUsd(sourceCharge.rawUsd),
-            usd: roundUsd(sourceCharge.billedUsd),
-            credits: sourceEstimate.credits,
-            source: 'estimate',
+            unit: 'second',
+            duration: billedSeconds,
+            resolution,
+            raw_usd: roundUsd(charge.rawUsd),
+            usd: roundUsd(charge.billedUsd),
+            source: 'rate_card',
           })
         }
-        const request = buildHiggsfieldVideoRequest(videoEntry, { duration, resolution: body.resolution, aspectRatio: body.aspect_ratio })
+        // The vendor's schema requires a prompt even to quote a price; its
+        // content does not change the number.
+        const request = buildHiggsfieldVideoRequest(videoEntry, {
+          prompt: body.prompt || 'a product rotating on a table, studio light',
+          duration,
+          resolution: body.resolution,
+          aspectRatio: body.aspect_ratio,
+        })
         const estimate = await higgsfieldEstimate(apiKey, request.endpoint, request.input, c.req.raw.signal)
-        const charge = higgsfieldCharge(videoEntry, estimate.rawUsd)
+        const charge = higgsfieldCharge(estimate.rawUsd)
+        if (!charge) {
+          return c.json({ error: { message: 'Higgsfield returned no price for this request.', type: 'server_error', code: 'estimate_unavailable' } }, 503)
+        }
         return c.json({ model: videoEntry.id, provider: 'higgsfield', unit: 'clip', duration, raw_usd: roundUsd(charge.rawUsd), usd: roundUsd(charge.billedUsd), credits: estimate.credits, source: 'estimate' })
       }
 
@@ -5522,7 +5542,10 @@ export function aiProxyRoutes() {
       if (entry.provider === 'higgsfield') {
         const request = buildHiggsfieldImageRequest(entry, { prompt: 'a product photo', size: body.size, quality: body.quality })
         const estimate = await higgsfieldEstimate(apiKey, request.endpoint, request.input, c.req.raw.signal)
-        const charge = higgsfieldCharge(entry, estimate.rawUsd)
+        const charge = higgsfieldCharge(estimate.rawUsd)
+        if (!charge) {
+          return c.json({ error: { message: 'Higgsfield returned no price for this image.', type: 'server_error', code: 'estimate_unavailable' } }, 503)
+        }
         return c.json({ model: entry.id, provider: 'higgsfield', unit: 'image', raw_usd: roundUsd(charge.rawUsd), usd: roundUsd(charge.billedUsd), credits: estimate.credits, source: 'estimate' })
       }
       const charge = calculateImageUsageCost(entry.id, body.quality || 'standard', body.size || '1024x1024')
@@ -5716,6 +5739,7 @@ export function aiProxyRoutes() {
         start_image?: string
         reference_images?: string[]
         source_video_url?: string
+        source_duration_seconds?: number
         preset_id?: string
         genjutsu?: string
       }
@@ -5738,6 +5762,8 @@ export function aiProxyRoutes() {
       // A Genjutsu edit's length is the source clip's; everything else has a
       // fixed duration menu the model documents.
       const duration = entry.sourceVideo ? 0 : body.duration ?? entry.defaultDuration
+      /** Billed length of a Genjutsu source clip, in seconds. */
+      let sourceSeconds: number | undefined
       if (!entry.sourceVideo && !entry.durations.includes(duration)) {
         return invalid(`${entry.displayName} supports durations ${entry.durations.join(', ')} seconds; got ${duration}.`, 'invalid_duration')
       }
@@ -5767,7 +5793,24 @@ export function aiProxyRoutes() {
         if (entry.genjutsu === 'restyle' && !body.preset_id) {
           return invalid('Genjutsu Restyle needs a preset_id from GET /ai/v1/media/presets.', 'missing_preset_id')
         }
+        // These workflows are billed per source second, and the vendor quotes
+        // no usable number up front, so the length has to come from the caller.
+        // Without it we would bill zero — refuse instead.
+        const declared = body.source_duration_seconds
+        if (typeof declared !== 'number' || !Number.isFinite(declared) || declared <= 0) {
+          return invalid(
+            `${entry.displayName} is billed per source second: pass source_duration_seconds (the clip's length).`,
+            'missing_source_duration',
+          )
+        }
+        const minSeconds = entry.minSourceSeconds ?? 4
+        if (declared < minSeconds) {
+          return invalid(`The source clip is ${declared.toFixed(1)} s; ${entry.displayName} needs at least ${minSeconds} s.`, 'source_too_short')
+        }
+        // The provider trims anything longer than its max, so bill the trimmed length.
+        sourceSeconds = Math.min(declared, entry.maxSourceSeconds ?? 30)
       }
+      const resolution = body.resolution ?? entry.defaultResolution ?? '720p'
       if (body.start_image !== undefined) {
         const acceptable = typeof body.start_image === 'string'
           && (body.start_image.startsWith('data:image/') || /^https:\/\//i.test(body.start_image))
@@ -5837,8 +5880,8 @@ export function aiProxyRoutes() {
       }
 
       // Higgsfield: input media must be public URLs, so data URIs are uploaded
-      // first (the API key stays server-side) and the request is estimated
-      // before submission — that estimate is what a completed job is billed.
+      // first (the API key stays server-side). The price is settled before we
+      // submit: a job we cannot price is refused, never run for free.
       const referenceUrls = await Promise.all(refs.map((ref) => higgsfieldEnsurePublicUrl(apiKey, ref, signal)))
       const startImageUrl = body.start_image
         ? await higgsfieldEnsurePublicUrl(apiKey, body.start_image, signal)
@@ -5847,22 +5890,39 @@ export function aiProxyRoutes() {
         prompt: prompt || undefined,
         duration,
         aspectRatio: body.aspect_ratio,
-        resolution: body.resolution,
+        resolution,
         startImageUrl,
         referenceUrls,
         sourceVideoUrl: body.source_video_url,
         presetId: body.preset_id,
       })
 
-      let estimate: HiggsfieldEstimate | null = null
-      try {
-        estimate = await higgsfieldEstimate(apiKey, request.endpoint, request.input, signal)
-      } catch (err: any) {
-        console.warn(`[AI Proxy] Higgsfield estimate failed for ${entry.id}: ${err?.message}`)
+      let charge: { rawUsd: number; billedUsd: number } | null
+      let credits: number | undefined
+      if (entry.genjutsu) {
+        // Genjutsu answers `/estimate` with a prose rate card, not a `usd`
+        // figure, so price it from the vendor's per-second table instead.
+        charge = calculateGenjutsuUsageCost(entry.usdPerSecondByResolution, resolution, sourceSeconds!)
+        if (!charge) {
+          return invalid(
+            `Cannot price ${entry.displayName} at ${resolution}; supported resolutions are ${(entry.resolutions ?? []).join(', ')}.`,
+            'estimate_unavailable',
+          )
+        }
+      } else {
+        const estimate = await higgsfieldEstimate(apiKey, request.endpoint, request.input, signal).catch(() => null)
+        charge = higgsfieldCharge(estimate?.rawUsd ?? null)
+        credits = estimate?.credits
+        if (!charge) {
+          return c.json(
+            { error: { message: 'Higgsfield did not return a price for this request. Nothing was submitted or charged; try again.', type: 'server_error', code: 'estimate_unavailable' } },
+            503,
+          )
+        }
       }
 
       const submission = await higgsfieldSubmit(apiKey, request.endpoint, request.input, { idempotencyKey: id, signal })
-      const charge = higgsfieldCharge(entry, estimate?.rawUsd ?? null)
+      const billedDuration = entry.sourceVideo ? sourceSeconds! : duration
 
       await putVideoJob({
         id,
@@ -5875,26 +5935,26 @@ export function aiProxyRoutes() {
         endpoint: request.endpoint,
         statusUrl: submission.statusUrl,
         requestId: submission.requestId,
-        estimate: { rawUsd: charge.rawUsd, billedUsd: charge.billedUsd, ...(estimate?.credits !== undefined ? { credits: estimate.credits } : {}) },
-        duration,
+        estimate: { rawUsd: charge.rawUsd, billedUsd: charge.billedUsd, ...(credits !== undefined ? { credits } : {}) },
+        duration: billedDuration,
         audio: false,
         aspectRatio: body.aspect_ratio,
-        ...(body.resolution ? { resolution: body.resolution } : {}),
+        resolution,
         ...(entry.sourceVideo ? { sourceVideo: true } : {}),
         imageToVideo: !!body.start_image,
         createdAt: Date.now(),
       })
-      console.log(`[AI Proxy] 🎬 Video job ${id}: ${tokenPayload.projectId} → ${request.endpoint} (${entry.sourceVideo ? 'source clip' : `${duration}s`}, price ${charge.source})`)
+      console.log(`[AI Proxy] 🎬 Video job ${id}: ${tokenPayload.projectId} → ${request.endpoint} (${billedDuration}s${entry.sourceVideo ? ', source clip' : ''}, $${charge.billedUsd.toFixed(3)})`)
 
       return c.json({
         id,
         status: 'queued',
         model: entry.id,
-        duration,
+        duration: billedDuration,
         audio: false,
         provider: 'higgsfield',
         estimated_usd: roundUsd(charge.billedUsd),
-        price_source: charge.source,
+        price_source: entry.genjutsu ? 'rate_card' : 'estimate',
       })
     } catch (error: any) {
       console.error('[AI Proxy] Video submit error:', error.message)

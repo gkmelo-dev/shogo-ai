@@ -187,6 +187,9 @@ test("a SOUL V2 image generates, within its price cap", async ({ request }) => {
 
   const res = await request.fetch(`${LOCAL_API_BASE}/api/ai/v1/images/generations`, {
     method: "POST",
+    // An image render takes ~20 s; Playwright's default request timeout is well
+    // under that, and a timeout here would look like a provider failure.
+    timeout: 180_000,
     headers: proxyHeaders(proxy),
     data: { model: "hf-soul-v2", prompt: "a single red apple on a plain white seamless background, studio light", size: "1024x1024", n: 1 },
   })
@@ -205,6 +208,7 @@ test("a Hailuo 2.3 clip completes, within its price cap", async ({ request }) =>
 
   const res = await request.fetch(`${LOCAL_API_BASE}/api/ai/v1/videos/generations`, {
     method: "POST",
+    timeout: 120_000,
     headers: proxyHeaders(proxy),
     data: { model: "hf-hailuo-2.3", prompt: "a red apple rotating slowly on a white table, soft studio light", duration: 6 },
   })
@@ -236,6 +240,7 @@ test("Genjutsu restyles that clip at 480p, within its price cap", async ({ reque
   const quote = await estimate(request, proxy, {
     model: "hf-genjutsu-restyle",
     source_video_url: sourceUrl,
+    source_duration_seconds: 6,
     preset_id: presetId,
     resolution: "480p",
   })
@@ -244,10 +249,12 @@ test("Genjutsu restyles that clip at 480p, within its price cap", async ({ reque
 
   const res = await request.fetch(`${LOCAL_API_BASE}/api/ai/v1/videos/generations`, {
     method: "POST",
+    timeout: 180_000,
     headers: proxyHeaders(proxy),
     data: {
       model: "hf-genjutsu-restyle",
       source_video_url: sourceUrl,
+      source_duration_seconds: 6,
       preset_id: presetId,
       resolution: "480p",
     },
