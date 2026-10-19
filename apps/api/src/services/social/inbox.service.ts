@@ -561,6 +561,26 @@ export async function getConversation(
   }
 }
 
+/**
+ * Where a read marker belongs: the `sentAt` of the newest incoming message the
+ * reader could actually have seen — not the wall clock.
+ *
+ * `reconcileUnreadCount` compares the marker against the provider's `sentAt`,
+ * so a marker taken from our clock hides anything the provider *sent* before
+ * the read but *delivered* after it (a delayed webhook, or a sweep after an
+ * offline window) — the exact case the derived count exists to catch.
+ * Incoming-only for the same reason: our own outgoing rows are written with our
+ * clock, so anchoring on them would put the marker back at "now".
+ */
+async function readAnchor(workspaceId: string, conversationId: string): Promise<Date | null> {
+  const newest = await db.socialMessage.findFirst({
+    where: { workspaceId, conversationId, direction: 'incoming' },
+    orderBy: [{ sentAt: 'desc' }, { id: 'desc' }],
+    select: { sentAt: true },
+  })
+  return newest?.sentAt ?? null
+}
+
 /** Local read marker. The thread's provider-side unread is left to the app. */
 export async function markConversationRead(workspaceId: string, conversationId: string) {
   const conversation = await db.socialConversation.findFirst({
@@ -568,9 +588,10 @@ export async function markConversationRead(workspaceId: string, conversationId: 
     select: { id: true },
   })
   if (!conversation) throw new SocialError(404, 'conversation_not_found', 'No such conversation')
+  const anchor = await readAnchor(workspaceId, conversation.id)
   return db.socialConversation.update({
     where: { id: conversation.id },
-    data: { unreadCount: 0, lastReadAt: new Date() },
+    data: { unreadCount: 0, ...(anchor ? { lastReadAt: anchor } : {}) },
   })
 }
 
@@ -681,14 +702,16 @@ export async function replyToConversation(workspaceId: string, conversationId: s
     sentAt: new Date(),
   })
 
+  const anchor = await readAnchor(workspaceId, conversation.id)
   await db.socialConversation.update({
     where: { id: conversation.id },
     data: {
       lastMessageAt: new Date(),
       lastMessagePreview: preview(text),
-      // Replying is reading: the unread marker moves with the reply.
+      // Replying is reading: the unread marker moves with the reply, anchored
+      // to the thread so a message delivered after this reply still counts.
       unreadCount: 0,
-      lastReadAt: new Date(),
+      ...(anchor ? { lastReadAt: anchor } : {}),
     },
   })
 
