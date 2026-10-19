@@ -85,6 +85,7 @@ export function inviteLinkAcceptRoutes(config: InviteLinkAcceptConfig): Hono {
         memberId: member.id,
         role: member.role,
         source: 'invite_link',
+        invitedBy: link.createdBy,
       })
     }
 

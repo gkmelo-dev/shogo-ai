@@ -290,26 +290,26 @@ export const invitationHooks: InvitationHooks = {
 
   afterUpdate: async (record, ctx) => {
     if (record.status !== 'accepted' || !record.invitedBy) return
+    // Workspace joins are notified once, from the membership chokepoint
+    // (services/join-notifications.ts) — mailing here too is the duplicate SHO-51
+    // fixed. A project invitation has no member-joined mail, so it still sends.
+    if (!record.projectId) return
 
     try {
-      const [inviter, invitee, workspace, project] = await Promise.all([
+      const [inviter, invitee, project] = await Promise.all([
         ctx.prisma.user.findUnique({ where: { id: record.invitedBy }, select: { email: true } }),
         ctx.prisma.user.findFirst({ where: { email: record.email.toLowerCase() }, select: { name: true } }),
-        record.workspaceId ? ctx.prisma.workspace.findUnique({ where: { id: record.workspaceId }, select: { name: true } }) : null,
-        record.projectId ? ctx.prisma.project.findUnique({ where: { id: record.projectId }, select: { name: true } }) : null,
+        ctx.prisma.project.findUnique({ where: { id: record.projectId }, select: { name: true } }),
       ])
-      if (!inviter?.email) return
-
-      const resourceName = project?.name || workspace?.name
-      if (!resourceName) return
+      if (!inviter?.email || !project?.name) return
 
       const baseUrl = getFrontendUrl()
       sendInviteAcceptedEmail({
         to: inviter.email,
         inviteeName: invitee?.name || record.email,
         inviteeEmail: record.email,
-        resourceName,
-        resourceType: project ? 'project' : 'workspace',
+        resourceName: project.name,
+        resourceType: 'project',
         dashboardUrl: `${baseUrl}/settings?tab=people`,
       }).catch((err) => console.error('[Email] invite-accepted failed:', err))
     } catch (err) {

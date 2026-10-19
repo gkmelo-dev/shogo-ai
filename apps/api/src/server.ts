@@ -209,8 +209,6 @@ const getInstanceDisplayPrice: any = cloud.getInstanceDisplayPrice ?? (() => und
 const sendPlanUpgradedEmail: any = cloud.sendPlanUpgradedEmail ?? (async () => {})
 const sendInvitationEmail: any = cloud.sendInvitationEmail ?? (async () => {})
 const sendProjectInviteEmail: any = cloud.sendProjectInviteEmail ?? (async () => {})
-const sendInviteAcceptedEmail: any = cloud.sendInviteAcceptedEmail ?? (async () => {})
-const sendMemberJoinedEmail: any = cloud.sendMemberJoinedEmail ?? (async () => {})
 const sendMemberRemovedEmail: any = cloud.sendMemberRemovedEmail ?? (async () => {})
 const sendAccountDeletedEmail: any = cloud.sendAccountDeletedEmail ?? (async () => {})
 const identifyUser: any = cloud.identifyUser ?? (async () => {})
@@ -8966,52 +8964,8 @@ app.route('/api', inviteLinkAcceptRoutes({
         console.error('[Billing] invite-link accept seat sync failed:', err.message ?? err),
       )
     }
-
-    // Send notification emails (non-blocking — errors are logged internally)
-    const baseUrl = getFrontendUrl()
-    const [acceptingUser, workspace, project] = await Promise.all([
-      prisma.user.findUnique({ where: { id: userId }, select: { name: true, email: true } }),
-      resolvedWorkspaceId ? prisma.workspace.findUnique({ where: { id: resolvedWorkspaceId }, select: { name: true } }) : null,
-      link.projectId ? prisma.project.findUnique({ where: { id: link.projectId }, select: { name: true } }) : null,
-    ])
-    const acceptingName = acceptingUser?.name || acceptingUser?.email || 'Someone'
-    const acceptingEmail = acceptingUser?.email || ''
-    const resourceName = project?.name || workspace?.name || 'your workspace'
-    const resourceType = link.projectId ? 'project' : 'workspace'
-    const workspaceName = workspace?.name || 'your workspace'
-
-    if (link.createdBy) {
-      const creator = await prisma.user.findUnique({ where: { id: link.createdBy }, select: { email: true } })
-      if (creator?.email) {
-        await sendInviteAcceptedEmail({
-          to: creator.email,
-          inviteeName: acceptingName,
-          inviteeEmail: acceptingEmail,
-          resourceName,
-          resourceType,
-          dashboardUrl: baseUrl,
-        })
-      }
-    }
-
-    if (resolvedWorkspaceId) {
-      const owners = await prisma.member.findMany({
-        where: { workspaceId: resolvedWorkspaceId, role: 'owner', projectId: null, userId: { not: userId } },
-        include: { user: { select: { email: true } } },
-      })
-      for (const owner of owners) {
-        if (owner.user?.email) {
-          await sendMemberJoinedEmail({
-            to: owner.user.email,
-            memberName: acceptingName,
-            memberEmail: acceptingEmail,
-            workspaceName,
-            role: link.role,
-            dashboardUrl: baseUrl,
-          })
-        }
-      }
-    }
+    // Join mail comes from onWorkspaceMemberJoined inside the route, so this
+    // handler never mails; see services/join-notifications.ts (SHO-51).
   },
 }))
 
