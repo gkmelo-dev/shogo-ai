@@ -33,12 +33,24 @@ export interface ChatMentionMeta {
  * Where a chip opens. Workspace-agent chats belong to the workspace agent,
  * project chats to the project surface — and both carry the session id, so the
  * screen lands on the conversation rather than the workspace's current one.
+ *
+ * `workspace=` is what makes the switch survive the boot: a cross-workspace tap
+ * does a full navigation, and the workspace that owns the chat being left
+ * finishes its turn around the same moment and clamps the stored id back
+ * (`shouldRestoreChatWorkspace`). The URL is read first at startup
+ * (`AppSidebar`), so it wins — and it is stripped while `chatSessionId` is kept.
  */
-export function chatMentionHref(meta: { id: string; projectId?: string | null }): string {
-  const chatSessionId = encodeURIComponent(meta.id)
-  return meta.projectId
-    ? `/(app)/projects/${meta.projectId}?chatSessionId=${chatSessionId}`
-    : `/(app)/agent?chatSessionId=${chatSessionId}`
+export function chatMentionHref(meta: {
+  id: string
+  projectId?: string | null
+  workspaceId?: string
+}): string {
+  const base = meta.projectId ? `/(app)/projects/${meta.projectId}` : "/(app)/agent"
+  const chatSessionId = `chatSessionId=${encodeURIComponent(meta.id)}`
+  const workspace = meta.workspaceId
+    ? `&workspace=${encodeURIComponent(meta.workspaceId)}`
+    : ""
+  return `${base}?${chatSessionId}${workspace}`
 }
 
 interface ChatMentionStatus {
@@ -215,7 +227,7 @@ export function ChatMentionChip({
     openInWorkspace(
       router,
       meta?.workspaceId,
-      chatMentionHref({ id, projectId: meta?.projectId ?? null }),
+      chatMentionHref({ id, projectId: meta?.projectId ?? null, workspaceId: meta?.workspaceId }),
       activeWorkspace?.id,
       projects,
     )

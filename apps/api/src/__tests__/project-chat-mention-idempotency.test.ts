@@ -112,6 +112,7 @@ mock.module('../services/billing.service', () => ({
   consumeUsage: async () => ({ success: true, remainingIncludedUsd: 99 }),
   hasBalance: async () => true,
   checkUsageBalance: async () => ({ ok: true }),
+  getEffectivePlanId: async () => 'free',
   usageLimitErrorPayload: (reason?: string) => ({ code: reason ?? 'usage_limit_reached', message: 'limit' }),
   hasAdvancedModelAccess: async () => true,
 }))
@@ -155,8 +156,6 @@ mock.module('../lib/knative-project-manager', () => ({
     waitForReady: async () => {},
   }),
 }))
-
-mock.module('fs', () => ({ existsSync: () => true }))
 
 const encoder = new TextEncoder()
 let fetchResponder: ((url: string) => Response | Promise<Response>) | null = null

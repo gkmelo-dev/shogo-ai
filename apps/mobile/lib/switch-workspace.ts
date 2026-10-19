@@ -83,6 +83,30 @@ export function reloadAfterWorkspaceSwitch(): void {
 }
 
 /**
+ * Whether a finishing turn should force the screen back to the workspace that
+ * owns its chat.
+ *
+ * A legacy project session gets upgraded to a workspace session through several
+ * collection refreshes, and one of those can briefly omit the team; restoring
+ * the chat's own workspace before the sidebar reconciles keeps the selection
+ * valid. It must **not** undo a switch the person just made: pressing a chat
+ * chip for another workspace moves this screen to a different session, and the
+ * source turn then finishes while the target is already open — clamping there
+ * would put the app back in the workspace whose chat the person just left.
+ */
+export function shouldRestoreChatWorkspace(args: {
+  chatWorkspaceId: string | null | undefined
+  activeWorkspaceId: string | null
+  finishedSessionId: string | null | undefined
+  liveSessionId: string | null | undefined
+}): boolean {
+  if (!args.chatWorkspaceId) return false
+  if (args.activeWorkspaceId === args.chatWorkspaceId) return false
+  if (args.finishedSessionId && args.liveSessionId !== args.finishedSessionId) return false
+  return true
+}
+
+/**
  * Make `workspaceId` active and open `path` (an Expo Router href) in it.
  * Same-workspace targets are a plain push; cross-workspace targets do a full
  * navigation on web for the reason described on `reloadAfterWorkspaceSwitch`.

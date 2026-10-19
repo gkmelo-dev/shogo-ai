@@ -164,6 +164,7 @@ import {
   getActiveWorkspaceId,
   setActiveWorkspaceId,
 } from "../../lib/workspace-store"
+import { shouldRestoreChatWorkspace } from "../../lib/switch-workspace"
 import {
   hasAcceptedAiConsent,
   acceptAiConsent,
@@ -3085,12 +3086,18 @@ const ChatPanelContent = observer(function ChatPanelContent({
       setEmptyResponseError(nextError)
 
       if (currentSessionId) {
-        // The chat's workspace is authoritative for this turn. A legacy
-        // project session can trigger several collection refreshes while it
-        // is upgraded to a workspace session; if one of those refreshes
-        // briefly omits the team, restore the workspace that owns the chat
-        // before the sidebar reconciles its selection.
-        if (workspaceId && getActiveWorkspaceId() !== workspaceId) {
+        // The chat's workspace is authoritative for this turn — unless the
+        // person already moved this screen to another chat (a cross-workspace
+        // chip press), in which case the switch they just made wins.
+        if (
+          workspaceId &&
+          shouldRestoreChatWorkspace({
+            chatWorkspaceId: workspaceId,
+            activeWorkspaceId: getActiveWorkspaceId(),
+            finishedSessionId: currentSessionId,
+            liveSessionId: currentSessionIdRef.current,
+          })
+        ) {
           setActiveWorkspaceId(workspaceId)
         }
         refetchUsageWallet()
