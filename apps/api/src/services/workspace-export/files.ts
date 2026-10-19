@@ -34,7 +34,6 @@ import {
   statSync,
 } from 'node:fs'
 import { join, relative, resolve } from 'node:path'
-import { isMacOSJunkName } from '@shogo/shared-runtime'
 import { importCloudModule } from '../../lib/cloud-import'
 import { deriveProjectRuntimeToken } from '../../lib/project-runtime-token'
 
@@ -48,6 +47,15 @@ export const isKubernetes = (): boolean => !!process.env.KUBERNETES_SERVICE_HOST
 
 /** Per-file cap for anything that travels in an archive. */
 export const MAX_FILE_SIZE = 10 * 1024 * 1024
+
+/**
+ * macOS detritus: `._*` AppleDouble sidecars crash Metro's Babel parser, and a
+ * stray `__MACOSX` folder is never project content. Declared here rather than
+ * imported from `@shogo/shared-runtime` so this service has no dependency a
+ * test would have to mock.
+ */
+export const isMacOsJunk = (name: string): boolean =>
+  name === '__MACOSX' || name.startsWith('._')
 
 // `dist/` and `build/` are intentionally NOT excluded here — a bundle carries
 // the prebuilt app output so an imported project can serve its preview
@@ -126,8 +134,7 @@ export function collectWorkspaceFiles(
   for (const entry of entries) {
     if (EXCLUDED_DIRS.has(entry.name)) continue
     if (extraExcludedDirs?.has(entry.name)) continue
-    // macOS detritus: `._*` AppleDouble sidecars crash Metro's Babel parser.
-    if (isMacOSJunkName(entry.name)) continue
+    if (isMacOsJunk(entry.name)) continue
 
     const fullPath = join(dir, entry.name)
     const relPath = relative(baseDir, fullPath).replace(/\\/g, '/')
@@ -434,7 +441,7 @@ export function collectWorkspaceRootFiles(
   for (const entry of entries) {
     if (EXCLUDED_DIRS.has(entry.name)) continue
     if (extraExcludedNames.has(entry.name)) continue
-    if (isMacOSJunkName(entry.name)) continue
+    if (isMacOsJunk(entry.name)) continue
     if (entry.name === '.workspace-roots') continue
     if (projectIdSet.has(entry.name)) continue
 

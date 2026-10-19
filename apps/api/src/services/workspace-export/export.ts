@@ -24,10 +24,7 @@ import {
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { GetObjectCommand } from '@aws-sdk/client-s3'
 import { prisma } from '../../lib/prisma'
-import { exportChatPartsWithAttachments } from '../../lib/chat-attachments'
-import { getArtifactBucket, getArtifactS3Client } from '../../lib/s3'
 import {
   isEnvFile,
   redactEnvText,
@@ -331,8 +328,17 @@ function safeName(value: string, fallback: string): string {
   return cleaned || fallback
 }
 
+/**
+ * Object storage is loaded lazily: the archive service must stay importable in
+ * a process that never touches S3 (the desktop build, and every test that mocks
+ * `lib/s3` for its own purposes).
+ */
 async function readArtifactBytes(key: string): Promise<Uint8Array | null> {
   try {
+    const [{ GetObjectCommand }, { getArtifactBucket, getArtifactS3Client }] = await Promise.all([
+      import('@aws-sdk/client-s3'),
+      import('../../lib/s3'),
+    ])
     const res = await getArtifactS3Client().send(
       new GetObjectCommand({ Bucket: getArtifactBucket(), Key: key }),
     )
@@ -433,6 +439,7 @@ export async function buildWorkspaceArchive(req: WorkspaceExportRequest): Promis
     // archive already carry `attachment://` references instead of inlined
     // bytes. One attachment is read, compressed and released at a time.
     if (includeAttachments) {
+      const { exportChatPartsWithAttachments } = await import('../../lib/chat-attachments')
       for (const message of snapshot.rows.get('ChatMessage') ?? []) {
         if (!message.parts) continue
         const result = await exportChatPartsWithAttachments(message.parts)
