@@ -198,6 +198,66 @@ describe('relay tenant scoping', () => {
     expect(body.error.message).toBe('Instagram rate limited')
     expect(body.error.platform).toBe('instagram')
   })
+
+  test('a dead-lettered delivery can be replayed, by its own workspace only', async () => {
+    const { enqueueRelayedEvent, failRelayedEvents, MAX_ATTEMPTS, listDeadLettered } = await import(
+      '../../services/social/relay-events.service'
+    )
+
+    // Two dead letters, one per tenant.
+    const mine = await enqueueRelayedEvent({
+      workspaceId: own,
+      envelope: {
+        externalId: `lws_${suffix}`,
+        localWorkspaceId: suffix,
+        eventId: `evt_replay_${suffix}`,
+        type: 'comment.received',
+        occurredAt: new Date().toISOString(),
+      },
+    })
+    const theirs = await enqueueRelayedEvent({
+      workspaceId: other,
+      envelope: {
+        externalId: `lws_other_${suffix}`,
+        localWorkspaceId: `${suffix}-other`,
+        eventId: `evt_other_${suffix}`,
+        type: 'comment.received',
+        occurredAt: new Date().toISOString(),
+      },
+    })
+    for (const [workspaceId, id] of [
+      [own, mine.id],
+      [other, theirs.id],
+    ] as const) {
+      for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+        await failRelayedEvents({ workspaceId, failures: [{ id, error: 'catalog rejected it' }] })
+      }
+    }
+    expect((await listDeadLettered({ workspaceId: own })).map((row: any) => row.id)).toEqual([mine.id])
+
+    // A foreign id changes nothing: the replay is scoped by the caller's key.
+    const foreign = await relay('/events/replay', own, {
+      method: 'POST',
+      body: JSON.stringify({ ids: [theirs.id] }),
+    })
+    expect(foreign.status).toBe(200)
+    expect((await foreign.json()).requeued).toBe(0)
+
+    const replay = await relay('/events/replay', own, {
+      method: 'POST',
+      body: JSON.stringify({ ids: [mine.id] }),
+    })
+    expect(replay.status).toBe(200)
+    expect((await replay.json()).requeued).toBe(1)
+
+    // Back in the poll, so the desktop can apply and ack it this time.
+    const pending = await relay('/events', own)
+    const events = (await pending.json()).events
+    expect(events.map((event: any) => event.id)).toEqual([mine.id])
+
+    // And the other tenant's row is untouched.
+    expect((await listDeadLettered({ workspaceId: other })).map((row: any) => row.id)).toEqual([theirs.id])
+  })
 })
 
 /**

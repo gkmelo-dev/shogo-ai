@@ -16,7 +16,7 @@ import { setupChannelsTestDb } from '../../../__tests__/helpers/channels-test-db
 setupChannelsTestDb()
 
 const { prisma } = await import('../../../lib/prisma')
-const { setSocialClient } = await import('../client')
+const { getSocialClient, setSocialClient } = await import('../client')
 const { applySocialEvent } = await import('../webhooks')
 const {
   backfillInbox,
@@ -296,15 +296,43 @@ describe('replying', () => {
     expect(thread.conversation.unreadCount).toBe(0)
   })
 
-  test('two identical replies reuse the same idempotency key', async () => {
+  test('a repeated reply is a new send, while a retry of the same one is not', async () => {
     const [conversation] = await listConversations(workspaceId)
-    await replyToConversation(workspaceId, conversation.id, { text: 'Repeated answer' })
-    await replyToConversation(workspaceId, conversation.id, { text: 'Repeated answer' })
+    const keysFor = () =>
+      calls
+        .filter((call) => call.method === 'POST' && call.path === '/inbox/conversations/conv_1/messages')
+        .map((call) => call.idempotencyKey)
 
-    const keys = calls
-      .filter((call) => call.method === 'POST' && call.path === '/inbox/conversations/conv_1/messages')
-      .map((call) => call.idempotencyKey)
-    expect(keys[keys.length - 1]).toBe(keys[keys.length - 2])
+    const baseline = keysFor().length
+    await replyToConversation(workspaceId, conversation.id, { text: 'Repeated answer' })
+    await replyToConversation(workspaceId, conversation.id, { text: 'Repeated answer' })
+    const keys = keysFor().slice(baseline)
+    // A deliberate second copy of the same words has to actually go out, so it
+    // cannot share the first attempt's key.
+    expect(keys).toHaveLength(2)
+    expect(keys[1]).not.toBe(keys[0])
+
+    // A send whose response never arrives records nothing, so its retry derives
+    // the very same key — which is the whole point of the key.
+    const previous = getSocialClient()
+    setSocialClient({
+      mode: 'cloud',
+      async request(req: any) {
+        calls.push(req)
+        throw new Error('socket hang up')
+      },
+    } as any)
+    try {
+      await expect(
+        replyToConversation(workspaceId, conversation.id, { text: 'Repeated answer' }),
+      ).rejects.toThrow()
+    } finally {
+      setSocialClient(previous as any)
+    }
+
+    const lostKey = keysFor()[baseline + 2]
+    await replyToConversation(workspaceId, conversation.id, { text: 'Repeated answer' })
+    expect(keysFor()[baseline + 3]).toBe(lostKey)
   })
 
   test('a comment reply is addressed to the comment and marks it answered', async () => {
@@ -403,6 +431,58 @@ describe('backfill', () => {
 
     const read = await markConversationRead(workspaceId, first.id)
     expect(read.unreadCount).toBe(0)
+  })
+})
+
+describe('a long thread', () => {
+  test('opens on its recent end and pages backwards to the first message', async () => {
+    const thread = await db.socialConversation.create({
+      data: { workspaceId, zernioConversationId: 'conv_long', platform: 'instagram' },
+    })
+    const base = Date.UTC(2026, 9, 19, 12, 0, 0)
+
+    // 250 messages, so the default 100-message window cannot hold them.
+    for (let index = 1; index <= 250; index++) {
+      await db.socialMessage.create({
+        data: {
+          workspaceId,
+          conversationId: thread.id,
+          zernioMessageId: `msg_long_${index}`,
+          direction: index % 2 ? 'incoming' : 'outgoing',
+          platform: 'instagram',
+          text: `long ${index}`,
+          sentAt: new Date(base + index * 60_000),
+        },
+      })
+    }
+
+    const first = await getConversation(workspaceId, thread.id)
+    expect(first.messages).toHaveLength(100)
+    expect(first.messages.at(-1).text).toBe('long 250')
+    expect(first.hasMore).toBe(true)
+    expect(first.nextCursor).toBe(first.messages[0].id)
+
+    // Page backwards: strictly older, no overlap, and it terminates at message 1.
+    const second = await getConversation(workspaceId, thread.id, { before: first.nextCursor })
+    expect(second.messages.at(-1).text).toBe('long 150')
+    expect(second.messages[0].text).toBe('long 51')
+    const third = await getConversation(workspaceId, thread.id, { before: second.nextCursor })
+    expect(third.messages.at(-1).text).toBe('long 50')
+    expect(third.messages[0].text).toBe('long 1')
+    expect(third.hasMore).toBe(false)
+    expect(third.nextCursor).toBeNull()
+
+    // The whole thread, read through the cursor, is every message exactly once.
+    const seen = [...third.messages, ...second.messages, ...first.messages].map((message: any) => message.text)
+    expect(new Set(seen).size).toBe(250)
+
+    // A cursor from another thread is refused rather than silently ignored.
+    await expect(
+      getConversation(workspaceId, thread.id, { before: 'not-a-message-of-this-thread' }),
+    ).rejects.toMatchObject({ status: 400, code: 'invalid_cursor' })
+
+    await db.socialMessage.deleteMany({ where: { conversationId: thread.id } })
+    await db.socialConversation.delete({ where: { id: thread.id } })
   })
 })
 

@@ -24,6 +24,7 @@ import {
   listDeadLettered,
   listRelayedEvents,
   pruneRelayedEvents,
+  requeueRelayedEvents,
 } from '../services/social/relay-events.service'
 import {
   backfillInbox,
@@ -107,6 +108,19 @@ function requireString(raw: unknown, field: string): string {
   const value = typeof raw === 'string' ? raw.trim() : ''
   if (!value) throw new SocialError(400, 'invalid_body', `${field} is required`)
   return value
+}
+
+/**
+ * The thread window a caller asked for. `before` pages backwards through a
+ * long thread; without it the first page is the recent end, because a chat view
+ * has to show the message being answered.
+ */
+function conversationWindow(c: any): { messageLimit?: number; before?: string | null } {
+  const limitRaw = Number(c.req.query('limit'))
+  return {
+    messageLimit: Number.isFinite(limitRaw) && limitRaw > 0 ? limitRaw : undefined,
+    before: c.req.query('before') || null,
+  }
 }
 
 /**
@@ -354,7 +368,9 @@ export function socialRoutes(config: SocialRoutesConfig): Hono {
     const userId = await requireMember(c, workspaceId)
     if (userId instanceof Response) return userId
     try {
-      return c.json(await getConversation(workspaceId, c.req.param('conversationId')))
+      return c.json(
+        await getConversation(workspaceId, c.req.param('conversationId'), conversationWindow(c)),
+      )
     } catch (err) {
       return errorResponse(c, err)
     }
@@ -557,7 +573,9 @@ export function agentSocialRoutes(config: AgentSocialRoutesConfig): Hono {
     const auth = await authorize(c)
     if (auth instanceof Response) return auth
     try {
-      return c.json(await getConversation(auth.workspaceId, c.req.param('conversationId')))
+      return c.json(
+        await getConversation(auth.workspaceId, c.req.param('conversationId'), conversationWindow(c)),
+      )
     } catch (err) {
       return errorResponse(c, err)
     }
@@ -714,6 +732,20 @@ export function socialRelayRoutes(): Hono {
     const caller = relayCaller(c)
     if ('response' in caller) return caller.response
     return c.json({ events: await listDeadLettered({ workspaceId: caller.workspaceId }) })
+  })
+
+  /**
+   * Retry dead-lettered deliveries. The provider will not resend them — it was
+   * told `200` — so this is the only way a delivery lost to a bug comes back
+   * after the bug is fixed.
+   */
+  router.post('/social-relay/events/replay', async (c) => {
+    const caller = relayCaller(c)
+    if ('response' in caller) return caller.response
+    const body = await readJson(c)
+    const ids = Array.isArray(body.ids) ? body.ids.filter((id: unknown) => typeof id === 'string') : []
+    const requeued = await requeueRelayedEvents({ workspaceId: caller.workspaceId, ids })
+    return c.json({ ok: true, requeued })
   })
 
   router.all('/social-relay/*', async (c) => {

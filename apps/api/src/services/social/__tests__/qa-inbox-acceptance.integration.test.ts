@@ -113,6 +113,9 @@ beforeAll(async () => {
         direction: 'incoming',
         text: 'B private thread',
         sender: { name: 'B person' },
+        // Pinned before the 120 messages the long-thread case adds, so "newest"
+        // is a property of the fixture and not of the wall clock.
+        createdAt: '2026-10-19T12:00:00.000Z',
       },
     },
   })

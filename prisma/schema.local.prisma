@@ -4080,6 +4080,7 @@ model SocialConversation {
   participantPicture   String?
   status               String    @default("active")
   unreadCount          Int       @default(0)
+  lastReadAt           DateTime?
   lastMessageAt        DateTime?
   lastMessagePreview   String?
   assignedToUserId     String?

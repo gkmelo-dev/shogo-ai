@@ -26,6 +26,8 @@ const {
   listRelayedEvents,
   MAX_ATTEMPTS,
   pruneRelayedEvents,
+  requeueRelayedEvents,
+  retryDelayMs,
 } = await import('../relay-events.service')
 
 const db = prisma as any
@@ -113,9 +115,18 @@ describe('a delivery that cannot be applied', () => {
       })
       expect(result.recorded).toBe(1)
       if (attempt < MAX_ATTEMPTS) {
-        // Still in the queue: the next poll hands it out again.
         expect(result.deadLettered).toEqual([])
+        // Waiting out its backoff: still held, not handed out yet.
+        expect(await listRelayedEvents({ workspaceId })).toHaveLength(0)
+        expect(await listDeadLettered({ workspaceId })).toHaveLength(0)
+        // Once the delay has passed the same row is handed out again.
+        await db.socialRelayedEvent.update({
+          where: { id },
+          data: { lastAttemptAt: new Date(Date.now() - retryDelayMs(attempt) - 1_000) },
+        })
         expect(await listRelayedEvents({ workspaceId })).toHaveLength(1)
+        // The attempt still counts: a redelivery is not a fresh start.
+        expect((await db.socialRelayedEvent.findUnique({ where: { id } })).attempts).toBe(attempt)
       } else {
         expect(result.deadLettered).toEqual([id])
       }
@@ -133,9 +144,38 @@ describe('a delivery that cannot be applied', () => {
     expect(row.appliedAt).toBeNull()
   })
 
-  test('an applied or already-dead delivery records no further failure', async () => {
+  test('a dead letter replays once the cause is fixed', async () => {
     const dead = await listDeadLettered({ workspaceId })
-    const again = await failRelayedEvents({ workspaceId, failures: [{ id: dead[0].id, error: 'boom' }] })
+    const id = dead[0].id
+
+    // Another tenant cannot requeue it, and a live row is not a dead letter.
+    expect(await requeueRelayedEvents({ workspaceId: otherWorkspaceId, ids: [id] })).toBe(0)
+    expect(await requeueRelayedEvents({ workspaceId, ids: ['no-such-row'] })).toBe(0)
+
+    expect(await requeueRelayedEvents({ workspaceId, ids: [id] })).toBe(1)
+    const row = await db.socialRelayedEvent.findUnique({ where: { id } })
+    expect(row.failedAt).toBeNull()
+    expect(row.attempts).toBe(0)
+    expect(row.lastError).toBeNull()
+
+    // Back in the queue with a full schedule, and no longer in the dead list.
+    expect((await listRelayedEvents({ workspaceId })).map((event: any) => event.id)).toEqual([id])
+    expect(await listDeadLettered({ workspaceId })).toHaveLength(0)
+
+    // Applying it now works, and it leaves the queue for good.
+    expect(await ackRelayedEvents({ workspaceId, ids: [id] })).toBe(1)
+    expect(await listRelayedEvents({ workspaceId })).toHaveLength(0)
+    await db.socialRelayedEvent.deleteMany({ where: { workspaceId } })
+  })
+
+  test('an applied or already-dead delivery records no further failure', async () => {
+    const { id } = await enqueueRelayedEvent({ workspaceId, envelope: envelope('evt_check') })
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      await failRelayedEvents({ workspaceId, failures: [{ id, error: `boom ${attempt}` }] })
+    }
+    expect((await listDeadLettered({ workspaceId })).map((row: any) => row.id)).toEqual([id])
+
+    const again = await failRelayedEvents({ workspaceId, failures: [{ id, error: 'boom' }] })
     expect(again).toEqual({ recorded: 0, deadLettered: [] })
 
     const missing = await failRelayedEvents({ workspaceId, failures: [{ id: 'no-such-row', error: 'boom' }] })

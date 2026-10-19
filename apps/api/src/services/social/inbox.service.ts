@@ -496,17 +496,69 @@ export async function listConversations(workspaceId: string, input: ListConversa
   })
 }
 
-export async function getConversation(workspaceId: string, conversationId: string, messageLimit = 100) {
+export interface ConversationWindow {
+  /** How many messages to return (default 100, max 200). */
+  messageLimit?: number
+  /**
+   * Page backwards: return the messages older than this message id. The first
+   * page of a thread is its *recent* end, because a chat view has to show the
+   * message being answered, not message 1 of 400.
+   */
+  before?: string | null
+}
+
+export interface ConversationView {
+  conversation: any
+  /** Ascending by `sentAt`, so it renders top to bottom as-is. */
+  messages: any[]
+  /** True when there is older history above this window. */
+  hasMore: boolean
+  /** Pass as `before` to fetch the next older page. */
+  nextCursor: string | null
+}
+
+export async function getConversation(
+  workspaceId: string,
+  conversationId: string,
+  window: number | ConversationWindow = {},
+): Promise<ConversationView> {
+  const options: ConversationWindow = typeof window === 'number' ? { messageLimit: window } : window
+  const limit = clampLimit(options.messageLimit, 100, 200)
+
   const conversation = await db.socialConversation.findFirst({
     where: { workspaceId, id: conversationId },
   })
   if (!conversation) throw new SocialError(404, 'conversation_not_found', 'No such conversation')
-  const messages = await db.socialMessage.findMany({
-    where: { workspaceId, conversationId: conversation.id },
-    orderBy: { sentAt: 'asc' },
-    take: clampLimit(messageLimit, 100, 200),
+
+  const where: Record<string, unknown> = { workspaceId, conversationId: conversation.id }
+
+  if (options.before) {
+    const cursor = await db.socialMessage.findFirst({
+      where: { workspaceId, conversationId: conversation.id, id: options.before },
+      select: { id: true, sentAt: true },
+    })
+    if (!cursor) throw new SocialError(400, 'invalid_cursor', 'That message is not part of this thread')
+    // Strictly older, with an id tiebreak so two messages sharing a timestamp
+    // can never be returned twice or skipped.
+    where.OR = [
+      { sentAt: { lt: cursor.sentAt } },
+      { sentAt: cursor.sentAt, id: { lt: cursor.id } },
+    ]
+  }
+
+  const rows = await db.socialMessage.findMany({
+    where,
+    orderBy: [{ sentAt: 'desc' }, { id: 'desc' }],
+    take: limit + 1,
   })
-  return { conversation, messages }
+  const hasMore = rows.length > limit
+  const messages = (hasMore ? rows.slice(0, limit) : rows).reverse()
+  return {
+    conversation,
+    messages,
+    hasMore,
+    nextCursor: hasMore && messages.length > 0 ? messages[0].id : null,
+  }
 }
 
 /** Local read marker. The thread's provider-side unread is left to the app. */
@@ -518,7 +570,7 @@ export async function markConversationRead(workspaceId: string, conversationId: 
   if (!conversation) throw new SocialError(404, 'conversation_not_found', 'No such conversation')
   return db.socialConversation.update({
     where: { id: conversation.id },
-    data: { unreadCount: 0 },
+    data: { unreadCount: 0, lastReadAt: new Date() },
   })
 }
 
@@ -556,11 +608,17 @@ export async function markCommentRead(workspaceId: string, commentId: string) {
 
 // ── sending ───────────────────────────────────────────────────────────────
 
-function replyKey(prefix: string, workspaceId: string, id: string, text: string): string {
-  // Deterministic per (workspace, target, body): a double-tap or a retry after
-  // a lost response replays the provider's original answer instead of sending
-  // the message twice.
-  return `${prefix}:${workspaceId}:${id}:${Buffer.from(text).toString('base64url').slice(0, 90)}`
+/**
+ * Deterministic per (workspace, target, body) **and per attempt slot**: a retry
+ * after a lost response replays the provider's original answer, while a second,
+ * deliberate copy of the same text is a different key and actually goes out.
+ * The slot is how many copies of that exact reply we have already recorded for
+ * the target — rows are only written on success, so a send that got no response
+ * cannot advance it.
+ */
+function replyKey(prefix: string, workspaceId: string, id: string, text: string, slot: number): string {
+  const body = Buffer.from(text).toString('base64url').slice(0, 80)
+  return `${prefix}:${workspaceId}:${id}:${body}:${slot}`
 }
 
 export interface ReplyInput {
@@ -595,12 +653,16 @@ export async function replyToConversation(workspaceId: string, conversationId: s
     )
   }
 
+  const slot = await db.socialMessage.count({
+    where: { workspaceId, conversationId: conversation.id, direction: 'outgoing', text },
+  })
+
   const result = await getSocialClient().request<any>({
     workspaceId,
     method: 'POST',
     path: `/inbox/conversations/${encodeURIComponent(conversation.zernioConversationId)}/messages`,
     body: { accountId: account.zernioAccountId, message: text },
-    idempotencyKey: input.idempotencyKey?.trim() || replyKey('dm', workspaceId, conversation.id, text),
+    idempotencyKey: input.idempotencyKey?.trim() || replyKey('dm', workspaceId, conversation.id, text, slot),
   })
 
   const sent = asRecord(result?.data) ?? asRecord(result) ?? {}
@@ -621,7 +683,13 @@ export async function replyToConversation(workspaceId: string, conversationId: s
 
   await db.socialConversation.update({
     where: { id: conversation.id },
-    data: { lastMessageAt: new Date(), lastMessagePreview: preview(text), unreadCount: 0 },
+    data: {
+      lastMessageAt: new Date(),
+      lastMessagePreview: preview(text),
+      // Replying is reading: the unread marker moves with the reply.
+      unreadCount: 0,
+      lastReadAt: new Date(),
+    },
   })
 
   return {
@@ -647,9 +715,12 @@ export async function replyToComment(workspaceId: string, commentId: string, inp
     throw new SocialError(409, 'comment_is_own', 'That comment was written by the connected account')
   }
 
+  // Answer from the account the comment arrived on. Guessing a same-platform
+  // account would reply as a different brand's handle, which is worse than
+  // telling the caller to sync first.
   const account = comment.accountId
     ? await db.socialAccount.findFirst({ where: { workspaceId, id: comment.accountId } })
-    : await db.socialAccount.findFirst({ where: { workspaceId, platform: comment.platform, isActive: true } })
+    : null
   if (!account) {
     throw new SocialError(
       409,
@@ -658,12 +729,16 @@ export async function replyToComment(workspaceId: string, commentId: string, inp
     )
   }
 
+  const slot = await db.socialComment.count({
+    where: { workspaceId, zernioPostId: comment.zernioPostId, isOwn: true, text },
+  })
+
   const result = await getSocialClient().request<any>({
     workspaceId,
     method: 'POST',
     path: `/inbox/comments/${encodeURIComponent(comment.zernioPostId)}`,
     body: { accountId: account.zernioAccountId, message: text, commentId: comment.zernioCommentId },
-    idempotencyKey: input.idempotencyKey?.trim() || replyKey('comment', workspaceId, comment.id, text),
+    idempotencyKey: input.idempotencyKey?.trim() || replyKey('comment', workspaceId, comment.id, text, slot),
   })
 
   const sent = asRecord(result?.data) ?? asRecord(result) ?? {}
@@ -767,6 +842,7 @@ export async function backfillInbox(workspaceId: string, options: { limit?: numb
     result.conversations++
 
     if (!providerAccountId) continue
+    let newIncoming = 0
     try {
       const page = await client.request<any>({
         workspaceId,
@@ -790,8 +866,12 @@ export async function backfillInbox(workspaceId: string, options: { limit?: numb
           error: str(asRecord(message?.deliveryError)?.message),
           sentAt: dateOrNull(message?.createdAt) ?? dateOrNull(message?.sentAt) ?? new Date(),
         })
-        if (delivered?.created) result.messages++
+        if (delivered?.created) {
+          result.messages++
+          if (message?.direction !== 'outgoing') newIncoming++
+        }
       }
+      if (newIncoming > 0) await reconcileUnreadCount(workspaceId, written.id)
     } catch (err) {
       // One unreadable thread must not abandon the sweep.
       if (err instanceof SocialError && err.status === 401) throw err
@@ -842,6 +922,29 @@ export async function backfillInbox(workspaceId: string, options: { limit?: numb
   }
 
   return result
+}
+
+/**
+ * Recompute a thread's unread badge from its own rows and the read marker.
+ *
+ * The webhook path increments instead — it is cheap and it knows exactly what
+ * is new. A sweep is the only thing that finds messages we never saw (a desktop
+ * that was offline, or history the provider backfills without firing a hook),
+ * so it must *set* the count rather than add to it: two overlapping sweeps, or
+ * a sweep over messages the webhook already counted, would otherwise inflate
+ * the badge. `lastReadAt` is what makes the derived count possible.
+ */
+async function reconcileUnreadCount(workspaceId: string, conversationId: string): Promise<number> {
+  const conversation = await db.socialConversation.findFirst({
+    where: { workspaceId, id: conversationId },
+    select: { lastReadAt: true },
+  })
+  if (!conversation) return 0
+  const where: Record<string, unknown> = { workspaceId, conversationId, direction: 'incoming' }
+  if (conversation.lastReadAt) where.sentAt = { gt: conversation.lastReadAt }
+  const unreadCount = await db.socialMessage.count({ where })
+  await db.socialConversation.update({ where: { id: conversationId }, data: { unreadCount } })
+  return unreadCount
 }
 
 /** The workspace's display name, which a fresh profile is created with. */

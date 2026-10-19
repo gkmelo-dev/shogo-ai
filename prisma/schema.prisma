@@ -5167,6 +5167,10 @@ model SocialConversation {
   /// active | archived | requests
   status               String    @default("active")
   unreadCount          Int       @default(0)
+  /// When a person last read the thread. Unread is derived from it, so a
+  /// backfill sweep that brings in messages we never saw counts them exactly
+  /// once instead of trusting a provider counter that lags our own events.
+  lastReadAt           DateTime?
   lastMessageAt        DateTime?
   lastMessagePreview   String?
   assignedToUserId     String?

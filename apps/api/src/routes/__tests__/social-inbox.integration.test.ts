@@ -45,6 +45,7 @@ let owner = ''
 let viewer = ''
 let workspaceId = ''
 let conversationId = ''
+let accountId = ''
 
 beforeAll(async () => {
   const [ownerUser, viewerUser] = await Promise.all([
@@ -80,6 +81,9 @@ beforeAll(async () => {
       displayName: 'Acme',
     },
   })
+  accountId = (
+    await db.socialAccount.findFirst({ where: { workspaceId }, select: { id: true } })
+  )!.id
 
   setSocialClient({
     mode: 'cloud',
@@ -141,6 +145,62 @@ describe('inbox routes', () => {
     const body = await res.json()
     expect(body.messages).toHaveLength(1)
     expect(body.messages[0].direction).toBe('incoming')
+    expect(body.hasMore).toBe(false)
+    expect(body.nextCursor).toBeNull()
+  })
+
+  test('a long thread is windowed from the recent end and pages with the cursor', async () => {
+    const long = await db.socialConversation.create({
+      data: {
+        workspaceId,
+        accountId,
+        zernioConversationId: `conv_paged_${suffix}`,
+        platform: 'instagram',
+      },
+    })
+    for (let index = 1; index <= 12; index++) {
+      await db.socialMessage.create({
+        data: {
+          workspaceId,
+          conversationId: long.id,
+          zernioMessageId: `paged_${index}_${suffix}`,
+          direction: index % 2 ? 'incoming' : 'outgoing',
+          platform: 'instagram',
+          text: `paged ${index}`,
+          sentAt: new Date(Date.UTC(2026, 9, 20, 9, index)),
+        },
+      })
+    }
+
+    const first = await request(
+      `/api/workspaces/${workspaceId}/social/inbox/conversations/${long.id}?limit=5`,
+      owner,
+    )
+    expect(first.status).toBe(200)
+    const page = await first.json()
+    expect(page.messages).toHaveLength(5)
+    // Newest in the window, because a chat view opens where the conversation is.
+    expect(page.messages.at(-1).text).toBe('paged 12')
+    expect(page.hasMore).toBe(true)
+
+    const older = await request(
+      `/api/workspaces/${workspaceId}/social/inbox/conversations/${long.id}?limit=5&before=${page.nextCursor}`,
+      owner,
+    )
+    expect(older.status).toBe(200)
+    const previous = await older.json()
+    expect(previous.messages.at(-1).text).toBe('paged 7')
+    expect(previous.messages[0].text).toBe('paged 3')
+
+    const broken = await request(
+      `/api/workspaces/${workspaceId}/social/inbox/conversations/${long.id}?before=00000000-0000-4000-8000-000000000000`,
+      owner,
+    )
+    expect(broken.status).toBe(400)
+    expect((await broken.json()).error.code).toBe('invalid_cursor')
+
+    await db.socialMessage.deleteMany({ where: { conversationId: long.id } })
+    await db.socialConversation.delete({ where: { id: long.id } })
   })
 
   test('a viewer can read but cannot send as the account', async () => {
@@ -196,6 +256,8 @@ describe('inbox routes', () => {
     const comment = await db.socialComment.create({
       data: {
         workspaceId,
+        // Linked to the account it arrived on: a reply never guesses an account.
+        accountId,
         zernioCommentId: `cmt_${suffix}`,
         zernioPostId: `post_${suffix}`,
         platformPostId: `ig_${suffix}`,
@@ -218,6 +280,27 @@ describe('inbox routes', () => {
 
     const stored = await db.socialComment.findUnique({ where: { id: comment.id } })
     expect(stored.status).toBe('replied')
+  })
+
+  test('a comment with no linked account is refused rather than answered as someone else', async () => {
+    const orphan = await db.socialComment.create({
+      data: {
+        workspaceId,
+        zernioCommentId: `cmt_orphan_${suffix}`,
+        zernioPostId: `post_orphan_${suffix}`,
+        platformPostId: `ig_orphan_${suffix}`,
+        platform: 'instagram',
+        text: 'MERGE',
+        occurredAt: new Date('2026-10-19T20:30:00.000Z'),
+      },
+    })
+
+    const reply = await request(`/api/workspaces/${workspaceId}/social/comments/${orphan.id}/reply`, owner, {
+      method: 'POST',
+      body: JSON.stringify({ text: 'Sent you a DM' }),
+    })
+    expect(reply.status).toBe(409)
+    expect((await reply.json()).error.code).toBe('comment_account_unknown')
   })
 
   test('an outsider cannot read the inbox', async () => {

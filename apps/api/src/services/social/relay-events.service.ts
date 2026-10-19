@@ -33,7 +33,31 @@ export const KEEP_APPLIED_DAYS = 7
 /** Undelivered/dead-lettered rows are dropped after this long. */
 export const KEEP_UNDELIVERED_DAYS = 30
 /** Attempts before a delivery is dead-lettered instead of retried. */
-export const MAX_ATTEMPTS = 5
+export const MAX_ATTEMPTS = 8
+
+/**
+ * How long a failed delivery waits before the queue hands it out again, indexed
+ * by the attempt that just failed. A poison payload is retried about nine times
+ * over roughly an hour and a half rather than five times in two and a half
+ * minutes — long enough for a transient cause (a locked DB, a bad deploy) to
+ * clear, and then it is dead-lettered and visible instead of retried for ever.
+ */
+const RETRY_BACKOFF_MS = [30_000, 30_000, 120_000, 600_000, 1_800_000, 1_800_000, 1_800_000]
+
+export function retryDelayMs(attempts: number): number {
+  if (attempts <= 0) return 0
+  const index = Math.min(attempts - 1, RETRY_BACKOFF_MS.length - 1)
+  return RETRY_BACKOFF_MS[index]
+}
+
+/** True when a row has waited out its backoff and can be handed out again. */
+function isDue(row: any, now: number): boolean {
+  const attempts = row.attempts ?? 0
+  if (attempts === 0) return true
+  const lastAttemptAt = row.lastAttemptAt ? new Date(row.lastAttemptAt).getTime() : 0
+  if (!lastAttemptAt) return true
+  return lastAttemptAt + retryDelayMs(attempts) <= now
+}
 
 export interface SocialRelayedEventEnvelope {
   externalId: string
@@ -135,19 +159,26 @@ export async function listRelayedEvents(args: {
   }
   if (args.since) where.occurredAt = { gte: args.since }
   if (args.localWorkspaceId) where.localWorkspaceId = args.localWorkspaceId
+  const limit = Math.min(Math.max(args.limit ?? 50, 1), 200)
   const rows = await db.socialRelayedEvent.findMany({
     where,
     orderBy: { createdAt: 'asc' },
-    take: Math.min(Math.max(args.limit ?? 50, 1), 200),
+    // A row waiting out its backoff is still in the table but not in this page,
+    // so fetch deeper than the caller asked for before filtering.
+    take: Math.min(limit * 4, 800),
   })
-  return rows.map((row: any) => ({
-    id: row.id,
-    dedupeKey: row.dedupeKey,
-    workspaceId: row.workspaceId,
-    attempts: row.attempts ?? 0,
-    appliedAt: row.appliedAt ? new Date(row.appliedAt).toISOString() : null,
-    ...readEnvelope(row),
-  }))
+  const now = Date.now()
+  return rows
+    .filter((row: any) => isDue(row, now))
+    .slice(0, limit)
+    .map((row: any) => ({
+      id: row.id,
+      dedupeKey: row.dedupeKey,
+      workspaceId: row.workspaceId,
+      attempts: row.attempts ?? 0,
+      appliedAt: row.appliedAt ? new Date(row.appliedAt).toISOString() : null,
+      ...readEnvelope(row),
+    }))
 }
 
 /**
@@ -213,6 +244,25 @@ export async function failRelayedEvents(args: {
     if (dead) deadLettered.push(failure.id)
   }
   return { recorded, deadLettered }
+}
+
+/**
+ * Put dead-lettered deliveries back in the queue. A dead letter is not a
+ * graveyard: once the cause is fixed (a schema drift, a bad deploy), an operator
+ * or the desktop can retry exactly those rows instead of asking the provider to
+ * send them again — which it will not do, because it was already told `200`.
+ *
+ * Only the caller's own workspace, and only rows that are actually
+ * dead-lettered; the attempt count restarts so the row gets a full backoff
+ * schedule.
+ */
+export async function requeueRelayedEvents(args: { workspaceId: string; ids: string[] }): Promise<number> {
+  if (args.ids.length === 0) return 0
+  const result = await db.socialRelayedEvent.updateMany({
+    where: { workspaceId: args.workspaceId, id: { in: args.ids }, failedAt: { not: null }, appliedAt: null },
+    data: { failedAt: null, attempts: 0, lastAttemptAt: null, lastError: null },
+  })
+  return result.count
 }
 
 /** Deliveries the desktop gave up on, for an operator to look at. */
