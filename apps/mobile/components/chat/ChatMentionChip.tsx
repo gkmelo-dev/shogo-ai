@@ -36,7 +36,7 @@ export type { ChatMentionMeta }
  *
  * The workspace itself is deliberately not in the href: a chat in another
  * workspace is opened by having the chat screen adopt the workspace that owns
- * the session it loaded (`adoptChatSessionWorkspace`). A `?workspace=` param
+ * the session it loaded (`adoptChatWorkspace`). A `?workspace=` param
  * cannot do it — the boot's redirect-to-home bounce replaces the URL before
  * anything reads it.
  */
