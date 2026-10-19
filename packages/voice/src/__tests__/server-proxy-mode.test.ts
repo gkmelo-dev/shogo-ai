@@ -267,6 +267,31 @@ describe('createVoiceHandlers — runtime-token proxy mode', () => {
     expect(body.detail).toContain('no voice routes')
   })
 
+  test('tts forwards upstream Warning 199 so a pod caller sees the fallback', async () => {
+    const proxied = (async () =>
+      new Response(new Uint8Array([4, 5]), {
+        status: 200,
+        headers: {
+          'content-type': 'audio/mpeg',
+          'x-tts-model-used': 'eleven_v4_turbo',
+          'x-tts-model-requested': 'eleven_v4',
+          warning: '199 - "eleven_v4 unavailable, used eleven_v4_turbo"',
+        },
+      })) as unknown as typeof fetch
+    const handlers = createVoiceHandlers({
+      proxy: { runtimeToken: 'rt', projectId: 'p', apiUrl: 'http://api', fetch: proxied },
+    })
+    const res = await handlers.tts(
+      new Request('http://pod/api/voice/tts', {
+        method: 'POST',
+        body: JSON.stringify({ text: 'hi', modelId: 'eleven_v4' }),
+      }),
+    )
+    expect(res.status).toBe(200)
+    expect(res.headers.get('x-tts-model-used')).toBe('eleven_v4_turbo')
+    expect(res.headers.get('warning')).toContain('199')
+  })
+
   test('tts without text never hits the network', async () => {
     const { fetch: fetchImpl, calls } = makeMockFetch(() => ({ status: 200, body: {} }))
     const handlers = createVoiceHandlers({

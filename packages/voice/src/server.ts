@@ -511,7 +511,7 @@ function createProxyHandlers(
       const headers: Record<string, string> = {}
       const ct = upstream.headers.get('content-type')
       if (ct) headers['content-type'] = ct
-      for (const h of ['x-tts-model-used', 'x-tts-model-requested']) {
+      for (const h of ['x-tts-model-used', 'x-tts-model-requested', 'warning']) {
         const v = upstream.headers.get(h)
         if (v) headers[h] = v
       }
