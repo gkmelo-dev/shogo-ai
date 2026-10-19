@@ -107,6 +107,30 @@ export function shouldRestoreChatWorkspace(args: {
 }
 
 /**
+ * Adopt the workspace that owns a chat when a deep link opens a session the app
+ * is not currently in — `/agent?chatSessionId=<id>` from a chat chip.
+ *
+ * Returns true when it switched, so the caller waits for the re-render instead
+ * of loading the session against the wrong workspace (the server rejects a send
+ * there with `session_not_in_workspace`). Deliberately *not* driven from a URL
+ * param: on web the chip press is a full navigation, and the boot bounces
+ * through `/`, replacing the URL before any mount effect reads it — which is
+ * why `?workspace=` never survived. This runs after boot, from the fact the
+ * screen already has (the session's own workspace), so no ordering race is left
+ * and native (no reload at all) is covered too.
+ */
+export function adoptChatWorkspace(
+  chatWorkspaceId: string | null | undefined,
+  activeWorkspaceId: string | null | undefined,
+  projects?: WorkspaceProjectCollection,
+): boolean {
+  if (!chatWorkspaceId || chatWorkspaceId === activeWorkspaceId) return false
+  setActiveWorkspaceId(chatWorkspaceId)
+  if (projects) reloadProjects(chatWorkspaceId, projects)
+  return true
+}
+
+/**
  * Make `workspaceId` active and open `path` (an Expo Router href) in it.
  * Same-workspace targets are a plain push; cross-workspace targets do a full
  * navigation on web for the reason described on `reloadAfterWorkspaceSwitch`.

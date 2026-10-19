@@ -61,10 +61,14 @@ store.set = storeModule.setActiveWorkspaceId
 const getActiveWorkspaceId = storeModule.getActiveWorkspaceId
 const setActiveWorkspaceId = storeModule.setActiveWorkspaceId
 const shouldRestoreChatWorkspace = switchModule.shouldRestoreChatWorkspace
+const adoptChatWorkspace = switchModule.adoptChatWorkspace
 
 const { ChatMentionChip, chatMentionHref, ChatMentionText } = await import(
   "../ChatMentionChip"
 )
+const { chatMentionMetaFor } = await import("../../../lib/chat-mention-meta")
+
+const realFetch = globalThis.fetch
 
 beforeEach(() => {
   setActiveWorkspaceId("ws-a")
@@ -74,20 +78,21 @@ beforeEach(() => {
 })
 
 afterEach(() => {
+  globalThis.fetch = realFetch
   cleanup()
 })
 
 describe("chat mention chip", () => {
-  test("a workspace chat carries its session and workspace", () => {
+  test("a workspace chat carries its session", () => {
     expect(chatMentionHref({ id: "chat-b", projectId: null, workspaceId: "ws-b" })).toBe(
-      "/(app)/agent?chatSessionId=chat-b&workspace=ws-b",
+      "/(app)/agent?chatSessionId=chat-b",
     )
   })
 
   test("a project chat opens its project surface with that session", () => {
     expect(
       chatMentionHref({ id: "chat-b", projectId: "proj-2", workspaceId: "ws-b" }),
-    ).toBe("/(app)/projects/proj-2?chatSessionId=chat-b&workspace=ws-b")
+    ).toBe("/(app)/projects/proj-2?chatSessionId=chat-b")
   })
 
   test("a chat of unknown workspace opens on the session alone", () => {
@@ -114,8 +119,47 @@ describe("chat mention chip", () => {
 
     expect(getActiveWorkspaceId()).toBe("ws-b")
     expect(push).toHaveBeenCalledTimes(1)
-    expect(push.mock.calls[0][0]).toContain("workspace=ws-b")
+    expect(push.mock.calls[0][0]).toBe("/(app)/agent?chatSessionId=chat-b")
     expect(projectCollection.clear).toHaveBeenCalled()
+  })
+
+  test("a URL session in another workspace persists the target id", async () => {
+    // What a cold boot at `/agent?chatSessionId=chat-b` does: the screen has no
+    // workspace in the URL, so it asks who owns the session and adopts it.
+    globalThis.fetch = mock(async () =>
+      new Response(
+        JSON.stringify({
+          chats: [
+            {
+              id: "chat-b",
+              title: "Deploy notes",
+              projectId: null,
+              workspaceId: "ws-b",
+              workspaceName: "Other team",
+            },
+          ],
+        }),
+        { headers: { "Content-Type": "application/json" } },
+      ),
+    ) as any
+
+    const meta = await chatMentionMetaFor("chat-b")
+    expect(meta?.workspaceId).toBe("ws-b")
+
+    const adopted = adoptChatWorkspace(meta?.workspaceId, getActiveWorkspaceId(), projectCollection)
+
+    expect(adopted).toBe(true)
+    expect(getActiveWorkspaceId()).toBe("ws-b")
+    expect(projectCollection.loadAll).toHaveBeenCalledWith({ workspaceId: "ws-b" })
+  })
+
+  test("a URL session already in the active workspace is left alone", async () => {
+    setActiveWorkspaceId("ws-a")
+
+    expect(adoptChatWorkspace("ws-a", getActiveWorkspaceId(), projectCollection)).toBe(false)
+    expect(adoptChatWorkspace(null, getActiveWorkspaceId(), projectCollection)).toBe(false)
+    expect(getActiveWorkspaceId()).toBe("ws-a")
+    expect(projectCollection.loadAll).not.toHaveBeenCalled()
   })
 
   test("pressing a chip in the active workspace stays put", () => {
@@ -184,13 +228,15 @@ describe("chat mention chip", () => {
   })
 
   test("a message body renders one chip per distinct tag", () => {
-    const { container } = render(<ChatMentionText text="see <@c:chat-b> and <@c:chat-c>" />)
+    // Ids no other case in this file resolves, so the chips fall back to their
+    // id-derived labels and the assertion does not depend on cache order.
+    const { container } = render(<ChatMentionText text="see <@c:chat-x> and <@c:chat-y>" />)
     const chips = Array.from(container.querySelectorAll("span")).filter((node) =>
       node.textContent?.startsWith("@"),
     )
     expect(chips.map((node) => node.textContent)).toEqual([
-      "@chat chat-b",
-      "@chat chat-c",
+      "@chat chat-x",
+      "@chat chat-y",
     ])
   })
 })
