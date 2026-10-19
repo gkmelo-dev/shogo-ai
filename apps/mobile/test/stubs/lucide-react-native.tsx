@@ -339,6 +339,14 @@ export {
   Icon as XCircle,
   Icon as Y,
   Icon as Zap,
+  Icon as Bold,
+  Icon as Heading1,
+  Icon as Heading2,
+  Icon as Italic,
+  Icon as LockOpen,
+  Icon as Quote,
+  Icon as SquareCheck,
+  Icon as Strikethrough,
   Icon as KanbanSquare,
 }
 export default Icon
