@@ -380,9 +380,13 @@ export async function installAgent(params: {
   // what the agents read.
   let packBindings: unknown = null
   let created: string[] = []
+  let packAnswers: Record<string, unknown> = {}
   if (pack) {
     const { applySystemPack, previewSystemPack, uninstallSystemPack } = await import('./system-apply.service')
-    const answers = params.answers ?? {}
+    const { normalizeAnswers } = await import('@shogo/agent-runtime/src/system-manifest')
+    // Stored on the install row keyed by `applies` path, with skipped questions
+    // resolved to their defaults: re-applying later must not change the answer.
+    const answers = normalizeAnswers(pack.setup, params.answers ?? undefined)
     const preview = await previewSystemPack({ workspaceId, manifest: pack, answers, anchorProjectId: newProject.id })
     const applied = await applySystemPack({
       workspaceId,
@@ -398,6 +402,7 @@ export async function installAgent(params: {
       throw new Error(`pack_apply_failed: ${applied.errors.join('; ')}`)
     }
     packBindings = applied.bindings
+    packAnswers = answers
     created = applied.applied
   }
 
@@ -412,7 +417,7 @@ export async function installAgent(params: {
         installedVersion: listing.currentVersion,
         status: 'active',
         baselineManifest: baselineManifest as object,
-        ...(pack ? { answers: (params.answers ?? {}) as object, packBindings: packBindings as object } : {}),
+        ...(pack ? { answers: packAnswers as object, packBindings: packBindings as object } : {}),
       },
     })
     await tx.marketplaceListing.update({

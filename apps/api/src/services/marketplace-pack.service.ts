@@ -11,7 +11,7 @@
 
 import { existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { parseSystemManifest, type SystemManifest } from '@shogo/agent-runtime/src/system-manifest'
+import { parseSystemManifest, resolveScheduleTiming, type SystemManifest } from '@shogo/agent-runtime/src/system-manifest'
 import { listPackTemplates } from '@shogo/agent-runtime/src/pack-templates'
 import { prisma } from '../lib/prisma'
 import { getWorkspacesDir } from '../lib/workspaces-dir'
@@ -78,7 +78,9 @@ export function listPackCatalogue(): PackCatalogueEntry[] {
       description: pack.description,
       questions: manifest.setup?.questions ?? [],
       channels: (manifest.teamChannels ?? []).map((c) => c.name),
-      schedules: (manifest.schedules ?? []).map((s) => ({ key: s.key, name: s.name, cron: s.cron, enabled: s.enabled })),
+      // The composed cron: an `hour`/`timezone` schedule has no `cron` string of
+      // its own until the answers are in, so the catalogue shows what it resolves to.
+      schedules: (manifest.schedules ?? []).map((s) => ({ key: s.key, name: s.name, cron: resolveScheduleTiming(s, undefined).cronExpression, enabled: s.enabled })),
     }
   })
 }

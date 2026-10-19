@@ -29,13 +29,33 @@ import { CAPABILITY_KEYS } from '@shogo/shared-runtime/capability-settings'
 
 const KEY_RE = /^[a-z0-9][a-z0-9-]{0,63}$/
 
+const TIME_OF_DAY_RE = /^([01]?\d|2[0-3]):([0-5]\d)$/
+
+/**
+ * A value a pack leaves for the install wizard to fill: `{{answers.<path>}}`.
+ * Anything carrying one is validated after substitution, not at parse time —
+ * the manifest is written before the answers exist.
+ */
+export function hasAnswerTemplate(value: string | undefined): boolean {
+  return !!value && /\{\{\s*answers\./.test(value)
+}
+
+/** `HH:MM`, 24-hour. The shape a `review-time` answer and quiet hours take. */
+export function isTimeOfDay(value: string): boolean {
+  return TIME_OF_DAY_RE.test(value.trim())
+}
+
 export const AttachModeSchema = z.enum(['readwrite', 'readonly'])
 
+const quietTime = z.string().refine((v) => isTimeOfDay(v) || hasAnswerTemplate(v), 'HH:MM')
+
 export const QuietHoursSchema = z.object({
-  start: z.string().regex(/^\d{2}:\d{2}$/, 'HH:MM'),
-  end: z.string().regex(/^\d{2}:\d{2}$/, 'HH:MM'),
+  start: quietTime,
+  end: quietTime,
   timezone: z.string().optional(),
 })
+
+export type QuietHours = z.infer<typeof QuietHoursSchema>
 
 export const HeartbeatSpecSchema = z.object({
   enabled: z.boolean().optional(),
@@ -205,11 +225,38 @@ export const ScheduleSpecSchema = z.object({
   project: z.string().regex(KEY_RE).optional(),
   /** Team channel the result is posted in (resolved to its conversation id at apply time). */
   channel: z.string().transform((n) => n.replace(/^#/, '')).optional(),
-  cron: z.string().refine(isCronExpression, 'a five-field cron expression (minute hour day month weekday)'),
+  /**
+   * Five-field cron (`m h dom mon dow`), or a cron composed from answers
+   * (`0 {{answers.profile.hour}} * * 1-5`). Use `hour` for a daily run.
+   */
+  cron: z.string().refine((v) => isCronExpression(v) || hasAnswerTemplate(v), 'a five-field cron expression (minute hour day month weekday)').optional(),
+  /**
+   * Time of day the run happens: `HH:MM` or an answer (`{{answers.profile.review-time}}`).
+   * Composed into `<minute> <hour> * * <days>` so the run lands in the answered hour,
+   * in the zone below — never in UTC by accident.
+   */
+  hour: z.string().optional(),
+  /** Minute past the hour for an `hour` schedule. Defaults to the answer's minutes, else 0. */
+  minute: z.number().int().min(0).max(59).optional(),
+  /** Cron day-of-week field for an `hour` schedule, e.g. `1-5`. Defaults to every day. */
+  days: z.string().regex(CRON_TOKEN_RE, 'a cron weekday field').optional(),
   timezone: z.string().min(1).optional(),
   prompt: z.string().min(1).max(10_000),
   enabled: z.boolean().default(true),
-}).strict()
+}).strict().superRefine((spec, ctx) => {
+  if (spec.cron === undefined && spec.hour === undefined) {
+    ctx.addIssue({ code: 'custom', path: ['cron'], message: 'a schedule needs `cron` or `hour`' })
+  }
+  if (spec.cron !== undefined && spec.hour !== undefined) {
+    ctx.addIssue({ code: 'custom', path: ['hour'], message: 'a schedule takes `cron` or `hour`, not both' })
+  }
+  if (spec.hour !== undefined && !isTimeOfDay(spec.hour) && !hasAnswerTemplate(spec.hour)) {
+    ctx.addIssue({ code: 'custom', path: ['hour'], message: 'hour must be HH:MM or {{answers.<path>}}' })
+  }
+  if (spec.hour === undefined && (spec.minute !== undefined || spec.days !== undefined)) {
+    ctx.addIssue({ code: 'custom', path: ['minute'], message: 'minute and days need `hour`' })
+  }
+})
 
 export const SETUP_QUESTION_TYPES = ['text', 'choice', 'multi', 'confirm'] as const
 
@@ -430,7 +477,7 @@ export function parseSystemManifest(source: string | unknown): ManifestParseResu
     scheduleKeys.add(s.key)
     if (s.project && !keys.has(s.project)) errors.push(`${where}: project "${s.project}" is not a project key in this manifest`)
     if (s.channel && !channelNames.has(s.channel)) errors.push(`${where}: channel "${s.channel}" is not a teamChannel in this manifest`)
-    if (s.timezone) {
+    if (s.timezone && !hasAnswerTemplate(s.timezone)) {
       try {
         new Intl.DateTimeFormat('en-US', { timeZone: s.timezone }).format()
       } catch {
@@ -670,6 +717,15 @@ export interface ScheduleValues {
   enabled: boolean
   /** Team channel name to post into; resolved to a conversation id at apply time. */
   channel: string | null
+  /** Set when the spec cannot become a schedule from the answers it has. */
+  error?: string
+}
+
+/** The cron + zone a spec resolves to, or the reason it cannot. */
+export interface ScheduleTiming {
+  cronExpression: string
+  timezone: string
+  error: string | null
 }
 
 export interface ScheduleOp {
@@ -680,6 +736,8 @@ export interface ScheduleOp {
   spec: ScheduleSpec | null
   hash: string | null
   values: ScheduleValues | null
+  /** The spec resolved to something the schedules API would reject; report it, write nothing. */
+  error?: string | null
 }
 
 export interface SystemDiff {
@@ -1222,16 +1280,67 @@ export function diffTriggers(manifest: SystemManifest, live: LiveTrigger[], lock
 }
 
 /**
- * `{{answers.<path>}}` substitution. Answers are a plain record; a dotted path
- * reads into it (`profile.product`). A bare key also resolves when the path is
- * `profile.<key>` — install wizards collect answers by question id and the
- * `applies` path says where they land.
+ * Read one answer. Answers arrive either nested (`{ profile: { product } }`) or
+ * flat (`{ 'profile.product': ... }`, which is what the install wizard posts),
+ * and either keyed by the question id or by its `applies` path. All of those
+ * mean the same thing here.
+ */
+function readAnswer(answers: Record<string, unknown>, path: string): unknown {
+  if (Object.prototype.hasOwnProperty.call(answers, path)) return answers[path]
+  return path.split('.').reduce<unknown>((acc, key) => (acc && typeof acc === 'object' ? (acc as Record<string, unknown>)[key] : undefined), answers)
+}
+
+function writeAnswer(answers: Record<string, unknown>, path: string, value: unknown): void {
+  const keys = path.split('.')
+  let node = answers
+  for (const key of keys.slice(0, -1)) {
+    const next = node[key]
+    if (!next || typeof next !== 'object' || Array.isArray(next)) node[key] = {}
+    node = node[key] as Record<string, unknown>
+  }
+  node[keys[keys.length - 1]] = value
+}
+
+/** No answer: missing, blank, or an empty multi-select. A skipped question is not answered `''`. */
+export function isBlankAnswer(value: unknown): boolean {
+  if (value === undefined || value === null) return true
+  if (typeof value === 'string') return value.trim() === ''
+  if (Array.isArray(value)) return value.length === 0
+  return false
+}
+
+/**
+ * One canonical answer set. Every question resolves under its `applies` path
+ * *and* under its id, and a skipped question takes its default — so an answer
+ * the wizard collected reaches the file, the prompt and the schedule that read
+ * it, wherever the pack keys it.
+ */
+export function normalizeAnswers(setup: SetupSpec | undefined, answers?: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {}
+  for (const [key, value] of Object.entries(answers ?? {})) {
+    if (!isBlankAnswer(value)) writeAnswer(out, key, value)
+  }
+  for (const q of setup?.questions ?? []) {
+    const path = q.applies ?? `profile.${q.id}`
+    const given = readAnswer(out, path) ?? readAnswer(out, q.id)
+    const value = isBlankAnswer(given) ? q.default : given
+    if (isBlankAnswer(value)) continue
+    writeAnswer(out, path, value)
+    if (readAnswer(out, q.id) === undefined) writeAnswer(out, q.id, value)
+  }
+  return out
+}
+
+/**
+ * `{{answers.<path>}}` substitution. The dotted `applies` path wins, then the
+ * bare question id, so both a normalized answer set and a hand-written
+ * `{ product: '…' }` resolve.
  */
 export function answerLookup(answers: Record<string, unknown> | undefined, path: string): string | null {
   if (!answers) return null
-  const read = (p: string): unknown => p.split('.').reduce<unknown>((acc, key) => (acc && typeof acc === 'object' ? (acc as Record<string, unknown>)[key] : undefined), answers)
-  let value = read(path)
-  if (value === undefined && path.startsWith('profile.')) value = read(path.slice('profile.'.length))
+  let value = readAnswer(answers, path)
+  if (value === undefined && path.startsWith('profile.')) value = readAnswer(answers, path.slice('profile.'.length))
+  if (value === undefined) value = readAnswer(answers, path.split('.').slice(-1)[0])
   if (value === undefined) return null
   if (Array.isArray(value)) return value.map((v) => String(v)).join(', ')
   if (value === true) return 'yes'
@@ -1258,11 +1367,17 @@ export function substituteTemplates(
   },
 ): string {
   const withAnswers = substituteAnswers(text, ctx.answers)
+  // A pack may write either `{{agent.x}}` or the mention form `<@a:p:{{agent.x}}>`
+  // (the form the plan's examples use). The wrapped one is replaced whole, so a
+  // prompt never ends up as the unusable `<@a:p:<@a:p:id>>`.
   return withAnswers.replace(
-    /\{\{\s*(agent|channel)\.([a-zA-Z0-9_-]+)\s*\}\}/g,
-    (whole, kind: string, key: string) => {
-      if (kind === 'agent') return ctx.bindings?.[key] ? `<@a:p:${ctx.bindings[key]}>` : whole
-      const id = ctx.channelIds?.[key]
+    /<@a:p:\{\{\s*agent\.([a-zA-Z0-9_-]+)\s*\}\}>|\{\{\s*(agent|channel)\.([a-zA-Z0-9_-]+)\s*\}\}/g,
+    (whole, wrappedAgent: string | undefined, kind: string | undefined, key: string | undefined) => {
+      if (wrappedAgent !== undefined) {
+        return ctx.bindings?.[wrappedAgent] ? `<@a:p:${ctx.bindings[wrappedAgent]}>` : whole
+      }
+      if (kind === 'agent') return ctx.bindings?.[key!] ? `<@a:p:${ctx.bindings[key!]}>` : whole
+      const id = ctx.channelIds?.[key!]
       if (ctx.channelStyle === 'id' && id) return id
       return `#${key}`
     },
@@ -1271,16 +1386,26 @@ export function substituteTemplates(
 
 /**
  * The same manifest with `{{answers.*}}` filled into files, topics,
- * descriptions and prompts. Everything else is untouched, so keys and
+ * descriptions, prompts and the agent's quiet hours, and skipped questions
+ * filled from their defaults. Everything else is untouched, so keys and
  * bindings still line up.
  */
 export function applyAnswersToManifest(manifest: SystemManifest, answers?: Record<string, unknown>): SystemManifest {
-  if (!answers || Object.keys(answers).length === 0) return manifest
-  const sub = (s: string | undefined) => (s === undefined ? undefined : substituteAnswers(s, answers))
+  const normalized = normalizeAnswers(manifest.setup, answers)
+  if (Object.keys(normalized).length === 0) return manifest
+  const sub = (s: string | undefined) => (s === undefined ? undefined : substituteAnswers(s, normalized))
+  const quiet = (q: QuietHours | undefined): QuietHours | undefined =>
+    q === undefined ? undefined : {
+      ...q,
+      start: substituteAnswers(q.start, normalized),
+      end: substituteAnswers(q.end, normalized),
+      ...(q.timezone ? { timezone: substituteAnswers(q.timezone, normalized) } : {}),
+    }
   const projects = manifest.projects.map((p) => ({
     ...p,
     description: sub(p.description),
-    files: Object.fromEntries(Object.entries(p.files).map(([path, body]) => [path, substituteAnswers(body, answers)])),
+    files: Object.fromEntries(Object.entries(p.files).map(([path, body]) => [path, substituteAnswers(body, normalized)])),
+    ...(p.agent ? { agent: { ...p.agent, ...(p.agent.heartbeat ? { heartbeat: { ...p.agent.heartbeat, ...(p.agent.heartbeat.quietHours ? { quietHours: quiet(p.agent.heartbeat.quietHours) } : {}) } } : {}) } } : {}),
   }))
   const teamChannels = manifest.teamChannels.map((c) => ({
     ...c,
@@ -1288,22 +1413,31 @@ export function applyAnswersToManifest(manifest: SystemManifest, answers?: Recor
     boards: c.boards.map((b) => ({ ...b, description: sub(b.description) })),
   }))
   const triggers = manifest.triggers.map((t) => ({ ...t, prompt: sub(t.prompt) }))
-  const schedules = manifest.schedules.map((s) => ({ ...s, prompt: substituteAnswers(s.prompt, answers) }))
+  const schedules = manifest.schedules.map((s) => ({
+    ...s,
+    prompt: substituteAnswers(s.prompt, normalized),
+    ...(s.hour !== undefined ? { hour: substituteAnswers(s.hour, normalized) } : {}),
+    ...(s.cron !== undefined ? { cron: substituteAnswers(s.cron, normalized) } : {}),
+    ...(s.timezone !== undefined ? { timezone: substituteAnswers(s.timezone, normalized) } : {}),
+  }))
   return { ...manifest, projects, teamChannels, triggers, schedules }
 }
 
 /**
  * Render the `setup.profile` section body from answers. Used by the install
  * wizard to fill the anchor's `## Workspace profile`; the apply engine writes
- * it, so both the runtime and the marketplace path produce the same text.
+ * it, so both the runtime and the marketplace path produce the same text. An
+ * answered question always wins; only a skipped one takes its default.
  */
 export function renderProfileSection(setup: SetupSpec | undefined, answers: Record<string, unknown> = {}): string | null {
   const profile = setup?.profile
   if (!profile) return null
+  const normalized = normalizeAnswers(setup, answers)
   const lines: string[] = []
   for (const q of setup.questions) {
-    const raw = q.applies?.startsWith('profile.') ? q.applies.slice('profile.'.length) : q.id
-    const value = answerLookup(answers, q.applies ?? `profile.${q.id}`) ?? answerLookup(answers, raw) ?? (q.default !== undefined ? answerLookup({ v: q.default }, 'v') : null)
+    const value = answerLookup(normalized, q.applies ?? `profile.${q.id}`)
+      ?? answerLookup(normalized, q.id)
+      ?? (q.default !== undefined ? answerLookup({ v: q.default }, 'v') : null)
     if (!value) continue
     lines.push(`- **${q.header}**: ${value}`)
   }
@@ -1331,6 +1465,46 @@ export function mergeProfileSection(body: string, section: string, rendered: str
   return [...before, '', rendered, '', ...after].join('\n').replace(/\n{3,}/g, '\n\n')
 }
 
+/**
+ * Turn a schedule spec into the cron + zone the schedules API takes. Answers
+ * are substituted first and the result is validated, so a pack that asks for a
+ * review time runs at that time in that zone instead of quietly at 07:00 UTC.
+ * The only place a spec becomes a schedule: `system_apply` and the marketplace
+ * apply engine both go through it.
+ */
+export function resolveScheduleTiming(spec: ScheduleSpec, answers?: Record<string, unknown>): ScheduleTiming {
+  const timezone = (spec.timezone ? substituteAnswers(spec.timezone, answers).trim() : '') || 'UTC'
+  let cronExpression: string
+  if (spec.hour !== undefined) {
+    const answered = substituteAnswers(spec.hour, answers).trim()
+    if (hasAnswerTemplate(answered)) {
+      return { cronExpression: answered, timezone, error: `hour "${answered}" was not filled in — the install is missing that answer` }
+    }
+    if (!isTimeOfDay(answered)) {
+      return { cronExpression: answered, timezone, error: `hour "${answered}" is not a time of day (HH:MM)` }
+    }
+    const [hours, minutes] = answered.split(':').map((part) => Number(part))
+    cronExpression = `${spec.minute ?? minutes} ${hours} * * ${spec.days ?? '*'}`
+  } else {
+    cronExpression = substituteAnswers(spec.cron ?? '', answers).trim()
+    if (hasAnswerTemplate(cronExpression)) {
+      return { cronExpression, timezone, error: `cron "${cronExpression}" was not filled in — the install is missing that answer` }
+    }
+    if (!isCronExpression(cronExpression)) {
+      return { cronExpression, timezone, error: `"${cronExpression}" is not a five-field cron expression` }
+    }
+  }
+  if (hasAnswerTemplate(timezone)) {
+    return { cronExpression, timezone, error: `timezone "${timezone}" was not filled in — the install is missing that answer` }
+  }
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: timezone }).format()
+  } catch {
+    return { cronExpression, timezone, error: `unknown timezone "${timezone}"` }
+  }
+  return { cronExpression, timezone, error: null }
+}
+
 /** Manifest `schedules` render into the same shape the schedules API takes. */
 export function resolveScheduleValues(
   spec: ScheduleSpec,
@@ -1340,6 +1514,7 @@ export function resolveScheduleValues(
     channelIds?: Record<string, string>
   },
 ): ScheduleValues {
+  const timing = resolveScheduleTiming(spec, ctx.answers)
   return {
     name: spec.name,
     prompt: substituteTemplates(spec.prompt, {
@@ -1348,10 +1523,11 @@ export function resolveScheduleValues(
       channelIds: ctx.channelIds,
       channelStyle: 'id',
     }),
-    cronExpression: spec.cron.trim(),
-    timezone: spec.timezone ?? 'UTC',
+    cronExpression: timing.cronExpression,
+    timezone: timing.timezone,
     enabled: spec.enabled,
     channel: spec.channel ?? null,
+    ...(timing.error ? { error: timing.error } : {}),
   }
 }
 
@@ -1361,12 +1537,13 @@ export function resolveScheduleValues(
  * the same apply does not make the next apply look like a change.
  */
 function scheduleHash(spec: ScheduleSpec, answers?: Record<string, unknown>): string {
+  const timing = resolveScheduleTiming(spec, answers)
   return createHash('sha256')
     .update(JSON.stringify(stable({
       name: spec.name,
       prompt: substituteAnswers(spec.prompt, answers),
-      cron: spec.cron.trim(),
-      timezone: spec.timezone ?? 'UTC',
+      cron: timing.cronExpression,
+      timezone: timing.timezone,
       enabled: spec.enabled,
       channel: spec.channel ?? null,
     })))
@@ -1394,6 +1571,12 @@ export function diffSchedules(
     const hash = scheduleHash(spec, ctx.answers)
     const entry = locked[spec.key]
     const current = entry ? byId.get(entry.id) ?? null : null
+    if (values.error) {
+      // A spec that cannot become a schedule (an unanswered hour, a bad zone)
+      // is reported by the caller and nothing is written for it.
+      ops.push({ kind: 'schedule', key: spec.key, action: current ? 'update' : 'create', scheduleId: current?.id ?? null, spec, hash, values, error: values.error })
+      continue
+    }
     if (!current) {
       ops.push({ kind: 'schedule', key: spec.key, action: 'create', scheduleId: null, spec, hash, values })
       continue
@@ -1542,9 +1725,11 @@ export function summarizeDiff(diff: SystemDiff): string[] {
   }
   for (const t of diff.triggers ?? []) lines.push(`${t.action} trigger ${t.key}${t.spec ? ` "${t.spec.name}"` : ''}`)
   for (const s of diff.schedules ?? []) {
-    lines.push(s.action === 'delete'
-      ? `delete schedule ${s.key}`
-      : `${s.action} schedule ${s.key} "${s.values?.name ?? ''}"${s.values ? ` (${s.values.cronExpression} ${s.values.timezone}${s.values.channel ? ` → #${s.values.channel}` : ''}${s.values.enabled ? '' : ', disabled'})` : ''}`)
+    lines.push(s.error
+      ? `skip schedule ${s.key} — ${s.error}`
+      : s.action === 'delete'
+        ? `delete schedule ${s.key}`
+        : `${s.action} schedule ${s.key} "${s.values?.name ?? ''}"${s.values ? ` (${s.values.cronExpression} ${s.values.timezone}${s.values.channel ? ` → #${s.values.channel}` : ''}${s.values.enabled ? '' : ', disabled'})` : ''}`)
   }
   return lines
 }

@@ -14,7 +14,10 @@ import {
   summarizeDiff,
   IMPLICIT_ANCHOR,
   mergeProfileSection,
+  normalizeAnswers,
   renderProfileSection,
+  resolveScheduleTiming,
+  resolveScheduleValues,
   substituteTemplates,
   type FileProbe,
   type LiveProject,
@@ -1030,5 +1033,152 @@ describe('schedule prompt substitution', () => {
     const diff = computeSystemDiff(m, [], null, { callerProjectId: 'p-evolver', schedules: [] })
     expect(diff.schedules[0].values?.prompt).toContain('#evolution')
     expect(diff.schedules[0].values?.prompt).toContain('<@a:p:p-evolver>')
+  })
+})
+
+// ─── answers, and the schedules they time ────────────────────────────────
+
+const ANSWERED_PACK_YAML = `
+version: 1
+name: Self Evolving
+anchor: evolver
+projects:
+  - key: evolver
+    name: Evolver
+    agent:
+      heartbeat:
+        enabled: true
+        quietHours:
+          start: "{{answers.profile.quiet-hours-start}}"
+          end: "{{answers.profile.quiet-hours-end}}"
+          timezone: "{{answers.profile.timezone}}"
+    files:
+      AGENTS.md: |
+        # Evolver
+        ## Workspace profile
+        - **Review time**: {{answers.profile.review-time}} ({{answers.profile.timezone}})
+teamChannels:
+  - name: evolution
+schedules:
+  - key: daily-evolution
+    name: Daily self review
+    project: evolver
+    channel: evolution
+    hour: "{{answers.profile.review-time}}"
+    timezone: "{{answers.profile.timezone}}"
+    prompt: 'Run the review with <@a:p:{{agent.evolver}}>.'
+setup:
+  questions:
+    - id: hour
+      header: Review time
+      question: What time?
+      type: choice
+      options: ['07:00', '18:30']
+      default: '07:00'
+      applies: profile.review-time
+    - id: timezone
+      header: Timezone
+      question: Which zone?
+      type: text
+      default: UTC
+      applies: profile.timezone
+    - id: quiet-start
+      header: Quiet hours start
+      question: From when?
+      type: text
+      default: '22:00'
+      applies: profile.quiet-hours-start
+    - id: quiet-end
+      header: Quiet hours end
+      question: Until when?
+      type: text
+      default: '07:00'
+      applies: profile.quiet-hours-end
+  profile:
+    file: AGENTS.md
+    section: "## Workspace profile"
+`
+
+const answeredPack = () => {
+  const r = parseSystemManifest(ANSWERED_PACK_YAML)
+  if (!r.ok) throw new Error(r.errors.join('\n'))
+  return r.manifest!
+}
+
+describe('schedule timing from answers', () => {
+  /** What the install wizard posts: flat keys, keyed by the `applies` path. */
+  const answers = {
+    'profile.review-time': '18:30',
+    'profile.timezone': 'America/New_York',
+    'profile.quiet-hours-start': '21:15',
+    'profile.quiet-hours-end': '06:45',
+  }
+
+  test('hour + timezone answers become the cron and the zone the schedule runs in', () => {
+    const timing = resolveScheduleTiming(answeredPack().schedules[0], answers)
+    expect(timing).toEqual({ cronExpression: '30 18 * * *', timezone: 'America/New_York', error: null })
+    const values = resolveScheduleValues(answeredPack().schedules[0], { answers })
+    expect(values.cronExpression).toBe('30 18 * * *')
+    expect(values.timezone).toBe('America/New_York')
+  })
+
+  test('the answers reach the apply: the op carries the answered cron and zone', () => {
+    const diff = computeSystemDiff(answeredPack(), [], null, { callerProjectId: 'p-evolver', answers, schedules: [] })
+    expect(diff.schedules).toHaveLength(1)
+    expect(diff.schedules[0].values).toMatchObject({ cronExpression: '30 18 * * *', timezone: 'America/New_York' })
+    expect(diff.schedules[0].error).toBeFalsy()
+  })
+
+  test('a skipped answer falls back to the question default, at its hour', () => {
+    const diff = computeSystemDiff(answeredPack(), [], null, { callerProjectId: 'p-evolver', answers: {}, schedules: [] })
+    expect(diff.schedules[0].values).toMatchObject({ cronExpression: '0 7 * * *', timezone: 'UTC' })
+  })
+
+  test('an unanswered hour is reported, not silently written as UTC 07:00', () => {
+    const m = { ...answeredPack(), setup: undefined }
+    const diff = computeSystemDiff(m, [], null, { callerProjectId: 'p-evolver', schedules: [] })
+    expect(diff.schedules[0].error).toContain('was not filled in')
+    expect(diff.schedules[0].values?.cronExpression).toBe('{{answers.profile.review-time}}')
+  })
+
+  test('a cron composed from an answer is validated after substitution', () => {
+    const base = answeredPack()
+    const spec = { ...base.schedules[0], hour: undefined, cron: '0 {{answers.profile.review-time}} * * *' } as unknown as typeof base.schedules[0]
+    const zone = { 'profile.timezone': 'Europe/Berlin' }
+    expect(resolveScheduleTiming(spec, { 'profile.review-time': '9', ...zone })).toMatchObject({ cronExpression: '0 9 * * *', error: null })
+    expect(resolveScheduleTiming(spec, { 'profile.review-time': 'quarter past', ...zone }).error).toContain('five-field cron')
+  })
+
+  test('quiet hours answers reach the agent config, not a schedule column', () => {
+    const diff = computeSystemDiff(answeredPack(), [], null, { callerProjectId: 'p-evolver', answers, schedules: [] })
+    const configure = diff.create.length ? diff.configure[0] : diff.configure[0]
+    expect(configure?.patch.agent).toMatchObject({
+      quietHoursStart: '21:15',
+      quietHoursEnd: '06:45',
+      quietHoursTimezone: 'America/New_York',
+    })
+  })
+})
+
+describe('answer keys', () => {
+  test('an answer keyed by the question id reaches the applies path, and the reverse', () => {
+    const setup = answeredPack().setup
+    const byId = normalizeAnswers(setup, { hour: '18:30', timezone: 'Europe/Berlin' })
+    expect(byId.profile).toMatchObject({ 'review-time': '18:30', timezone: 'Europe/Berlin' })
+    expect(byId.hour).toBe('18:30')
+    expect(renderProfileSection(setup, { hour: '18:30', timezone: 'Europe/Berlin' })).toContain('- **Review time**: 18:30')
+    expect(renderProfileSection(setup, { 'profile.review-time': '18:30' })).toContain('- **Review time**: 18:30')
+  })
+
+  test('an answered question never takes its default instead', () => {
+    const setup = answeredPack().setup
+    const rendered = renderProfileSection(setup, { 'profile.review-time': '18:30' })
+    expect(rendered?.split('\n')[0]).toBe('- **Review time**: 18:30')
+  })
+
+  test('a blank answer is a skip, so the default applies', () => {
+    const setup = answeredPack().setup
+    expect(renderProfileSection(setup, { 'profile.review-time': '   ' })).toContain('Review time**: 07:00')
+    expect(normalizeAnswers(setup, { 'profile.review-time': '' }).profile).toMatchObject({ 'review-time': '07:00' })
   })
 })

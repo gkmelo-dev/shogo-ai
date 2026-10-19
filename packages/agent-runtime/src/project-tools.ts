@@ -73,11 +73,11 @@ import {
   IMPLICIT_ANCHOR,
   isSafeRelativePath,
   mergeProfileSection,
+  normalizeAnswers,
   parseSystemManifest,
   manifestHints,
   renderProfileSection,
   resolveAgentRef,
-  resolveScheduleValues,
   summarizeDiff,
   type BoardOp,
   type FileProbe,
@@ -750,6 +750,7 @@ export function createSystemApplyTool(ctx: ToolContext): AgentTool {
     label: 'Apply System Manifest',
     description: [
       'Reconcile a `shogo-system.yaml` manifest against the workspace: create missing projects, attach them as declared, set heartbeat/model/capabilities, write each project\'s prompt files (AGENTS.md, HEARTBEAT.md, .shogo/agents/*.md), create the `teamChannels` the agents work in with their members and `boards`, set up `triggers` (including ones that turn events into cards), and create the `schedules` (cron + channel + agent prompt) the system runs on.',
+      'A schedule takes `cron` (`0 7 * * 1-5`) or `hour` (+ optional `minute`/`days`) and a `timezone`; `cron`, `hour` and `timezone` accept `{{answers.profile.<key>}}`, so a run happens at the hour and zone the install answered rather than at a fixed UTC time. A schedule whose answers are missing is reported in `errors` and not written.',
       'Idempotent: a second run reports an empty diff. Bindings from manifest key to project id are recorded in .shogo/system.lock.json so renames do not create duplicates.',
       'This is also how you create a team channel or change one (privacy, topic, members): edit its `teamChannels` entry and apply.',
       'Run with `dryRun: true` first. If the plan does only what the person asked for, apply it; if it changes more, show the plan and ask before applying. Chat integrations and external channels are listed under `manual` because they need credentials.',
@@ -782,6 +783,10 @@ export function createSystemApplyTool(ctx: ToolContext): AgentTool {
       const parsed = parseSystemManifest(source)
       if (!parsed.ok || !parsed.manifest) return textResult({ error: 'Manifest is invalid', issues: parsed.errors, hints: manifestHints(parsed.errors) })
       const manifest = parsed.manifest
+      // Answers are keyed by question id, by `applies` path, flat or nested;
+      // one canonical set means the file, the prompt and the schedule that read
+      // the same answer all see the same value.
+      const answers = normalizeAnswers(manifest.setup, p.answers)
 
       const unavailable = manifest.projects
         .filter((pr) => pr.agent?.model !== undefined && !isAvailableModel(pr.agent.model))
@@ -874,7 +879,7 @@ export function createSystemApplyTool(ctx: ToolContext): AgentTool {
         triggersUnavailable,
         schedules,
         schedulesUnavailable,
-        answers: p.answers,
+        answers,
       })
       const report: ApplyReport = {
         ok: true,
@@ -1121,7 +1126,7 @@ export function createSystemApplyTool(ctx: ToolContext): AgentTool {
         if (id) scheduleBindings[spec.key] = id
       }
       const scheduleOps = ctx.userId
-        ? diffSchedules(manifest, schedules ?? [], lock, { bindings: scheduleBindings, answers: p.answers, channelIds })
+        ? diffSchedules(manifest, schedules ?? [], lock, { bindings: scheduleBindings, answers, channelIds })
         : diff.schedules
       for (const op of scheduleOps) {
         if (!ctx.userId) break
@@ -1134,7 +1139,14 @@ export function createSystemApplyTool(ctx: ToolContext): AgentTool {
           }
           continue
         }
-        const values = resolveScheduleValues(op.spec!, { bindings: scheduleBindings, answers: p.answers, channelIds })
+        // `values` come from the one resolver both apply paths use; the spec is
+        // never re-resolved here, so the runtime and the marketplace engine
+        // cannot disagree about what a schedule becomes.
+        if (op.error || !op.values) {
+          report.errors.push(`schedule ${op.key}: ${op.error ?? 'the spec could not be resolved'}`)
+          continue
+        }
+        const values = op.values
         const notifyConversationId = values.channel ? channelIds[values.channel] ?? null : null
         if (values.channel && !notifyConversationId) {
           report.skipped.push(`schedule ${op.key}: channel #${values.channel} has no conversation id; results will not post anywhere`)
@@ -1166,7 +1178,7 @@ export function createSystemApplyTool(ctx: ToolContext): AgentTool {
 
       // 9. Workspace profile: answers from the install wizard land in one
       //    `## section` of the anchor's file, leaving its other sections alone.
-      const profileAnswers = p.answers && Object.keys(p.answers).length ? p.answers : null
+      const profileAnswers = Object.keys(answers).length ? answers : null
       const anchorId = manifest.anchor ? idOf(manifest.anchor) : ctx.projectId
       if (profileAnswers && manifest.setup?.profile && anchorId && manifest.setup.questions.length) {
         const rendered = renderProfileSection(manifest.setup, profileAnswers)

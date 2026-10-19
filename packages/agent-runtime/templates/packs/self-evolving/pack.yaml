@@ -13,6 +13,13 @@ projects:
         boardsEnabled: true
         boardAdminEnabled: false
         teamChatEnabled: true
+      heartbeat:
+        enabled: true
+        interval: 3600
+        quietHours:
+          start: "{{answers.profile.quiet-hours-start}}"
+          end: "{{answers.profile.quiet-hours-end}}"
+          timezone: "{{answers.profile.timezone}}"
     files:
       AGENTS.md: |-
         # Self Evolver
@@ -39,6 +46,7 @@ projects:
         - **What this team builds**: {{answers.profile.product}}
         - **Agents to coach**: {{answers.profile.roster}}
         - **Review time**: {{answers.profile.review-time}} ({{answers.profile.timezone}})
+        - **Quiet hours**: {{answers.profile.quiet-hours-start}}–{{answers.profile.quiet-hours-end}} ({{answers.profile.timezone}})
       HEARTBEAT.md: |-
         # Heartbeat
 
@@ -60,16 +68,17 @@ schedules:
     name: Daily self review
     project: self-evolving
     channel: evolution
-    cron: 0 7 * * *
-    timezone: UTC
+    hour: "{{answers.profile.review-time}}"
+    timezone: "{{answers.profile.timezone}}"
     enabled: true
     prompt: "Start today’s review with <@a:p:{{agent.self-evolving}}>: read the last 24 hours of work, coach the roster, file ideas in {{channel.ideas}}, and post the review in {{channel.evolution}}."
   - key: weekly-rollup
     name: Monday rollup
     project: self-evolving
     channel: evolution
-    cron: 0 8 * * 1
-    timezone: UTC
+    hour: "{{answers.profile.review-time}}"
+    days: "1"
+    timezone: "{{answers.profile.timezone}}"
     enabled: true
     prompt: "Write the Monday rollup in {{channel.evolution}} with <@a:p:{{agent.self-evolving}}>: repeated lessons, the one to fix this week, and movement on last week’s ideas."
 setup:
@@ -93,15 +102,48 @@ setup:
         - 06:00
         - 07:00
         - 08:00
+        - 12:00
         - 18:00
+        - 21:00
       default: 07:00
       applies: profile.review-time
     - id: timezone
       header: Timezone
-      question: Which timezone is that in (IANA name)?
-      type: text
+      question: Which timezone is that in?
+      type: choice
+      options:
+        - UTC
+        - America/Los_Angeles
+        - America/New_York
+        - Europe/London
+        - Europe/Berlin
+        - Asia/Singapore
+        - Asia/Tokyo
+        - Australia/Sydney
       default: UTC
       applies: profile.timezone
+    - id: quiet-hours-start
+      header: Quiet hours start
+      question: From what time should the agent not ping you?
+      type: choice
+      options:
+        - 20:00
+        - 21:00
+        - 22:00
+        - 23:00
+      default: 22:00
+      applies: profile.quiet-hours-start
+    - id: quiet-hours-end
+      header: Quiet hours end
+      question: When may it start pinging you again?
+      type: choice
+      options:
+        - 06:00
+        - 07:00
+        - 08:00
+        - 09:00
+      default: 07:00
+      applies: profile.quiet-hours-end
   profile:
     file: AGENTS.md
     section: "## Workspace profile"

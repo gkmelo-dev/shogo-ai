@@ -10,7 +10,7 @@ import { describe, test, expect } from 'bun:test'
 import { existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { listPackTemplates, renderAllPackFiles, getPackTemplate } from '../pack-templates'
-import { parseSystemManifest } from '../system-manifest'
+import { applyAnswersToManifest, parseSystemManifest, renderProfileSection, resolveScheduleValues } from '../system-manifest'
 
 const TEMPLATES_DIR = join(import.meta.dir, '..', '..', 'templates')
 
@@ -84,6 +84,48 @@ describe('pack templates', () => {
         expect({ pack: pack.id, schedule: s.key, enabled: s.enabled }).toEqual({ pack: pack.id, schedule: s.key, enabled: enabledByDefault })
       }
     }
+  })
+
+  test('every answer reaches the profile as the answer, never as its default', () => {
+    const answerFor = (q: { id: string; type?: string; options?: string[]; default?: unknown }) => {
+      if (q.type === 'choice' || q.type === 'multi') {
+        const option = [...(q.options ?? [])].reverse().find((o) => o !== q.default)
+        if (!option) throw new Error(`question ${q.id} has no non-default option to answer with`)
+        return option
+      }
+      if (q.type === 'confirm') return true
+      return `answer-${q.id}`
+    }
+    for (const pack of packs) {
+      const manifest = parseSystemManifest(pack.manifest).manifest!
+      const answers: Record<string, unknown> = {}
+      for (const q of manifest.setup!.questions) answers[q.applies ?? `profile.${q.id}`] = answerFor(q)
+      const section = renderProfileSection(manifest.setup, answers) ?? ''
+      const bodies = applyAnswersToManifest(manifest, answers).projects.flatMap((p) => Object.values(p.files)).join('\n')
+      for (const q of manifest.setup!.questions) {
+        const raw = answerFor(q)
+        const shown = Array.isArray(raw) ? raw.join(', ') : raw === true ? 'yes' : String(raw)
+        const line = `- **${q.header}**: ${shown}`
+        expect({ pack: pack.id, question: q.id, line: section.includes(line) }).toEqual({ pack: pack.id, question: q.id, line: true })
+        // The file the install writes carries it too — not the placeholder, not the default.
+        expect({ pack: pack.id, question: q.id, inFile: bodies.includes(shown) }).toEqual({ pack: pack.id, question: q.id, inFile: true })
+        expect({ pack: pack.id, question: q.id, unresolved: bodies.includes(`{{answers.${q.applies ?? `profile.${q.id}`}}}`) }).toEqual({ pack: pack.id, question: q.id, unresolved: false })
+      }
+    }
+  })
+
+  test('a pack that asks for a time runs at that time, in that zone', () => {
+    const manifest = parseSystemManifest(getPackTemplate('self-evolving')!.manifest).manifest!
+    const values = resolveScheduleValues(manifest.schedules[0], {
+      answers: { 'profile.review-time': '18:30', 'profile.timezone': 'America/New_York' },
+    })
+    expect(values).toMatchObject({ cronExpression: '30 18 * * *', timezone: 'America/New_York' })
+    expect(values.error).toBeUndefined()
+    // Monday rollup: same answered hour, Monday only.
+    const rollup = resolveScheduleValues(manifest.schedules[1], {
+      answers: { 'profile.review-time': '18:30', 'profile.timezone': 'America/New_York' },
+    })
+    expect(rollup).toMatchObject({ cronExpression: '30 18 * * 1', timezone: 'America/New_York' })
   })
 
   test('generated templates/packs files match the source', () => {

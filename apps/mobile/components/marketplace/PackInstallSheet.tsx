@@ -11,7 +11,7 @@
  * performs.
  */
 
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useState } from 'react'
 import { ActivityIndicator, Modal, Pressable, ScrollView, Text, TextInput, View } from 'react-native'
 import { X } from 'lucide-react-native'
 
@@ -54,28 +54,31 @@ export function PackInstallSheet({
   const questions = preview?.questions ?? []
   const [answers, setAnswers] = useState<Record<string, unknown>>({})
 
+  // Answers are keyed by the `applies` path (`profile.review-time`), the same
+  // key the apply engine substitutes — over HTTP the two processes never share
+  // an id twice, so the question id is only the fallback.
+  const keyOf = (q: PackQuestion) => q.applies ?? q.id
+
   useEffect(() => {
     if (!visible) return
     const defaults: Record<string, unknown> = {}
     for (const q of questions) {
-      if (q.default !== undefined) defaults[q.id] = q.default
-      else if (q.type === 'multi') defaults[q.id] = []
+      if (q.default !== undefined) defaults[keyOf(q)] = q.default
+      else if (q.type === 'multi') defaults[keyOf(q)] = []
     }
     setAnswers(defaults)
   }, [visible, questions.length])
 
-  const missing = useMemo(
-    () => questions.filter((q) => q.required !== false && q.type !== 'confirm' && isEmpty(answers[q.id])),
-    [questions, answers],
-  )
+  const set = (key: string, value: unknown) => setAnswers((prev) => ({ ...prev, [key]: value }))
 
-  const set = (id: string, value: unknown) => setAnswers((prev) => ({ ...prev, [id]: value }))
-
-  const toggleMulti = (id: string, option: string) => {
-    const current = Array.isArray(answers[id]) ? (answers[id] as string[]) : []
+  const toggleMulti = (key: string, option: string) => {
+    const current = Array.isArray(answers[key]) ? (answers[key] as string[]) : []
     const next = current.includes(option) ? current.filter((v) => v !== option) : [...current, option]
-    set(id, next)
+    set(key, next)
   }
+
+  const defaultLabel = (q: PackQuestion) =>
+    q.default === undefined ? null : Array.isArray(q.default) ? q.default.join(', ') : String(q.default)
 
   return (
     <Modal visible={visible} transparent animationType="slide" onRequestClose={onCancel}>
@@ -112,8 +115,8 @@ export function PackInstallSheet({
 
                   {(q.type === 'text' || !q.type) && (
                     <TextInput
-                      value={typeof answers[q.id] === 'string' ? (answers[q.id] as string) : ''}
-                      onChangeText={(v) => set(q.id, v)}
+                      value={typeof answers[keyOf(q)] === 'string' ? (answers[keyOf(q)] as string) : ''}
+                      onChangeText={(v) => set(keyOf(q), v)}
                       placeholder={typeof q.default === 'string' ? q.default : 'Type an answer'}
                       placeholderTextColor="#71717a"
                       className="bg-secondary text-foreground rounded-xl px-3 py-3 text-sm"
@@ -123,11 +126,11 @@ export function PackInstallSheet({
                   {q.type === 'choice' && (
                     <View className="flex-row flex-wrap gap-2">
                       {(q.options ?? []).map((option) => {
-                        const selected = answers[q.id] === option
+                        const selected = answers[keyOf(q)] === option
                         return (
                           <Pressable
                             key={option}
-                            onPress={() => set(q.id, option)}
+                            onPress={() => set(keyOf(q), option)}
                             className={`px-3 py-2 rounded-xl border ${selected ? 'border-primary bg-primary/10' : 'border-border bg-secondary'}`}
                           >
                             <Text className={`text-xs ${selected ? 'text-primary' : 'text-foreground'}`}>{option}</Text>
@@ -140,12 +143,12 @@ export function PackInstallSheet({
                   {q.type === 'multi' && (
                     <View className="flex-row flex-wrap gap-2">
                       {(q.options ?? []).map((option) => {
-                        const current = Array.isArray(answers[q.id]) ? (answers[q.id] as string[]) : []
+                        const current = Array.isArray(answers[keyOf(q)]) ? (answers[keyOf(q)] as string[]) : []
                         const selected = current.includes(option)
                         return (
                           <Pressable
                             key={option}
-                            onPress={() => toggleMulti(q.id, option)}
+                            onPress={() => toggleMulti(keyOf(q), option)}
                             className={`px-3 py-2 rounded-xl border ${selected ? 'border-primary bg-primary/10' : 'border-border bg-secondary'}`}
                           >
                             <Text className={`text-xs ${selected ? 'text-primary' : 'text-foreground'}`}>{option}</Text>
@@ -157,14 +160,19 @@ export function PackInstallSheet({
 
                   {q.type === 'confirm' && (
                     <Pressable
-                      onPress={() => set(q.id, answers[q.id] !== true)}
-                      className={`self-start px-3 py-2 rounded-xl border ${answers[q.id] === true ? 'border-primary bg-primary/10' : 'border-border bg-secondary'}`}
+                      onPress={() => set(keyOf(q), answers[keyOf(q)] !== true)}
+                      className={`self-start px-3 py-2 rounded-xl border ${answers[keyOf(q)] === true ? 'border-primary bg-primary/10' : 'border-border bg-secondary'}`}
                     >
-                      <Text className={`text-xs ${answers[q.id] === true ? 'text-primary' : 'text-foreground'}`}>
-                        {answers[q.id] === true ? 'Yes' : 'No'}
+                      <Text className={`text-xs ${answers[keyOf(q)] === true ? 'text-primary' : 'text-foreground'}`}>
+                        {answers[keyOf(q)] === true ? 'Yes' : 'No'}
                       </Text>
                     </Pressable>
                   )}
+
+                  {/* Every question is skippable: say what a blank one falls back to. */}
+                  <Text className="text-muted-foreground text-[11px] mt-2">
+                    {defaultLabel(q) !== null ? `Skippable — without an answer it uses "${defaultLabel(q)}"` : 'Skippable — leave it blank and the agent works it out'}
+                  </Text>
                 </View>
               ))}
 
@@ -191,16 +199,14 @@ export function PackInstallSheet({
 
           <View className="px-5 pb-6 pt-2 border-t border-border">
             <Pressable
-              disabled={loading || installing || missing.length > 0}
+              disabled={loading || installing}
               onPress={() => onInstall(answers)}
-              className={`rounded-xl py-3 items-center ${loading || installing || missing.length > 0 ? 'bg-primary/50' : 'bg-primary'}`}
+              className={`rounded-xl py-3 items-center ${loading || installing ? 'bg-primary/50' : 'bg-primary'}`}
             >
               {installing ? (
                 <ActivityIndicator color="#fff" />
               ) : (
-                <Text className="text-primary-foreground text-sm font-semibold">
-                  {missing.length > 0 ? `Answer ${missing.length} more` : 'Install'}
-                </Text>
+                <Text className="text-primary-foreground text-sm font-semibold">Install</Text>
               )}
             </Pressable>
           </View>
@@ -208,11 +214,4 @@ export function PackInstallSheet({
       </View>
     </Modal>
   )
-}
-
-function isEmpty(value: unknown): boolean {
-  if (value === undefined || value === null) return true
-  if (typeof value === 'string') return value.trim() === ''
-  if (Array.isArray(value)) return value.length === 0
-  return false
 }

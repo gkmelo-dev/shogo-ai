@@ -21,12 +21,18 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import {
+  answerLookup,
   applyAnswersToManifest,
+  diffSchedules,
   mergeProfileSection,
+  normalizeAnswers,
   renderProfileSection,
   resolveScheduleValues,
   substituteTemplates,
+  type LiveSchedule,
+  type ScheduleOp,
   type ScheduleSpec,
+  type SystemLock,
   type SystemManifest,
 } from '@shogo/agent-runtime/src/system-manifest'
 import { prisma } from '../lib/prisma'
@@ -170,7 +176,11 @@ export async function previewSystemPack(params: {
   anchorProjectId?: string
 }): Promise<PackPreview> {
   const { workspaceId } = params
-  const manifest = applyAnswersToManifest(params.manifest, params.answers)
+  // One canonical answer set: keyed by `applies` path and by question id, with
+  // a skipped question taking its default. Everything below reads this, so the
+  // preview shows what the install will actually write.
+  const answers = normalizeAnswers(params.manifest.setup, params.answers)
+  const manifest = applyAnswersToManifest(params.manifest, answers)
   const conflicts: string[] = []
   const plan: string[] = []
 
@@ -216,10 +226,27 @@ export async function previewSystemPack(params: {
     for (const b of ch.boards ?? []) plan.push(`create board #${channelNames[ch.name]} ${b.name}${b.keyPrefix ? ` (${b.keyPrefix})` : ''}`)
   }
   for (const s of manifest.schedules) {
-    const values = resolveScheduleValues(s, { answers: params.answers })
+    const values = resolveScheduleValues(s, { answers })
+    if (values.error) {
+      plan.push(`cannot create schedule "${values.name}" — ${values.error}`)
+      continue
+    }
     plan.push(`create schedule "${values.name}" (${values.cronExpression} ${values.timezone}${values.channel ? ` → #${values.channel}` : ''}${values.enabled ? '' : ', disabled until you enable it'})`)
   }
   for (const t of manifest.triggers) plan.push(`create trigger "${t.name}" (${t.event})`)
+  // Every question is skippable: say which default is standing in for an
+  // answer the person has not given, rather than showing an unanswered blank.
+  for (const q of manifest.setup?.questions ?? []) {
+    const path = q.applies ?? `profile.${q.id}`
+    const given = answerLookup(params.answers, path) ?? answerLookup(params.answers, q.id)
+    if (given) continue
+    if (q.default === undefined) {
+      plan.push(`"${q.header}" is skipped — nothing is written for it`)
+      continue
+    }
+    const shown = Array.isArray(q.default) ? q.default.join(', ') : String(q.default)
+    plan.push(`"${q.header}" is skipped — the default "${shown}" is used`)
+  }
   if (!plan.length) plan.push('nothing to create — everything this pack declares already exists')
 
   return {
@@ -231,13 +258,43 @@ export async function previewSystemPack(params: {
 }
 
 /**
+ * The schedule half of an apply, as ops. This is `diffSchedules` — the same
+ * function the runtime's `system_apply` runs — fed with the bindings a pack
+ * install already has, so the two paths cannot disagree about what a schedule
+ * spec becomes. Shared by `applySystemPack` and its parity test.
+ */
+export function planScheduleOps(args: {
+  manifest: SystemManifest
+  answers?: Record<string, unknown>
+  bindings: PackBindings
+  live: LiveSchedule[]
+}): ScheduleOp[] {
+  const lock: SystemLock = {
+    version: 1,
+    name: args.manifest.name,
+    bindings: { ...args.bindings.projects },
+    schedules: Object.fromEntries(
+      Object.entries(args.bindings.schedules ?? {})
+        .filter(([, id]) => !!id)
+        .map(([key, id]) => [key, { id, hash: '' }]),
+    ),
+  }
+  return diffSchedules(args.manifest, args.live, lock, {
+    bindings: args.bindings.projects,
+    answers: args.answers,
+    channelIds: args.bindings.channels,
+  })
+}
+
+/**
  * Create (or update, when bindings are supplied) everything a pack declares.
  * Dry run returns the same report with nothing written, so the preview shown
  * before an install is produced by the code that performs it.
  */
 export async function applySystemPack(args: ApplyPackArgs): Promise<ApplyPackResult> {
   const { workspaceId, actorUserId, dryRun = false } = args
-  const manifest = applyAnswersToManifest(args.manifest, args.answers)
+  const answers = normalizeAnswers(args.manifest.setup, args.answers)
+  const manifest = applyAnswersToManifest(args.manifest, answers)
   const bindings: PackBindings = {
     projects: { ...(args.bindings?.projects ?? {}) },
     channels: { ...(args.bindings?.channels ?? {}) },
@@ -248,7 +305,7 @@ export async function applySystemPack(args: ApplyPackArgs): Promise<ApplyPackRes
   const preview = await previewSystemPack({
     workspaceId,
     manifest,
-    answers: args.answers,
+    answers,
     anchorProjectId: args.anchorProjectId,
   })
   const channelNames = { ...preview.channelNames, ...(args.channelNames ?? {}) }
@@ -273,6 +330,27 @@ export async function applySystemPack(args: ApplyPackArgs): Promise<ApplyPackRes
     if (isAnchor && args.anchorProjectId) {
       bindings.projects[spec.key] = args.anchorProjectId
       result.anchorProjectId = args.anchorProjectId
+      // The listing already created the anchor, but the pack still owns its
+      // agent settings — model, capabilities and the quiet hours it asked for.
+      if (spec.agent) {
+        try {
+          await configureProject(args.anchorProjectId, {
+            agent: {
+              modelName: spec.agent.model,
+              modelProvider: spec.agent.provider,
+              heartbeatEnabled: spec.agent.heartbeat?.enabled,
+              heartbeatInterval: spec.agent.heartbeat?.interval,
+              quietHoursStart: spec.agent.heartbeat?.quietHours?.start,
+              quietHoursEnd: spec.agent.heartbeat?.quietHours?.end,
+              quietHoursTimezone: spec.agent.heartbeat?.quietHours?.timezone,
+            },
+            ...(spec.agent.capabilities ? { settings: spec.agent.capabilities } : {}),
+          })
+          result.applied.push(`configure ${spec.key} (agent settings)`)
+        } catch (err: any) {
+          result.errors.push(`project ${spec.key}: ${err?.message ?? err}`)
+        }
+      }
       continue
     }
     if (bindings.projects[spec.key]) {
@@ -422,41 +500,62 @@ export async function applySystemPack(args: ApplyPackArgs): Promise<ApplyPackRes
     }
   }
 
-  // 5. Schedules. `{{agent.*}}` resolves to the created project, `channel:` to
-  //    the conversation id, so a run lands in the channel it belongs to.
-  for (const spec of manifest.schedules) bindings.schedules[spec.key] ??= ''
-  for (const spec of manifest.schedules) {
-    try {
-      const values = resolveScheduleValues(spec, { bindings: bindings.projects, answers: args.answers, channelIds: bindings.channels })
-      const notifyConversationId = values.channel ? bindings.channels[values.channel] ?? null : null
-      const existingId = bindings.schedules[spec.key]
-      const body = {
-        workspaceId,
-        userId: actorUserId,
-        name: values.name,
-        prompt: values.prompt,
-        cronExpression: values.cronExpression,
-        timezone: values.timezone,
-        enabled: values.enabled,
-        notifyConversationId,
+  // 5. Schedules, through the same diff `system_apply` runs. `{{agent.*}}`
+  //    resolves to the created project, `channel:` to the conversation id, and
+  //    the cron/zone come from the answers, so a run lands where it belongs.
+  let liveSchedules: LiveSchedule[] = []
+  try {
+    liveSchedules = (await listSchedules(workspaceId)) ?? []
+  } catch (err: any) {
+    result.errors.push(`schedules could not be read: ${err?.message ?? err}`)
+  }
+  const scheduleOps = planScheduleOps({ manifest, answers, bindings, live: liveSchedules })
+  for (const op of scheduleOps) {
+    if (op.action === 'delete') {
+      if (!op.scheduleId) continue
+      try {
+        await deleteSchedule(workspaceId, op.scheduleId)
+        delete bindings.schedules[op.key]
+        result.applied.push(`delete schedule ${op.key}`)
+      } catch (err: any) {
+        result.errors.push(`schedule ${op.key}: ${err?.message ?? err}`)
       }
-      if (existingId) {
-        await updateSchedule(workspaceId, existingId, {
-          name: body.name,
-          prompt: body.prompt,
-          cronExpression: body.cronExpression,
-          timezone: body.timezone,
-          enabled: body.enabled,
+      continue
+    }
+    if (op.error || !op.values) {
+      result.errors.push(`schedule ${op.key}: ${op.error ?? 'the spec could not be resolved'}`)
+      continue
+    }
+    const values = op.values
+    const notifyConversationId = values.channel ? bindings.channels[values.channel] ?? null : null
+    try {
+      if (op.action === 'update' && op.scheduleId) {
+        await updateSchedule(workspaceId, op.scheduleId, {
+          name: values.name,
+          prompt: values.prompt,
+          cronExpression: values.cronExpression,
+          timezone: values.timezone,
+          enabled: values.enabled,
           notifyConversationId,
         })
-        result.applied.push(`update schedule ${spec.key}`)
+        bindings.schedules[op.key] = op.scheduleId
+        result.applied.push(`update schedule ${op.key}`)
       } else {
-        const created = await createSchedule(body)
-        bindings.schedules[spec.key] = created.id
-        result.applied.push(`create schedule ${spec.key}${notifyConversationId ? '' : ' (no channel — results stay in the agent chat)'}`)
+        const created = await createSchedule({
+          workspaceId,
+          userId: actorUserId,
+          name: values.name,
+          prompt: values.prompt,
+          cronExpression: values.cronExpression,
+          timezone: values.timezone,
+          enabled: values.enabled,
+          notifyConversationId,
+        })
+        bindings.schedules[op.key] = created.id
+        result.applied.push(`create schedule ${op.key}${notifyConversationId ? '' : ' (no channel — results stay in the agent chat)'}`)
       }
     } catch (err: any) {
-      result.errors.push(`schedule ${spec.key}: ${err?.message ?? err}`)
+      result.errors.push(`schedule ${op.key}: ${err?.message ?? err}`)
     }
   }
 
@@ -596,7 +695,7 @@ export function packScheduleLines(manifest: SystemManifest): Array<{ key: string
   return manifest.schedules.map((s: ScheduleSpec) => ({
     key: s.key,
     name: s.name,
-    cron: s.cron,
+    cron: s.cron ?? `${s.minute ?? 0} ${s.hour ?? ''} * * ${s.days ?? '*'}`.replace(/\s+/g, ' ').trim(),
     channel: s.channel ?? null,
     enabled: s.enabled,
   }))

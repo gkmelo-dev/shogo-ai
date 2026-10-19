@@ -32,6 +32,12 @@ export interface PackTemplate {
 
 const PROFILE_SECTION = '## Workspace profile'
 
+/**
+ * Timezones offered as a choice rather than free text: a schedule's zone is
+ * validated, so a typo'd "Pacific" must not be able to sink an install.
+ */
+const IANA_ZONES = ['UTC', 'America/Los_Angeles', 'America/New_York', 'Europe/London', 'Europe/Berlin', 'Asia/Singapore', 'Asia/Tokyo', 'Australia/Sydney']
+
 const PRODUCT_QUESTION = (): SetupQuestion => ({
   id: 'product',
   header: 'What this team builds',
@@ -333,8 +339,9 @@ const DAILY_STANDUP: PackTemplate = (() => {
     {
       id: 'timezone',
       header: 'Timezone',
-      question: 'Which timezone is that in (IANA name)?',
-      type: 'text',
+      question: 'Which timezone is that in?',
+      type: 'choice',
+      options: IANA_ZONES,
       default: 'UTC',
       applies: 'profile.timezone',
     },
@@ -374,8 +381,10 @@ Keep it under 15 lines. Link cards by key, never paste a whole thread.
         name: 'Daily standup',
         project: 'standup-agent',
         channel: 'standup',
-        cron: '0 9 * * 1-5',
-        timezone: 'UTC',
+        // Weekdays, at the answered hour in the answered zone.
+        hour: '{{answers.profile.standup-time}}',
+        days: '1-5',
+        timezone: '{{answers.profile.timezone}}',
         enabled: false,
         prompt: 'Write today’s standup in {{channel.standup}} with <@a:p:{{agent.standup-agent}}>: moved, stuck, decisions.',
       },
@@ -563,17 +572,36 @@ const SELF_EVOLVING: PackTemplate = (() => {
       header: 'Review time',
       question: 'What time should the daily review run?',
       type: 'choice',
-      options: ['06:00', '07:00', '08:00', '18:00'],
+      options: ['06:00', '07:00', '08:00', '12:00', '18:00', '21:00'],
       default: '07:00',
       applies: 'profile.review-time',
     },
     {
       id: 'timezone',
       header: 'Timezone',
-      question: 'Which timezone is that in (IANA name)?',
-      type: 'text',
+      question: 'Which timezone is that in?',
+      type: 'choice',
+      options: IANA_ZONES,
       default: 'UTC',
       applies: 'profile.timezone',
+    },
+    {
+      id: 'quiet-hours-start',
+      header: 'Quiet hours start',
+      question: 'From what time should the agent not ping you?',
+      type: 'choice',
+      options: ['20:00', '21:00', '22:00', '23:00'],
+      default: '22:00',
+      applies: 'profile.quiet-hours-start',
+    },
+    {
+      id: 'quiet-hours-end',
+      header: 'Quiet hours end',
+      question: 'When may it start pinging you again?',
+      type: 'choice',
+      options: ['06:00', '07:00', '08:00', '09:00'],
+      default: '07:00',
+      applies: 'profile.quiet-hours-end',
     },
   ]
   const manifest = {
@@ -585,7 +613,21 @@ const SELF_EVOLVING: PackTemplate = (() => {
         key: 'self-evolving',
         name: 'Self Evolver',
         description: 'Reviews the last 24 hours of agent work, writes lessons into each agent’s MEMORY.md, and files platform ideas.',
-        agent: { model: 'auto', capabilities: { boardsEnabled: true, boardAdminEnabled: false, teamChatEnabled: true } },
+        agent: {
+          model: 'auto',
+          capabilities: { boardsEnabled: true, boardAdminEnabled: false, teamChatEnabled: true },
+          // Quiet hours are the agent's own (AgentConfig), not a schedule column:
+          // they are the window the heartbeat may not ping anyone in.
+          heartbeat: {
+            enabled: true,
+            interval: 3600,
+            quietHours: {
+              start: '{{answers.profile.quiet-hours-start}}',
+              end: '{{answers.profile.quiet-hours-end}}',
+              timezone: '{{answers.profile.timezone}}',
+            },
+          },
+        },
         files: {
           'AGENTS.md': `# Self Evolver
 
@@ -610,7 +652,8 @@ On Mondays add a section: which lessons repeated, which one the workspace should
 ## Workspace profile
 - **What this team builds**: {{answers.profile.product}}
 - **Agents to coach**: {{answers.profile.roster}}
-- **Review time**: {{answers.profile.review-time}} ({{answers.profile.timezone}})`,
+- **Review time**: {{answers.profile.review-time}} ({{answers.profile.timezone}})
+- **Quiet hours**: {{answers.profile.quiet-hours-start}}–{{answers.profile.quiet-hours-end}} ({{answers.profile.timezone}})`,
           'HEARTBEAT.md': `# Heartbeat
 
 1. If today's review has not been posted in #evolution yet, write it.
@@ -636,8 +679,9 @@ On Mondays add a section: which lessons repeated, which one the workspace should
         name: 'Daily self review',
         project: 'self-evolving',
         channel: 'evolution',
-        cron: '0 7 * * *',
-        timezone: 'UTC',
+        // The run happens at the answered hour, in the answered zone — not 07:00 UTC.
+        hour: '{{answers.profile.review-time}}',
+        timezone: '{{answers.profile.timezone}}',
         enabled: true,
         prompt: 'Start today’s review with <@a:p:{{agent.self-evolving}}>: read the last 24 hours of work, coach the roster, file ideas in {{channel.ideas}}, and post the review in {{channel.evolution}}.',
       },
@@ -646,8 +690,9 @@ On Mondays add a section: which lessons repeated, which one the workspace should
         name: 'Monday rollup',
         project: 'self-evolving',
         channel: 'evolution',
-        cron: '0 8 * * 1',
-        timezone: 'UTC',
+        hour: '{{answers.profile.review-time}}',
+        days: '1',
+        timezone: '{{answers.profile.timezone}}',
         enabled: true,
         prompt: 'Write the Monday rollup in {{channel.evolution}} with <@a:p:{{agent.self-evolving}}>: repeated lessons, the one to fix this week, and movement on last week’s ideas.',
       },

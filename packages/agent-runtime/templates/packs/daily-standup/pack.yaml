@@ -40,8 +40,9 @@ schedules:
     name: Daily standup
     project: standup-agent
     channel: standup
-    cron: 0 9 * * 1-5
-    timezone: UTC
+    hour: "{{answers.profile.standup-time}}"
+    days: 1-5
+    timezone: "{{answers.profile.timezone}}"
     enabled: false
     prompt: "Write today’s standup in {{channel.standup}} with <@a:p:{{agent.standup-agent}}>: moved, stuck, decisions."
 setup:
@@ -64,8 +65,17 @@ setup:
       applies: profile.standup-time
     - id: timezone
       header: Timezone
-      question: Which timezone is that in (IANA name)?
-      type: text
+      question: Which timezone is that in?
+      type: choice
+      options:
+        - UTC
+        - America/Los_Angeles
+        - America/New_York
+        - Europe/London
+        - Europe/Berlin
+        - Asia/Singapore
+        - Asia/Tokyo
+        - Australia/Sydney
       default: UTC
       applies: profile.timezone
   profile:
