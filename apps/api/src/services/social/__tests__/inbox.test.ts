@@ -296,6 +296,23 @@ describe('replying', () => {
     expect(thread.conversation.unreadCount).toBe(0)
   })
 
+  test('the read marker follows the thread, not the clock', async () => {
+    const [conversation] = await listConversations(workspaceId)
+    await replyToConversation(workspaceId, conversation.id, { text: 'Anchored reply' })
+
+    const row = await db.socialConversation.findFirst({ where: { id: conversation.id } })
+    const newestIncoming = await db.socialMessage.findFirst({
+      where: { conversationId: conversation.id, direction: 'incoming' },
+      orderBy: { sentAt: 'desc' },
+    })
+    // The reply row itself carries our clock; the marker must still sit on the
+    // newest thing the reader was shown, or a message the provider sent before
+    // the reply but delivered after it would be swept away as already read.
+    expect(row.lastReadAt.getTime()).toBe(newestIncoming.sentAt.getTime())
+    expect(newestIncoming.zernioMessageId).toBe('msg_in_1')
+    expect(row.lastReadAt.getTime()).toBeLessThan(row.lastMessageAt.getTime())
+  })
+
   test('a repeated reply is a new send, while a retry of the same one is not', async () => {
     const [conversation] = await listConversations(workspaceId)
     const keysFor = () =>
@@ -431,6 +448,9 @@ describe('backfill', () => {
 
     const read = await markConversationRead(workspaceId, first.id)
     expect(read.unreadCount).toBe(0)
+    // Anchored to the newest message in the thread, not to "now" — otherwise a
+    // message sent before this read but delivered after it never counts.
+    expect(read.lastReadAt.toISOString()).toBe('2026-10-19T22:00:00.000Z')
   })
 })
 
