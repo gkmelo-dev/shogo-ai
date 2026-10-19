@@ -15,6 +15,7 @@ import { createReadStream } from 'node:fs'
 import { dirname } from 'node:path'
 import { rmSync } from 'node:fs'
 import { decide, denialResponse, loadAccess, principalOf } from '../lib/authz'
+import { pinWorkspaceRoutesToHomeRegion } from '../lib/chat-region-pin'
 import type { AuthContext } from '../middleware/auth'
 import { WorkspaceExportTooLargeError } from '../services/workspace-export/archive'
 import {
@@ -74,6 +75,12 @@ function archiveResponse(tempPath: string, bytes: number, filename: string): Res
 
 export function workspaceExportRoutes(): Hono {
   const app = new Hono()
+
+  // An export reads model rows *and* every project's files, so it must run
+  // where the workspace's runtimes live. Same pin as the workspace runtime
+  // routes; a no-op in single-region, local and desktop.
+  app.use('/:workspaceId/export', pinWorkspaceRoutesToHomeRegion())
+  app.use('/:workspaceId/export/estimate', pinWorkspaceRoutesToHomeRegion())
 
   const authorizeExport = async (c: any, workspaceId: string) => {
     const principal = principalOf(c)
