@@ -269,6 +269,8 @@ interface RunningBodyProps extends Omit<RunningDockPanelProps, "processes" | "re
   processes: RunningProcess[]
   /** Rows playing their exit animation. */
   exiting: ReadonlySet<string>
+  /** Rows that were pinned back open from inside their exit: full size again. */
+  restored: ReadonlySet<string>
   onHoldChange: (key: string, holding: boolean) => void
 }
 
@@ -282,6 +284,7 @@ function RunningBody({
   loadOutput,
   onOpenTask,
   exiting,
+  restored,
   onHoldChange,
 }: RunningBodyProps) {
   const [now, setNow] = useState(() => Date.now())
@@ -290,6 +293,10 @@ function RunningBody({
   // the start of its exit. A row that is not exiting keeps no height at all,
   // so an open output viewer can grow it.
   const heights = useRef<Map<string, number>>(new Map())
+  // A row pinned back out of its exit keeps an explicit height — once Motion has
+  // animated it, style.height stays an animated value — so it is measured into
+  // state and the row grows with its output instead of clipping it.
+  const [restoredHeights, setRestoredHeights] = useState<Record<string, number>>({})
 
   useEffect(() => {
     const hasRunning = processes.some((p) => !isFinishedProcess(p))
@@ -309,6 +316,10 @@ function RunningBody({
   function handleRowLayout(key: string, e: LayoutChangeEvent) {
     const height = e.nativeEvent.layout.height
     if (height > 0) heights.current.set(key, height)
+    if (height <= 0 || !restored.has(key)) return
+    setRestoredHeights((prev) =>
+      Math.abs((prev[key] ?? -1) - height) < 0.5 ? prev : { ...prev, [key]: height },
+    )
   }
 
   const waitedOn = new Set(waiting?.taskIds ?? [])
@@ -339,12 +350,16 @@ function RunningBody({
         {processes.map((proc) => {
           const key = processKey(proc)
           const isExiting = exiting.has(key)
+          const isRestored = !isExiting && restored.has(key)
+          const shownHeight = restoredHeights[key] ?? heights.current.get(key) ?? 0
           return (
             <Motion.View
               key={key}
-              animate={isExiting ? ROW_EXIT : ROW_SHOWN}
+              animate={
+                isExiting ? ROW_EXIT : isRestored ? { opacity: 1, height: shownHeight } : ROW_SHOWN
+              }
               initial={isExiting ? { opacity: 1, height: heights.current.get(key) ?? 0 } : undefined}
-              transition={isExiting ? EXIT_TRANSITION : ROW_TRANSITION}
+              transition={isExiting || isRestored ? EXIT_TRANSITION : ROW_TRANSITION}
               style={ROW_STYLE}
             >
               <View onLayout={(e) => handleRowLayout(key, e)}>
@@ -404,11 +419,19 @@ interface Retirement {
   exiting: Set<string>
   /** Rows removed from the dock. The poll keeps listing them for ten minutes; this set is the authority. */
   gone: Set<string>
+  /** Rows pinned back open from inside their exit — on screen again, still to be retired. */
+  restored: Set<string>
   /** Bumped on every change so the dock re-renders its body even when the header text is unchanged. */
   revision: number
 }
 
-const EMPTY_RETIREMENT: Retirement = { exiting: new Set(), gone: new Set(), revision: 0 }
+const EMPTY_RETIREMENT: Retirement = { exiting: new Set(), gone: new Set(), restored: new Set(), revision: 0 }
+
+function without(set: ReadonlySet<string>, key: string): Set<string> {
+  const next = new Set(set)
+  next.delete(key)
+  return next
+}
 
 export function RunningDockPanel(props: RunningDockPanelProps) {
   const { processes, subagents, recentTools, waiting, agentIdle } = props
@@ -420,6 +443,9 @@ export function RunningDockPanel(props: RunningDockPanelProps) {
   const [retirement, setRetirement] = useState<Retirement>(EMPTY_RETIREMENT)
   // Rows with their output viewer open are pinned until it closes.
   const [held, setHeld] = useState<ReadonlySet<string>>(() => new Set())
+  // The same set, readable inside a timer: a click and the exit timeout can
+  // land in the same tick, and a row must never retire under its reader.
+  const heldRef = useRef<Set<string>>(new Set())
   const timers = useRef(
     new Map<string, { linger: ReturnType<typeof setTimeout>; exit?: ReturnType<typeof setTimeout> }>(),
   )
@@ -440,13 +466,15 @@ export function RunningDockPanel(props: RunningDockPanelProps) {
     if (processes.length > 0) return
     clearTimers()
     setRetirement((prev) =>
-      prev.gone.size === 0 && prev.exiting.size === 0
+      prev.gone.size === 0 && prev.exiting.size === 0 && prev.restored.size === 0
         ? prev
-        : { exiting: new Set(), gone: new Set(), revision: prev.revision + 1 },
+        : { exiting: new Set(), gone: new Set(), restored: new Set(), revision: prev.revision + 1 },
     )
   }, [processes.length, clearTimers])
 
   const handleHoldChange = useCallback((key: string, holding: boolean) => {
+    if (holding) heldRef.current.add(key)
+    else heldRef.current.delete(key)
     setHeld((prev) => {
       if (prev.has(key) === holding) return prev
       const next = new Set(prev)
@@ -454,6 +482,19 @@ export function RunningDockPanel(props: RunningDockPanelProps) {
       else next.delete(key)
       return next
     })
+    if (!holding) return
+    // Pinned from inside its exit: the row goes back to full size instead of
+    // staying mounted at height 0, where nothing would ever bring it back.
+    setRetirement((prev) =>
+      prev.exiting.has(key)
+        ? {
+            exiting: without(prev.exiting, key),
+            gone: prev.gone,
+            restored: new Set(prev.restored).add(key),
+            revision: prev.revision + 1,
+          }
+        : prev,
+    )
   }, [])
 
   useEffect(() => {
@@ -485,18 +526,33 @@ export function RunningDockPanel(props: RunningDockPanelProps) {
               : {
                   exiting: new Set(prev.exiting).add(key),
                   gone: prev.gone,
+                  restored: prev.restored,
                   revision: prev.revision + 1,
                 },
           )
           timer.exit = setTimeout(() => {
             timers.current.delete(key)
+            // Held again while the exit was running: the row is being read, so
+            // it goes back on screen instead of vanishing underneath the reader.
+            if (heldRef.current.has(key)) {
+              setRetirement((prev) =>
+                prev.exiting.has(key)
+                  ? {
+                      exiting: without(prev.exiting, key),
+                      gone: prev.gone,
+                      restored: new Set(prev.restored).add(key),
+                      revision: prev.revision + 1,
+                    }
+                  : prev,
+              )
+              return
+            }
             setRetirement((prev) => {
               if (prev.gone.has(key)) return prev
-              const exiting = new Set(prev.exiting)
-              exiting.delete(key)
               return {
-                exiting,
+                exiting: without(prev.exiting, key),
                 gone: new Set(prev.gone).add(key),
+                restored: prev.restored,
                 revision: prev.revision + 1,
               }
             })
@@ -542,6 +598,7 @@ export function RunningDockPanel(props: RunningDockPanelProps) {
           {...props}
           processes={visible}
           exiting={retirement.exiting}
+          restored={retirement.restored}
           onHoldChange={handleHoldChange}
         />
       ),
@@ -555,6 +612,7 @@ export function RunningDockPanel(props: RunningDockPanelProps) {
     waiting,
     agentIdle,
     retirement.exiting,
+    retirement.restored,
     retirement.revision,
     handleHoldChange,
     props.onOpenTask,

@@ -175,6 +175,40 @@ describe("RunningDockPanel", () => {
     expect(view.queryByText(/3 pass/)).toBeNull()
   })
 
+  test("Output opened while the row is already exiting pins it, and it still retires once closed", async () => {
+    jest.useFakeTimers()
+    lastNow = Date.now()
+    const t0 = lastNow
+    renderPanel({
+      processes: [task({ id: "t_done", command: "bun test", status: "completed", startedAt: t0 - 10_000, finishedAt: t0 })],
+      loadOutput: async (id) => ({ taskId: id, output: "3 pass" }),
+    })
+    const view = body()
+    expect(view.getByText("completed")).toBeTruthy()
+
+    // The exit is running when the reader clicks: the row must come back.
+    advance(DOCK_FINISHED_LINGER_MS)
+    advance(100)
+    await act(async () => {
+      fireEvent.click(view.getByText("Output"))
+    })
+    expect(view.getByText(/3 pass/)).toBeTruthy()
+
+    advance(DOCK_FINISHED_LINGER_MS * 2)
+    expect(view.getByText("completed")).toBeTruthy()
+    expect(descriptor!.summary).toBe("1 finished")
+
+    // Closed again: it is long past its linger, so it leaves — for good.
+    await act(async () => {
+      fireEvent.click(view.getByText("Hide"))
+    })
+    advance(DOCK_FINISHED_EXIT_MS + 500)
+    expect(body().queryByText("completed")).toBeNull()
+    expect(descriptor).toBeNull()
+
+    jest.useRealTimers()
+  })
+
   test("a settled row keeps its outcome, frozen duration and Output for the linger, with no Cancel", async () => {
     jest.useFakeTimers()
     lastNow = Date.now()
