@@ -79,6 +79,8 @@ const JSON_OBJECT_FIELDS = new Set([
   // Background task destination (Json? on PG, JSON String on SQLite): where the
   // dock opens the agent's thread for a task that handed work off.
   'link',
+  // Social posts / targets keep their media URL list as JSON on both sides.
+  'mediaJson',
 ])
 
 // In SQLite mode, String[] fields are stored as JSON strings, and

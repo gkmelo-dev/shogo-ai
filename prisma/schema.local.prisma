@@ -195,6 +195,9 @@ model Workspace {
   slackInstallation      SlackWorkspaceInstallation?
   agentProfile           WorkspaceAgentProfile?
   goals                  Goal[]
+  socialProfiles         SocialProfile[]
+  socialAccounts         SocialAccount[]
+  socialPosts            SocialPost[]
 
   @@index([parentWorkspaceId])
   @@map("workspaces")
@@ -3931,4 +3934,92 @@ model ProblemOccurrence {
   @@index([workItemId, occurredAt])
   @@index([workspaceId, fingerprint])
   @@map("problem_occurrences")
+}
+
+// ─── Social management (Zernio) — SQLite mirror of prisma/schema.prisma ──────
+// Json? columns are stored as JSON strings; String[] as JSON-encoded String.
+
+model SocialProfile {
+  id              String   @id @default(uuid())
+  workspaceId     String   @unique
+  zernioProfileId String   @unique
+  externalId      String   @unique
+  name            String
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  workspace Workspace       @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  accounts  SocialAccount[]
+
+  @@map("social_profiles")
+}
+
+model SocialAccount {
+  id              String    @id @default(uuid())
+  workspaceId     String
+  profileId       String
+  zernioAccountId String    @unique
+  platform        String
+  username        String
+  displayName     String?
+  isActive        Boolean   @default(true)
+  tokenHealthy    Boolean   @default(true)
+  needsReconnect  Boolean   @default(false)
+  lastHealthAt    DateTime?
+  connectedAt     DateTime  @default(now())
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  workspace Workspace          @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  profile   SocialProfile      @relation(fields: [profileId], references: [id], onDelete: Cascade)
+  targets   SocialPostTarget[]
+
+  @@unique([workspaceId, platform, username])
+  @@index([workspaceId, platform])
+  @@map("social_accounts")
+}
+
+model SocialPost {
+  id              String    @id @default(uuid())
+  workspaceId     String
+  status          String    @default("draft")
+  content         String
+  mediaJson       String?
+  scheduledFor    DateTime?
+  publishedAt     DateTime?
+  zernioPostId    String?
+  idempotencyKey  String    @unique
+  createdByUserId String?
+  tags            String    @default("[]")
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  workspace Workspace          @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  targets   SocialPostTarget[]
+
+  @@index([workspaceId, scheduledFor])
+  @@index([workspaceId, status])
+  @@map("social_posts")
+}
+
+model SocialPostTarget {
+  id              String   @id @default(uuid())
+  postId          String
+  accountId       String
+  platform        String
+  customContent   String?
+  mediaJson       String?
+  status          String   @default("pending")
+  platformPostId  String?
+  platformPostUrl String?
+  error           String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  post    SocialPost    @relation(fields: [postId], references: [id], onDelete: Cascade)
+  account SocialAccount @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  @@unique([postId, accountId])
+  @@index([accountId, status])
+  @@map("social_post_targets")
 }

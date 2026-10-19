@@ -246,6 +246,9 @@ model Workspace {
   chatInstallations      ChatInstallation[]
   boards                 Board[]
   workItems              WorkItem[]
+  socialProfiles         SocialProfile[]
+  socialAccounts         SocialAccount[]
+  socialPosts            SocialPost[]
 
   @@index([createdAt])
   @@index([homeRegion])
@@ -4984,4 +4987,109 @@ model AgentCallSessionLink {
 
   @@index([expiresAt])
   @@map("agent_call_session_links")
+}
+
+// ─── Social management (Zernio) ──────────────────────────────────────────────
+// One workspace = one brand. A workspace owns exactly one Zernio profile
+// (`SocialProfile`), and every connected account hangs directly off the
+// workspace. Agencies that manage several client brands use one workspace per
+// client — see the "one idea = one card" note in the channel doc.
+
+/// The workspace's Zernio profile. `externalId` is the workspace id, which is
+/// what Zernio echoes back on every webhook, so the webhook resolves straight
+/// to a workspace and drops ids that have no profile row.
+model SocialProfile {
+  id              String   @id @default(uuid())
+  workspaceId     String   @unique
+  zernioProfileId String   @unique
+  externalId      String   @unique
+  name            String
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  workspace Workspace       @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  accounts  SocialAccount[]
+
+  @@map("social_profiles")
+}
+
+/// One connected platform account. Zernio bills per connected account, so an
+/// account row outlives `isActive = false` and is only removed on disconnect.
+model SocialAccount {
+  id              String    @id @default(uuid())
+  workspaceId     String
+  profileId       String
+  zernioAccountId String    @unique
+  /// instagram | facebook | tiktok | x | threads | linkedin | youtube | ...
+  platform        String
+  username        String
+  displayName     String?
+  isActive        Boolean   @default(true)
+  tokenHealthy    Boolean   @default(true)
+  needsReconnect  Boolean   @default(false)
+  lastHealthAt    DateTime?
+  connectedAt     DateTime  @default(now())
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  workspace Workspace          @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  profile   SocialProfile      @relation(fields: [profileId], references: [id], onDelete: Cascade)
+  targets   SocialPostTarget[]
+
+  @@unique([workspaceId, platform, username])
+  @@index([workspaceId, platform])
+  @@map("social_accounts")
+}
+
+/// One composed post fanned out to one or more accounts. Per-target results
+/// live in `SocialPostTarget`, so a post can finish `partial`.
+model SocialPost {
+  id              String    @id @default(uuid())
+  workspaceId     String
+  /// draft | scheduled | queued | publishing | published | partial | failed
+  status          String    @default("draft")
+  content         String
+  /// JSON array of public media URLs.
+  mediaJson       Json?
+  scheduledFor    DateTime?
+  publishedAt     DateTime?
+  zernioPostId    String?
+  /// Stable per (workspace, content, schedule, targets) — dedupes a double submit.
+  idempotencyKey  String    @unique
+  createdByUserId String?
+  tags            String[]  @default([])
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  workspace Workspace          @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  targets   SocialPostTarget[]
+
+  @@index([workspaceId, scheduledFor])
+  @@index([workspaceId, status])
+  @@map("social_posts")
+}
+
+/// The per-account leg of a post. A failed leg never fails the whole post: it
+/// records the platform's own error and the post becomes `partial`.
+model SocialPostTarget {
+  id              String   @id @default(uuid())
+  postId          String
+  accountId       String
+  platform        String
+  customContent   String?
+  mediaJson       Json?
+  /// pending | publishing | published | failed | skipped
+  status          String   @default("pending")
+  platformPostId  String?
+  platformPostUrl String?
+  error           String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  post    SocialPost    @relation(fields: [postId], references: [id], onDelete: Cascade)
+  account SocialAccount @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  @@unique([postId, accountId])
+  @@index([accountId, status])
+  @@map("social_post_targets")
 }

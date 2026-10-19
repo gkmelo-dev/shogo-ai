@@ -42,6 +42,7 @@ import { createChatMessageFeedbackRoutes, createChatSessionFeedbackRoutes } from
 import { createChatSessionForkRoutes } from '../routes/chat-session-fork'
 import { chatQueuedMessageActionsRoutes } from '../routes/chat-queued-message-actions'
 import { toolsProxyRoutes } from '../routes/tools-proxy'
+import { socialRoutes } from '../routes/social'
 import { techStackRoutes } from '../routes/tech-stacks'
 import { apiKeyRoutes } from '../routes/api-keys'
 import { integrationRoutes } from '../routes/integrations'
@@ -182,6 +183,9 @@ export function createLocalApp(): LocalAppBundle {
   app.route('/api', rbacRoutes())
   app.route('/api', chatRoutes())
   app.route('/api', toolsProxyRoutes())
+  // Social management: the desktop owns its own account/post rows and forwards
+  // every Zernio call to the cloud relay inside services/social/client.ts.
+  app.route('/api', socialRoutes({ resolveUserId: getAuthUserId }))
   app.route('/api', techStackRoutes())
   app.route('/api', apiKeyRoutes())
   // Settings > Integrations is shown on desktop; the routes forward to cloud

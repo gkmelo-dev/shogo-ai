@@ -87,6 +87,7 @@ import { createChatMessageFeedbackRoutes, createChatSessionFeedbackRoutes } from
 import { createChatSessionForkRoutes } from './routes/chat-session-fork'
 import { chatQueuedMessageActionsRoutes } from './routes/chat-queued-message-actions'
 import { toolsProxyRoutes } from './routes/tools-proxy'
+import { socialRelayRoutes, socialRoutes } from './routes/social'
 import {
   generateTitleCompletion,
   setTitleGenerationModelId,
@@ -8586,6 +8587,11 @@ app.route('/api/v1', publicApi)
 // Uses the same JWT auth as the AI proxy — no raw API keys in agent pods.
 const toolsProxy = toolsProxyRoutes()
 app.route('/api', toolsProxy)
+// Social management (Zernio). People talk to the workspace-scoped routes; a
+// desktop forwards its provider calls to the relay, which is the only place
+// the master Zernio key is used.
+app.route('/api', socialRoutes({ resolveUserId: getAuthUserId }))
+app.route('/api', socialRelayRoutes())
 
 // EZ Mode / voice translator routes (session-auth'd via authMiddleware
 // above). Keeps ELEVENLABS_API_KEY on the server and serves the shared

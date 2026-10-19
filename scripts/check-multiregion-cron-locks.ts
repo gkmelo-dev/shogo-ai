@@ -851,6 +851,48 @@ const ACCEPTED_UNIQUE_KEYS: UniqueKeyRule[] = [
     reason:
       'Reaction toggle under /api/conversation-messages/:id/reactions by the reacting user only; create-or-ignore / deleteMany on the same triple.',
   },
+  {
+    key: 'SocialProfile.workspaceId',
+    category: 'single_tenant_upsert',
+    reason:
+      'One Zernio profile per workspace, created on the workspace\'s first connect under /api/workspaces/:workspaceId/social/connect (home region) and adopted by externalId if the create raced.',
+  },
+  {
+    key: 'SocialProfile.zernioProfileId',
+    category: 'external_global_id',
+    reason:
+      'Zernio-assigned profile id; the single create path stores it once per workspace and re-reads by externalId on a conflict.',
+  },
+  {
+    key: 'SocialProfile.externalId',
+    category: 'external_global_id',
+    reason:
+      'The routing key handed to Zernio is the workspace id, so a duplicate means the same workspace created two profiles — the create path resolves it by re-reading the profile for that externalId.',
+  },
+  {
+    key: 'SocialAccount.zernioAccountId',
+    category: 'external_global_id',
+    reason:
+      'Zernio-assigned account id, written by connect-completion and the account sync/webhook upserts; a cross-region retry upserts the same row.',
+  },
+  {
+    key: 'SocialAccount.(platform,username,workspaceId)',
+    category: 'single_tenant_upsert',
+    reason:
+      'Account sync and the connect redirect upsert by zernioAccountId inside one workspace; this key only rejects a second handle collision in the same workspace.',
+  },
+  {
+    key: 'SocialPost.idempotencyKey',
+    category: 'request_scoped',
+    reason:
+      'SHA-256 of workspace + content + schedule + targets, written only by the composer / publish tool in the workspace\'s home region; a duplicate submit re-reads the existing post.',
+  },
+  {
+    key: 'SocialPostTarget.(accountId,postId)',
+    category: 'single_tenant_upsert',
+    reason:
+      'Target rows are created with their post in one insert (same home region) and only updated afterwards; the pair is unique by construction.',
+  },
 ]
 
 // ===========================================================================
