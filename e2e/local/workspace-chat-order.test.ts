@@ -213,3 +213,80 @@ test("the drawer lists workspace chats newest activity first", async ({ page }) 
     })
     .toBe(true);
 });
+
+test("pinned chats lead and the archived group is activity-ordered too", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+
+  const workspace = await establishLocalPersonalSession(page);
+  expect(workspace.id).toBe(workspaceId);
+
+  const prefix = `SHO-56P ${Date.now()}`;
+  const created: Array<{ id: string; name: string }> = [];
+  for (const suffix of ["D", "E", "F", "G"]) {
+    const response = await page.request.post(
+      `${API}/api/workspaces/${workspaceId}/sessions`,
+      { data: { name: `${prefix} ${suffix}` } },
+    );
+    expect(response.status()).toBe(201);
+    const body = await response.json();
+    created.push({ id: body.session.id, name: body.session.name });
+    cleanupSessions.push(body.session.id);
+  }
+
+  // Activity is the exact reverse of the id order, so an id sort and an activity
+  // sort cannot agree: newest activity goes to the smallest id. The least recent
+  // chat is pinned (it must still lead), the most recent stays unpinned, and the
+  // two middle chats are archived, where activity order must hold again.
+  const idAsc = [...created].sort((a, b) => a.id.localeCompare(b.id));
+  const [newest, archivedNewer, archivedOlder, pinnedOldest] = idAsc;
+  const rows = [
+    { row: pinnedOldest, minutes: 362, pinned: true, archived: false },
+    { row: newest, minutes: 62, pinned: false, archived: false },
+    { row: archivedNewer, minutes: 122, pinned: false, archived: true },
+    { row: archivedOlder, minutes: 182, pinned: false, archived: true },
+  ];
+  const now = Date.now();
+  for (const { row, minutes, pinned, archived } of rows) {
+    db.prepare(
+      "UPDATE chat_sessions SET lastActiveAt = ?, updatedAt = ?, isPinned = ?, isArchived = ? WHERE id = ?",
+    ).run(
+      prismaDate(new Date(now - minutes * 60_000)),
+      prismaDate(new Date(now)),
+      pinned ? 1 : 0,
+      archived ? 1 : 0,
+      row.id,
+    );
+  }
+
+  await page.addInitScript((activeWorkspace: WorkspaceRow) => {
+    localStorage.setItem("shogo:active-workspace-id", activeWorkspace.id);
+    localStorage.setItem(
+      "shogo:active-workspace-kind",
+      JSON.stringify({ id: activeWorkspace.id, kind: "personal" }),
+    );
+  }, workspace);
+  await page.goto("/(app)");
+
+  await page.getByRole("button", { name: "Open chat sessions" }).click();
+  await expect(page.getByText("Chats", { exact: true })).toBeVisible();
+
+  const ourRows = (labels: string[]) =>
+    labels.filter((label) => label.startsWith(prefix));
+  await expect
+    .poll(async () => ourRows(await renderedChatLabels(page)))
+    .toEqual([pinnedOldest.name, newest.name]);
+
+  await page
+    .getByRole("button", { name: "Expand archived side chats" })
+    .click();
+  await expect
+    .poll(async () => ourRows(await renderedChatLabels(page)))
+    .toEqual([
+      pinnedOldest.name,
+      newest.name,
+      archivedNewer.name,
+      archivedOlder.name,
+    ]);
+});
