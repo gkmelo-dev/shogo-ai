@@ -15,15 +15,10 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Alert, Platform, Pressable, TextInput, View } from 'react-native'
 import { observer } from 'mobx-react-lite'
-import {
-  AlertTriangle as AlertTriangleIcon,
-  Download as DownloadIcon,
-  Upload as UploadIcon,
-} from 'lucide-react-native'
 import { useActiveWorkspace } from '../../hooks/useActiveWorkspace'
 import { useDomainHttp } from '../../contexts/domain'
 import { API_URL, api } from '../../lib/api'
-import { Button, Card, CardContent, Switch, cn } from '@shogo/shared-ui/primitives'
+import { Button, Card, CardContent, Switch } from '@shogo/shared-ui/primitives'
 import { Text } from './account-sheet-chrome'
 
 interface Estimate {
@@ -234,10 +229,7 @@ export const WorkspaceExportSection = observer(function WorkspaceExportSection()
             <Text className="text-xs text-amber-400">{loadError}</Text>
           ) : null}
           {estimate?.warnings?.length ? (
-            <View className="flex-row items-start gap-2">
-              <AlertTriangleIcon size={14} className="mt-0.5 text-amber-400" />
-              <Text className="flex-1 text-xs text-amber-400">{estimate.warnings.join(' ')}</Text>
-            </View>
+            <Text className="text-xs text-amber-400">{estimate.warnings.join(' ')}</Text>
           ) : null}
 
           <View className="flex-row items-center justify-between">
@@ -267,9 +259,8 @@ export const WorkspaceExportSection = observer(function WorkspaceExportSection()
           <Button
             onPress={onExport}
             disabled={busy !== null}
-            className={cn('flex-row items-center justify-center gap-2')}
+            className="flex-row items-center justify-center gap-2"
           >
-            <DownloadIcon size={16} color="#fff" />
             <Text className="text-sm font-medium text-primary-foreground">
               {busy === 'export' ? 'Building archive…' : 'Export workspace'}
             </Text>
@@ -291,7 +282,6 @@ export const WorkspaceExportSection = observer(function WorkspaceExportSection()
             disabled={busy !== null}
             className="flex-row items-center justify-center gap-2"
           >
-            <UploadIcon size={16} />
             <Text className="text-sm font-medium">
               {busy === 'import' ? 'Importing…' : 'Choose archive…'}
             </Text>
