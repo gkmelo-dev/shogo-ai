@@ -490,6 +490,18 @@ export function enforceImageSizeLimit(
       mutated = true
       continue
     }
+    // Cheap length check before decode: inflating a 6 MB base64 payload to
+    // prove it is oversized is wasted work.
+    if (block.data.length > MAX_IMAGE_BASE64_BYTES) {
+      next.push(buildOversizedPlaceholder({
+        label: opts.label,
+        base64Length: block.data.length,
+        mimeType: block.mimeType,
+        pathHint: opts.pathHint,
+      }))
+      mutated = true
+      continue
+    }
     // Magic bytes are not enough: a PNG with a corrupt IDAT CRC sniffs fine and
     // still poisons the session. Decode before the block is allowed through.
     const decoded = decodeImageInfo(block.data, effectiveMime)
@@ -497,16 +509,6 @@ export function enforceImageSizeLimit(
       next.push(buildInvalidImagePlaceholder({
         label: opts.label,
         mimeType: effectiveMime ?? block.mimeType,
-        pathHint: opts.pathHint,
-      }))
-      mutated = true
-      continue
-    }
-    if (block.data.length > MAX_IMAGE_BASE64_BYTES) {
-      next.push(buildOversizedPlaceholder({
-        label: opts.label,
-        base64Length: block.data.length,
-        mimeType: block.mimeType,
         pathHint: opts.pathHint,
       }))
       mutated = true

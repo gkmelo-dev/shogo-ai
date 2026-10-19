@@ -212,6 +212,19 @@ describe('enforceImageSizeLimit', () => {
     expect((out[0] as TextContent).text).toContain('image/bmp')
     expect((out[0] as TextContent).text).not.toContain('exceeds')
   })
+
+  test('checks size before decoding, so an oversized payload is reported as oversized and never inflated', () => {
+    const oversized: ImageContent = {
+      type: 'image',
+      data: 'A'.repeat(MAX_IMAGE_BASE64_BYTES + 1),
+      mimeType: 'image/png',
+    }
+    const out = enforceImageSizeLimit([oversized], { label: 'read_file', pathHint: 'big.png' })
+    const text = (out[0] as TextContent).text
+    expect(text).toContain('exceeds')
+    expect(text).toContain('big.png')
+    expect(text).not.toContain('not a decodable')
+  })
 })
 
 describe('sniffed image format', () => {

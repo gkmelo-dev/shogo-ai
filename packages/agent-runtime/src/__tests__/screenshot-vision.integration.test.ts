@@ -19,9 +19,10 @@
  *    `model.input` lacks `image`, which is what made screenshots invisible).
  */
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test'
-import { mkdtempSync, realpathSync, rmSync } from 'node:fs'
+import { mkdtempSync, realpathSync, rmSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { chromium } from 'playwright-core'
 import type { AgentTool } from '@mariozechner/pi-agent-core'
 import type { Message, ToolResultMessage } from '@mariozechner/pi-ai'
 import { createTools } from '../gateway-tools'
@@ -29,6 +30,31 @@ import { resetSharedBrowserPool } from '../browser-pool'
 import { runAgentLoop } from '../agent-loop'
 import { resolveModel } from '../pi-adapter'
 import { createMockStreamFn, buildTextResponse, buildToolUseResponse } from './helpers/mock-anthropic'
+
+/**
+ * These specs launch real Chromium. The CI `test` matrix job runs `bun test`
+ * without installing browsers (only `e2e-local` installs them), so skip with a
+ * loud reason instead of failing every shard — run
+ * `npx playwright install chromium` locally to exercise them.
+ */
+function chromiumInstalled(): boolean {
+  const override = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH
+  if (override) return existsSync(override)
+  try {
+    return existsSync(chromium.executablePath())
+  } catch {
+    return false
+  }
+}
+
+const HAS_CHROMIUM = chromiumInstalled()
+
+if (!HAS_CHROMIUM) {
+  console.warn(
+    '[screenshot-vision] skipped: no Playwright Chromium in this environment — ' +
+      'run `npx playwright install chromium` to run the real-browser specs.',
+  )
+}
 
 const FIXTURE_URL =
   'data:text/html,' +
@@ -96,7 +122,7 @@ afterAll(async () => {
   rmSync(workspaceDir, { recursive: true, force: true })
 })
 
-describe('browser screenshot → model request', () => {
+describe.skipIf(!HAS_CHROMIUM)('browser screenshot → model request', () => {
   test('a vision model receives the PNG as an image part', async () => {
     const captured: Message[][] = []
     const streamFn = createMockStreamFn(
