@@ -5,7 +5,7 @@ import {
   Boxes,
   Building2,
   CreditCard,
-  Database,
+  Download,
   Laptop,
   Monitor,
   Paintbrush,
@@ -63,7 +63,7 @@ export const SETTINGS_TABS: readonly SettingsTabDefinition[] = [
   { id: "models", label: "Models", Icon: Boxes, group: "settings" },
   { id: "integrations", label: "Integrations", Icon: Plug, group: "settings" },
   { id: "automations", label: "Automations", Icon: Zap, group: "settings" },
-  { id: "data", label: "Backup & export", Icon: Database, group: "settings" },
+  { id: "data", label: "Backup & export", Icon: Download, group: "settings" },
   {
     id: "remote-control",
     label: "Remote Control",
