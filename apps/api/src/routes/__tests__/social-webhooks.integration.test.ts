@@ -23,6 +23,7 @@ const { prisma } = await import('../../lib/prisma')
 const { socialRelayRoutes, socialEventRoutes, socialWebhookRoutes } = await import('../social')
 const { setSocialClient } = await import('../../services/social/client')
 const { getSyncEngine } = await import('../../lib/sync-engine')
+const { drainRelayedEvents } = await import('../../services/social/relay-consumer')
 
 const db = prisma as any
 
@@ -453,5 +454,141 @@ describe('relayed delivery: poll and ack', () => {
     expect(res.status).toBe(200)
     expect((await res.json()).ignored).toBe('unknown_profile')
     expect(await db.socialRelayedEvent.count()).toBe(before)
+  })
+})
+
+/**
+ * QA acceptance (SHO-71 AC7, desktop half): the whole delivery chain, with the
+ * real consumer driving the real routes and the real apply handler. The cloud
+ * side is a signed provider webhook; the desktop side is `drainRelayedEvents`
+ * with only the transport injected, so a route, ack or dedupe bug shows up as
+ * a missing or doubled row rather than a passing stub.
+ */
+describe('relayed delivery: the desktop consumer, end to end', () => {
+  // Earlier cases queue deliveries for these two scopes and never poll them;
+  // close them out so an exact count here means what it says.
+  beforeAll(async () => {
+    await db.socialRelayedEvent.updateMany({
+      where: { localWorkspaceId: { in: [desktopLocalA, desktopLocalB] }, appliedAt: null },
+      data: { appliedAt: new Date() },
+    })
+  })
+
+  /** The consumer's `fetch` is the app itself: real routes, real headers. */
+  const relayFetch = (async (url: string, init: any = {}) => {
+    const parsed = new URL(String(url))
+    return app.request(`${parsed.pathname}${parsed.search}`, {
+      method: init.method ?? 'GET',
+      body: init.body,
+      headers: { ...(init.headers ?? {}), 'x-workspace': cloudWorkspace },
+    })
+  }) as unknown as typeof fetch
+
+  const relayConfig = () => ({
+    mode: 'relay' as const,
+    baseUrl: 'http://relay.test/api/social-relay',
+    apiKey: 'shogo_sk_qa',
+  })
+
+  const drainDesktopA = () =>
+    drainRelayedEvents({
+      fetchImpl: relayFetch,
+      resolveConfig: relayConfig,
+      localScopes: async () => [desktopLocalA],
+    })
+
+  test('a signed webhook reaches the desktop\'s own DB exactly once', async () => {
+    const eventId = `evt_${crypto.randomUUID()}`
+    const hook = await signedHook(
+      zernioEvent(`lws_${desktopLocalA}`, 'comment.received', {
+        comment: { id: 'cmt_qa_1', text: 'MERGE please' },
+      }),
+      eventId,
+    )
+    expect(hook.status).toBe(200)
+    // The cloud applied nothing: a local scope has no cloud rows.
+    expect(
+      await db.workspaceEvent.count({ where: { workspaceId: cloudWorkspace, dedupeKey: `zernio:${eventId}` } }),
+    ).toBe(0)
+
+    const first = await drainDesktopA()
+    expect(first).toMatchObject({ fetched: 1, applied: 1, acked: 1 })
+
+    const applied = await db.workspaceEvent.findMany({
+      where: { workspaceId: desktopLocalA, dedupeKey: `zernio:${eventId}` },
+    })
+    expect(applied).toHaveLength(1)
+    expect(applied[0].type).toBe('social.comment.received')
+
+    // Acked, so the next poll has nothing to hand over.
+    expect(await drainDesktopA()).toMatchObject({ fetched: 0, applied: 0, acked: 0 })
+  })
+
+  test('a delivery whose ack was lost is re-applied without duplicating the event', async () => {
+    const eventId = `evt_${crypto.randomUUID()}`
+    expect(
+      (
+        await signedHook(
+          zernioEvent(`lws_${desktopLocalA}`, 'message.received', {
+            message: { id: 'msg_qa_1', text: 'sent from the provider' },
+          }),
+          eventId,
+        )
+      ).status,
+    ).toBe(200)
+    expect((await drainDesktopA()).applied).toBe(1)
+
+    // The desktop applied it but never got to say so (network died mid-ack).
+    await db.socialRelayedEvent.updateMany({
+      where: { dedupeKey: `zernio:${eventId}` },
+      data: { appliedAt: null },
+    })
+
+    const second = await drainDesktopA()
+    expect(second).toMatchObject({ fetched: 1, applied: 1, acked: 1 })
+    // Same outbox dedupe key, so the workspace still sees one event.
+    expect(
+      await db.workspaceEvent.count({ where: { workspaceId: desktopLocalA, dedupeKey: `zernio:${eventId}` } }),
+    ).toBe(1)
+  })
+
+  test('a disconnect flips the cloud row *and* still reaches the desktop', async () => {
+    const profile = await db.socialProfile.findUnique({
+      where: { workspaceId_localWorkspaceId: { workspaceId: cloudWorkspace, localWorkspaceId: desktopLocalB } },
+    })
+    await db.socialAccount.create({
+      data: {
+        workspaceId: cloudWorkspace,
+        profileId: profile.id,
+        zernioAccountId: 'acc_qa_disconnect',
+        platform: 'instagram',
+        username: 'qa.ig',
+      },
+    })
+    const eventId = `evt_${crypto.randomUUID()}`
+
+    const res = await signedHook(
+      JSON.stringify({
+        type: 'account.disconnected',
+        profiles: [{ id: 'zp', externalId: `lws_${desktopLocalB}` }],
+        account: { id: 'acc_qa_disconnect', platform: 'instagram', username: 'qa.ig' },
+      }),
+      eventId,
+    )
+    expect(res.status).toBe(200)
+
+    // The meter bills the cloud's copy, so it must not stay healthy...
+    const cloudRow = await db.socialAccount.findUnique({ where: { zernioAccountId: 'acc_qa_disconnect' } })
+    expect(cloudRow.isActive).toBe(false)
+    // ...and the desktop must still be told, in its own DB.
+    const delivered = await drainRelayedEvents({
+      fetchImpl: relayFetch,
+      resolveConfig: relayConfig,
+      localScopes: async () => [desktopLocalB],
+    })
+    expect(delivered).toMatchObject({ fetched: 1, applied: 1 })
+    expect(
+      await db.workspaceEvent.count({ where: { workspaceId: desktopLocalB, dedupeKey: `zernio:${eventId}` } }),
+    ).toBe(1)
   })
 })
