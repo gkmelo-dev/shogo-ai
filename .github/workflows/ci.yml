@@ -237,6 +237,13 @@ jobs:
           TYPECHECK_EXCLUDE: apps/mobile
         run: bun run typecheck
 
+      - name: Higgsfield docs drift
+        if: needs.queue-verified.outputs.verified != 'true'
+        # The committed vendor snapshot is the contract for every media endpoint
+        # we call; fail when a model id, duration, resolution or aspect ratio we
+        # send is not in the docs (or the snapshot was edited, not re-derived).
+        run: bun run check:higgsfield-docs
+
       - name: Save TypeScript build info
         if: (github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.ts-cache.outputs.cache-hit != 'true') && needs.queue-verified.outputs.verified != 'true'
         uses: actions/cache/save@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
@@ -459,7 +466,9 @@ jobs:
           # to wake the chat with no user input.
           # chat-background-tasks reads the dock a background task left behind
           # after navigating away, a reload and a restart of the panel.
-          - { name: 'E2E (chat resume)', spec: 'chat-resume-on-send chat-stop-then-send chat-task-resume chat-background-tasks' }
+          # chat-task-thread-pane presses a dock row and reads the side window
+          # it opens (its log, never blank) without leaving the chat.
+          - { name: 'E2E (chat resume)', spec: 'chat-resume-on-send chat-stop-then-send chat-task-resume chat-background-tasks chat-task-thread-pane' }
     permissions:
       contents: read
     timeout-minutes: 60

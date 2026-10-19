@@ -36,7 +36,7 @@ import {
 import { memberCallFailure, resolveWhileStarting } from '../lib/workspace-member-call'
 import { resolveWorkspaceRuntimeUrl } from '../lib/resolve-workspace-runtime-url'
 import { isMetalEnabled } from '../lib/metal-eligibility'
-import { remoteToolPermission } from '../lib/remote-tool-policy'
+import { REMOTE_IMPORT_MAX_BASE64_CHARS, remoteToolPermission } from '../lib/remote-tool-policy'
 import { deriveWorkspaceRuntimeToken } from '../lib/workspace-runtime-token'
 import { getRuntimeManager } from '../lib/runtime/manager'
 import { resolve as resolvePath } from 'path'
@@ -2251,6 +2251,75 @@ export function runtimeInternalRoutes(opts: RuntimeInternalRoutesOptions): Hono 
   })
 
   /**
+   * POST /api/internal/projects/:projectId/files/import
+   *   body: { archive (base64 tar.gz), dest?, overwrite? }
+   *
+   * `copy_to_project`: unpack files from another project of the caller's
+   * workspace inside this project's own runtime (`/agent/remote/import`).
+   * Same auth, wake and ticket hand-off as `/remote-tool`; always needs
+   * `project:update` on the target.
+   */
+  app.post('/projects/:projectId/files/import', async (c) => {
+    const projectId = c.req.param('projectId')
+    const authz = await authorizeLifecycleProject(c, projectId)
+    if (!authz) {
+      const identity = await authenticate(c)
+      const target = identity
+        ? ((await prisma.project.findUnique({ where: { id: projectId }, select: { workspaceId: true } })) as { workspaceId: string } | null)
+        : null
+      if (target) {
+        return c.json(
+          { error: { code: 'cross_workspace', message: 'The target project is in a different workspace.' } },
+          403,
+        )
+      }
+      return c.json({ error: 'Unauthorized' }, 401)
+    }
+
+    const ticketHeader = c.req.header(REQUESTER_TICKET_HEADER)
+    if (ticketHeader && !(await verifyRequesterTicketInWorkspace(ticketHeader, authz.workspaceId))) {
+      return c.json({ error: { code: 'invalid_requester_ticket', message: 'The requester ticket is invalid or expired.' } }, 401)
+    }
+
+    const body = (await c.req.json().catch(() => null)) as Record<string, unknown> | null
+    if (!body || typeof body.archive !== 'string' || !body.archive) {
+      return c.json({ error: { code: 'bad_request', message: 'archive (base64 tar.gz) is required' } }, 400)
+    }
+    if (body.archive.length > REMOTE_IMPORT_MAX_BASE64_CHARS) {
+      return c.json({ error: { code: 'too_large', message: 'The archive exceeds the 25 MB transfer limit.' } }, 413)
+    }
+    if (body.dest !== undefined && typeof body.dest !== 'string') {
+      return c.json({ error: { code: 'bad_request', message: 'dest must be a string' } }, 400)
+    }
+    const denied = await enforceProjectPermission(c, authz.identity, authz.workspaceId, projectId, 'project:update')
+    if (denied) return denied
+
+    const callerProjectId =
+      authz.identity.kind === 'project'
+        ? authz.identity.projectId
+        : typeof body.callerProjectId === 'string' ? body.callerProjectId : undefined
+
+    let requesterTicket: string | undefined
+    const callerTicket = callerProjectId ? verifyRequesterTicket(ticketHeader, callerProjectId) : null
+    if (callerTicket && callerProjectId !== projectId) {
+      requesterTicket = handOffRequesterTicket(callerTicket, projectId) ?? undefined
+    }
+
+    const agentCallSvc = await loadAgentCall?.()
+    if (!agentCallSvc) return unavailable(c, 'Remote project file import')
+    const work = agentCallSvc.callProjectRemoteImport(c, projectId, authz.workspaceId, {
+      archive: body.archive,
+      ...(typeof body.dest === 'string' ? { dest: body.dest } : {}),
+      overwrite: body.overwrite === true,
+      callerProjectId,
+      ...(requesterTicket ? { requesterTicket } : {}),
+    })
+    if (wantsKeepAlive(c.req.header(KEEPALIVE_HEADER))) return keepAliveJson(work)
+    const outcome = await work
+    return c.json(outcome.body, outcome.status as any)
+  })
+
+  /**
    * GET /api/internal/projects/:projectId/agent-call/:runId?waitMs=
    *
    * Long-poll a call started with `wait=false, track=true`. Returns as soon as
@@ -2318,7 +2387,7 @@ export function runtimeInternalRoutes(opts: RuntimeInternalRoutesOptions): Hono 
     throw err
   }
 
-  /** POST /api/internal/tasks  body: { id, chatSessionId, source, targetRef, title, until? } */
+  /** POST /api/internal/tasks  body: { id, chatSessionId, source, targetRef, title, until?, link? } */
   app.post('/tasks', async (c) => {
     const body = (await c.req.json().catch(() => null)) as Record<string, unknown> | null
     const chatSessionId = typeof body?.chatSessionId === 'string' ? body.chatSessionId : ''
@@ -2333,6 +2402,7 @@ export function runtimeInternalRoutes(opts: RuntimeInternalRoutesOptions): Hono 
         targetRef: String(body!.targetRef ?? ''),
         title: String(body!.title ?? ''),
         until: typeof body!.until === 'string' ? body!.until : null,
+        link: body!.link,
       })
       return c.json({ task: viewOf(row) }, 201)
     } catch (err) {
