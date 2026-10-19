@@ -89,10 +89,20 @@ export type GetVoiceUser = (req: Request) => Promise<VoiceUser | null> | VoiceUs
  *   - `process.env.RUNTIME_AUTH_SECRET` (pod-injected runtime token)
  *   - `process.env.PROJECT_ID` (pod-injected project scope)
  *   - `process.env.SHOGO_API_URL` (falls back to `SHOGO_CLOUD_URL`)
+ *
+ * The API host is resolved per request, not at construction, so a pod
+ * that sets the token without a host still gets every local-only
+ * handler (body validation, 405s, the static audio-tags catalog) and
+ * only the call that actually leaves the process refuses to guess.
  */
 export interface VoiceProxyOptions {
   runtimeToken: string
   projectId: string
+  /**
+   * Base URL of the Shogo API. Empty string when the proxy was derived
+   * from env: the host is then re-read from `SHOGO_API_URL` /
+   * `SHOGO_CLOUD_URL` on each proxied call.
+   */
   apiUrl: string
   /** Custom fetch impl (forwarded to the proxy fetches). */
   fetch?: typeof fetch
@@ -243,6 +253,15 @@ function parseMusicBody(raw: unknown): { params: ComposeMusicParams } | { error:
  * explicit `apiKey` in `'auto'` mode wins over the ambient runtime token
  * so BYO keeps working inside a pod.
  */
+const MISSING_API_HOST_MESSAGE =
+  'createVoiceHandlers: runtime-token proxy mode needs SHOGO_API_URL (or SHOGO_CLOUD_URL) in env; refusing to guess an API host'
+
+/** The Shogo API host from pod env, if the pod injected one. */
+function envApiUrl(): string | undefined {
+  if (typeof process === 'undefined' || !process.env) return undefined
+  return process.env.SHOGO_API_URL ?? process.env.SHOGO_CLOUD_URL
+}
+
 function resolveProxyOptions(
   config: VoiceHandlersConfig,
 ): VoiceProxyOptions | null {
@@ -263,16 +282,14 @@ function resolveProxyOptions(
     const runtimeToken = process.env.RUNTIME_AUTH_SECRET
     const projectId = process.env.PROJECT_ID
     if (!runtimeToken || !projectId) return null
-    const apiUrl = process.env.SHOGO_API_URL ?? process.env.SHOGO_CLOUD_URL
-    if (!apiUrl) {
-      throw new Error(
-        'createVoiceHandlers: runtime-token proxy mode needs SHOGO_API_URL (or SHOGO_CLOUD_URL) in env; refusing to guess an API host',
-      )
-    }
     return {
       runtimeToken,
       projectId,
-      apiUrl,
+      // Deliberately not required here: see `resolveApiBase`. Throwing at
+      // construction made every local-only handler (400 validation, 405s,
+      // the static audio-tags catalog) unusable on a host with a token but
+      // no URL — which is exactly CI's env.
+      apiUrl: envApiUrl() ?? '',
       ...(config.fetch ? { fetch: config.fetch } : {}),
     }
   }
@@ -331,7 +348,19 @@ function createProxyHandlers(
       'createVoiceHandlers proxy: global fetch is unavailable; pass proxy.fetch',
     )
   }
-  const apiBase = proxy.apiUrl.replace(/\/+$/, '')
+
+  /**
+   * The API host for one proxied call. Resolved per call, never at
+   * construction: a pod may inject the runtime token before (or without)
+   * a host, and the local-only handlers — body validation, 405s, the
+   * static audio-tags catalog — must not depend on one. Only a request
+   * that actually leaves the process gets the loud refusal.
+   */
+  function resolveApiBase(): string {
+    const raw = proxy.apiUrl || envApiUrl()
+    if (!raw) throw new Error(MISSING_API_HOST_MESSAGE)
+    return raw.replace(/\/+$/, '')
+  }
 
   /**
    * Build an upstream URL with the project id pinned by the runtime
@@ -341,7 +370,11 @@ function createProxyHandlers(
    * unknown params risks privilege confusion if the upstream API
    * grows new auth-relevant flags.
    */
-  function proxyUrl(path: string, forward: Record<string, string | null>): string {
+  function proxyUrl(
+    base: string,
+    path: string,
+    forward: Record<string, string | null>,
+  ): string {
     const tail: string[] = [`projectId=${encodeURIComponent(proxy.projectId)}`]
     for (const [k, v] of Object.entries(forward)) {
       if (typeof v === 'string' && v.length > 0) {
@@ -349,7 +382,7 @@ function createProxyHandlers(
       }
     }
     const sep = path.includes('?') ? '&' : '?'
-    return `${apiBase}${path}${sep}${tail.join('&')}`
+    return `${base}${path}${sep}${tail.join('&')}`
   }
 
   /** Allowlist of query params forwarded from the incoming request. */
@@ -357,6 +390,9 @@ function createProxyHandlers(
 
   async function doSignedUrl(req: Request): Promise<Response> {
     if (req.method !== 'GET') return json({ error: 'Method Not Allowed' }, 405)
+    // Resolved before the try so a missing host surfaces as the real
+    // error, not a generic 502 "signedUrl proxy failed".
+    const base = resolveApiBase()
     try {
       let incomingUrl: URL | null = null
       try {
@@ -373,7 +409,7 @@ function createProxyHandlers(
           if (v != null) forward[key] = v
         }
       }
-      const upstream = await fetchImpl(proxyUrl('/api/voice/signed-url', forward), {
+      const upstream = await fetchImpl(proxyUrl(base, '/api/voice/signed-url', forward), {
         method: 'GET',
         headers: { 'x-runtime-token': proxy.runtimeToken },
         credentials: 'omit',
@@ -417,8 +453,9 @@ function createProxyHandlers(
     const raw = await readJson(req)
     const parsed = parseMusicBody(raw)
     if ('error' in parsed) return json({ error: parsed.error }, 400)
+    const base = resolveApiBase()
     try {
-      const upstream = await fetchImpl(proxyUrl('/api/voice/music', {}), {
+      const upstream = await fetchImpl(proxyUrl(base, '/api/voice/music', {}), {
         method: 'POST',
         headers: {
           'x-runtime-token': proxy.runtimeToken,
@@ -476,8 +513,9 @@ function createProxyHandlers(
     const text = typeof body.text === 'string' ? body.text : ''
     if (!text.trim()) return json({ error: 'Missing text' }, 400)
 
+    const base = resolveApiBase()
     try {
-      const upstream = await fetchImpl(proxyUrl('/api/voice/tts', {}), {
+      const upstream = await fetchImpl(proxyUrl(base, '/api/voice/tts', {}), {
         method: 'POST',
         headers: {
           'x-runtime-token': proxy.runtimeToken,
@@ -537,7 +575,7 @@ function createProxyHandlers(
     }
 
     const textToSpeech = async (params: TextToSpeechParams): Promise<TextToSpeechResult> => {
-      const upstream = await fetchImpl(proxyUrl('/api/voice/tts', {}), {
+      const upstream = await fetchImpl(proxyUrl(resolveApiBase(), '/api/voice/tts', {}), {
         method: 'POST',
         headers: {
           'x-runtime-token': proxy.runtimeToken,
@@ -577,7 +615,7 @@ function createProxyHandlers(
     }
 
     const composeMusic = async (params: ComposeMusicParams) => {
-      const upstream = await fetchImpl(proxyUrl('/api/voice/music', {}), {
+      const upstream = await fetchImpl(proxyUrl(resolveApiBase(), '/api/voice/music', {}), {
         method: 'POST',
         headers: {
           'x-runtime-token': proxy.runtimeToken,

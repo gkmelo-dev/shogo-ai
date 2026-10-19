@@ -126,10 +126,16 @@ describe('createVoiceHandlers — credential precedence', () => {
     expect(() => createVoiceHandlers({ mode: 'proxy' })).toThrow(/mode "proxy"/)
   })
 
-  test('pod env without SHOGO_API_URL / SHOGO_CLOUD_URL → loud error, no guessed host', () => {
+  test('pod env without SHOGO_API_URL / SHOGO_CLOUD_URL → constructing is fine, a proxied call refuses to guess a host', async () => {
     process.env.RUNTIME_AUTH_SECRET = 'rt'
     process.env.PROJECT_ID = 'proj'
-    expect(() => createVoiceHandlers({})).toThrow(/SHOGO_API_URL/)
+    // Construction must never throw: a pod that sets the token but not the
+    // host still needs the local-only handlers (validation, 405s, catalog).
+    const handlers = createVoiceHandlers({})
+    expect(
+      (await handlers.audioTags(new Request('http://app/api/voice/audio-tags'))).status,
+    ).toBe(200)
+    await expect(handlers.tts(ttsRequest())).rejects.toThrow(/SHOGO_API_URL/)
   })
 
   test('tts works with only an apiKey (no getUser / companionStore)', async () => {

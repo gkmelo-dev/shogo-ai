@@ -19,11 +19,13 @@ import { createVoiceHandlers } from '../server'
 const ORIGINAL_RT = process.env.RUNTIME_AUTH_SECRET
 const ORIGINAL_PID = process.env.PROJECT_ID
 const ORIGINAL_API = process.env.SHOGO_API_URL
+const ORIGINAL_CLOUD = process.env.SHOGO_CLOUD_URL
 
 beforeEach(() => {
   delete process.env.RUNTIME_AUTH_SECRET
   delete process.env.PROJECT_ID
   delete process.env.SHOGO_API_URL
+  delete process.env.SHOGO_CLOUD_URL
 })
 
 afterEach(() => {
@@ -33,6 +35,8 @@ afterEach(() => {
   else process.env.PROJECT_ID = ORIGINAL_PID
   if (ORIGINAL_API === undefined) delete process.env.SHOGO_API_URL
   else process.env.SHOGO_API_URL = ORIGINAL_API
+  if (ORIGINAL_CLOUD === undefined) delete process.env.SHOGO_CLOUD_URL
+  else process.env.SHOGO_CLOUD_URL = ORIGINAL_CLOUD
 })
 
 type Call = { url: string; init: RequestInit }
@@ -265,6 +269,36 @@ describe('createVoiceHandlers — runtime-token proxy mode', () => {
     expect(res.status).toBe(501)
     const body = (await res.json()) as { detail: string }
     expect(body.detail).toContain('no voice routes')
+  })
+
+  test('a pod with a runtime token but no API host still serves the local-only handlers', async () => {
+    process.env.RUNTIME_AUTH_SECRET = 'rt'
+    process.env.PROJECT_ID = 'p'
+    // No SHOGO_API_URL / SHOGO_CLOUD_URL — CI's env. Construction must not
+    // throw, and everything that never leaves the process must still answer.
+    const handlers = createVoiceHandlers({})
+    expect(
+      (await handlers.audioTags(new Request('http://pod/api/voice/audio-tags'))).status,
+    ).toBe(200)
+    const rejected = await handlers.music(
+      new Request('http://pod/api/voice/music', {
+        method: 'POST',
+        body: JSON.stringify({ prompt: 'x', compositionPlan: { sections: [] } }),
+      }),
+    )
+    expect(rejected.status).toBe(400)
+    expect(
+      (await handlers.music(new Request('http://pod/api/voice/music', { method: 'GET' }))).status,
+    ).toBe(405)
+    // Only an actual proxied call refuses to guess a host.
+    await expect(
+      handlers.music(
+        new Request('http://pod/api/voice/music', {
+          method: 'POST',
+          body: JSON.stringify({ prompt: 'x' }),
+        }),
+      ),
+    ).rejects.toThrow(/SHOGO_API_URL/)
   })
 
   test('tts forwards upstream Warning 199 so a pod caller sees the fallback', async () => {
