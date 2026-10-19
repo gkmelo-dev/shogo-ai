@@ -146,6 +146,44 @@ test("prices come back for an image and a clip", async ({ request }) => {
   console.log(`live estimates — soul image: $${image}, hailuo 6s: $${clip}`)
 })
 
+test("a Genjutsu edit is quoted from the rate card, not from the vendor", async ({ request }) => {
+  // Genjutsu answers /estimate with prose, so the proxy prices the edit itself:
+  // vendor per-source-second rate × the declared length, plus the usual markup.
+  // Nothing is submitted, so this costs nothing.
+  const draft = await estimate(request, proxy, {
+    model: "hf-genjutsu-motion-transfer",
+    source_duration_seconds: 4,
+    resolution: "480p",
+  })
+  expect(draft).toBeCloseTo(0.318 * 4 * 1.2, 2)
+
+  const hero = await estimate(request, proxy, {
+    model: "hf-genjutsu-restyle",
+    source_duration_seconds: 8,
+    resolution: "1080p",
+    preset_id: "preset-not-verified-by-an-estimate",
+  })
+  expect(hero).toBeCloseTo(1.632 * 8 * 1.2, 2)
+
+  // The provider trims a source clip to 30 s, so a longer one bills 30 s.
+  const trimmed = await estimate(request, proxy, {
+    model: "hf-genjutsu-object-swap",
+    source_duration_seconds: 60,
+    resolution: "720p",
+  })
+  expect(trimmed).toBeCloseTo(0.681 * 30 * 1.2, 2)
+})
+
+test("a Genjutsu edit with no declared length is refused, never quoted at zero", async ({ request }) => {
+  const res = await request.fetch(`${LOCAL_API_BASE}/api/ai/v1/media/estimate`, {
+    method: "POST",
+    headers: proxyHeaders(proxy),
+    data: { model: "hf-genjutsu-motion-transfer", resolution: "720p" },
+  })
+  expect(res.status(), await res.text()).toBe(400)
+  expect((await res.json() as any).error.code).toBe("missing_source_duration")
+})
+
 test("the restyle presets list is reachable", async ({ request }) => {
   const res = await request.fetch(`${LOCAL_API_BASE}/api/ai/v1/media/presets`, { headers: proxyHeaders(proxy) })
   expect(res.ok(), await res.text()).toBe(true)
