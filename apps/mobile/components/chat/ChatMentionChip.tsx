@@ -192,6 +192,21 @@ export function ChatMentionChip({
 }
 
 /**
+ * The point in time a message's tags are measured from: when the person sent it.
+ *
+ * Keyed on the role, not on the bubble variant: the newest user message is
+ * painted by `EditableUserMessage`, which is not the `userBubble` variant, and a
+ * null window there is what left a fresh tag with no delivery state at all.
+ */
+export function chatMentionSince(message: {
+  role?: string | null
+  createdAt?: string | number | Date | null
+}): string | number | Date | null {
+  if (message?.role !== "user") return null
+  return message.createdAt ?? null
+}
+
+/**
  * A message body with its `<@c:ID>` tokens rendered as chips. Everything else
  * is plain text (user messages are not markdown).
  */

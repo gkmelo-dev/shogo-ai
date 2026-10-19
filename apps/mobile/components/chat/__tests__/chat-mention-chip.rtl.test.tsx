@@ -63,7 +63,7 @@ const setActiveWorkspaceId = storeModule.setActiveWorkspaceId
 const shouldRestoreChatWorkspace = switchModule.shouldRestoreChatWorkspace
 const adoptChatWorkspace = switchModule.adoptChatWorkspace
 
-const { ChatMentionChip, chatMentionHref, ChatMentionText } = await import(
+const { ChatMentionChip, chatMentionHref, chatMentionSince, ChatMentionText } = await import(
   "../ChatMentionChip"
 )
 const { chatMentionMetaFor } = await import("../../../lib/chat-mention-meta")
@@ -121,6 +121,17 @@ describe("chat mention chip", () => {
     expect(push).toHaveBeenCalledTimes(1)
     expect(push.mock.calls[0][0]).toBe("/(app)/agent?chatSessionId=chat-b")
     expect(projectCollection.clear).toHaveBeenCalled()
+  })
+
+  test("a user message anchors its tags to when it was sent", () => {
+    // The newest user message is painted by `EditableUserMessage`, not the
+    // `userBubble` variant — keying the window on the variant left a fresh tag
+    // with no delivery state at all (SHO-52 round 5).
+    expect(chatMentionSince({ role: "user", createdAt: 1_700_000_000_000 })).toBe(
+      1_700_000_000_000,
+    )
+    expect(chatMentionSince({ role: "assistant", createdAt: 1_700_000_000_000 })).toBeNull()
+    expect(chatMentionSince({ role: "user" })).toBeNull()
   })
 
   test("a URL session in another workspace persists the target id", async () => {

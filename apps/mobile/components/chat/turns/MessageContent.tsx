@@ -25,7 +25,7 @@ import { extractTextContent } from "@shogo/shared-app/chat"
 import { MarkdownText } from "../MarkdownText"
 import { analyzeContent } from "../long-text-utils"
 import { LongTextPreviewCard } from "../LongTextPreviewCard"
-import { ChatMentionText } from "../ChatMentionChip"
+import { ChatMentionText, chatMentionSince } from "../ChatMentionChip"
 import { FileViewerModal } from "../FileViewerModal"
 import { ChatImageContextMenu, ImagePreviewModal } from "../ImagePreviewModal"
 import { VideoPreviewModal } from "../VideoPreviewModal"
@@ -485,7 +485,7 @@ export function MessageContent({
       ) : (
         <ChatMentionText
           text={content}
-          since={userBubble ? (message as any).createdAt : null}
+          since={chatMentionSince(message as any)}
           inverted={userBubble}
           style={
             usesMobileChatTypography
