@@ -128,6 +128,7 @@ function columnInput(body: Record<string, any>) {
     wipLimit: pick(body, 'wipLimit', 'wip_limit'),
     agentRef: pick(body, 'agentRef', 'agent', 'agent_ref'),
     slaHours: pick(body, 'slaHours', 'sla_hours'),
+    rules: body.rules ?? (typeof body.allowAutoMerge === 'boolean' ? { allowAutoMerge: body.allowAutoMerge } : undefined),
     position: body.position,
     after: body.after,
     before: body.before,
