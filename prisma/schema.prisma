@@ -250,6 +250,9 @@ model Workspace {
   socialAccounts         SocialAccount[]
   socialPosts            SocialPost[]
   socialRelayedEvents    SocialRelayedEvent[]
+  socialConversations    SocialConversation[]
+  socialMessages         SocialMessage[]
+  socialComments         SocialComment[]
 
   @@index([createdAt])
   @@index([homeRegion])
@@ -5043,6 +5046,8 @@ model SocialAccount {
   workspace Workspace          @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
   profile   SocialProfile      @relation(fields: [profileId], references: [id], onDelete: Cascade)
   targets   SocialPostTarget[]
+  conversations SocialConversation[]
+  comments  SocialComment[]
 
   @@unique([workspaceId, platform, username])
   @@index([workspaceId, platform])
@@ -5071,6 +5076,7 @@ model SocialPost {
 
   workspace Workspace          @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
   targets   SocialPostTarget[]
+  comments  SocialComment[]
 
   @@index([workspaceId, scheduledFor])
   @@index([workspaceId, status])
@@ -5127,10 +5133,128 @@ model SocialRelayedEvent {
   occurredAt       DateTime  @default(now())
   /// Set when the desktop has applied it; null means still to deliver.
   appliedAt        DateTime?
+  /// Failed apply attempts. A delivery whose payload we cannot apply is retried
+  /// rather than acked away, but not forever: past `RELAYED_EVENT_MAX_ATTEMPTS`
+  /// it is dead-lettered (`failedAt`) so a poison event cannot loop.
+  attempts         Int       @default(0)
+  lastAttemptAt    DateTime?
+  lastError        String?
+  /// Dead-letter marker: this delivery will not be handed out again.
+  failedAt         DateTime?
   createdAt        DateTime  @default(now())
 
   workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
 
   @@index([workspaceId, localWorkspaceId, appliedAt])
+  @@index([workspaceId, failedAt])
   @@map("social_relayed_events")
+}
+
+/// One inbox thread — a DM conversation on a messaging platform. Written by
+/// the provider's webhooks and by the backfill sweep, never by polling the
+/// provider for each render: polling every workspace's threads is what the
+/// provider's own inbox guidance tells you not to do.
+model SocialConversation {
+  id                   String    @id @default(uuid())
+  workspaceId          String
+  /// The account the thread belongs to, when the payload names one we hold.
+  accountId            String?
+  zernioConversationId String    @unique
+  platform             String
+  participantId        String?
+  participantName      String?
+  participantPicture   String?
+  /// active | archived | requests
+  status               String    @default("active")
+  unreadCount          Int       @default(0)
+  lastMessageAt        DateTime?
+  lastMessagePreview   String?
+  assignedToUserId     String?
+  createdAt            DateTime  @default(now())
+  updatedAt            DateTime  @updatedAt
+
+  workspace Workspace       @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  account   SocialAccount?  @relation(fields: [accountId], references: [id], onDelete: SetNull)
+  messages  SocialMessage[]
+
+  @@index([workspaceId, lastMessageAt])
+  @@index([workspaceId, unreadCount])
+  @@index([workspaceId, platform])
+  @@map("social_conversations")
+}
+
+/// One message inside a thread. Unique on the provider's message id, so a
+/// redelivered webhook and a backfill sweep that overlaps it are the same row.
+model SocialMessage {
+  id              String   @id @default(uuid())
+  workspaceId     String
+  conversationId  String
+  zernioMessageId String   @unique
+  /// incoming | outgoing
+  direction       String
+  platform        String
+  text            String?
+  attachmentsJson Json?
+  authorId        String?
+  authorName      String?
+  authorUsername  String?
+  authorPicture   String?
+  /// queued | sent | delivered | read | failed
+  status          String   @default("sent")
+  error           String?
+  /// True once a billable outbound message has been counted (P6's `social_dm`
+  /// meter flips this; the reply path records the row and leaves it false).
+  metered         Boolean  @default(false)
+  sentAt          DateTime
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  workspace    Workspace          @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  conversation SocialConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  @@index([conversationId, sentAt])
+  @@index([workspaceId, sentAt])
+  @@map("social_messages")
+}
+
+/// One comment on a post we published (or on a post the account owns that
+/// Zernio tracks). Separate from messages on purpose: comments are answered
+/// publicly and addressed by their own ids.
+model SocialComment {
+  id              String    @id @default(uuid())
+  workspaceId     String
+  /// Our post row, when the comment landed on something we published.
+  postId          String?
+  accountId       String?
+  zernioCommentId String    @unique
+  /// What `POST /inbox/comments/{postId}` takes: Zernio's post id when the
+  /// payload carries one, else the platform's own post id.
+  zernioPostId    String
+  platformPostId  String
+  platform        String
+  text            String
+  authorId        String?
+  authorName      String?
+  authorUsername  String?
+  authorPicture   String?
+  /// The connected account wrote this — the platform echoes our own replies
+  /// back as comment events.
+  isOwn           Boolean   @default(false)
+  isHidden        Boolean   @default(false)
+  /// new | read | replied
+  status          String    @default("new")
+  repliedAt       DateTime?
+  permalink       String?
+  occurredAt      DateTime
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  workspace Workspace      @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  post      SocialPost?    @relation(fields: [postId], references: [id], onDelete: SetNull)
+  account   SocialAccount? @relation(fields: [accountId], references: [id], onDelete: SetNull)
+
+  @@index([workspaceId, occurredAt])
+  @@index([workspaceId, status])
+  @@index([zernioPostId])
+  @@map("social_comments")
 }

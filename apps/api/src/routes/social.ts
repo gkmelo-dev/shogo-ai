@@ -20,9 +20,22 @@ import { getWorkspaceRole } from '../services/conversation.service'
 import { relayOperation } from '../services/social/relay.service'
 import {
   ackRelayedEvents,
+  failRelayedEvents,
+  listDeadLettered,
   listRelayedEvents,
   pruneRelayedEvents,
 } from '../services/social/relay-events.service'
+import {
+  backfillInbox,
+  getComment,
+  getConversation,
+  listComments,
+  listConversations,
+  markCommentRead,
+  markConversationRead,
+  replyToComment,
+  replyToConversation,
+} from '../services/social/inbox.service'
 import { LOCAL_SCOPE_HEADER } from '../services/social/client'
 import { isScopeId, localScopeFor } from '../services/social/local-scope'
 import {
@@ -321,6 +334,124 @@ export function socialRoutes(config: SocialRoutesConfig): Hono {
     }
   })
 
+  // ── inbox: DMs ──────────────────────────────────────────────────────────
+  router.get('/workspaces/:workspaceId/social/inbox', async (c) => {
+    const workspaceId = c.req.param('workspaceId')
+    const userId = await requireMember(c, workspaceId)
+    if (userId instanceof Response) return userId
+    const conversations = await listConversations(workspaceId, {
+      status: c.req.query('status') ?? null,
+      platform: c.req.query('platform') ?? null,
+      unreadOnly: c.req.query('unread') === 'true' || c.req.query('unread') === '1',
+      limit: Number(c.req.query('limit') ?? 50),
+    })
+    const unread = conversations.reduce((total: number, row: any) => total + (row.unreadCount ?? 0), 0)
+    return c.json({ conversations, unread })
+  })
+
+  router.get('/workspaces/:workspaceId/social/inbox/conversations/:conversationId', async (c) => {
+    const workspaceId = c.req.param('workspaceId')
+    const userId = await requireMember(c, workspaceId)
+    if (userId instanceof Response) return userId
+    try {
+      return c.json(await getConversation(workspaceId, c.req.param('conversationId')))
+    } catch (err) {
+      return errorResponse(c, err)
+    }
+  })
+
+  router.post('/workspaces/:workspaceId/social/inbox/conversations/:conversationId/messages', async (c) => {
+    const workspaceId = c.req.param('workspaceId')
+    const userId = await requireMember(c, workspaceId)
+    if (userId instanceof Response) return userId
+    const body = await readJson(c)
+    try {
+      const reply = await replyToConversation(workspaceId, c.req.param('conversationId'), {
+        text: body.text,
+        idempotencyKey: body.idempotencyKey ?? c.req.header('idempotency-key') ?? null,
+      })
+      return c.json({ reply }, 201)
+    } catch (err) {
+      return errorResponse(c, err)
+    }
+  })
+
+  router.post('/workspaces/:workspaceId/social/inbox/conversations/:conversationId/read', async (c) => {
+    const workspaceId = c.req.param('workspaceId')
+    const userId = await requireMember(c, workspaceId)
+    if (userId instanceof Response) return userId
+    try {
+      return c.json({ conversation: await markConversationRead(workspaceId, c.req.param('conversationId')) })
+    } catch (err) {
+      return errorResponse(c, err)
+    }
+  })
+
+  router.post('/workspaces/:workspaceId/social/inbox/sync', async (c) => {
+    const workspaceId = c.req.param('workspaceId')
+    const userId = await requireMember(c, workspaceId)
+    if (userId instanceof Response) return userId
+    try {
+      const limit = Number(c.req.query('limit') ?? 50)
+      return c.json({ backfill: await backfillInbox(workspaceId, { limit: Number.isFinite(limit) ? limit : 50 }) })
+    } catch (err) {
+      return errorResponse(c, err)
+    }
+  })
+
+  // ── inbox: comments ─────────────────────────────────────────────────────
+  router.get('/workspaces/:workspaceId/social/comments', async (c) => {
+    const workspaceId = c.req.param('workspaceId')
+    const userId = await requireMember(c, workspaceId)
+    if (userId instanceof Response) return userId
+    return c.json({
+      comments: await listComments(workspaceId, {
+        platform: c.req.query('platform') ?? null,
+        status: c.req.query('status') ?? null,
+        includeOwn: c.req.query('includeOwn') === 'true',
+        limit: Number(c.req.query('limit') ?? 50),
+      }),
+    })
+  })
+
+  router.get('/workspaces/:workspaceId/social/comments/:commentId', async (c) => {
+    const workspaceId = c.req.param('workspaceId')
+    const userId = await requireMember(c, workspaceId)
+    if (userId instanceof Response) return userId
+    try {
+      return c.json({ comment: await getComment(workspaceId, c.req.param('commentId')) })
+    } catch (err) {
+      return errorResponse(c, err)
+    }
+  })
+
+  router.post('/workspaces/:workspaceId/social/comments/:commentId/reply', async (c) => {
+    const workspaceId = c.req.param('workspaceId')
+    const userId = await requireMember(c, workspaceId)
+    if (userId instanceof Response) return userId
+    const body = await readJson(c)
+    try {
+      const reply = await replyToComment(workspaceId, c.req.param('commentId'), {
+        text: body.text,
+        idempotencyKey: body.idempotencyKey ?? c.req.header('idempotency-key') ?? null,
+      })
+      return c.json({ reply }, 201)
+    } catch (err) {
+      return errorResponse(c, err)
+    }
+  })
+
+  router.post('/workspaces/:workspaceId/social/comments/:commentId/read', async (c) => {
+    const workspaceId = c.req.param('workspaceId')
+    const userId = await requireMember(c, workspaceId)
+    if (userId instanceof Response) return userId
+    try {
+      return c.json({ comment: await markCommentRead(workspaceId, c.req.param('commentId')) })
+    } catch (err) {
+      return errorResponse(c, err)
+    }
+  })
+
   return router
 }
 
@@ -407,6 +538,81 @@ export function agentSocialRoutes(config: AgentSocialRoutesConfig): Hono {
     }
   })
 
+  // The agent triages the same inbox a person does: list, read a thread, reply,
+  // and answer a comment. Same services, so a tool call cannot drift from the UI.
+  router.get('/workspaces/:workspaceId/social/inbox', async (c) => {
+    const auth = await authorize(c)
+    if (auth instanceof Response) return auth
+    const conversations = await listConversations(auth.workspaceId, {
+      status: c.req.query('status') ?? null,
+      platform: c.req.query('platform') ?? null,
+      unreadOnly: c.req.query('unread') === 'true' || c.req.query('unread') === '1',
+      limit: Number(c.req.query('limit') ?? 20),
+    })
+    const unread = conversations.reduce((total: number, row: any) => total + (row.unreadCount ?? 0), 0)
+    return c.json({ conversations, unread })
+  })
+
+  router.get('/workspaces/:workspaceId/social/inbox/conversations/:conversationId', async (c) => {
+    const auth = await authorize(c)
+    if (auth instanceof Response) return auth
+    try {
+      return c.json(await getConversation(auth.workspaceId, c.req.param('conversationId')))
+    } catch (err) {
+      return errorResponse(c, err)
+    }
+  })
+
+  router.post('/workspaces/:workspaceId/social/inbox/conversations/:conversationId/messages', async (c) => {
+    const auth = await authorize(c)
+    if (auth instanceof Response) return auth
+    const body = await readJson(c)
+    try {
+      return c.json(
+        {
+          reply: await replyToConversation(auth.workspaceId, c.req.param('conversationId'), {
+            text: body.text,
+            idempotencyKey: body.idempotencyKey ?? c.req.header('idempotency-key') ?? null,
+          }),
+        },
+        201,
+      )
+    } catch (err) {
+      return errorResponse(c, err)
+    }
+  })
+
+  router.get('/workspaces/:workspaceId/social/comments', async (c) => {
+    const auth = await authorize(c)
+    if (auth instanceof Response) return auth
+    return c.json({
+      comments: await listComments(auth.workspaceId, {
+        platform: c.req.query('platform') ?? null,
+        status: c.req.query('status') ?? null,
+        limit: Number(c.req.query('limit') ?? 20),
+      }),
+    })
+  })
+
+  router.post('/workspaces/:workspaceId/social/comments/:commentId/reply', async (c) => {
+    const auth = await authorize(c)
+    if (auth instanceof Response) return auth
+    const body = await readJson(c)
+    try {
+      return c.json(
+        {
+          reply: await replyToComment(auth.workspaceId, c.req.param('commentId'), {
+            text: body.text,
+            idempotencyKey: body.idempotencyKey ?? c.req.header('idempotency-key') ?? null,
+          }),
+        },
+        201,
+      )
+    } catch (err) {
+      return errorResponse(c, err)
+    }
+  })
+
   return router
 }
 
@@ -478,15 +684,36 @@ export function socialRelayRoutes(): Hono {
     return c.json({ events })
   })
 
-  /** Ack deliveries the desktop has applied. Ids from another tenant change nothing. */
+  /**
+   * Ack deliveries the desktop has applied, and report the ones it could not.
+   * Ids from another tenant change nothing. A reported failure keeps the row in
+   * the queue and counts an attempt; past the cap it is dead-lettered rather
+   * than retried for ever — the response names those so the desktop can log it.
+   */
   router.post('/social-relay/events/ack', async (c) => {
     const caller = relayCaller(c)
     if ('response' in caller) return caller.response
     const body = await readJson(c)
     const ids = Array.isArray(body.ids) ? body.ids.filter((id: unknown) => typeof id === 'string') : []
+    const failures = Array.isArray(body.failed)
+      ? body.failed
+          .filter((entry: unknown) => !!entry && typeof (entry as any).id === 'string')
+          .map((entry: any) => ({
+            id: entry.id as string,
+            error: typeof entry.error === 'string' ? entry.error : 'apply failed',
+          }))
+      : []
     const acked = await ackRelayedEvents({ workspaceId: caller.workspaceId, ids })
-    if (acked > 0) await pruneRelayedEvents(caller.workspaceId).catch(() => {})
-    return c.json({ ok: true, acked })
+    const failed = await failRelayedEvents({ workspaceId: caller.workspaceId, failures })
+    if (acked > 0 || failed.recorded > 0) await pruneRelayedEvents(caller.workspaceId).catch(() => {})
+    return c.json({ ok: true, acked, failed: failed.recorded, deadLettered: failed.deadLettered })
+  })
+
+  /** Deliveries the desktop gave up on, so an operator can see what was lost. */
+  router.get('/social-relay/events/failed', async (c) => {
+    const caller = relayCaller(c)
+    if ('response' in caller) return caller.response
+    return c.json({ events: await listDeadLettered({ workspaceId: caller.workspaceId }) })
   })
 
   router.all('/social-relay/*', async (c) => {
@@ -608,6 +835,7 @@ export function socialEventRoutes(config: SocialEventRoutesConfig): Hono {
         type: requireString(body.type, 'type'),
         account,
         detail: body.detail ?? null,
+        payload: body.payload ?? null,
       })
       return c.json(applied.body as any, applied.status as any)
     } catch (err) {

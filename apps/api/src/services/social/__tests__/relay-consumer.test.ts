@@ -112,7 +112,7 @@ describe('relayed event consumer', () => {
     expect(calls.some((call) => call.url.endsWith('/events/ack'))).toBe(false)
   })
 
-  test('a delivery that fails to apply stays unacked and is retried', async () => {
+  test('a delivery that fails to apply stays unacked, and the failure is reported', async () => {
     const { impl, calls } = fakeFetch({ 'local-a': [delivery({ id: 'row-1', eventId: 'evt_1' })] })
     const result = await drainRelayedEvents({
       fetchImpl: impl,
@@ -123,7 +123,66 @@ describe('relayed event consumer', () => {
       },
     })
     expect(result).toMatchObject({ fetched: 1, applied: 0, acked: 0 })
-    expect(calls.some((call) => call.url.endsWith('/events/ack'))).toBe(false)
+
+    // It must NOT be acked — and the failure has to reach the cloud, or the
+    // delivery is retried for ever without anybody counting the attempts.
+    const ack = calls.find((call) => call.url.endsWith('/events/ack'))
+    const body = JSON.parse(ack!.init.body)
+    expect(body.ids).toEqual([])
+    expect(body.failed).toEqual([{ id: 'row-1', error: 'local DB is locked' }])
+  })
+
+  test('a rejected payload is a failure to retry, not a delivery to ack', async () => {
+    const { impl, calls } = fakeFetch({ 'local-a': [delivery({ id: 'row-1', eventId: 'evt_1' })] })
+    const result = await drainRelayedEvents({
+      fetchImpl: impl,
+      resolveConfig: relayConfig,
+      localScopes: async () => ['local-a'],
+      // What `applySocialEvent` answers when the catalog refuses the payload.
+      apply: async () => ({
+        status: 502,
+        body: { error: { code: 'social_event_rejected', message: 'payload failed the validator' } },
+      }),
+    })
+    expect(result).toMatchObject({ fetched: 1, applied: 0, acked: 0 })
+    const body = JSON.parse(calls.find((call) => call.url.endsWith('/events/ack'))!.init.body)
+    expect(body.failed).toEqual([{ id: 'row-1', error: 'payload failed the validator' }])
+  })
+
+  test('a delivery with nothing to apply is reported, not retried silently', async () => {
+    const { impl, calls } = fakeFetch({ 'local-a': [delivery({ id: 'row-1', eventId: '' })] })
+    const result = await drainRelayedEvents({
+      fetchImpl: impl,
+      resolveConfig: relayConfig,
+      localScopes: async () => ['local-a'],
+      apply: async () => {
+        throw new Error('must not apply')
+      },
+    })
+    expect(result).toMatchObject({ fetched: 1, applied: 0, acked: 0 })
+    const body = JSON.parse(calls.find((call) => call.url.endsWith('/events/ack'))!.init.body)
+    expect(body.failed[0].id).toBe('row-1')
+    expect(body.failed[0].error).toContain('missing')
+  })
+
+  test('the whole payload is handed to apply, so the inbox can read the conversation', async () => {
+    const withPayload = delivery({
+      id: 'row-1',
+      eventId: 'evt_1',
+      payload: { conversation: { id: 'conv_1' }, message: { id: 'msg_1' } } as never,
+    })
+    const { impl } = fakeFetch({ 'local-a': [withPayload] })
+    const applied: ApplySocialEventInput[] = []
+    await drainRelayedEvents({
+      fetchImpl: impl,
+      resolveConfig: relayConfig,
+      localScopes: async () => ['local-a'],
+      apply: async (input) => {
+        applied.push(input)
+        return { status: 200, body: { ok: true } }
+      },
+    })
+    expect(applied[0].payload).toEqual({ conversation: { id: 'conv_1' }, message: { id: 'msg_1' } })
   })
 
   test('a cloud scope or BYOK machine polls nothing at all', async () => {

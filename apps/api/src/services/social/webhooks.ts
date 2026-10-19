@@ -18,6 +18,7 @@ import { prisma } from '../../lib/prisma'
 import { getSyncEngine } from '../../lib/sync-engine'
 import { emitWorkspaceEvent } from '../workspace-events'
 import { SocialError } from './client'
+import { ingestSocialEvent } from './inbox.service'
 import { enqueueRelayedEvent } from './relay-events.service'
 import { getProfileByExternalId, type SocialProfileRow } from './profiles.service'
 import {
@@ -52,6 +53,8 @@ export interface ApplySocialEventInput {
   type: string
   account?: { zernioAccountId: string; platform: string; username: string } | null
   detail?: unknown
+  /** The whole verified payload: `conversation` and `post` live here. */
+  payload?: unknown
   occurredAt?: Date
 }
 
@@ -90,14 +93,39 @@ async function fixAccountRow(input: {
 }
 
 /**
- * Apply one already-resolved event: keep the account rows honest, then emit the
- * `social.*` event. Idempotent on the provider's event id — the outbox dedupe
- * key is `zernio:<id>`, so a webhook Zernio retries (it retries 7×) and a
- * desktop that receives the relayed copy both end up as one event.
+ * Apply one already-resolved event: write the inbox rows the event describes,
+ * keep the account rows honest, then emit the `social.*` event. Idempotent on
+ * the provider's event id — the outbox dedupe key is `zernio:<id>`, so a
+ * webhook Zernio retries (it retries 7×) and a desktop that receives the
+ * relayed copy both end up as one event.
+ *
+ * A payload the catalog refuses is **not** a silent success: the ingestion may
+ * well have landed (`message.delivered` is inbox-only), but the trigger never
+ * fired, so the caller gets a non-2xx. Zernio then retries, and a desktop
+ * leaves the delivery unacked until it is dead-lettered — either way somebody
+ * can see it, which `200 { ok: true }` would have hidden.
  */
 export async function applySocialEvent(input: ApplySocialEventInput): Promise<ApplySocialEventResult> {
+  const ingested = await ingestSocialEvent({
+    workspaceId: input.workspaceId,
+    type: input.type,
+    detail: input.detail,
+    payload: input.payload,
+    account: input.account,
+    occurredAt: input.occurredAt,
+  })
+
   const type = socialEventTypeFor(input.type)
-  if (!type) return { status: 200, body: { ok: true, ignored: `unmapped:${input.type}` } }
+  if (!type) {
+    return {
+      status: 200,
+      body: {
+        ok: true,
+        ignored: `unmapped:${input.type}`,
+        ...(ingested.handled ? { inbox: ingested } : {}),
+      },
+    }
+  }
 
   await fixAccountRow({ workspaceId: input.workspaceId, type, account: input.account })
 
@@ -122,9 +150,30 @@ export async function applySocialEvent(input: ApplySocialEventInput): Promise<Ap
     actor: { source: 'zernio', externalId: input.externalId, trust: 'platform' },
   })
 
+  if (!emitted) {
+    // The catalog refused the payload (see `emitWorkspaceEvent`): the trigger
+    // did not run, so do not report success.
+    return {
+      status: 502,
+      body: {
+        error: {
+          code: 'social_event_rejected',
+          message: `The ${type} payload failed the event catalog validator; retrying`,
+        },
+        ...(ingested.handled ? { inbox: ingested } : {}),
+      },
+    }
+  }
+
   return {
     status: 200,
-    body: { ok: true, type, eventId: emitted?.eventId ?? null, duplicate: emitted?.duplicate ?? false },
+    body: {
+      ok: true,
+      type,
+      eventId: emitted.eventId,
+      duplicate: emitted.duplicate,
+      ...(ingested.handled ? { inbox: ingested } : {}),
+    },
   }
 }
 
@@ -148,6 +197,8 @@ async function relayToDesktop(profile: SocialProfileRow, event: ZernioEvent): Pr
     type: event.type,
     account: event.account ?? null,
     detail: event.detail ?? null,
+    /** The room the inbox needs: `conversation`, `post`, `comment`, `message`. */
+    payload: event.payload ?? null,
     occurredAt,
   }
 
@@ -235,6 +286,7 @@ export async function handleZernioWebhook(input: ZernioWebhookInput): Promise<{ 
     type: event.type,
     account: event.account,
     detail: event.detail,
+    payload: event.payload,
   })
   return result
 }

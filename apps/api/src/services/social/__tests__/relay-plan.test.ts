@@ -137,3 +137,79 @@ describe('relay scoping', () => {
     })
   })
 })
+
+describe('inbox scoping', () => {
+  const account = 'zernio_ig'
+
+  test('a conversation list is pinned to the caller’s own profile', () => {
+    expect(plan({ path: '/inbox/conversations', query: { profileId: 'someone_else', limit: '25' } })).toMatchObject({
+      kind: 'forward',
+      path: '/inbox/conversations',
+      query: { profileId: 'zernio_profile_1', limit: '25' },
+    })
+  })
+
+  test('a thread needs an account the workspace owns, in either direction', () => {
+    expect(
+      plan({ path: '/inbox/conversations/conv_1/messages', query: { accountId: account } }),
+    ).toMatchObject({
+      kind: 'forward',
+      path: '/inbox/conversations/conv_1/messages',
+      verifyAccountId: account,
+    })
+
+    expect(
+      plan({
+        method: 'POST',
+        path: '/inbox/conversations/conv_1/messages',
+        body: { accountId: account, message: 'Yes — we ship there.', extra: 'dropped' },
+      }),
+    ).toMatchObject({
+      kind: 'forward',
+      body: { accountId: account, message: 'Yes — we ship there.' },
+      verifyAccountId: account,
+    })
+  })
+
+  test('a thread with no account, or an empty message, is refused before it leaves', () => {
+    expect(plan({ path: '/inbox/conversations/conv_1/messages', query: {} })).toMatchObject({
+      kind: 'deny',
+      status: 400,
+      code: 'invalid_body',
+    })
+    expect(
+      plan({
+        method: 'POST',
+        path: '/inbox/conversations/conv_1/messages',
+        body: { accountId: account, message: '   ' },
+      }),
+    ).toMatchObject({ kind: 'deny', status: 400, code: 'invalid_body' })
+  })
+
+  test('comments are listed by profile and answered by account + comment id', () => {
+    expect(plan({ path: '/inbox/comments', query: { profileId: 'someone_else' } })).toMatchObject({
+      kind: 'forward',
+      query: { profileId: 'zernio_profile_1' },
+    })
+    expect(
+      plan({
+        method: 'POST',
+        path: '/inbox/comments/zernio_post_1',
+        body: { accountId: account, message: 'Just merged!', commentId: 'cmt_1' },
+      }),
+    ).toMatchObject({
+      kind: 'forward',
+      path: '/inbox/comments/zernio_post_1',
+      body: { accountId: account, message: 'Just merged!', commentId: 'cmt_1' },
+      verifyAccountId: account,
+    })
+  })
+
+  test('an inbox path outside the allowlist is still denied', () => {
+    expect(plan({ method: 'DELETE', path: '/inbox/conversations/conv_1' })).toMatchObject({ kind: 'deny' })
+    expect(plan({ method: 'PUT', path: '/inbox/comments/zernio_post_1' })).toMatchObject({
+      kind: 'deny',
+      status: 405,
+    })
+  })
+})

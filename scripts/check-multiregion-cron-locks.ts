@@ -306,6 +306,24 @@ const ACCEPTED_UNIQUE_KEYS: UniqueKeyRule[] = [
       '`zernio:<provider event id>` is assigned by Zernio and is the same string on every region; the webhook ingress writes it once and a provider retry re-reads that row instead of inserting.',
   },
   {
+    key: 'SocialConversation.zernioConversationId',
+    category: 'external_global_id',
+    reason:
+      'Zernio assigns the conversation id globally and echoes the same value on every webhook and every list sweep, so both ends of the relay upsert one row instead of racing an insert; ownership is still checked against the row\'s workspaceId before any write.',
+  },
+  {
+    key: 'SocialMessage.zernioMessageId',
+    category: 'external_global_id',
+    reason:
+      'The provider message id is global and is the same on the webhook, the retried delivery and the REST sweep — which is exactly what makes ingestion idempotent across them.',
+  },
+  {
+    key: 'SocialComment.zernioCommentId',
+    category: 'external_global_id',
+    reason:
+      'Zernio assigns the comment id globally and repeats it on the webhook echo, the comment listing and the reply response, so those three converge on one row.',
+  },
+  {
     key: 'EventSubscription.composioTriggerId',
     category: 'external_global_id',
     reason:

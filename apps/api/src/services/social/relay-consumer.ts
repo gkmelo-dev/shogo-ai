@@ -14,6 +14,7 @@
  */
 
 import { LOCAL_SCOPE_HEADER, resolveSocialClientConfig, type SocialClientConfig } from './client'
+import { MAX_ATTEMPTS } from './relay-events.service'
 import {
   applySocialEvent,
   type ApplySocialEventInput,
@@ -33,6 +34,7 @@ export interface RelayedEventDelivery {
   type: string
   account?: { zernioAccountId: string; platform: string; username: string } | null
   detail?: unknown
+  payload?: unknown
   occurredAt?: string
 }
 
@@ -113,14 +115,20 @@ export async function drainRelayedEvents(deps: RelayConsumerDeps = {}): Promise<
   if (events.length === 0) return empty
 
   const appliedIds: string[] = []
+  const failed: { id: string; error: string }[] = []
   let applied = 0
   for (const event of events) {
     // A delivery names the local workspace it belongs to; that id *is* this
     // database's workspace id, which is what the event outbox is scoped by.
     const workspaceId = event.localWorkspaceId || event.workspaceId
-    if (!workspaceId || !event.eventId || !event.type) continue
+    if (!workspaceId || !event.eventId || !event.type) {
+      // Not something we can ever apply, so report it rather than retry it
+      // silently — the cloud dead-letters it after the attempt cap.
+      failed.push({ id: event.id, error: 'delivery is missing workspaceId, eventId or type' })
+      continue
+    }
     try {
-      await apply({
+      const result = await apply({
         workspaceId,
         externalId: event.externalId,
         localWorkspaceId: event.localWorkspaceId,
@@ -128,29 +136,43 @@ export async function drainRelayedEvents(deps: RelayConsumerDeps = {}): Promise<
         type: event.type,
         account: event.account ?? null,
         detail: event.detail ?? null,
+        payload: event.payload ?? null,
         occurredAt: event.occurredAt ? new Date(event.occurredAt) : undefined,
       })
-      appliedIds.push(event.id)
-      applied++
+      // `apply` answers with a status so a rejected payload is not mistaken for
+      // a delivered one: acking it would drop the event for good.
+      if (result.status >= 200 && result.status < 300) {
+        appliedIds.push(event.id)
+        applied++
+      } else {
+        failed.push({ id: event.id, error: readError(result.body) ?? `apply answered ${result.status}` })
+      }
     } catch (err) {
       // Leave it unacked: the next tick retries, and the outbox dedupe key
       // means a partial success still lands as one event.
+      failed.push({ id: event.id, error: err instanceof Error ? err.message : String(err) })
       console.warn('[Social] relayed event not applied:', err instanceof Error ? err.message : err)
     }
   }
 
   let acked = 0
-  if (appliedIds.length > 0) {
+  if (appliedIds.length > 0 || failed.length > 0) {
     try {
       const res = await fetchImpl(`${config.baseUrl}/events/ack`, {
         method: 'POST',
         headers: { ...headers(config), 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ids: appliedIds }),
+        body: JSON.stringify({ ids: appliedIds, failed }),
         signal: AbortSignal.timeout(15_000),
       })
       if (res.ok) {
-        const body = (await res.json().catch(() => ({}))) as { acked?: number }
+        const body = (await res.json().catch(() => ({}))) as { acked?: number; deadLettered?: string[] }
         acked = typeof body?.acked === 'number' ? body.acked : 0
+        if (Array.isArray(body?.deadLettered) && body.deadLettered.length > 0) {
+          console.error(
+            `[Social] ${body.deadLettered.length} relayed delivery(s) dead-lettered after ${MAX_ATTEMPTS} attempts:`,
+            body.deadLettered.join(', '),
+          )
+        }
       }
     } catch {
       // Unacked rows are redelivered and deduped on `zernio:<event id>`.
@@ -158,6 +180,12 @@ export async function drainRelayedEvents(deps: RelayConsumerDeps = {}): Promise<
   }
 
   return { fetched: events.length, applied, acked }
+}
+
+function readError(body: unknown): string | null {
+  const record = body && typeof body === 'object' ? (body as any) : null
+  const message = record?.error?.message ?? record?.error
+  return typeof message === 'string' && message ? message : null
 }
 
 let timer: ReturnType<typeof setInterval> | null = null

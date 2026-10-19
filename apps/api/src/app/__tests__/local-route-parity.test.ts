@@ -77,6 +77,15 @@ const REQUIRED_LOCAL_ROUTES = [
   'PATCH /api/workspaces/:workspaceId/social/posts/:postId',
   'DELETE /api/workspaces/:workspaceId/social/posts/:postId',
   'GET /api/workspaces/:workspaceId/social/calendar',
+  'GET /api/workspaces/:workspaceId/social/inbox',
+  'GET /api/workspaces/:workspaceId/social/inbox/conversations/:conversationId',
+  'POST /api/workspaces/:workspaceId/social/inbox/conversations/:conversationId/messages',
+  'POST /api/workspaces/:workspaceId/social/inbox/conversations/:conversationId/read',
+  'POST /api/workspaces/:workspaceId/social/inbox/sync',
+  'GET /api/workspaces/:workspaceId/social/comments',
+  'GET /api/workspaces/:workspaceId/social/comments/:commentId',
+  'POST /api/workspaces/:workspaceId/social/comments/:commentId/reply',
+  'POST /api/workspaces/:workspaceId/social/comments/:commentId/read',
   // The desktop half of webhook routing: a verified event for one of this
   // machine's local scopes is applied here, in its own DB.
   'POST /api/social/events',

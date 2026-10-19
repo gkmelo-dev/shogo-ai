@@ -60,6 +60,12 @@ export interface ZernioEvent {
   account: { zernioAccountId: string; platform: string; username: string } | null
   /** Provider payload for the mapped event (`comment`, `message`, `run`). */
   detail: unknown
+  /**
+   * The whole verified body. The inbox needs the sibling blocks the mapped
+   * detail does not carry (`conversation`, `post`), and a desktop applies the
+   * event from what it is given rather than from Zernio.
+   */
+  payload: unknown
 }
 
 function accountFromPayload(payload: any): ZernioEvent['account'] {
@@ -98,7 +104,7 @@ export function parseZernioEvent(rawBody: string, eventIdHeader: string | null |
 
   const detailKey = type.split('.')[0] ?? ''
   const detail = detailKey && payload[detailKey] !== undefined ? payload[detailKey] : (payload.data ?? null)
-  return { id, type, externalId, account: accountFromPayload(payload), detail }
+  return { id, type, externalId, account: accountFromPayload(payload), detail, payload }
 }
 
 /**

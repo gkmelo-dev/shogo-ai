@@ -12,6 +12,16 @@
  * `dedupeKey` is `zernio:<provider event id>` — the same key the cloud event
  * outbox uses — so a provider retry (Zernio retries 7×) collapses onto the row
  * that already exists instead of delivering twice.
+ *
+ * A delivery the desktop cannot apply is **not** acked: it keeps its place in
+ * the queue, the failure is written down (`attempts`, `lastError`), and after
+ * `MAX_ATTEMPTS` it is dead-lettered (`failedAt`) so one poison payload cannot
+ * spin forever. That is the difference between "we dropped it silently" and
+ * "we tried, and here is why it did not land".
+ *
+ * Rows do not accumulate forever either: applied rows live through the backfill
+ * window (an inbox needs them when a desktop comes back after a few days), and
+ * anything else is dropped after `KEEP_UNDELIVERED_DAYS`.
  */
 
 import { prisma } from '../../lib/prisma'
@@ -19,7 +29,11 @@ import { prisma } from '../../lib/prisma'
 const db = prisma as any
 
 /** Applied rows are kept this long so a reconnecting desktop can backfill. */
-const KEEP_APPLIED_DAYS = 7
+export const KEEP_APPLIED_DAYS = 7
+/** Undelivered/dead-lettered rows are dropped after this long. */
+export const KEEP_UNDELIVERED_DAYS = 30
+/** Attempts before a delivery is dead-lettered instead of retried. */
+export const MAX_ATTEMPTS = 5
 
 export interface SocialRelayedEventEnvelope {
   externalId: string
@@ -28,6 +42,8 @@ export interface SocialRelayedEventEnvelope {
   type: string
   account?: { zernioAccountId: string; platform: string; username: string } | null
   detail?: unknown
+  /** The whole verified payload, so the desktop applies from it, not Zernio. */
+  payload?: unknown
   occurredAt: string
 }
 
@@ -35,6 +51,8 @@ export interface SocialRelayedEventRow extends SocialRelayedEventEnvelope {
   id: string
   dedupeKey: string
   workspaceId: string
+  attempts: number
+  appliedAt?: string | null
 }
 
 export function relayedEventDedupeKey(eventId: string): string {
@@ -94,16 +112,28 @@ function readEnvelope(row: any): SocialRelayedEventEnvelope {
 }
 
 /**
- * Undelivered rows for the caller's workspace — all of its local scopes, or
- * just one when the desktop names it. Scoping by workspace id comes from the
- * caller's key, never from a request parameter.
+ * Deliveries for the caller's workspace — all of its local scopes, or just one
+ * when the desktop names it. Scoping by workspace id comes from the caller's
+ * key, never from a request parameter.
+ *
+ * The default is what is still to deliver: unapplied and not dead-lettered.
+ * `includeApplied` widens it to the backfill window, which is how a desktop
+ * rebuilds an inbox after being offline (see `inbox.service.backfillInbox`).
  */
 export async function listRelayedEvents(args: {
   workspaceId: string
   localWorkspaceId?: string
   limit?: number
+  includeApplied?: boolean
+  /** Only rows received at or after this instant (backfill window). */
+  since?: Date
 }): Promise<SocialRelayedEventRow[]> {
-  const where: Record<string, unknown> = { workspaceId: args.workspaceId, appliedAt: null }
+  const where: Record<string, unknown> = { workspaceId: args.workspaceId }
+  if (!args.includeApplied) {
+    where.appliedAt = null
+    where.failedAt = null
+  }
+  if (args.since) where.occurredAt = { gte: args.since }
   if (args.localWorkspaceId) where.localWorkspaceId = args.localWorkspaceId
   const rows = await db.socialRelayedEvent.findMany({
     where,
@@ -114,6 +144,8 @@ export async function listRelayedEvents(args: {
     id: row.id,
     dedupeKey: row.dedupeKey,
     workspaceId: row.workspaceId,
+    attempts: row.attempts ?? 0,
+    appliedAt: row.appliedAt ? new Date(row.appliedAt).toISOString() : null,
     ...readEnvelope(row),
   }))
 }
@@ -135,11 +167,91 @@ export async function ackRelayedEvents(args: {
   return result.count
 }
 
-/** Drop applied rows past the backfill window; called opportunistically. */
+export interface RelayedEventFailure {
+  id: string
+  error: string
+}
+
+/**
+ * Record deliveries this consumer could not apply. They stay unacked, so the
+ * next poll hands them out again — up to `MAX_ATTEMPTS`, after which they are
+ * dead-lettered and surfaced instead of silently retried forever.
+ *
+ * Returns what was dead-lettered now, so the client can say so out loud.
+ */
+export async function failRelayedEvents(args: {
+  workspaceId: string
+  failures: RelayedEventFailure[]
+}): Promise<{ recorded: number; deadLettered: string[] }> {
+  if (args.failures.length === 0) return { recorded: 0, deadLettered: [] }
+
+  const ids = args.failures.map((failure) => failure.id)
+  const rows = await db.socialRelayedEvent.findMany({
+    where: { workspaceId: args.workspaceId, id: { in: ids }, appliedAt: null },
+    select: { id: true, attempts: true, failedAt: true },
+  })
+  const known = new Map(rows.map((row: any) => [row.id, row]))
+
+  const deadLettered: string[] = []
+  let recorded = 0
+  for (const failure of args.failures) {
+    const row: any = known.get(failure.id)
+    // Not ours, already applied, or already dead-lettered: nothing to record.
+    if (!row || row.failedAt) continue
+    const attempts = (row.attempts ?? 0) + 1
+    const dead = attempts >= MAX_ATTEMPTS
+    await db.socialRelayedEvent.update({
+      where: { id: failure.id },
+      data: {
+        attempts,
+        lastAttemptAt: new Date(),
+        lastError: failure.error.slice(0, 1000),
+        ...(dead ? { failedAt: new Date() } : {}),
+      },
+    })
+    recorded++
+    if (dead) deadLettered.push(failure.id)
+  }
+  return { recorded, deadLettered }
+}
+
+/** Deliveries the desktop gave up on, for an operator to look at. */
+export async function listDeadLettered(args: {
+  workspaceId: string
+  limit?: number
+}): Promise<SocialRelayedEventRow[]> {
+  const rows = await db.socialRelayedEvent.findMany({
+    where: { workspaceId: args.workspaceId, failedAt: { not: null } },
+    orderBy: { createdAt: 'desc' },
+    take: Math.min(Math.max(args.limit ?? 20, 1), 100),
+  })
+  return rows.map((row: any) => ({
+    id: row.id,
+    dedupeKey: row.dedupeKey,
+    workspaceId: row.workspaceId,
+    attempts: row.attempts ?? 0,
+    appliedAt: null,
+    ...readEnvelope(row),
+  }))
+}
+
+/**
+ * Drop rows past their window. Applied rows are kept for the backfill window;
+ * anything still undelivered (or dead-lettered) is kept much longer, then
+ * dropped — a desktop that never comes back must not leave rows forever.
+ */
 export async function pruneRelayedEvents(workspaceId: string): Promise<number> {
-  const cutoff = new Date(Date.now() - KEEP_APPLIED_DAYS * 86_400_000)
+  const now = Date.now()
+  const appliedCutoff = new Date(now - KEEP_APPLIED_DAYS * 86_400_000)
+  const undeliveredCutoff = new Date(now - KEEP_UNDELIVERED_DAYS * 86_400_000)
   const result = await db.socialRelayedEvent.deleteMany({
-    where: { workspaceId, appliedAt: { lt: cutoff } },
+    where: {
+      workspaceId,
+      OR: [
+        { appliedAt: { lt: appliedCutoff } },
+        { appliedAt: null, createdAt: { lt: undeliveredCutoff } },
+      ],
+    },
   })
   return result.count
 }

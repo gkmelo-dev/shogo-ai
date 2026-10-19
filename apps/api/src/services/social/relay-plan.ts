@@ -184,5 +184,94 @@ export function planRelayRequest(args: {
     }
   }
 
+  // ── inbox: DMs and comments ─────────────────────────────────────────────
+  //
+  // These read and write customer conversations, so every one of them is
+  // pinned: `profileId` is rewritten to the caller's own profile, and an
+  // `accountId` (query or body) has to be proved to belong to the workspace
+  // before a single byte reaches the provider.
+  if (seg[0] === 'inbox' && seg[1] === 'conversations' && seg.length === 2) {
+    const missing = needsProfile(args.profile)
+    if (missing) return missing
+    if (method !== 'GET') return deny(405, 'method_not_allowed', `${method} /inbox/conversations is not relayed`)
+    const query: Record<string, string> = { profileId: args.profile!.zernioProfileId }
+    if (typeof args.query.limit === 'string') query.limit = args.query.limit
+    if (typeof args.query.accountId === 'string') query.accountId = args.query.accountId
+    if (typeof args.query.status === 'string') query.status = args.query.status
+    if (typeof args.query.platform === 'string') query.platform = args.query.platform
+    return {
+      kind: 'forward',
+      path: '/inbox/conversations',
+      query,
+      ...(query.accountId ? { verifyAccountId: query.accountId } : {}),
+    }
+  }
+
+  if (seg[0] === 'inbox' && seg[1] === 'conversations' && seg.length === 4 && seg[3] === 'messages') {
+    const missing = needsProfile(args.profile)
+    if (missing) return missing
+    const queryAccountId = typeof args.query.accountId === 'string' ? args.query.accountId : ''
+    const bodyAccountId = typeof args.body?.accountId === 'string' ? args.body.accountId : ''
+    const accountId = method === 'POST' ? bodyAccountId : queryAccountId
+    // Both directions address one account's thread. Without it we cannot prove
+    // whose thread this is, so we do not forward.
+    if (!accountId) return deny(400, 'invalid_body', 'accountId is required for an inbox thread')
+    const path = `/inbox/conversations/${encodeURIComponent(seg[2]!)}/messages`
+    if (method === 'GET') {
+      const query: Record<string, string> = { accountId }
+      if (typeof args.query.limit === 'string') query.limit = args.query.limit
+      if (typeof args.query.sortOrder === 'string') query.sortOrder = args.query.sortOrder
+      return { kind: 'forward', path, query, verifyAccountId: accountId }
+    }
+    if (method === 'POST') {
+      if (typeof args.body?.message !== 'string' || !args.body.message.trim()) {
+        return deny(400, 'invalid_body', 'message is required')
+      }
+      return {
+        kind: 'forward',
+        path,
+        query: {},
+        body: { accountId, message: args.body.message },
+        verifyAccountId: accountId,
+      }
+    }
+    return deny(405, 'method_not_allowed', `${method} ${args.path} is not relayed`)
+  }
+
+  if (seg[0] === 'inbox' && seg[1] === 'comments' && seg.length === 2) {
+    const missing = needsProfile(args.profile)
+    if (missing) return missing
+    if (method !== 'GET') return deny(405, 'method_not_allowed', `${method} /inbox/comments is not relayed`)
+    const query: Record<string, string> = { profileId: args.profile!.zernioProfileId }
+    if (typeof args.query.limit === 'string') query.limit = args.query.limit
+    if (typeof args.query.platform === 'string') query.platform = args.query.platform
+    return { kind: 'forward', path: '/inbox/comments', query }
+  }
+
+  if (seg[0] === 'inbox' && seg[1] === 'comments' && seg.length === 3) {
+    const missing = needsProfile(args.profile)
+    if (missing) return missing
+    const queryAccountId = typeof args.query.accountId === 'string' ? args.query.accountId : ''
+    const bodyAccountId = typeof args.body?.accountId === 'string' ? args.body.accountId : ''
+    const accountId = method === 'POST' ? bodyAccountId : queryAccountId
+    if (!accountId) return deny(400, 'invalid_body', 'accountId is required for a comment thread')
+    const path = `/inbox/comments/${encodeURIComponent(seg[2]!)}`
+    if (method === 'GET') {
+      const query: Record<string, string> = { accountId }
+      if (typeof args.query.limit === 'string') query.limit = args.query.limit
+      if (typeof args.query.commentId === 'string') query.commentId = args.query.commentId
+      return { kind: 'forward', path, query, verifyAccountId: accountId }
+    }
+    if (method === 'POST') {
+      if (typeof args.body?.message !== 'string' || !args.body.message.trim()) {
+        return deny(400, 'invalid_body', 'message is required')
+      }
+      const body: Record<string, unknown> = { accountId, message: args.body.message }
+      if (typeof args.body?.commentId === 'string') body.commentId = args.body.commentId
+      return { kind: 'forward', path, query: {}, body, verifyAccountId: accountId }
+    }
+    return deny(405, 'method_not_allowed', `${method} ${args.path} is not relayed`)
+  }
+
   return deny(403, 'relay_path_not_allowed', `The relay does not serve ${method} ${args.path}.`)
 }
