@@ -27,9 +27,12 @@ import { basename, join } from 'node:path'
 import {
   getTechStackPath,
   loadTechStackMeta,
+  readTechStackMarker,
+  runtimeTemplateTopLevelEntries,
   seedRuntimeTemplate,
   seedTechStack,
   wipeProjectFiles,
+  writeTechStackDoc,
 } from './workspace-defaults'
 
 /** Whether `projectDir` is the runtime's own workspace root or a member folder. */
@@ -82,8 +85,10 @@ export interface ApplyTechStackChangeResult {
   /** Top-level entries removed by `resetFiles`; `null` when nothing was wiped. */
   wiped: number | null
   /**
-   * Starter files that already existed and were therefore left alone — the
-   * ones the caller has to migrate (or re-run with `resetFiles: true`).
+   * Existing top-level entries the new stack's seeding would have written and
+   * therefore left alone — its own `starter/` files plus, for Vite-family
+   * stacks, the files the bundled runtime-template provides. These are the ones
+   * the caller has to migrate (or re-run with `resetFiles: true`).
    */
   kept: string[]
   /** Whether the runtime env the stack resolves from was updated. */
@@ -109,6 +114,23 @@ function starterEntries(stackId: string): string[] {
   } catch {
     return []
   }
+}
+
+/**
+ * Every top-level entry seeding `stackId` into a workspace would write.
+ *
+ * A stack declares its files in one of two places — its own `starter/`, or (for
+ * Vite-family stacks, which declare `runtime.devServer: 'vite'`) the bundled
+ * runtime-template. Both have to be counted: `react-app` has no `starter/` at
+ * all, so reading only `starter/` reported `kept: []` for the most common switch
+ * there is.
+ */
+export function seedEntries(stackId: string): string[] {
+  const entries = new Set(starterEntries(stackId))
+  if (loadTechStackMeta(stackId)?.runtime?.devServer === 'vite') {
+    for (const entry of runtimeTemplateTopLevelEntries()) entries.add(entry)
+  }
+  return [...entries].sort()
 }
 
 /**
@@ -169,7 +191,9 @@ export function applyTechStackChange(input: ApplyTechStackChangeInput): ApplyTec
     return { ...base, error: `Project folder does not exist: ${input.projectDir}` }
   }
 
-  const entries = starterEntries(stackId)
+  const entries = seedEntries(stackId)
+  // Marker read BEFORE seeding — `seedTechStack()` rewrites it.
+  const previousStackId = readTechStackMarker(input.projectDir)
   const kept = input.resetFiles
     ? []
     : entries.filter((entry) => existsSync(join(input.projectDir, entry)))
@@ -179,6 +203,14 @@ export function applyTechStackChange(input: ApplyTechStackChangeInput): ApplyTec
 
   const seeded = seedTechStack(input.projectDir, stackId)
   if (!seeded) return { ...base, wiped, kept, error: `Failed to seed tech stack ${stackId}` }
+
+  // `.shogo/` survives `wipeProjectFiles()`, and `seedTechStack()` only fills
+  // STACK.md when it is missing — so on a switch it would keep describing the
+  // stack the marker just left. Replace it, but leave `.shogo/AGENTS.md` (agent
+  // identity) and the rest of `.shogo/` alone.
+  if (previousStackId !== stackId) {
+    writeTechStackDoc(input.projectDir, stackId, { overwrite: true })
+  }
 
   // Vite-family stacks borrow the bundled runtime template (vite + react +
   // tailwind + the Hono/Prisma sidecar); whether a stack is one is declared in

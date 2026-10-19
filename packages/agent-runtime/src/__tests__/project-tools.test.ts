@@ -447,6 +447,38 @@ describe('project_configure', () => {
     expect(existsSync(join(workspaceDir, 'remotion.config.ts'))).toBe(true)
   })
 
+  test('a switch to a starter-less stack reports the files it left in place', async () => {
+    api.getConfig.data.settings = { techStackId: 'react-app' }
+    api.configure.data.settings = { techStackId: 'video-editor' }
+    const ctx = baseCtx({ projectId: 'proj-1' })
+    await run(createProjectConfigureTool(ctx), { techStackId: 'video-editor' })
+
+    api.getConfig.data.settings = { techStackId: 'video-editor' }
+    api.configure.data.settings = { techStackId: 'react-app' }
+    const out = await run(createProjectConfigureTool(ctx), { techStackId: 'react-app' })
+
+    // react-app ships no starter/ — these come from the bundled runtime-template
+    // and already exist in the video project, so the agent has to migrate them.
+    expect(out.stack.kept).toContain('package.json')
+    expect(out.stack.kept).toContain('index.html')
+    expect(out.stack.kept).toContain('src')
+    expect(out.stack.note).toContain('Migrate them')
+    // …and the stack doc follows the marker rather than describing the old stack.
+    expect(readFileSync(join(workspaceDir, '.shogo', 'STACK.md'), 'utf-8')).toContain('# Tech Stack — React App')
+  })
+
+  test('a switch to a stack that ships no files says so instead of nothing', async () => {
+    api.getConfig.data.settings = { techStackId: 'react-app' }
+    api.configure.data.settings = { techStackId: 'none' }
+    const ctx = baseCtx({ projectId: 'proj-1' })
+
+    const out = await run(createProjectConfigureTool(ctx), { techStackId: 'none' })
+
+    expect(out.stack.kept).toEqual([])
+    expect(out.stack.note).toContain('ships no files of its own')
+    expect(out.stack.note).toContain('resetFiles: true')
+  })
+
   test('reports appliesOnNextStart when the project is not mounted here', async () => {
     api.graph.data = [
       { id: 'caller-1', name: 'Caller', description: null, workingMode: 'managed', settings: null, attachments: [], agent: null },

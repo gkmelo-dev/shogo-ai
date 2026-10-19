@@ -14,6 +14,7 @@ import { tmpdir } from 'os'
 import { join } from 'path'
 import {
   applyTechStackChange,
+  seedEntries,
   setTechStackPreviewRestarter,
   syncTechStackEnv,
   type PreviewRestartRequest,
@@ -136,6 +137,94 @@ describe('applyTechStackChange (resetFiles)', () => {
 
     expect(result.ok).toBe(true)
     expect(existsSync(join(dir, 'src', 'App.tsx'))).toBe(false)
+  })
+})
+
+describe('applyTechStackChange (stack doc)', () => {
+  /** A real video-editor project: its own starter, marker and STACK.md. */
+  function videoProject(): string {
+    const dir = mkdtempSync(join(tmpdir(), 'shogo-stack-doc-'))
+    dirs.push(dir)
+    writeFileSync(join(dir, '.tech-stack'), 'video-editor')
+    const seeded = applyTechStackChange({ projectDir: dir, projectId: 'p-1', stackId: 'video-editor', scope: 'root' })
+    expect(seeded.ok).toBe(true)
+    writeFileSync(join(dir, '.shogo', 'AGENTS.md'), '# video agent identity\n')
+    return dir
+  }
+
+  test('a non-destructive switch replaces .shogo/STACK.md and keeps AGENTS.md', () => {
+    const dir = videoProject()
+    expect(readFileSync(join(dir, '.shogo', 'STACK.md'), 'utf-8')).toContain('Video Editor')
+
+    const result = applyTechStackChange({ projectDir: dir, projectId: 'p-1', stackId: 'react-app', scope: 'root' })
+
+    expect(result.ok).toBe(true)
+    expect(readFileSync(join(dir, '.shogo', 'STACK.md'), 'utf-8')).toContain('# Tech Stack — React App')
+    expect(readFileSync(join(dir, '.shogo', 'AGENTS.md'), 'utf-8')).toBe('# video agent identity\n')
+    expect(readFileSync(join(dir, '.tech-stack'), 'utf-8').trim()).toBe('react-app')
+  })
+
+  test('resetFiles replaces it too — .shogo/ survives the wipe, so nothing else would', () => {
+    const dir = videoProject()
+
+    const result = applyTechStackChange({
+      projectDir: dir,
+      projectId: 'p-1',
+      stackId: 'react-app',
+      scope: 'root',
+      resetFiles: true,
+    })
+
+    expect(result.ok).toBe(true)
+    expect(result.wiped).toBeGreaterThan(0)
+    expect(existsSync(join(dir, 'src', 'videos', 'Main.tsx'))).toBe(false)
+    const doc = readFileSync(join(dir, '.shogo', 'STACK.md'), 'utf-8')
+    expect(doc).toContain('# Tech Stack — React App')
+    expect(doc).not.toContain('Video Editor')
+  })
+
+  test('re-seeding the same stack leaves a hand-edited STACK.md alone', () => {
+    const dir = videoProject()
+    writeFileSync(join(dir, '.shogo', 'STACK.md'), '# our own notes\n')
+
+    applyTechStackChange({ projectDir: dir, projectId: 'p-1', stackId: 'video-editor', scope: 'root', resetFiles: true })
+
+    expect(readFileSync(join(dir, '.shogo', 'STACK.md'), 'utf-8')).toBe('# our own notes\n')
+  })
+})
+
+describe('applyTechStackChange (kept for starter-less stacks)', () => {
+  test('react-app reports the bundled runtime-template files it left alone', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'shogo-stack-kept-'))
+    dirs.push(dir)
+    writeFileSync(join(dir, '.tech-stack'), 'video-editor')
+    applyTechStackChange({ projectDir: dir, projectId: 'p-1', stackId: 'video-editor', scope: 'root' })
+
+    const result = applyTechStackChange({ projectDir: dir, projectId: 'p-1', stackId: 'react-app', scope: 'root' })
+
+    expect(result.ok).toBe(true)
+    // react-app has no starter/ of its own — these come from the runtime-template.
+    expect(result.kept).toContain('package.json')
+    expect(result.kept).toContain('index.html')
+    expect(result.kept).toContain('src')
+    // Files the target stack does not write are not "kept".
+    expect(result.kept).not.toContain('remotion.config.ts')
+    expect(result.kept).not.toContain('README.md')
+  })
+
+  test('a stack that ships no files reports no collisions', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'shogo-stack-none-'))
+    dirs.push(dir)
+    writeFileSync(join(dir, '.tech-stack'), 'video-editor')
+    applyTechStackChange({ projectDir: dir, projectId: 'p-1', stackId: 'video-editor', scope: 'root' })
+
+    const result = applyTechStackChange({ projectDir: dir, projectId: 'p-1', stackId: 'none', scope: 'root' })
+
+    expect(result.ok).toBe(true)
+    expect(seedEntries('none')).toEqual([])
+    expect(result.kept).toEqual([])
+    // Nothing was overwritten — the project keeps its code.
+    expect(existsSync(join(dir, 'src', 'videos', 'Main.tsx'))).toBe(true)
   })
 })
 

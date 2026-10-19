@@ -36,7 +36,7 @@ import { BACKGROUND_TASK_HINT, textResult } from './gateway-tools'
 import { trackRemoteTask } from './remote-tasks'
 import { capabilityState, effectiveCapabilityValue, lockedCapabilityKeys, resolveRuntimeCapabilities } from './capability-status-prompt'
 import { isMetalRuntime } from './remote-tools'
-import { applyTechStackChange, type ApplyTechStackChangeResult } from './tech-stack-switch'
+import { applyTechStackChange, seedEntries, type ApplyTechStackChangeResult } from './tech-stack-switch'
 import { listTechStacks, loadTechStackMeta, resolveWorkspaceConfigFilePath } from './workspace-defaults'
 import { isWorkspaceAgentRuntime } from './workspace-runtime-mode'
 import { TECH_STACK_REGISTRY } from '@shogo/shared-runtime'
@@ -628,7 +628,14 @@ export function createProjectConfigureTool(ctx: ToolContext): AgentTool {
                               `Kept ${local.kept.length} file(s) that exist in both the project and the new starter: ` +
                               `${local.kept.join(', ')}. Migrate them to the new stack, or re-run with resetFiles: true to replace them.`,
                           }
-                        : {}),
+                        : seedEntries(stackResult.to).length === 0
+                          ? {
+                              note:
+                                `"${stackResult.to}" ships no files of its own, so nothing was added or overwritten — ` +
+                                `the current project files are untouched and remain the project's code. ` +
+                                `Pass resetFiles: true to delete them and start from an empty project.`,
+                            }
+                          : {}),
                       ...(local.ok ? {} : { error: local.error }),
                     }
                   : {}),
