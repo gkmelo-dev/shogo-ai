@@ -178,6 +178,11 @@ test.describe("chat dock background tasks", () => {
 
   test("a finished task clears itself from the dock a few seconds after it settles", async () => {
     const page = await context.newPage()
+    // The dock's 5 s process poll; it must stop once no row is left to update.
+    const taskPolls: number[] = []
+    page.on("request", (req) => {
+      if (/\/agent\/chat\/[^/]+\/tasks(\?|$)/.test(req.url())) taskPolls.push(Date.now())
+    })
     await openWorkspaceChat(page)
 
     // Start watching the row's DOM before it settles, so the exit is recorded.
@@ -211,11 +216,27 @@ test.describe("chat dock background tasks", () => {
 
     // Then it retires itself (DOCK_FINISHED_LINGER_MS + DOCK_FINISHED_EXIT_MS)
     // and the chip goes with it — no ten-minute row, no empty Finished chip.
-    await expect(page.getByText("completed", { exact: true })).toHaveCount(0, { timeout: 15_000 })
+    await expect(page.getByText("completed", { exact: true })).toHaveCount(0, { timeout: 8_000 })
+    const clearedAt = Date.now()
     await expect(
       runningChip(page).or(page.getByLabel("Finished", { exact: true })),
     ).toHaveCount(0, { timeout: 15_000 })
     await expect(cancelButtons(page)).toHaveCount(0, { timeout: 5_000 })
+
+    // No ten-minute row: first sight → gone stays inside linger + exit + slack.
+    expect(clearedAt - row[0].t).toBeLessThanOrEqual(8_000)
+
+    // Two full poll intervals later it has not come back, and the dock has
+    // stopped polling for it (nothing on screen needs an update any more).
+    await page.waitForTimeout(12_000)
+    await expect(page.getByText("completed", { exact: true })).toHaveCount(0)
+    await expect(
+      runningChip(page).or(page.getByLabel("Finished", { exact: true })),
+    ).toHaveCount(0)
+    expect(
+      taskPolls.filter((at) => at > clearedAt + 2_000),
+      "the dock kept polling /tasks after the last row retired",
+    ).toHaveLength(0)
 
     await page.close()
   })
