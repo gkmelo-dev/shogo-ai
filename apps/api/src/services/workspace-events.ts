@@ -179,7 +179,6 @@ export async function onWorkspaceMemberJoined(input: {
     await notifyWorkspaceJoined({
       workspaceId: input.workspaceId,
       userId: input.userId,
-      memberId: input.memberId,
       role: input.role,
       invitedBy: input.invitedBy,
     })

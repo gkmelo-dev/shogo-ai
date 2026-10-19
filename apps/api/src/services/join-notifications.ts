@@ -20,15 +20,6 @@ import { sendInviteAcceptedEmail, sendMemberJoinedEmail } from './email.service'
 
 const db = prisma as any
 
-export interface NotifyWorkspaceJoinedInput {
-  workspaceId: string
-  userId: string
-  memberId: string
-  role?: string | null
-  /** Who invited/created the link, when the caller knows. Otherwise resolved from the accepted invitation. */
-  invitedBy?: string | null
-}
-
 type JoinMail = 'invite-accepted' | 'member-joined'
 
 function frontendUrl(): string {
@@ -51,7 +42,13 @@ async function resolveInviterId(workspaceId: string, email: string | null | unde
   return invitation?.invitedBy ?? null
 }
 
-export async function notifyWorkspaceJoined(input: NotifyWorkspaceJoinedInput): Promise<void> {
+export async function notifyWorkspaceJoined(input: {
+  workspaceId: string
+  userId: string
+  role?: string | null
+  /** Who invited/created the link, when the caller knows. Otherwise resolved from the accepted invitation. */
+  invitedBy?: string | null
+}): Promise<void> {
   try {
     const [user, workspace, owners] = await Promise.all([
       db.user.findUnique({ where: { id: input.userId }, select: { name: true, email: true } }),
@@ -110,5 +107,38 @@ export async function notifyWorkspaceJoined(input: NotifyWorkspaceJoinedInput): 
     )
   } catch (error) {
     console.error('[JoinNotifications] send failed:', error instanceof Error ? error.message : error)
+  }
+}
+
+/**
+ * A project invite-link accept is a project-scoped (guest) membership: it has no
+ * `member.joined` event and no owner mail, so `notifyWorkspaceJoined` never runs
+ * for it — the creator still gets their one "accepted" mail from here.
+ */
+export async function notifyProjectLinkAccepted(input: {
+  link: { createdBy?: string | null; projectId?: string | null }
+  userId: string
+}): Promise<void> {
+  try {
+    const { createdBy, projectId } = input.link
+    if (!createdBy || !projectId) return
+
+    const [creator, acceptingUser, project] = await Promise.all([
+      db.user.findUnique({ where: { id: createdBy }, select: { email: true } }),
+      db.user.findUnique({ where: { id: input.userId }, select: { name: true, email: true } }),
+      db.project.findUnique({ where: { id: projectId }, select: { name: true } }),
+    ])
+    if (!creator?.email || !project?.name) return
+
+    await sendInviteAcceptedEmail({
+      to: creator.email,
+      inviteeName: acceptingUser?.name || acceptingUser?.email || 'A new member',
+      inviteeEmail: acceptingUser?.email || '',
+      resourceName: project.name,
+      resourceType: 'project',
+      dashboardUrl: `${frontendUrl()}/settings?tab=people`,
+    })
+  } catch (error) {
+    console.error('[JoinNotifications] project link send failed:', error instanceof Error ? error.message : error)
   }
 }

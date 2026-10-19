@@ -42,6 +42,7 @@ const { prisma } = await import('../lib/prisma')
 const { memberHooks } = await import('../generated/member.hooks')
 const { invitationHooks } = await import('../generated/invitation.hooks')
 const { inviteLinkAcceptRoutes } = await import('../routes/invite-link-accept')
+const { createInviteLinkAfterAccept } = await import('../routes/invite-link-after-accept')
 const { onWorkspaceMemberJoined } = await import('../services/workspace-events')
 
 const db = prisma as any
@@ -200,6 +201,61 @@ describe('accepting an invite link', () => {
     expect(again.status).toBe(200)
     await Bun.sleep(150)
     expect(sent).toHaveLength(0)
+  })
+})
+
+describe('accepting a project invite link', () => {
+  // The production handler from apps/api/src/routes/invite-link-after-accept.ts,
+  // not a copy: round 1's regression lived in exactly this block.
+  function buildProjectApp(inviteeId: string): Hono {
+    const app = new Hono()
+    app.route(
+      '/api',
+      inviteLinkAcceptRoutes({
+        resolveUserId: () => inviteeId,
+        afterAccept: createInviteLinkAfterAccept({ syncSeats: async () => ({}) }),
+      }),
+    )
+    return app
+  }
+
+  test('creator who owns the workspace gets one project accepted mail, no owner mail', async () => {
+    const world = await seedJoinWorld()
+    const link = await db.inviteLink.create({
+      data: { projectId: world.project.id, role: 'viewer', createdBy: world.owner.id },
+    })
+
+    const res = await buildProjectApp(world.invitee.id).request(`/api/invite-links/${link.token}/accept`, {
+      method: 'POST',
+    })
+    expect(res.status).toBe(200)
+
+    const mail = to(world.owner.email)
+    expect(mail).toHaveLength(1)
+    expect(mail[0].template).toBe('invite-accepted')
+    expect(sent.filter((m) => m.template === 'member-joined')).toHaveLength(0)
+    expect(sent.map((m) => m.to)).not.toContain(world.otherOwner.email)
+  })
+
+  test('creator who is not an owner still gets their one accepted mail', async () => {
+    const world = await seedJoinWorld()
+    const nonOwner = await db.user.create({
+      data: { name: 'admin', email: `admin-${crypto.randomUUID().slice(0, 8)}@example.com` },
+    })
+    await db.member.create({
+      data: { userId: nonOwner.id, workspaceId: world.workspace.id, role: 'admin' },
+    })
+    const link = await db.inviteLink.create({
+      data: { projectId: world.project.id, role: 'viewer', createdBy: nonOwner.id },
+    })
+
+    const res = await buildProjectApp(world.invitee.id).request(`/api/invite-links/${link.token}/accept`, {
+      method: 'POST',
+    })
+    expect(res.status).toBe(200)
+
+    expect(to(nonOwner.email).map((m) => m.template)).toEqual(['invite-accepted'])
+    expect(sent.filter((m) => m.template === 'member-joined')).toHaveLength(0)
   })
 })
 

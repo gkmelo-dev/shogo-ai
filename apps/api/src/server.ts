@@ -44,6 +44,7 @@ import { startAgentTaskWorker, stopAgentTaskWorker } from './jobs/run-agent-task
 import { startAgentScheduleWorker, stopAgentScheduleWorker } from './jobs/run-agent-schedule-dispatch'
 import { startEventDeliveryWorker, stopEventDeliveryWorker } from './jobs/run-event-delivery-dispatch'
 import { inviteLinkAcceptRoutes } from './routes/invite-link-accept'
+import { createInviteLinkAfterAccept } from './routes/invite-link-after-accept'
 import { inviteLinkRoutes } from './routes/invite-links'
 import { rbacRoutes } from './routes/rbac'
 import { appActionsRoutes } from './routes/app-actions'
@@ -8956,17 +8957,9 @@ app.route('/api', inviteLinkRoutes({
 // Accept invite link (public-ish - requires auth but not membership)
 app.route('/api', inviteLinkAcceptRoutes({
   resolveUserId: (c) => (c.get('auth') as any)?.userId ?? null,
-  afterAccept: async ({ link, userId, workspaceId: resolvedWorkspaceId, member }) => {
-    // Active-seat billing: workspace-level invite-link acceptance must bump
-    // the Stripe seat quantity (project-only memberships don't bill seats).
-    if (resolvedWorkspaceId && !member.projectId) {
-      billingService.syncSeatsFromMembership(resolvedWorkspaceId).catch((err: any) =>
-        console.error('[Billing] invite-link accept seat sync failed:', err.message ?? err),
-      )
-    }
-    // Join mail comes from onWorkspaceMemberJoined inside the route, so this
-    // handler never mails; see services/join-notifications.ts (SHO-51).
-  },
+  afterAccept: createInviteLinkAfterAccept({
+    syncSeats: (workspaceId) => billingService.syncSeatsFromMembership(workspaceId),
+  }),
 }))
 
 // Get invite link info (for accept page - minimal auth)
