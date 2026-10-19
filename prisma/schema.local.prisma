@@ -198,6 +198,7 @@ model Workspace {
   socialProfiles         SocialProfile[]
   socialAccounts         SocialAccount[]
   socialPosts            SocialPost[]
+  socialRelayedEvents    SocialRelayedEvent[]
 
   @@index([parentWorkspaceId])
   @@map("workspaces")
@@ -4024,4 +4025,29 @@ model SocialPostTarget {
   @@unique([postId, accountId])
   @@index([accountId, status])
   @@map("social_post_targets")
+}
+
+/// A verified webhook that belongs to a desktop's local scope, written down
+/// before we answer the provider. A desktop polls the cloud relay for these,
+/// applies each in its own DB and acks it; `dedupeKey` makes a provider retry
+/// collapse onto the row that already exists.
+model SocialRelayedEvent {
+  id               String    @id @default(uuid())
+  dedupeKey        String    @unique
+  workspaceId      String
+  localWorkspaceId String
+  externalId       String
+  eventType        String
+  /// JSON-encoded envelope the desktop replays through `applySocialEvent`.
+  /// Deliberately not `payload`: that name is globally JSON-coerced by the
+  /// SQLite client for `WorkspaceEvent.payload`.
+  eventJson        String
+  occurredAt       DateTime  @default(now())
+  appliedAt        DateTime?
+  createdAt        DateTime  @default(now())
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@index([workspaceId, localWorkspaceId, appliedAt])
+  @@map("social_relayed_events")
 }

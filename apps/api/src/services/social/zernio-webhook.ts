@@ -101,10 +101,19 @@ export function parseZernioEvent(rawBody: string, eventIdHeader: string | null |
   return { id, type, externalId, account: accountFromPayload(payload), detail }
 }
 
-/** The local scope of a routing id, validated: `lws_<uuid>` or `""`. */
+/**
+ * The local scope of a routing id, validated: `ws_<uuid>` is the cloud scope
+ * (`""`) and `lws_<uuid>` names a desktop scope. Anything else is not a routing
+ * id we minted, so it is refused rather than silently read as the cloud scope.
+ */
 export function scopeForExternalId(externalId: string): { ok: true; localWorkspaceId: string } | { ok: false } {
-  if (!externalId.startsWith('lws_')) return { ok: true, localWorkspaceId: '' }
-  const localWorkspaceId = externalId.slice('lws_'.length)
-  if (!isScopeId(localWorkspaceId)) return { ok: false }
-  return { ok: true, localWorkspaceId }
+  if (externalId.startsWith('lws_')) {
+    const localWorkspaceId = externalId.slice('lws_'.length)
+    return isScopeId(localWorkspaceId) ? { ok: true, localWorkspaceId } : { ok: false }
+  }
+  if (externalId.startsWith('ws_')) {
+    const workspaceId = externalId.slice('ws_'.length)
+    return isScopeId(workspaceId) ? { ok: true, localWorkspaceId: '' } : { ok: false }
+  }
+  return { ok: false }
 }

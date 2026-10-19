@@ -187,7 +187,9 @@ function createHttpSocialClient(config: SocialClientConfig): SocialClient {
       }
       if (req.body !== undefined) headers['Content-Type'] = 'application/json'
       if (req.idempotencyKey) headers['Idempotency-Key'] = req.idempotencyKey
-      if (config.mode !== 'cloud' && req.workspaceId) {
+      // Only the relay has a scope to declare; BYOK and direct cloud calls go
+      // straight to Zernio, and a local workspace id is not ours to send them.
+      if (config.mode === 'relay' && req.workspaceId) {
         const { localScopeFor } = await import('./local-scope')
         const scope = await localScopeFor(req.workspaceId)
         if (scope) headers[LOCAL_SCOPE_HEADER] = scope

@@ -272,6 +272,57 @@ describe('webhook ingress', () => {
     expect(
       await db.workspaceEvent.count({ where: { workspaceId: cloudWorkspace, dedupeKey: `zernio:${eventId}` } }),
     ).toBe(0)
+
+    // ...but the delivery is written down before the provider got its 200, so a
+    // desktop that was offline still receives it.
+    const row = await db.socialRelayedEvent.findUnique({ where: { dedupeKey: `zernio:${eventId}` } })
+    expect(row.localWorkspaceId).toBe(desktopLocalA)
+    expect(row.appliedAt).toBeNull()
+    expect(JSON.parse(row.eventJson).type).toBe('message.received')
+  })
+
+  test('a provider retry of a relayed event collapses onto the recorded delivery', async () => {
+    const eventId = `evt_${crypto.randomUUID()}`
+    const body = zernioEvent(`lws_${desktopLocalB}`, 'comment.received', { comment: { id: 'cmt_r' } })
+
+    expect((await signedHook(body, eventId)).status).toBe(200)
+    const retry = await signedHook(body, eventId)
+    expect(retry.status).toBe(200)
+
+    expect(
+      await db.socialRelayedEvent.count({ where: { dedupeKey: `zernio:${eventId}` } }),
+    ).toBe(1)
+  })
+
+  test('an account.disconnected for a local scope still flips the cloud account row', async () => {
+    const localProfile = await db.socialProfile.findUnique({
+      where: { workspaceId_localWorkspaceId: { workspaceId: cloudWorkspace, localWorkspaceId: desktopLocalA } },
+    })
+    await db.socialAccount.create({
+      data: {
+        workspaceId: cloudWorkspace,
+        profileId: localProfile.id,
+        zernioAccountId: 'acc_local_hook',
+        platform: 'tiktok',
+        username: 'local.tok',
+      },
+    })
+
+    const res = await signedHook(
+      JSON.stringify({
+        type: 'account.disconnected',
+        profiles: [{ id: 'zp', externalId: `lws_${desktopLocalA}` }],
+        account: { id: 'acc_local_hook', platform: 'tiktok', username: 'local.tok' },
+      }),
+      `evt_${crypto.randomUUID()}`,
+    )
+    expect(res.status).toBe(200)
+
+    // The relay recorded these accounts cloud-side on sync, so leaving the row
+    // healthy would keep billing an account the user removed.
+    const row = await db.socialAccount.findUnique({ where: { zernioAccountId: 'acc_local_hook' } })
+    expect(row.isActive).toBe(false)
+    expect(row.needsReconnect).toBe(true)
   })
 
   test('the desktop applies the relayed payload idempotently, in its own DB', async () => {
@@ -324,5 +375,83 @@ describe('webhook ingress', () => {
     )
     expect(res.status).toBe(400)
     expect((await res.json()).error.code).toBe('invalid_local_workspace')
+  })
+})
+
+describe('relayed delivery: poll and ack', () => {
+  let otherTenant = ''
+  let otherEventId = ''
+
+  beforeAll(async () => {
+    const other = await db.workspace.create({
+      data: { name: 'Other tenant', slug: `other-${suffix}`, kind: 'team' },
+    })
+    otherTenant = other.id
+    otherEventId = `evt_${crypto.randomUUID()}`
+    await db.socialRelayedEvent.create({
+      data: {
+        dedupeKey: `zernio:${otherEventId}`,
+        workspaceId: otherTenant,
+        localWorkspaceId: crypto.randomUUID(),
+        externalId: 'lws_other',
+        eventType: 'comment.received',
+        eventJson: JSON.stringify({ type: 'comment.received' }),
+      },
+    })
+  })
+
+  test('a desktop polls only its own workspace’s undelivered events', async () => {
+    const res = await relay('/events', cloudWorkspace, null)
+    expect(res.status).toBe(200)
+    const { events } = await res.json()
+    expect(events.length).toBeGreaterThan(0)
+    expect(events.every((event: any) => event.workspaceId === cloudWorkspace)).toBe(true)
+    expect(events.map((event: any) => event.id)).not.toContain(
+      (await db.socialRelayedEvent.findUnique({ where: { dedupeKey: `zernio:${otherEventId}` } })).id,
+    )
+    expect(events[0]).toMatchObject({ externalId: expect.any(String), eventId: expect.any(String) })
+  })
+
+  test('another tenant’s ids cannot be acked, and its events stay undelivered', async () => {
+    const foreign = await db.socialRelayedEvent.findUnique({
+      where: { dedupeKey: `zernio:${otherEventId}` },
+    })
+    const res = await relay('/events/ack', cloudWorkspace, null, {
+      method: 'POST',
+      body: JSON.stringify({ ids: [foreign.id] }),
+    })
+    expect(res.status).toBe(200)
+    expect((await res.json()).acked).toBe(0)
+    expect(
+      (await db.socialRelayedEvent.findUnique({ where: { id: foreign.id } })).appliedAt,
+    ).toBeNull()
+  })
+
+  test('an ack marks the delivery applied, so it is not polled again', async () => {
+    const pending = await (await relay('/events', cloudWorkspace, null)).json()
+    const first = pending.events[0]
+
+    const ack = await relay('/events/ack', cloudWorkspace, null, {
+      method: 'POST',
+      body: JSON.stringify({ ids: [first.id] }),
+    })
+    expect((await ack.json()).acked).toBe(1)
+
+    const after = await (await relay('/events', cloudWorkspace, null)).json()
+    expect(after.events.map((event: any) => event.id)).not.toContain(first.id)
+    expect(
+      (await db.socialRelayedEvent.findUnique({ where: { id: first.id } })).appliedAt,
+    ).not.toBeNull()
+  })
+
+  test('an event for a profile we do not own is never queued', async () => {
+    const before = await db.socialRelayedEvent.count()
+    const res = await signedHook(
+      zernioEvent(`ws_${crypto.randomUUID()}`, 'comment.received'),
+      `evt_${crypto.randomUUID()}`,
+    )
+    expect(res.status).toBe(200)
+    expect((await res.json()).ignored).toBe('unknown_profile')
+    expect(await db.socialRelayedEvent.count()).toBe(before)
   })
 })

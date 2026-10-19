@@ -18,6 +18,11 @@ import { prisma } from '../lib/prisma'
 import { getFrontendUrl } from '../lib/cloud-urls'
 import { getWorkspaceRole } from '../services/conversation.service'
 import { relayOperation } from '../services/social/relay.service'
+import {
+  ackRelayedEvents,
+  listRelayedEvents,
+  pruneRelayedEvents,
+} from '../services/social/relay-events.service'
 import { LOCAL_SCOPE_HEADER } from '../services/social/client'
 import { isScopeId, localScopeFor } from '../services/social/local-scope'
 import {
@@ -415,36 +420,79 @@ export function socialRelayRoutes(): Hono {
   const router = new Hono()
 
   /**
-   * The caller is a desktop forwarding with its Shogo key: `authMiddleware`
-   * has already resolved the linked cloud workspace, and that workspace — not
-   * anything in the request — decides which profile the operation may touch.
-   *
-   * `X-Shogo-Local-Workspace` narrows it to one local workspace of that tenant
-   * (each owns its own Zernio profile). A value that is not a workspace id is a
-   * caller bug and refused before any provider call.
+   * Who is calling, and for which local scope. `authMiddleware` resolved the
+   * cloud workspace from the Shogo key, so nothing in the request can widen it;
+   * `X-Shogo-Local-Workspace` only narrows it to one local workspace of that
+   * tenant. A value that is not a workspace id is a caller bug, refused before
+   * any provider call — or any row is read.
    */
-  router.all('/social-relay/*', async (c) => {
+  function relayCaller(c: any):
+    | { workspaceId: string; localWorkspaceId: string }
+    | { response: Response } {
     const auth = (c.get('auth') ?? {}) as any
     const workspaceId = typeof auth.workspaceId === 'string' ? auth.workspaceId : ''
     if (!workspaceId) {
-      return c.json(
-        { error: { code: 'unauthorized', message: 'The relay needs a workspace-scoped Shogo key' } },
-        401,
-      )
+      return {
+        response: c.json(
+          { error: { code: 'unauthorized', message: 'The relay needs a workspace-scoped Shogo key' } },
+          401,
+        ),
+      }
     }
 
     const localWorkspaceId = (c.req.header(LOCAL_SCOPE_HEADER) ?? '').trim()
     if (localWorkspaceId && !isScopeId(localWorkspaceId)) {
-      return c.json(
-        {
-          error: {
-            code: 'invalid_local_workspace',
-            message: `${LOCAL_SCOPE_HEADER} must be a local workspace id`,
+      return {
+        response: c.json(
+          {
+            error: {
+              code: 'invalid_local_workspace',
+              message: `${LOCAL_SCOPE_HEADER} must be a local workspace id`,
+            },
           },
-        },
-        400,
-      )
+          400,
+        ),
+      }
     }
+
+    return { workspaceId, localWorkspaceId }
+  }
+
+  /**
+   * Deliveries waiting for this desktop: relayed Zernio events for the local
+   * scopes of the caller's workspace, which the desktop applies in its own DB
+   * and then acks. Without the header, every local scope of the tenant is
+   * returned (one poll covers the whole machine); with it, just that one.
+   *
+   * Registered before the catch-all: these are ours, not Zernio paths.
+   */
+  router.get('/social-relay/events', async (c) => {
+    const caller = relayCaller(c)
+    if ('response' in caller) return caller.response
+    const limitRaw = Number(c.req.query('limit'))
+    const events = await listRelayedEvents({
+      workspaceId: caller.workspaceId,
+      localWorkspaceId: caller.localWorkspaceId || undefined,
+      limit: Number.isFinite(limitRaw) && limitRaw > 0 ? limitRaw : undefined,
+    })
+    return c.json({ events })
+  })
+
+  /** Ack deliveries the desktop has applied. Ids from another tenant change nothing. */
+  router.post('/social-relay/events/ack', async (c) => {
+    const caller = relayCaller(c)
+    if ('response' in caller) return caller.response
+    const body = await readJson(c)
+    const ids = Array.isArray(body.ids) ? body.ids.filter((id: unknown) => typeof id === 'string') : []
+    const acked = await ackRelayedEvents({ workspaceId: caller.workspaceId, ids })
+    if (acked > 0) await pruneRelayedEvents(caller.workspaceId).catch(() => {})
+    return c.json({ ok: true, acked })
+  })
+
+  router.all('/social-relay/*', async (c) => {
+    const caller = relayCaller(c)
+    if ('response' in caller) return caller.response
+    const { workspaceId, localWorkspaceId } = caller
 
     const prefix = '/api/social-relay'
     const rawPath = c.req.path.startsWith(prefix) ? c.req.path.slice(prefix.length) : ''

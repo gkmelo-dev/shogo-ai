@@ -300,6 +300,12 @@ const ACCEPTED_UNIQUE_KEYS: UniqueKeyRule[] = [
       'workspace-events.ts deduplicates one emitted event key per workspace before creating the append-only event row and its deliveries.',
   },
   {
+    key: 'SocialRelayedEvent.dedupeKey',
+    category: 'external_global_id',
+    reason:
+      '`zernio:<provider event id>` is assigned by Zernio and is the same string on every region; the webhook ingress writes it once and a provider retry re-reads that row instead of inserting.',
+  },
+  {
     key: 'EventSubscription.composioTriggerId',
     category: 'external_global_id',
     reason:

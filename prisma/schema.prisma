@@ -249,6 +249,7 @@ model Workspace {
   socialProfiles         SocialProfile[]
   socialAccounts         SocialAccount[]
   socialPosts            SocialPost[]
+  socialRelayedEvents    SocialRelayedEvent[]
 
   @@index([createdAt])
   @@index([homeRegion])
@@ -5099,4 +5100,37 @@ model SocialPostTarget {
   @@unique([postId, accountId])
   @@index([accountId, status])
   @@map("social_post_targets")
+}
+
+/// A verified webhook that belongs to a desktop's local scope, written down
+/// before we answer the provider.
+///
+/// Zernio retries only the deliveries it saw fail, so an event we already
+/// acknowledged into an in-memory log is gone for good if the desktop was
+/// offline, or if the poll lands on another replica. The row is the delivery:
+/// the desktop polls its scopes, applies each one in its own DB and acks it
+/// (`appliedAt`), and a provider retry collapses onto the same `dedupeKey`.
+model SocialRelayedEvent {
+  id               String    @id @default(uuid())
+  /// `zernio:<provider event id>` — one row per delivery.
+  dedupeKey        String    @unique
+  workspaceId      String
+  /// The desktop scope the event belongs to; never `""`.
+  localWorkspaceId String
+  externalId       String
+  /// The provider's event name (`comment.received`, …).
+  eventType        String
+  /// JSON-encoded envelope the desktop replays through `applySocialEvent`.
+  /// Deliberately not `payload`: that name is globally JSON-coerced by the
+  /// SQLite client for `WorkspaceEvent.payload`.
+  eventJson        String
+  occurredAt       DateTime  @default(now())
+  /// Set when the desktop has applied it; null means still to deliver.
+  appliedAt        DateTime?
+  createdAt        DateTime  @default(now())
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@index([workspaceId, localWorkspaceId, appliedAt])
+  @@map("social_relayed_events")
 }

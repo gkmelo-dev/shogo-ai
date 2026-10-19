@@ -18,6 +18,7 @@ import { prisma } from '../../lib/prisma'
 import { getSyncEngine } from '../../lib/sync-engine'
 import { emitWorkspaceEvent } from '../workspace-events'
 import { SocialError } from './client'
+import { enqueueRelayedEvent } from './relay-events.service'
 import { getProfileByExternalId, type SocialProfileRow } from './profiles.service'
 import {
   ZERNIO_EVENT_ID_HEADER,
@@ -60,6 +61,35 @@ export interface ApplySocialEventResult {
 }
 
 /**
+ * Keep the account rows honest for the events that carry an account. Shared by
+ * both scopes: the cloud records a desktop scope's accounts when the relay
+ * lists them, so a disconnect relayed to that desktop must still flip the
+ * cloud's copy — otherwise the meter keeps billing an account the user removed.
+ */
+async function fixAccountRow(input: {
+  workspaceId: string
+  type: string
+  account?: { zernioAccountId: string; platform: string; username: string } | null
+}): Promise<void> {
+  const isAccountEvent =
+    input.type === 'social.account.connected' || input.type === 'social.account.disconnected'
+  if (!isAccountEvent || !input.account?.zernioAccountId) return
+
+  const row = await db.socialAccount.findUnique({
+    where: { zernioAccountId: input.account.zernioAccountId },
+  })
+  if (!row || row.workspaceId !== input.workspaceId) return
+
+  await db.socialAccount.update({
+    where: { id: row.id },
+    data:
+      input.type === 'social.account.disconnected'
+        ? { isActive: false, tokenHealthy: false, needsReconnect: true, lastHealthAt: new Date() }
+        : { isActive: true, tokenHealthy: true, needsReconnect: false, lastHealthAt: new Date() },
+  })
+}
+
+/**
  * Apply one already-resolved event: keep the account rows honest, then emit the
  * `social.*` event. Idempotent on the provider's event id — the outbox dedupe
  * key is `zernio:<id>`, so a webhook Zernio retries (it retries 7×) and a
@@ -69,21 +99,7 @@ export async function applySocialEvent(input: ApplySocialEventInput): Promise<Ap
   const type = socialEventTypeFor(input.type)
   if (!type) return { status: 200, body: { ok: true, ignored: `unmapped:${input.type}` } }
 
-  const isAccountEvent = type === 'social.account.connected' || type === 'social.account.disconnected'
-  if (isAccountEvent && input.account?.zernioAccountId) {
-    const row = await db.socialAccount.findUnique({
-      where: { zernioAccountId: input.account.zernioAccountId },
-    })
-    if (row && row.workspaceId === input.workspaceId) {
-      await db.socialAccount.update({
-        where: { id: row.id },
-        data:
-          type === 'social.account.disconnected'
-            ? { isActive: false, tokenHealthy: false, needsReconnect: true, lastHealthAt: new Date() }
-            : { isActive: true, tokenHealthy: true, needsReconnect: false, lastHealthAt: new Date() },
-      })
-    }
-  }
+  await fixAccountRow({ workspaceId: input.workspaceId, type, account: input.account })
 
   const payload: Record<string, unknown> = { externalId: input.externalId }
   if (input.account) payload.account = input.account
@@ -114,29 +130,44 @@ export async function applySocialEvent(input: ApplySocialEventInput): Promise<Ap
 
 /**
  * A webhook for a desktop-sourced profile is handled on the desktop, in its own
- * DB: the cloud cannot write rows it does not own. It goes out on the sync
- * stream scoped to the cloud workspace, and the desktop's local API applies the
- * same event with the same dedupe key (`POST /api/social/events`).
+ * DB: the cloud cannot write rows it does not own. Two things happen here, in
+ * this order, and both matter:
+ *
+ * 1. The delivery is persisted (`social_relayed_event`) *before* the provider
+ *    gets its `200`. Zernio retries only what it saw fail, so an event that
+ *    only existed in memory would be lost for good.
+ * 2. A live hint goes out on the sync stream for a desktop that is already
+ *    listening; the poll is what actually guarantees delivery.
  */
-function relayToDesktop(profile: SocialProfileRow, event: ZernioEvent): void {
-  getSyncEngine().publish({
-    id: `social:${event.id}`,
-    type: 'SOCIAL_EVENT',
-    entityId: profile.id,
-    payload: {
-      externalId: event.externalId,
-      localWorkspaceId: profile.localWorkspaceId,
-      eventId: event.id,
-      type: event.type,
-      account: event.account ?? null,
-      detail: event.detail ?? null,
-      occurredAt: new Date().toISOString(),
-    },
-    timestamp: Date.now(),
-    source: 'api',
-    version: 1,
-    workspaceId: profile.workspaceId,
-  })
+async function relayToDesktop(profile: SocialProfileRow, event: ZernioEvent): Promise<void> {
+  const occurredAt = new Date().toISOString()
+  const envelope = {
+    externalId: event.externalId,
+    localWorkspaceId: profile.localWorkspaceId,
+    eventId: event.id,
+    type: event.type,
+    account: event.account ?? null,
+    detail: event.detail ?? null,
+    occurredAt,
+  }
+
+  await enqueueRelayedEvent({ workspaceId: profile.workspaceId, envelope })
+
+  try {
+    getSyncEngine().publish({
+      id: `social:${event.id}`,
+      type: 'SOCIAL_EVENT',
+      entityId: profile.id,
+      payload: envelope,
+      timestamp: Date.now(),
+      source: 'api',
+      version: 1,
+      workspaceId: profile.workspaceId,
+    })
+  } catch {
+    // The durable row is the delivery; a live hint that nobody is listening
+    // for is not a failure worth a provider retry.
+  }
 }
 
 export interface ZernioWebhookInput {
@@ -184,7 +215,15 @@ export async function handleZernioWebhook(input: ZernioWebhookInput): Promise<{ 
   }
 
   if (profile.localWorkspaceId) {
-    relayToDesktop(profile, event)
+    // The account row is the cloud's copy either way: the relay recorded it on
+    // sync, so a disconnect must not leave a healthy-looking row the meter
+    // keeps billing. Only the *event* stays out of the cloud.
+    await fixAccountRow({
+      workspaceId: profile.workspaceId,
+      type: socialEventTypeFor(event.type) ?? event.type,
+      account: event.account,
+    })
+    await relayToDesktop(profile, event)
     return { status: 200, body: { ok: true, relayed: profile.localWorkspaceId } }
   }
 
