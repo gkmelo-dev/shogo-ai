@@ -13,6 +13,8 @@ import {
   computeSystemDiff,
   summarizeDiff,
   IMPLICIT_ANCHOR,
+  mergeProfileSection,
+  renderProfileSection,
   type FileProbe,
   type LiveProject,
   type SystemLock,
@@ -865,5 +867,145 @@ triggers:
     expect(diff.boards).toEqual([])
     expect(diff.manual.join('\n')).toContain('boards: board management is off; set up #support Tickets by hand')
     expect(diff.manual.join('\n')).toContain('triggers: trigger changes are off; create New Zendesk tickets by hand')
+  })
+})
+
+// ─── schedules + setup ───────────────────────────────────────────────────
+
+const PACK_YAML = `
+version: 1
+name: Self Evolving
+anchor: evolver
+projects:
+  - key: evolver
+    name: Evolver
+    files:
+      AGENTS.md: |
+        # Evolver
+        ## Workspace profile
+        - **What this team builds**: {{answers.profile.product}}
+teamChannels:
+  - name: evolution
+    topic: "{{answers.profile.product}}"
+schedules:
+  - key: daily-evolution
+    name: Daily self review
+    project: evolver
+    channel: evolution
+    cron: "0 7 * * *"
+    timezone: America/Los_Angeles
+    prompt: 'Run the review with <@a:p:{{agent.evolver}}> and post in {{channel.evolution}}.'
+setup:
+  questions:
+    - id: product
+      header: What this team builds
+      question: What does this team build, in one sentence?
+      type: text
+      applies: profile.product
+  profile:
+    file: AGENTS.md
+    section: "## Workspace profile"
+`
+
+const pack = () => {
+  const r = parseSystemManifest(PACK_YAML)
+  if (!r.ok) throw new Error(r.errors.join('\n'))
+  return r.manifest!
+}
+
+describe('schedules + setup', () => {
+  test('round-trips schedules and setup questions', () => {
+    const m = pack()
+    expect(m.schedules).toHaveLength(1)
+    expect(m.schedules[0]).toMatchObject({ key: 'daily-evolution', cron: '0 7 * * *', channel: 'evolution', enabled: true })
+    expect(m.setup?.questions[0]).toMatchObject({ id: 'product', type: 'text', applies: 'profile.product' })
+    expect(m.setup?.profile).toEqual({ file: 'AGENTS.md', section: '## Workspace profile' })
+  })
+
+  test('a manifest without the new keys parses unchanged', () => {
+    const m = parseSystemManifest(MINIMAL_YAML).manifest!
+    expect(m.schedules).toEqual([])
+    expect(m.setup).toBeUndefined()
+    const diff = computeSystemDiff(m, [], null, { callerProjectId: 'caller-1' })
+    expect(diff.schedules).toEqual([])
+  })
+
+  test('rejects an unknown cron, duplicate keys and dangling references', () => {
+    const bad = (from: string, to: string) => parseSystemManifest(PACK_YAML.replace(from, to))
+    expect(bad('cron: "0 7 * * *"', 'cron: "every day at seven"').errors.join()).toContain('five-field cron')
+    const schedule = { key: 'daily-evolution', name: 'Daily self review', project: 'evolver', channel: 'evolution', cron: '0 7 * * *', prompt: 'go' }
+    const base = {
+      version: 1 as const,
+      name: 'p',
+      projects: [{ key: 'evolver', name: 'Evolver' }],
+      teamChannels: [{ name: 'evolution' }],
+    }
+    const dup = parseSystemManifest({ ...base, schedules: [schedule, { ...schedule, name: 'Second' }] })
+    expect(dup.errors.join()).toContain('duplicate schedule key "daily-evolution"')
+    expect(parseSystemManifest({ ...base, schedules: [{ ...schedule, project: 'ghost' }] }).errors.join()).toContain('project "ghost"')
+    expect(parseSystemManifest({ ...base, schedules: [{ ...schedule, channel: 'nope' }] }).errors.join()).toContain('channel "nope"')
+    expect(parseSystemManifest({ ...base, schedules: [{ ...schedule, timezone: 'Mars/Olympus' }] }).errors.join()).toContain('unknown timezone')
+    expect(
+      parseSystemManifest({ ...base, setup: { questions: [{ id: 'p', header: 'P', question: 'Which?', type: 'choice' }] } }).errors.join(),
+    ).toContain('needs options')
+  })
+
+  test('creates a schedule on first apply and updates only when its resolved spec changed', () => {
+    const m = pack()
+    const first = computeSystemDiff(m, [], null, { callerProjectId: 'p-evolver', schedules: [] })
+    expect(first.schedules).toHaveLength(1)
+    expect(first.schedules[0]).toMatchObject({ action: 'create', key: 'daily-evolution' })
+    expect(first.schedules[0].values?.prompt).toContain('<@a:p:p-evolver>')
+    expect(first.schedules[0].values?.prompt).toContain('#evolution')
+
+    const live = [{
+      id: 's1', name: 'Daily self review', prompt: first.schedules[0].values!.prompt,
+      cronExpression: '0 7 * * *', timezone: 'America/Los_Angeles', enabled: true, notifyConversationId: 'c-evo',
+    }]
+    const locked: SystemLock = { version: 1, name: m.name, bindings: { evolver: 'p-evolver' }, schedules: { 'daily-evolution': { id: 's1', hash: first.schedules[0].hash! } } }
+    const second = computeSystemDiff(m, [], locked, { callerProjectId: 'p-evolver', schedules: live })
+    expect(second.schedules).toEqual([])
+
+    const changed = computeSystemDiff(pack(), [], locked, { callerProjectId: 'p-evolver', schedules: [{ ...live[0], cronExpression: '0 8 * * *' }] })
+    expect(changed.schedules.map((s) => s.action)).toEqual(['update'])
+  })
+
+  test('never touches a schedule the pack did not create, and deletes only lock-owned ones', () => {
+    const m = pack()
+    const live = [
+      { id: 's-owned', name: 'Daily self review', prompt: 'x', cronExpression: '0 7 * * *', timezone: 'UTC', enabled: true, notifyConversationId: null },
+      { id: 's-user', name: 'Somebody else', prompt: 'y', cronExpression: '0 9 * * *', timezone: 'UTC', enabled: true, notifyConversationId: null },
+    ]
+    const locked: SystemLock = { version: 1, name: m.name, bindings: { evolver: 'p-evolver' }, schedules: { 'daily-evolution': { id: 's-owned', hash: 'stale' }, legacy: { id: 's-gone', hash: 'x' } } }
+    const diff = computeSystemDiff(m, [], locked, { callerProjectId: 'p-evolver', schedules: live })
+    expect(diff.schedules.map((s) => [s.key, s.action])).toEqual([['daily-evolution', 'update']])
+    // A schedule nobody locked is not adopted, changed or deleted.
+    expect(diff.schedules.some((s) => s.scheduleId === 's-user')).toBe(false)
+
+    const undeclared = computeSystemDiff({ ...m, schedules: [] }, [], { ...locked, schedules: { legacy: { id: 's-owned', hash: 'x' } } }, { callerProjectId: 'p-evolver', schedules: live })
+    expect(undeclared.schedules.map((s) => [s.key, s.action])).toEqual([['legacy', 'delete']])
+  })
+
+  test('answers fill files, topics and prompts; the profile section is replaced in place', () => {
+    const answers = { profile: { product: 'a language-learning app' } }
+    const m = computeSystemDiff(pack(), [], null, { callerProjectId: 'p-evolver', answers, schedules: [] })
+    const file = m.files.find((f) => f.path === 'AGENTS.md')
+    expect(file?.action).toBe('create')
+
+    const substituted = computeSystemDiff(pack(), [], null, { callerProjectId: 'p-evolver', answers, schedules: [] })
+    expect(substituted.schedules[0].values?.prompt).toContain('#evolution')
+
+    const body = '# Evolver\n\n## Workspace profile\n\nTODO\n\n## Rules\n\n- be kind\n'
+    const merged = mergeProfileSection(body, '## Workspace profile', '- **What this team builds**: a language-learning app')
+    expect(merged).toContain('- **What this team builds**: a language-learning app')
+    expect(merged).toContain('## Rules')
+    expect(merged).not.toContain('TODO')
+    expect(mergeProfileSection('# A\n', '## Missing', '- **x**: y')).toContain('## Missing\n\n- **x**: y')
+  })
+
+  test('renderProfileSection uses the applies path or the question default', () => {
+    const rendered = renderProfileSection(pack().setup, { profile: { product: 'widgets' } })
+    expect(rendered).toBe('- **What this team builds**: widgets')
+    expect(renderProfileSection(pack().setup, {})).toBeNull()
   })
 })

@@ -183,6 +183,58 @@ export const TriggerSpecSchema = z.object({
   enabled: z.boolean().default(true),
 }).strict()
 
+/**
+ * Five-field cron (`m h dom mon dow`). Names are allowed (`MON-FRI`), as are
+ * the usual step/range/list operators. Anything else is rejected here so a
+ * pack fails validation instead of creating a schedule that never fires; the
+ * API validates cadence and timezone for real when the schedule is created.
+ */
+const CRON_TOKEN_RE = /^[A-Za-z0-9*?/,#LW-]+$/
+export function isCronExpression(value: string): boolean {
+  const parts = value.trim().split(/\s+/)
+  if (parts.length !== 5) return false
+  if (!parts.every((p) => p.length > 0 && CRON_TOKEN_RE.test(p))) return false
+  return true
+}
+
+/** A recurring run the manifest creates, posts into a channel, and keeps in step on re-apply. */
+export const ScheduleSpecSchema = z.object({
+  key: z.string().regex(KEY_RE),
+  name: z.string().min(1).max(200),
+  /** Manifest project whose agent runs it; its tag replaces `{{agent.<key>}}` in the prompt. */
+  project: z.string().regex(KEY_RE).optional(),
+  /** Team channel the result is posted in (resolved to its conversation id at apply time). */
+  channel: z.string().transform((n) => n.replace(/^#/, '')).optional(),
+  cron: z.string().refine(isCronExpression, 'a five-field cron expression (minute hour day month weekday)'),
+  timezone: z.string().min(1).optional(),
+  prompt: z.string().min(1).max(10_000),
+  enabled: z.boolean().default(true),
+}).strict()
+
+export const SETUP_QUESTION_TYPES = ['text', 'choice', 'multi', 'confirm'] as const
+
+/** One question the install wizard asks. Rendered from data — never hardcoded per pack. */
+export const SetupQuestionSchema = z.object({
+  id: z.string().regex(KEY_RE),
+  header: z.string().min(1).max(80),
+  question: z.string().min(1).max(500),
+  type: z.enum(SETUP_QUESTION_TYPES).default('text'),
+  options: z.array(z.string().min(1).max(120)).min(1).optional(),
+  default: z.union([z.string(), z.array(z.string()), z.boolean()]).optional(),
+  /** Profile path the answer fills, e.g. `profile.product`. */
+  applies: z.string().optional(),
+  required: z.boolean().optional(),
+}).strict()
+
+export const SetupSpecSchema = z.object({
+  questions: z.array(SetupQuestionSchema).default([]),
+  /** Where answers land in the anchor's files: a `## section` body. */
+  profile: z.object({
+    file: z.string().default('AGENTS.md'),
+    section: z.string().min(1).max(120),
+  }).strict().optional(),
+}).strict()
+
 export const SystemManifestSchema = z.object({
   version: z.literal(1),
   name: z.string().min(1).max(120),
@@ -203,6 +255,14 @@ export const SystemManifestSchema = z.object({
   teamChannels: z.array(TeamChannelSpecSchema).default([]),
   /** Event triggers, including ones that turn events into board cards. */
   triggers: z.array(TriggerSpecSchema).default([]),
+  /** Recurring runs; tracked in the lock so re-apply updates instead of duplicating. */
+  schedules: z.array(ScheduleSpecSchema).default([]),
+  /**
+   * Install-time questions and where their answers land. A `shogo-system.yaml`
+   * written by an agent leaves this out; a marketplace pack uses it to ask
+   * 2–4 questions before anything is created.
+   */
+  setup: SetupSpecSchema.optional(),
 })
 
 export type SystemManifest = z.infer<typeof SystemManifestSchema>
@@ -214,6 +274,9 @@ export type AgentContextMode = z.infer<typeof AgentContextModeSchema>
 export type BoardSpec = z.infer<typeof BoardSpecSchema>
 export type BoardColumnSpec = z.infer<typeof BoardColumnSpecSchema>
 export type TriggerSpec = z.infer<typeof TriggerSpecSchema>
+export type ScheduleSpec = z.infer<typeof ScheduleSpecSchema>
+export type SetupSpec = z.infer<typeof SetupSpecSchema>
+export type SetupQuestion = z.infer<typeof SetupQuestionSchema>
 
 export interface ManifestParseResult {
   ok: boolean
@@ -360,6 +423,36 @@ export function parseSystemManifest(source: string | unknown): ManifestParseResu
   if (manifest.anchor && !keys.has(manifest.anchor)) {
     errors.push(`anchor "${manifest.anchor}" is not a project key`)
   }
+  const scheduleKeys = new Set<string>()
+  for (const s of manifest.schedules) {
+    const where = `schedules.${s.key}`
+    if (scheduleKeys.has(s.key)) errors.push(`duplicate schedule key "${s.key}"`)
+    scheduleKeys.add(s.key)
+    if (s.project && !keys.has(s.project)) errors.push(`${where}: project "${s.project}" is not a project key in this manifest`)
+    if (s.channel && !channelNames.has(s.channel)) errors.push(`${where}: channel "${s.channel}" is not a teamChannel in this manifest`)
+    if (s.timezone) {
+      try {
+        new Intl.DateTimeFormat('en-US', { timeZone: s.timezone }).format()
+      } catch {
+        errors.push(`${where}: unknown timezone "${s.timezone}"`)
+      }
+    }
+  }
+  const questionIds = new Set<string>()
+  for (const q of manifest.setup?.questions ?? []) {
+    const where = `setup.questions.${q.id}`
+    if (questionIds.has(q.id)) errors.push(`duplicate setup question id "${q.id}"`)
+    questionIds.add(q.id)
+    if ((q.type === 'choice' || q.type === 'multi') && !q.options?.length) {
+      errors.push(`${where}: a ${q.type} question needs options`)
+    }
+    if (q.applies !== undefined && !q.applies.startsWith('profile.')) {
+      errors.push(`${where}: applies must be a "profile.<key>" path`)
+    }
+  }
+  if (manifest.setup?.profile && !isSafeRelativePath(manifest.setup.profile.file)) {
+    errors.push(`setup.profile.file: unsafe file path "${manifest.setup.profile.file}"`)
+  }
   return errors.length > 0 ? { ok: false, errors } : { ok: true, manifest, errors: [] }
 }
 
@@ -386,6 +479,8 @@ export interface SystemLock {
   bindings: Record<string, string>
   /** Trigger key → live trigger id and the hash of the spec it was last applied from. */
   triggers?: Record<string, { id: string; hash: string }>
+  /** Schedule key → live schedule id and the hash of the values it was last applied from. */
+  schedules?: Record<string, { id: string; hash: string }>
 }
 
 export interface CreateOp { kind: 'create'; key: string; spec: ProjectSpec }
@@ -442,6 +537,7 @@ export interface FileOp {
 
 /** Live team chat channel, as returned by the agent-channels `team-channels` route. */
 export interface LiveTeamChannel {
+  id?: string
   name: string
   topic: string | null
   private: boolean
@@ -554,6 +650,38 @@ export interface TriggerOp {
   hash: string | null
 }
 
+/** Live schedule, as the internal schedules route returns it. */
+export interface LiveSchedule {
+  id: string
+  name: string
+  prompt: string
+  cronExpression: string
+  timezone: string
+  enabled: boolean
+  notifyConversationId: string | null
+}
+
+/** What a schedule is created (or updated) with, after template substitution. */
+export interface ScheduleValues {
+  name: string
+  prompt: string
+  cronExpression: string
+  timezone: string
+  enabled: boolean
+  /** Team channel name to post into; resolved to a conversation id at apply time. */
+  channel: string | null
+}
+
+export interface ScheduleOp {
+  kind: 'schedule'
+  key: string
+  action: 'create' | 'update' | 'delete'
+  scheduleId: string | null
+  spec: ScheduleSpec | null
+  hash: string | null
+  values: ScheduleValues | null
+}
+
 export interface SystemDiff {
   adopt: AdoptOp[]
   inaccessible: InaccessibleOp[]
@@ -565,6 +693,7 @@ export interface SystemDiff {
   teamChannels: TeamChannelOp[]
   boards: BoardOp[]
   triggers: TriggerOp[]
+  schedules: ScheduleOp[]
   /** Things `system_apply` cannot do without credentials — surfaced for the user. */
   manual: string[]
   /**
@@ -608,6 +737,11 @@ export interface DiffOptions {
   /** Current triggers; when omitted, declared triggers are reported as manual steps. */
   triggers?: LiveTrigger[]
   triggersUnavailable?: string
+  /** Current schedules; when omitted, declared schedules are reported as manual steps. */
+  schedules?: LiveSchedule[]
+  schedulesUnavailable?: string
+  /** Answers from an install wizard, substituted into files and prompts as `{{answers.*}}`. */
+  answers?: Record<string, unknown>
 }
 
 /**
@@ -709,11 +843,12 @@ function agentPatch(spec: ProjectSpec, live: LiveProject | null): ConfigureOp['p
  * and are resolved after creation.
  */
 export function computeSystemDiff(
-  manifest: SystemManifest,
+  sourceManifest: SystemManifest,
   live: LiveProject[],
   lock: SystemLock | null,
   opts: DiffOptions,
 ): SystemDiff {
+  const manifest = applyAnswersToManifest(sourceManifest, opts.answers)
   const { bindings, adopt, inaccessible } = resolveBindings(manifest, live, lock, opts.callerProjectId, opts.knownProjectIds)
   const liveById = new Map(live.map((p) => [p.id, p]))
   const blocked = new Set(inaccessible.map((op) => op.key))
@@ -851,6 +986,17 @@ export function computeSystemDiff(
     manual.push(`triggers: ${opts.triggersUnavailable ?? 'triggers are not reachable from this runtime'}; create ${manifest.triggers.map((t) => t.name).join(', ')} by hand`)
   }
 
+  const schedules = opts.schedules
+    ? diffSchedules(manifest, opts.schedules, lock, {
+        bindings,
+        answers: opts.answers,
+        channelIds: Object.fromEntries((opts.teamChannels?.channels ?? []).filter((c) => c.id).map((c) => [c.name, c.id!])),
+      })
+    : []
+  if (!opts.schedules && manifest.schedules.length) {
+    manual.push(`schedules: ${opts.schedulesUnavailable ?? 'schedules are not reachable from this runtime'}; create ${manifest.schedules.map((s) => s.name).join(', ')} by hand`)
+  }
+
   for (const f of files) {
     if (f.action === 'skip') warnings.push(fileSkipWarning(f.key, f.path))
   }
@@ -859,13 +1005,14 @@ export function computeSystemDiff(
     teamChannels.length === 0 &&
     boards.length === 0 &&
     triggers.length === 0 &&
+    schedules.length === 0 &&
     create.length === 0 &&
     configure.length === 0 &&
     attach.length === 0 &&
     detach.length === 0 &&
     files.every((f) => f.action === 'unchanged')
 
-  return { adopt, inaccessible, create, configure, attach, detach, files, teamChannels, boards, triggers, manual, warnings, empty }
+  return { adopt, inaccessible, create, configure, attach, detach, files, teamChannels, boards, triggers, schedules, manual, warnings, empty }
 }
 
 /**
@@ -1074,6 +1221,192 @@ export function diffTriggers(manifest: SystemManifest, live: LiveTrigger[], lock
   return ops
 }
 
+/**
+ * `{{answers.<path>}}` substitution. Answers are a plain record; a dotted path
+ * reads into it (`profile.product`). A bare key also resolves when the path is
+ * `profile.<key>` — install wizards collect answers by question id and the
+ * `applies` path says where they land.
+ */
+export function answerLookup(answers: Record<string, unknown> | undefined, path: string): string | null {
+  if (!answers) return null
+  const read = (p: string): unknown => p.split('.').reduce<unknown>((acc, key) => (acc && typeof acc === 'object' ? (acc as Record<string, unknown>)[key] : undefined), answers)
+  let value = read(path)
+  if (value === undefined && path.startsWith('profile.')) value = read(path.slice('profile.'.length))
+  if (value === undefined) return null
+  if (Array.isArray(value)) return value.map((v) => String(v)).join(', ')
+  if (value === true) return 'yes'
+  if (value === false) return 'no'
+  return value == null ? null : String(value)
+}
+
+/** Replace `{{answers.*}}`; an unanswered path is left visible so the gap is obvious. */
+export function substituteAnswers(text: string, answers?: Record<string, unknown>): string {
+  if (!answers) return text
+  return text.replace(/\{\{\s*answers\.([a-zA-Z0-9_.-]+)\s*\}\}/g, (whole, path: string) => answerLookup(answers, path) ?? whole)
+}
+
+/** `{{agent.<key>}}` → the agent's mention, `{{channel.<name>}}` → `#name`, `{{answers.*}}` → the answer. */
+export function substituteTemplates(
+  text: string,
+  ctx: { bindings?: Record<string, string>; answers?: Record<string, unknown> },
+): string {
+  const withAnswers = substituteAnswers(text, ctx.answers)
+  return withAnswers.replace(
+    /\{\{\s*(agent|channel)\.([a-zA-Z0-9_-]+)\s*\}\}/g,
+    (whole, kind: string, key: string) => {
+      if (kind === 'agent') return ctx.bindings?.[key] ? `<@a:p:${ctx.bindings[key]}>` : whole
+      return `#${key}`
+    },
+  )
+}
+
+/**
+ * The same manifest with `{{answers.*}}` filled into files, topics,
+ * descriptions and prompts. Everything else is untouched, so keys and
+ * bindings still line up.
+ */
+export function applyAnswersToManifest(manifest: SystemManifest, answers?: Record<string, unknown>): SystemManifest {
+  if (!answers || Object.keys(answers).length === 0) return manifest
+  const sub = (s: string | undefined) => (s === undefined ? undefined : substituteAnswers(s, answers))
+  const projects = manifest.projects.map((p) => ({
+    ...p,
+    description: sub(p.description),
+    files: Object.fromEntries(Object.entries(p.files).map(([path, body]) => [path, substituteAnswers(body, answers)])),
+  }))
+  const teamChannels = manifest.teamChannels.map((c) => ({
+    ...c,
+    topic: sub(c.topic),
+    boards: c.boards.map((b) => ({ ...b, description: sub(b.description) })),
+  }))
+  const triggers = manifest.triggers.map((t) => ({ ...t, prompt: sub(t.prompt) }))
+  const schedules = manifest.schedules.map((s) => ({ ...s, prompt: substituteAnswers(s.prompt, answers) }))
+  return { ...manifest, projects, teamChannels, triggers, schedules }
+}
+
+/**
+ * Render the `setup.profile` section body from answers. Used by the install
+ * wizard to fill the anchor's `## Workspace profile`; the apply engine writes
+ * it, so both the runtime and the marketplace path produce the same text.
+ */
+export function renderProfileSection(setup: SetupSpec | undefined, answers: Record<string, unknown> = {}): string | null {
+  const profile = setup?.profile
+  if (!profile) return null
+  const lines: string[] = []
+  for (const q of setup.questions) {
+    const raw = q.applies?.startsWith('profile.') ? q.applies.slice('profile.'.length) : q.id
+    const value = answerLookup(answers, q.applies ?? `profile.${q.id}`) ?? answerLookup(answers, raw) ?? (q.default !== undefined ? answerLookup({ v: q.default }, 'v') : null)
+    if (!value) continue
+    lines.push(`- **${q.header}**: ${value}`)
+  }
+  return lines.length ? lines.join('\n') : null
+}
+
+/**
+ * Write the profile answers into a file body: the `## <section>` heading is
+ * replaced (or appended when absent), leaving every other section alone.
+ */
+export function mergeProfileSection(body: string, section: string, rendered: string): string {
+  const heading = section.trim().startsWith('#') ? section.trim() : `## ${section.trim()}`
+  const lines = body.split('\n')
+  const start = lines.findIndex((l) => l.trim() === heading)
+  if (start === -1) {
+    const sep = body.endsWith('\n') ? '' : '\n'
+    return `${body}${sep}\n${heading}\n\n${rendered}\n`
+  }
+  let end = lines.length
+  for (let i = start + 1; i < lines.length; i++) {
+    if (/^##\s/.test(lines[i])) { end = i; break }
+  }
+  const before = lines.slice(0, start + 1)
+  const after = lines.slice(end)
+  return [...before, '', rendered, '', ...after].join('\n').replace(/\n{3,}/g, '\n\n')
+}
+
+/** Manifest `schedules` render into the same shape the schedules API takes. */
+export function resolveScheduleValues(
+  spec: ScheduleSpec,
+  ctx: { bindings?: Record<string, string>; answers?: Record<string, unknown> },
+): ScheduleValues {
+  return {
+    name: spec.name,
+    prompt: substituteTemplates(spec.prompt, ctx),
+    cronExpression: spec.cron.trim(),
+    timezone: spec.timezone ?? 'UTC',
+    enabled: spec.enabled,
+    channel: spec.channel ?? null,
+  }
+}
+
+/**
+ * Hash of the *declared* schedule — templates left intact, answers filled.
+ * Deliberately independent of live ids, so creating a project or channel in
+ * the same apply does not make the next apply look like a change.
+ */
+function scheduleHash(spec: ScheduleSpec, answers?: Record<string, unknown>): string {
+  return createHash('sha256')
+    .update(JSON.stringify(stable({
+      name: spec.name,
+      prompt: substituteAnswers(spec.prompt, answers),
+      cron: spec.cron.trim(),
+      timezone: spec.timezone ?? 'UTC',
+      enabled: spec.enabled,
+      channel: spec.channel ?? null,
+    })))
+    .digest('hex')
+    .slice(0, 16)
+}
+
+/**
+ * Schedule ops, keyed strictly by lock ownership: a schedule the pack did not
+ * create is never adopted, updated or removed. A declared key that is gone
+ * from the workspace is re-created; a key the lock records but the manifest no
+ * longer declares is deleted.
+ */
+export function diffSchedules(
+  manifest: SystemManifest,
+  live: LiveSchedule[],
+  lock: SystemLock | null,
+  ctx: { bindings?: Record<string, string>; answers?: Record<string, unknown>; channelIds?: Record<string, string> } = {},
+): ScheduleOp[] {
+  const ops: ScheduleOp[] = []
+  const byId = new Map(live.map((s) => [s.id, s]))
+  const locked = lock?.schedules ?? {}
+  for (const spec of manifest.schedules) {
+    const values = resolveScheduleValues(spec, ctx)
+    const hash = scheduleHash(spec, ctx.answers)
+    const entry = locked[spec.key]
+    const current = entry ? byId.get(entry.id) ?? null : null
+    if (!current) {
+      ops.push({ kind: 'schedule', key: spec.key, action: 'create', scheduleId: null, spec, hash, values })
+      continue
+    }
+    if (entry!.hash === hash && !scheduleDrifted(current, values, ctx.channelIds?.[values.channel ?? ''])) continue
+    ops.push({ kind: 'schedule', key: spec.key, action: 'update', scheduleId: current.id, spec, hash, values })
+  }
+  const declared = new Set(manifest.schedules.map((s) => s.key))
+  for (const [key, entry] of Object.entries(locked)) {
+    if (declared.has(key) || !byId.has(entry.id)) continue
+    ops.push({ kind: 'schedule', key, action: 'delete', scheduleId: entry.id, spec: null, hash: null, values: null })
+  }
+  return ops
+}
+
+/**
+ * A schedule edited outside the manifest (or created before a channel moved)
+ * is repaired on the next apply. Fields whose template could not be resolved
+ * yet — a project created earlier in this same apply, a channel not reached —
+ * are not compared, so a dry run never reports a spurious update.
+ */
+function scheduleDrifted(current: LiveSchedule, values: ScheduleValues, channelId: string | undefined): boolean {
+  if (current.name !== values.name) return true
+  if (current.cronExpression !== values.cronExpression) return true
+  if (current.timezone !== values.timezone) return true
+  if (current.enabled !== values.enabled) return true
+  if (!values.prompt.includes('{{') && current.prompt !== values.prompt) return true
+  if (values.channel && channelId && (current.notifyConversationId ?? null) !== channelId) return true
+  return false
+}
+
 function keywordsOf(member: { keywords?: string[] }): string | null {
   return member.keywords?.length ? member.keywords.map((k) => k.trim()).filter(Boolean).join(', ') : null
 }
@@ -1190,5 +1523,10 @@ export function summarizeDiff(diff: SystemDiff): string[] {
     lines.push(`${b.action} board #${b.channel} ${b.name}${b.changes.length ? `: ${b.changes.join(', ')}` : ''}`)
   }
   for (const t of diff.triggers ?? []) lines.push(`${t.action} trigger ${t.key}${t.spec ? ` "${t.spec.name}"` : ''}`)
+  for (const s of diff.schedules ?? []) {
+    lines.push(s.action === 'delete'
+      ? `delete schedule ${s.key}`
+      : `${s.action} schedule ${s.key} "${s.values?.name ?? ''}"${s.values ? ` (${s.values.cronExpression} ${s.values.timezone}${s.values.channel ? ` → #${s.values.channel}` : ''}${s.values.enabled ? '' : ', disabled'})` : ''}`)
+  }
   return lines
 }
