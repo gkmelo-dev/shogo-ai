@@ -592,3 +592,111 @@ describe('relayed delivery: the desktop consumer, end to end', () => {
     ).toBe(1)
   })
 })
+
+/**
+ * QA acceptance (SHO-71 AC3/AC7, P4): a DM for a local scope has to reach the
+ * desktop's *inbox*, not just its event outbox — and exactly once, because the
+ * unread badge is a counter incremented on insert. The dev's inbox tests cover
+ * the cloud's own scope and the consumer's happy path separately; this runs the
+ * whole chain for one local thread.
+ */
+describe('relayed delivery: a local-scope DM lands in the desktop inbox once', () => {
+  const sinkAccountId = `acc_qa_inbox_${suffix}`
+  const providerConversationId = `conv_qa_${suffix}`
+  const providerMessageId = `msg_qa_${suffix}`
+  const eventId = `evt_qa_inbox_${suffix}`
+
+  const relayFetch = (async (url: string, init: any = {}) => {
+    const parsed = new URL(String(url))
+    return app.request(`${parsed.pathname}${parsed.search}`, {
+      method: init.method ?? 'GET',
+      body: init.body,
+      headers: { ...(init.headers ?? {}), 'x-workspace': cloudWorkspace },
+    })
+  }) as unknown as typeof fetch
+
+  const drain = () =>
+    drainRelayedEvents({
+      fetchImpl: relayFetch,
+      resolveConfig: () => ({ mode: 'relay' as const, baseUrl: 'http://relay.test/api/social-relay', apiKey: 'shogo_sk_qa' }),
+      localScopes: async () => [desktopLocalA],
+    })
+
+  beforeAll(async () => {
+    await db.socialAccount.create({
+      data: {
+        workspaceId: desktopLocalA,
+        profileId: (
+          await db.socialProfile.findUnique({
+            where: { workspaceId_localWorkspaceId: { workspaceId: cloudWorkspace, localWorkspaceId: desktopLocalA } },
+          })
+        ).id,
+        zernioAccountId: sinkAccountId,
+        platform: 'instagram',
+        username: 'inbox.ig',
+      },
+    })
+    // Earlier cases queue deliveries for this scope; close them out so the
+    // counters below mean what they say.
+    await db.socialRelayedEvent.updateMany({
+      where: { localWorkspaceId: desktopLocalA, appliedAt: null },
+      data: { appliedAt: new Date() },
+    })
+
+    const res = await signedHook(
+      JSON.stringify({
+        type: 'message.received',
+        profiles: [{ id: 'zp', externalId: `lws_${desktopLocalA}` }],
+        account: { id: sinkAccountId, platform: 'instagram', username: 'inbox.ig' },
+        conversation: { id: providerConversationId, platform: 'instagram', status: 'active' },
+        message: {
+          id: providerMessageId,
+          conversationId: providerConversationId,
+          platform: 'instagram',
+          direction: 'incoming',
+          text: 'Do you ship to Portugal?',
+          sender: { id: 'psid_qa', name: 'Nadia' },
+          createdAt: '2026-10-19T23:00:00.000Z',
+        },
+      }),
+      eventId,
+    )
+    expect(res.status).toBe(200)
+    expect(await drain()).toMatchObject({ fetched: 1, applied: 1, acked: 1 })
+  })
+
+  test('the thread and its message are in the desktop\'s own inbox, with one unread', async () => {
+    const conversation = await db.socialConversation.findUnique({
+      where: { zernioConversationId: providerConversationId },
+    })
+    expect(conversation?.workspaceId).toBe(desktopLocalA)
+    expect(conversation?.unreadCount).toBe(1)
+    expect(conversation?.participantName).toBe('Nadia')
+
+    const messages = await db.socialMessage.findMany({ where: { conversationId: conversation.id } })
+    expect(messages).toHaveLength(1)
+    expect(messages[0]).toMatchObject({ direction: 'incoming', text: 'Do you ship to Portugal?' })
+    // ...and the account it arrived on is the one we can answer from.
+    expect(conversation?.accountId).toBeString()
+  })
+
+  test('the cloud inbox stays empty — a local thread is not the cloud\'s business', async () => {
+    expect(
+      await db.socialConversation.count({ where: { workspaceId: cloudWorkspace, zernioConversationId: providerConversationId } }),
+    ).toBe(0)
+    expect(
+      await db.socialMessage.count({ where: { workspaceId: cloudWorkspace, zernioMessageId: providerMessageId } }),
+    ).toBe(0)
+  })
+
+  test('redelivery (a lost ack) does not double the message or the badge', async () => {
+    await db.socialRelayedEvent.updateMany({ where: { dedupeKey: `zernio:${eventId}` }, data: { appliedAt: null } })
+    expect((await drain()).applied).toBe(1)
+
+    const conversation = await db.socialConversation.findUnique({
+      where: { zernioConversationId: providerConversationId },
+    })
+    expect(await db.socialMessage.count({ where: { conversationId: conversation.id } })).toBe(1)
+    expect(conversation.unreadCount).toBe(1)
+  })
+})
