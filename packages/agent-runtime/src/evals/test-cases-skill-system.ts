@@ -70,6 +70,21 @@ function skillFileWrites(r: EvalResult): string[] {
 
 const STANDUP_SKILL = '.shogo/skills/standup-collect/SKILL.md'
 
+/**
+ * 115 no-op skills used by the prompt-budget regression case (SHO-57).
+ * Long enough that 116 listings overflow the 16k `## Available Skills` budget,
+ * so anything appended after them is at risk of being cut.
+ */
+const SKILL_BUDGET_FILLERS: Record<string, string> = Object.fromEntries(
+  Array.from({ length: 115 }, (_, i) => {
+    const name = `filler-${String(i + 1).padStart(3, '0')}`
+    return [
+      `.shogo/skills/${name}/SKILL.md`,
+      `---\nname: ${name}\ndescription: Placeholder skill ${String(i + 1).padStart(3, '0')} — exists only to fill this workspace's skill list so the prompt budget is exercised; it does nothing and should never be invoked.\n---\n\n# ${name}\n\nPlaceholder. Nothing to do here.\n`,
+    ]
+  }),
+)
+
 /** The standup skill after this turn: the workspace file, else every write to it. */
 function standupSkillAfter(r: EvalResult): string {
   return readWorkspaceFile(r, STANDUP_SKILL) ||
@@ -516,6 +531,68 @@ Facilitate daily standup updates.`,
           return !deletedFileAnyRoute(r, STANDUP_SKILL) && !deletedFileAnyRoute(r, '.shogo/skills/x')
         },
       },
+    ],
+  },
+
+  // =========================================================================
+  // Case 7: SHO-57 — a skill at the tail of a 117-skill list must be found
+  // Level 3 | Discovery has to survive a truncated `## Available Skills` block
+  // =========================================================================
+  {
+    id: 'skill-tail-of-large-list',
+    name: 'Skill System: find and invoke a skill at the end of a 117-skill list',
+    category: 'skill',
+    level: 3,
+    input:
+      "We're cutting our marketing site's DNS over to Cloudflare on Thursday and I want the exact procedure in hand. Use the DNS cutover runbook skill you have installed and walk me through the key steps.",
+    maxScore: 100,
+    workspaceFiles: {
+      ...SKILL_BUDGET_FILLERS,
+      // Seeded under the `.claude/skills/` compat path on purpose: `loadAllSkills`
+      // returns `.shogo/skills` entries first and `.claude/skills` entries last,
+      // so this is deterministically the 117th listing regardless of directory
+      // read order — i.e. exactly the tail the 16k cut used to drop silently.
+      '.claude/skills/zz-dns-cutover-runbook/SKILL.md': `---
+name: zz-dns-cutover-runbook
+version: 1.4.0
+description: Step-by-step DNS cutover runbook for moving a live domain to a new provider without downtime
+trigger: "dns cutover|cut over dns|nameserver change|move domain|dns migration"
+tools: [exec, read_file]
+---
+
+# DNS Cutover Runbook
+
+Proven procedure for moving a production domain to a new DNS provider with no
+downtime. Follow it in order; every step has a verification command.
+
+1. Snapshot the current zone: \`dig +short AXFR\`, record every record and its TTL.
+2. Lower the TTL on A/AAAA/CNAME/MX to 300 and wait at least one old TTL window.
+3. Recreate every record at the new provider, including TXT records for mail.
+4. Verify both providers answer identically: \`dig @old NS\` vs \`dig @new NS\`.
+5. Switch the registrar's nameservers and confirm propagation with \`dig +trace\`.
+6. Keep the old zone read-only for 14 days before deleting it.
+
+Reference id for this runbook: MAGPIE-CUTOVER-7734. Quote it in the change ticket.`,
+    },
+    validationCriteria: [
+      {
+        id: 'invoked-the-tail-skill',
+        description: 'Invoked the runbook skill via skill({ action: "invoke" }) instead of guessing',
+        points: 60,
+        phase: 'execution',
+        validate: (r) => usedSkillTool(r, 'dns-cutover-runbook', ['invoke']),
+      },
+      {
+        id: 'response-has-runbook-marker',
+        description: 'Response contains the marker from the skill body (MAGPIE-CUTOVER-7734)',
+        points: 40,
+        phase: 'execution',
+        validate: (r) => responseContains(r, 'MAGPIE-CUTOVER-7734'),
+      },
+    ],
+    antiPatterns: [
+      'Agent claimed no such skill is installed because the prompt list was truncated',
+      'Agent invented a DNS procedure from general knowledge instead of invoking the installed skill',
     ],
   },
 
