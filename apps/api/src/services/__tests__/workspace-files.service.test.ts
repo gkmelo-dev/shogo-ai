@@ -182,4 +182,25 @@ describe('workspaceFileInventory / removeWorkspaceFiles', () => {
     const inventory = await workspaceFileInventory('missing', { workspacesDir, prisma: db })
     expect(inventory).toBeNull()
   })
+
+  test('a directory that cannot be removed becomes a warning, never a throw', () => {
+    // The workspace row is already gone by the time files are removed, so the
+    // only safe failure mode is a report. A path outside WORKSPACES_DIR is the
+    // deterministic stand-in for "rm failed" (chmod is unreliable under root).
+    const inventory = {
+      workspaceId: 'ws-fail',
+      workspaceName: 'Fail',
+      projects: [],
+      removedDirs: [join(root, 'user-repo')],
+      channelCount: 0,
+      boardCount: 0,
+      chatCount: 0,
+      totalBytes: 0,
+    }
+    const report = removeWorkspaceFiles(inventory, { workspacesDir })
+    expect(report.removedDirs).toEqual([])
+    expect(report.warnings).toHaveLength(1)
+    expect(report.warnings[0]).toContain('outside')
+    expect(existsSync(join(root, 'user-repo', 'index.ts'))).toBe(true)
+  })
 })

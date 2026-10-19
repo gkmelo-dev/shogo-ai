@@ -223,6 +223,19 @@ describe('PATCH /api/workspaces/:id (local)', () => {
     expect(((await res.json()) as any).error.code).toBe('invalid_name')
   })
 
+  test('still applies the settings scalars the generated PATCH allowed', async () => {
+    // Shadowing the generated route must not silently drop a toggle that some
+    // other screen writes through the same endpoint.
+    const res = await request(`/api/workspaces/${workspaceId}`, owner, {
+      method: 'PATCH',
+      body: JSON.stringify({ chatMode: 'team', slug: 'hijacked-slug' }),
+    })
+    expect(res.status).toBe(200)
+    const body: any = await res.json()
+    expect(body.data.chatMode).toBe('team')
+    expect(body.data.slug).not.toBe('hijacked-slug')
+  })
+
   test('refuses a non-member and a viewer', async () => {
     const asOutsider = await request(`/api/workspaces/${personalWorkspaceId}`, outsider, {
       method: 'PATCH',

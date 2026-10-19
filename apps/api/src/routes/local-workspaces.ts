@@ -215,7 +215,23 @@ export function localWorkspaceRoutes(options: LocalWorkspaceRouteOptions = {}): 
       data.name = parsed.name
     }
     if (body?.description !== undefined) data.description = body.description
-    if (body?.trainingDataMode !== undefined) data.trainingDataMode = body.trainingDataMode
+    // Pass through the same settings scalars the generated route accepts, so
+    // shadowing it locally doesn't silently drop a Compute/Integrations toggle.
+    for (const field of [
+      'trainingDataMode',
+      'chatMode',
+      'chatProvider',
+      'composioScope',
+      'ssoSettings',
+      'instanceSize',
+      'homeRegion',
+      'parentWorkspaceId',
+    ]) {
+      if (body?.[field] !== undefined) data[field] = body[field]
+    }
+    // `slug` is deliberately not writable: it is an internal identifier
+    // (shared-file tokens, export manifests), and renaming a workspace must not
+    // repoint or duplicate anything.
     if (Object.keys(data).length === 0) {
       const current = await prisma.workspace.findUnique({ where: { id: workspaceId } })
       return c.json({ ok: true, data: current })
