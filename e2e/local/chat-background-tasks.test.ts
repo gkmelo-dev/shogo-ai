@@ -109,7 +109,7 @@ async function expectCommandInDock(page: Page, command: string, timeout = 90_000
  */
 async function sampleRowExit(page: Page, text: string) {
   return page.evaluate(async (label) => {
-    const samples: Array<{ depth: number; height: number; opacity: number }> = []
+    const samples: Array<{ depth: number; height: number; opacity: number; t: number }> = []
     const findRow = () =>
       Array.from(document.querySelectorAll<HTMLElement>("div, span")).find(
         (el) => el.childElementCount === 0 && el.textContent === label,
@@ -134,6 +134,7 @@ async function sampleRowExit(page: Page, text: string) {
           depth,
           height: el.getBoundingClientRect().height,
           opacity: Number(getComputedStyle(el).opacity),
+          t: Date.now(),
         })
       })
       if (chain[0] && !chain[0].isConnected) break
@@ -197,6 +198,16 @@ test.describe("chat dock background tasks", () => {
       samples.some((s) => s.opacity > 0.05 && s.opacity < 0.95),
       `no mid-transition frame was sampled while the row left: ${JSON.stringify(samples.slice(-12))}`,
     ).toBe(true)
+
+    // Criterion 1: the row is readable for a beat from when it *appears* as
+    // settled — the linger is anchored to the server's `finishedAt`, which the
+    // poll can deliver up to 5 s late, so from first sight it is floored.
+    const row = samples.filter((s) => s.depth === 0)
+    const visibleMs = row[row.length - 1].t - row[0].t
+    expect(
+      visibleMs,
+      `the settled row was only on screen for ${visibleMs} ms`,
+    ).toBeGreaterThanOrEqual(1_200)
 
     // Then it retires itself (DOCK_FINISHED_LINGER_MS + DOCK_FINISHED_EXIT_MS)
     // and the chip goes with it — no ten-minute row, no empty Finished chip.

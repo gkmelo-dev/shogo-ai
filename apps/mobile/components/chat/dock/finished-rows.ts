@@ -17,6 +17,15 @@ import type { RunningProcess } from "../ProcessPanel"
 export const DOCK_FINISHED_LINGER_MS = 4_000
 /** Fade + height collapse of a row on its way out. */
 export const DOCK_FINISHED_EXIT_MS = 220
+/**
+ * Floor on how long a row stays readable *from the moment the client sees it
+ * settled*. The linger above is anchored to the runtime's `finishedAt`, but the
+ * client learns of a settle up to five seconds late (task-update frames only
+ * flow during a turn; otherwise the 5 s dock poll), so a row that settles
+ * between two polls can arrive with its whole linger already spent — and blink
+ * out before anyone reads the outcome.
+ */
+export const DOCK_FINISHED_MIN_VISIBLE_MS = 1_500
 
 /** Stable identity of a task row — the task id, or the run it was started as. */
 export function processKey(proc: RunningProcess): string {
@@ -39,4 +48,21 @@ export function finishLingerDelayMs(proc: RunningProcess, now: number): number {
     DOCK_FINISHED_LINGER_MS,
     Math.max(0, finishedAt + DOCK_FINISHED_LINGER_MS - now),
   )
+}
+
+/**
+ * How long until a settled row starts its exit, honouring both anchors: the
+ * server's finish time (so a row that was on screen when it settled keeps the
+ * full linger) and the first time the client rendered it as settled (so a row
+ * the poll delivers late still gets a readable window). `firstSeenSettledAt` is
+ * written once per task, so a poll landing mid-linger cannot restart it.
+ */
+export function visibleLingerDelayMs(
+  proc: RunningProcess,
+  now: number,
+  firstSeenSettledAt: number,
+): number {
+  const fromFinish = finishLingerDelayMs(proc, now)
+  const fromFirstSight = DOCK_FINISHED_MIN_VISIBLE_MS - (now - firstSeenSettledAt)
+  return Math.max(0, Math.min(DOCK_FINISHED_LINGER_MS, Math.max(fromFinish, fromFirstSight)))
 }

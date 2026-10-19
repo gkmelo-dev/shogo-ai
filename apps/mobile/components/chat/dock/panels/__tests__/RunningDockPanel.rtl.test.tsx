@@ -11,6 +11,7 @@ import { createReactNativeMock } from "../../../../../test/react-native-mock"
 import {
   DOCK_FINISHED_EXIT_MS,
   DOCK_FINISHED_LINGER_MS,
+  DOCK_FINISHED_MIN_VISIBLE_MS,
 } from "../../finished-rows"
 
 mock.module("react-native", () =>
@@ -288,18 +289,55 @@ describe("RunningDockPanel", () => {
     expect(view.queryByText("Kill")).toBeNull()
     expect(view.queryByText("Cancel")).toBeNull()
 
-    // t_b finished 5 s ago, so it is already past its linger: it stays mounted
-    // for its exit animation (and keeps counting) before it drops out.
+    // t_b finished 5 s before the poll delivered it, so its server linger is
+    // spent — but it still gets the readable floor from first sight, then its
+    // exit animation (and keeps counting) before it drops out.
     advance(50)
     expect(descriptor!.summary).toBe("2 finished")
     expect(body().getByText("failed")).toBeTruthy()
+    advance(DOCK_FINISHED_MIN_VISIBLE_MS - 50)
+    expect(descriptor!.summary).toBe("2 finished")
     advance(DOCK_FINISHED_EXIT_MS + 100)
     expect(descriptor!.summary).toBe("1 finished")
     expect(body().queryByText("failed")).toBeNull()
     expect(body().getByText("completed")).toBeTruthy()
 
     // Then the last row: the panel unregisters instead of showing an empty chip.
-    advance(2_000 + DOCK_FINISHED_EXIT_MS + 100)
+    advance(DOCK_FINISHED_LINGER_MS + DOCK_FINISHED_EXIT_MS + 100)
+    expect(descriptor).toBeNull()
+    expect(body().queryByText("completed")).toBeNull()
+
+    jest.useRealTimers()
+  })
+
+  test("a row the poll delivers already settled still gets a readable window", () => {
+    jest.useFakeTimers()
+    lastNow = Date.now()
+    const t0 = lastNow
+    const running = task({ id: "t_late", status: "running", startedAt: t0 - 60_000 })
+    const panel = mountPanel({ processes: [running] })
+    expect(descriptor!.title).toBe("Running")
+
+    // The task settled 3.9 s ago server-side; the 5 s poll only just caught up.
+    // Costing the linger from `finishedAt` alone leaves this row 100 ms of life.
+    act(() => {
+      panel.rerender(
+        <RunningDockPanel
+          processes={[{ ...running, status: "completed", finishedAt: t0 - 3_900 }]}
+          onKillProcess={() => {}}
+          subagents={[]}
+          recentTools={[]}
+        />,
+      )
+    })
+    expect(descriptor!.title).toBe("Finished")
+    expect(body().getByText("completed")).toBeTruthy()
+
+    advance(1_000)
+    expect(descriptor!.summary).toBe("1 finished")
+    expect(body().getByText("completed")).toBeTruthy()
+
+    advance(DOCK_FINISHED_MIN_VISIBLE_MS - 1_000 + DOCK_FINISHED_EXIT_MS + 100)
     expect(descriptor).toBeNull()
     expect(body().queryByText("completed")).toBeNull()
 

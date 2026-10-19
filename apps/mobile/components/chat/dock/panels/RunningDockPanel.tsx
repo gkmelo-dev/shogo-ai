@@ -24,7 +24,7 @@ import { useDockPanel } from "../useDockPanel"
 import type { DockPanelDescriptor } from "../../../../lib/chat-dock-store"
 import {
   DOCK_FINISHED_EXIT_MS,
-  finishLingerDelayMs,
+  visibleLingerDelayMs,
   isFinishedProcess,
   processKey,
 } from "../finished-rows"
@@ -449,6 +449,9 @@ export function RunningDockPanel(props: RunningDockPanelProps) {
   const timers = useRef(
     new Map<string, { linger: ReturnType<typeof setTimeout>; exit?: ReturnType<typeof setTimeout> }>(),
   )
+  // When the dock first rendered each row as settled — the anchor for the
+  // readable window. Written once per task, so a poll cannot restart it.
+  const firstSettledAt = useRef<Map<string, number>>(new Map())
 
   const clearTimers = useCallback(() => {
     for (const timer of timers.current.values()) {
@@ -465,6 +468,7 @@ export function RunningDockPanel(props: RunningDockPanelProps) {
   useEffect(() => {
     if (processes.length > 0) return
     clearTimers()
+    firstSettledAt.current.clear()
     setRetirement((prev) =>
       prev.gone.size === 0 && prev.exiting.size === 0 && prev.restored.size === 0
         ? prev
@@ -501,6 +505,14 @@ export function RunningDockPanel(props: RunningDockPanelProps) {
     const now = Date.now()
     const present = new Map<string, RunningProcess>()
     for (const proc of processes) present.set(processKey(proc), proc)
+
+    // Anchor the readable window at first sight, including for a row that is
+    // held: once its Output closes it is long past it and leaves immediately.
+    for (const proc of processes) {
+      if (!isFinishedProcess(proc)) continue
+      const key = processKey(proc)
+      if (!firstSettledAt.current.has(key)) firstSettledAt.current.set(key, now)
+    }
 
     for (const [key, timer] of timers.current) {
       const proc = present.get(key)
@@ -557,7 +569,7 @@ export function RunningDockPanel(props: RunningDockPanelProps) {
               }
             })
           }, DOCK_FINISHED_EXIT_MS)
-        }, finishLingerDelayMs(proc, now)),
+        }, visibleLingerDelayMs(proc, now, firstSettledAt.current.get(key) ?? now)),
       }
       timers.current.set(key, timer)
     }
