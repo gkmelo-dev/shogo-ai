@@ -38,6 +38,7 @@ import { capabilityState, effectiveCapabilityValue, lockedCapabilityKeys, resolv
 import { isMetalRuntime } from './remote-tools'
 import { applyTechStackChange, type ApplyTechStackChangeResult } from './tech-stack-switch'
 import { listTechStacks, loadTechStackMeta, resolveWorkspaceConfigFilePath } from './workspace-defaults'
+import { isWorkspaceAgentRuntime } from './workspace-runtime-mode'
 import { TECH_STACK_REGISTRY } from '@shogo/shared-runtime'
 import { availableModelsHint, isAvailableModel } from './available-models'
 import { channelIdentity } from './channel-tools'
@@ -56,6 +57,7 @@ import {
   getWorkspaceProjectGraph as apiGetWorkspaceProjectGraph,
   hasInternalApiCredentials,
   listTeamChannels,
+  listWorkspaceProjects as apiListWorkspaceProjects,
   projectScopedId,
   syncTeamChannelOwnership,
   upsertTeamChannel,
@@ -63,6 +65,7 @@ import {
 } from './internal-api'
 import {
   computeSystemDiff,
+  fileSkipWarning,
   IMPLICIT_ANCHOR,
   isSafeRelativePath,
   parseSystemManifest,
@@ -70,6 +73,7 @@ import {
   resolveAgentRef,
   summarizeDiff,
   type BoardOp,
+  type FileProbe,
   type LiveBoard,
   type LiveProject,
   type LiveTrigger,
@@ -899,6 +903,8 @@ interface ApplyReport {
   applied: string[]
   skipped: string[]
   errors: string[]
+  /** Left undone for a reason that clears on its own (a project not mounted here yet); `ok` stays true. */
+  warnings: string[]
   manual: string[]
   bindings: Record<string, string>
   empty: boolean
@@ -913,6 +919,7 @@ export function createSystemApplyTool(ctx: ToolContext): AgentTool {
       'Idempotent: a second run reports an empty diff. Bindings from manifest key to project id are recorded in .shogo/system.lock.json so renames do not create duplicates.',
       'This is also how you create a team channel or change one (privacy, topic, members): edit its `teamChannels` entry and apply.',
       'Run with `dryRun: true` first. If the plan does only what the person asked for, apply it; if it changes more, show the plan and ask before applying. Chat integrations and external channels are listed under `manual` because they need credentials.',
+      'A project whose folder is not on this runtime yet is reported under `warnings` with `ok: true` (files are skipped, never claimed as created) — re-run after it mounts to finish the job. Real failures are in `errors` with `ok: false`.',
     ].join(' '),
     parameters: Type.Object({
       manifestPath: Type.Optional(Type.String({ description: `Path relative to the project root (default "${DEFAULT_MANIFEST_PATH}").` })),
@@ -956,15 +963,26 @@ export function createSystemApplyTool(ctx: ToolContext): AgentTool {
       const live = toLive(graphRes.data)
       const lock = readLock(ctx)
 
-      const readFile = (projectId: string, path: string): string | null => {
+      // The graph only returns what this requester can see here. A locked id
+      // that exists in the workspace but is not in the graph (not mounted, not
+      // visible to this caller) is a configure — never a second copy — so ask
+      // the workspace project list before calling anything inaccessible.
+      const knownProjectIds = new Set(live.map((p) => p.id))
+      const unbound = Object.values(lock?.bindings ?? {}).filter((id) => !knownProjectIds.has(id))
+      if (unbound.length > 0) {
+        const listRes = await apiListWorkspaceProjects(workspaceId, ctx.userId ? { userId: ctx.userId } : {})
+        if (listRes.ok && listRes.data) for (const p of listRes.data) knownProjectIds.add(p.id)
+      }
+
+      const readFile = (projectId: string, path: string): FileProbe => {
         const dir = resolveProjectDir(ctx, projectId)
-        if (!dir) return null
+        if (!dir) return { status: 'unmounted' }
         const abs = resolve(dir, path)
-        if (!abs.startsWith(resolve(dir))) return null
+        if (!abs.startsWith(resolve(dir))) return { status: 'missing' }
         try {
-          return existsSync(abs) ? readFileSync(abs, 'utf-8') : null
+          return existsSync(abs) ? { status: 'ok', content: readFileSync(abs, 'utf-8') } : { status: 'missing' }
         } catch {
-          return null
+          return { status: 'missing' }
         }
       }
 
@@ -999,7 +1017,17 @@ export function createSystemApplyTool(ctx: ToolContext): AgentTool {
         }
       }
 
-      const diff = computeSystemDiff(manifest, live, lock, { callerProjectId: ctx.projectId, readFile, teamChannels, boards, boardsUnavailable, triggers, triggersUnavailable })
+      const diff = computeSystemDiff(manifest, live, lock, {
+        callerProjectId: ctx.projectId,
+        readFile,
+        knownProjectIds,
+        callerIsWorkspaceAgent: isWorkspaceAgentRuntime(),
+        teamChannels,
+        boards,
+        boardsUnavailable,
+        triggers,
+        triggersUnavailable,
+      })
       const report: ApplyReport = {
         ok: true,
         dryRun: p.dryRun === true,
@@ -1008,6 +1036,7 @@ export function createSystemApplyTool(ctx: ToolContext): AgentTool {
         applied: [],
         skipped: [],
         errors: [],
+        warnings: [...diff.warnings],
         manual: diff.manual,
         bindings: {},
         empty: diff.empty,
@@ -1112,8 +1141,10 @@ export function createSystemApplyTool(ctx: ToolContext): AgentTool {
         }
       }
 
-      // 4. Files. Only projects reachable on disk; the rest are reported so
-      //    the agent can re-run system_apply after the runtime remounts.
+      // 4. Files. Only projects reachable on disk; the rest are skipped with a
+      //    warning so the agent re-runs system_apply after the runtime mounts
+      //    them — an unreachable file is never reported as a create.
+      const warnedFile = new Set(diff.warnings)
       for (const spec of manifest.projects) {
         const id = idOf(spec.key)
         if (!id) continue
@@ -1121,7 +1152,13 @@ export function createSystemApplyTool(ctx: ToolContext): AgentTool {
         if (entries.length === 0) continue
         const dir = resolveProjectDir(ctx, id)
         if (!dir) {
-          report.skipped.push(`files ${spec.key}: project not reachable on disk yet (${entries.length} file(s)); re-run system_apply after the runtime remounts`)
+          for (const rel of Object.keys(spec.files)) {
+            const line = fileSkipWarning(spec.key, rel)
+            if (!warnedFile.has(line)) {
+              warnedFile.add(line)
+              report.warnings.push(line)
+            }
+          }
           continue
         }
         for (const [rel, content] of entries) {
