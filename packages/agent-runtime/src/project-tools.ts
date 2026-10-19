@@ -1134,7 +1134,7 @@ export function createSystemApplyTool(ctx: ToolContext): AgentTool {
           }
           continue
         }
-        const values = resolveScheduleValues(op.spec!, { bindings: scheduleBindings, answers: p.answers })
+        const values = resolveScheduleValues(op.spec!, { bindings: scheduleBindings, answers: p.answers, channelIds })
         const notifyConversationId = values.channel ? channelIds[values.channel] ?? null : null
         if (values.channel && !notifyConversationId) {
           report.skipped.push(`schedule ${op.key}: channel #${values.channel} has no conversation id; results will not post anywhere`)

@@ -1245,16 +1245,25 @@ export function substituteAnswers(text: string, answers?: Record<string, unknown
   return text.replace(/\{\{\s*answers\.([a-zA-Z0-9_.-]+)\s*\}\}/g, (whole, path: string) => answerLookup(answers, path) ?? whole)
 }
 
-/** `{{agent.<key>}}` → the agent's mention, `{{channel.<name>}}` → `#name`, `{{answers.*}}` → the answer. */
+/** `{{agent.<key>}}` → the agent's mention, `{{channel.<name>}}` → its id (or `#name`), `{{answers.*}}` → the answer. */
 export function substituteTemplates(
   text: string,
-  ctx: { bindings?: Record<string, string>; answers?: Record<string, unknown> },
+  ctx: {
+    bindings?: Record<string, string>
+    answers?: Record<string, unknown>
+    /** Team channel name → conversation id, resolved once the channel exists. */
+    channelIds?: Record<string, string>
+    /** `id` for prompts (a schedule posts by id); `mention` for prose files. */
+    channelStyle?: 'mention' | 'id'
+  },
 ): string {
   const withAnswers = substituteAnswers(text, ctx.answers)
   return withAnswers.replace(
     /\{\{\s*(agent|channel)\.([a-zA-Z0-9_-]+)\s*\}\}/g,
     (whole, kind: string, key: string) => {
       if (kind === 'agent') return ctx.bindings?.[key] ? `<@a:p:${ctx.bindings[key]}>` : whole
+      const id = ctx.channelIds?.[key]
+      if (ctx.channelStyle === 'id' && id) return id
       return `#${key}`
     },
   )
@@ -1325,11 +1334,20 @@ export function mergeProfileSection(body: string, section: string, rendered: str
 /** Manifest `schedules` render into the same shape the schedules API takes. */
 export function resolveScheduleValues(
   spec: ScheduleSpec,
-  ctx: { bindings?: Record<string, string>; answers?: Record<string, unknown> },
+  ctx: {
+    bindings?: Record<string, string>
+    answers?: Record<string, unknown>
+    channelIds?: Record<string, string>
+  },
 ): ScheduleValues {
   return {
     name: spec.name,
-    prompt: substituteTemplates(spec.prompt, ctx),
+    prompt: substituteTemplates(spec.prompt, {
+      bindings: ctx.bindings,
+      answers: ctx.answers,
+      channelIds: ctx.channelIds,
+      channelStyle: 'id',
+    }),
     cronExpression: spec.cron.trim(),
     timezone: spec.timezone ?? 'UTC',
     enabled: spec.enabled,

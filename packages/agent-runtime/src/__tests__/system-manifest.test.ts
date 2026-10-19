@@ -15,6 +15,7 @@ import {
   IMPLICIT_ANCHOR,
   mergeProfileSection,
   renderProfileSection,
+  substituteTemplates,
   type FileProbe,
   type LiveProject,
   type SystemLock,
@@ -1007,5 +1008,27 @@ describe('schedules + setup', () => {
     const rendered = renderProfileSection(pack().setup, { profile: { product: 'widgets' } })
     expect(rendered).toBe('- **What this team builds**: widgets')
     expect(renderProfileSection(pack().setup, {})).toBeNull()
+  })
+})
+
+describe('schedule prompt substitution', () => {
+  test('{{channel.x}} becomes the conversation id in a prompt and #x in prose', () => {
+    const m = pack()
+    const liveChannels = { channels: [{ id: 'conv-evo', name: 'evolution' }] }
+    const diff = computeSystemDiff(m, [], null, {
+      callerProjectId: 'p-evolver',
+      schedules: [],
+      teamChannels: liveChannels as any,
+    })
+    expect(diff.schedules[0].values?.prompt).toContain('conv-evo')
+    const prose = substituteTemplates('see {{channel.evolution}}', { channelIds: { evolution: 'conv-evo' } })
+    expect(prose).toBe('see #evolution')
+  })
+
+  test('a dry run before the channel exists keeps the resolved mention and #name', () => {
+    const m = pack()
+    const diff = computeSystemDiff(m, [], null, { callerProjectId: 'p-evolver', schedules: [] })
+    expect(diff.schedules[0].values?.prompt).toContain('#evolution')
+    expect(diff.schedules[0].values?.prompt).toContain('<@a:p:p-evolver>')
   })
 })
