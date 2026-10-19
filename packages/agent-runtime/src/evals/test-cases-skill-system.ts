@@ -71,12 +71,13 @@ function skillFileWrites(r: EvalResult): string[] {
 const STANDUP_SKILL = '.shogo/skills/standup-collect/SKILL.md'
 
 /**
- * 115 no-op skills used by the prompt-budget regression case (SHO-57).
- * Long enough that 116 listings overflow the 16k `## Available Skills` budget,
- * so anything appended after them is at risk of being cut.
+ * 116 no-op skills used by the prompt-budget regression case (SHO-57).
+ * With the real runbook below that is 117 skills — long enough that the
+ * `## Available Skills` listings overflow the 16k budget, so the last one
+ * is exactly what the old loop used to cut silently.
  */
 const SKILL_BUDGET_FILLERS: Record<string, string> = Object.fromEntries(
-  Array.from({ length: 115 }, (_, i) => {
+  Array.from({ length: 116 }, (_, i) => {
     const name = `filler-${String(i + 1).padStart(3, '0')}`
     return [
       `.shogo/skills/${name}/SKILL.md`,
@@ -552,11 +553,16 @@ Facilitate daily standup updates.`,
       // returns `.shogo/skills` entries first and `.claude/skills` entries last,
       // so this is deterministically the 117th listing regardless of directory
       // read order — i.e. exactly the tail the 16k cut used to drop silently.
+      //
+      // No `trigger:` on purpose. With one, `matchSkill` would match the prompt
+      // and inject this whole body into the turn before the `## Available Skills`
+      // list is ever consulted — the truncation would not matter and the case
+      // would score the same on `main` (verified: 40/100 both sides). Discovery
+      // has to go through the listing (and `skill search` when the list is cut).
       '.claude/skills/zz-dns-cutover-runbook/SKILL.md': `---
 name: zz-dns-cutover-runbook
 version: 1.4.0
 description: Step-by-step DNS cutover runbook for moving a live domain to a new provider without downtime
-trigger: "dns cutover|cut over dns|nameserver change|move domain|dns migration"
 tools: [exec, read_file]
 ---
 
@@ -578,21 +584,39 @@ Reference id for this runbook: MAGPIE-CUTOVER-7734. Quote it in the change ticke
       {
         id: 'invoked-the-tail-skill',
         description: 'Invoked the runbook skill via skill({ action: "invoke" }) instead of guessing',
-        points: 60,
+        points: 50,
         phase: 'execution',
         validate: (r) => usedSkillTool(r, 'dns-cutover-runbook', ['invoke']),
       },
       {
         id: 'response-has-runbook-marker',
         description: 'Response contains the marker from the skill body (MAGPIE-CUTOVER-7734)',
-        points: 40,
+        points: 30,
         phase: 'execution',
         validate: (r) => responseContains(r, 'MAGPIE-CUTOVER-7734'),
+      },
+      {
+        // The point of the card is that the *skill system* can find an installed
+        // skill whose line fell outside the prompt budget. On `main` the model
+        // can still stumble onto it by grepping the workspace, or by falling
+        // back to `search_integrations` — the very misdirection this card fixes
+        // (that index happens to list installed skills; the `[Skill: …]` wrapper
+        // and the tool description used to point there). Both routes are the
+        // failure, not the fix, so the case requires the short skill-system path:
+        // the fixed branch finds the skill in one call, from the listing or from
+        // `skill search`.
+        id: 'found-through-the-skill-system',
+        description: 'Found it through the skill system (listing or skill search) — no search_integrations fallback and at most 3 tool calls',
+        points: 20,
+        phase: 'execution',
+        validate: (r) =>
+          !r.toolCalls.some(t => t.name === 'search_integrations') && r.toolCalls.length <= 3,
       },
     ],
     antiPatterns: [
       'Agent claimed no such skill is installed because the prompt list was truncated',
       'Agent invented a DNS procedure from general knowledge instead of invoking the installed skill',
+      'Agent had to grep the workspace or search the integrations index to discover an installed skill',
     ],
   },
 
