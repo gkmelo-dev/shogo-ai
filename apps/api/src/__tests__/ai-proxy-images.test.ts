@@ -22,13 +22,13 @@ import {
 import { IMAGE_MODEL_CATALOG, VIDEO_MODEL_CATALOG } from '@shogo/model-catalog'
 
 describe('Image Usage Cost (USD)', () => {
-  test('dall-e-3 standard 1024x1024 → raw = config base, billed = raw * markup', () => {
+  test('dall-e-3 standard 1024x1024 → ladder price, billed = raw * markup', () => {
     const { rawUsd, billedUsd } = calculateImageUsageCost(
       'dall-e-3',
       'standard',
       '1024x1024',
     )
-    expect(rawUsd).toBe(IMAGE_USD_CONFIG['dall-e-3'].base)
+    expect(rawUsd).toBe(IMAGE_USD_CONFIG['dall-e-3'].prices.square.medium)
     expect(billedUsd).toBeCloseTo(rawUsd * MARKUP_MULTIPLIER, 10)
   })
 
@@ -45,23 +45,21 @@ describe('Image Usage Cost (USD)', () => {
     expect(large.rawUsd).toBeGreaterThan(normal.rawUsd)
   })
 
-  test('dall-e-3 hd + large size stacks both multipliers', () => {
+  test('dall-e-3 hd + large size stacks quality and size', () => {
     const base = calculateImageUsageCost('dall-e-3', 'standard', '1024x1024')
     const hdLarge = calculateImageUsageCost('dall-e-3', 'hd', '1792x1024')
-    const cfg = IMAGE_USD_CONFIG['dall-e-3']
-    expect(hdLarge.rawUsd).toBeCloseTo(
-      base.rawUsd * cfg.hdMultiplier * cfg.largeSizeMultiplier,
-      10,
-    )
+    const cfg = IMAGE_USD_CONFIG['dall-e-3'].prices
+    expect(hdLarge.rawUsd).toBeCloseTo(cfg.landscape.high, 10)
+    expect(hdLarge.rawUsd).toBeGreaterThan(base.rawUsd)
   })
 
-  test('gpt-image-1 standard → non-zero raw and billed', () => {
+  test('gpt-image-1 standard → the medium tier, non-zero raw and billed', () => {
     const { rawUsd, billedUsd } = calculateImageUsageCost(
       'gpt-image-1',
       'standard',
       '1024x1024',
     )
-    expect(rawUsd).toBeGreaterThan(0)
+    expect(rawUsd).toBeCloseTo(0.042, 8)
     expect(billedUsd).toBeCloseTo(rawUsd * MARKUP_MULTIPLIER, 10)
   })
 
@@ -104,7 +102,11 @@ describe('Image Usage Cost (USD)', () => {
 
   test('billed = raw * MARKUP_MULTIPLIER for every registered model', () => {
     for (const [model, cfg] of Object.entries(IMAGE_USD_CONFIG)) {
-      expect(cfg.base).toBeGreaterThan(0)
+      for (const sizeClass of ['square', 'portrait', 'landscape'] as const) {
+        for (const quality of ['low', 'medium', 'high'] as const) {
+          expect(cfg.prices[sizeClass][quality]).toBeGreaterThan(0)
+        }
+      }
       const { rawUsd, billedUsd } = calculateImageUsageCost(
         model,
         'standard',
@@ -120,8 +122,25 @@ describe('fal and new catalog image pricing', () => {
   test('every non-retired catalog image model has an explicit price', () => {
     for (const entry of Object.values(IMAGE_MODEL_CATALOG)) {
       if ('retired' in entry && entry.retired) continue
+      // Higgsfield prices are quoted per request by the vendor's free
+      // `/estimate` and that quote is what gets billed, so an entry can be
+      // legitimately unpriced here (the listing then shows `usd: null`). Where
+      // we do carry a figure it must be a real one.
+      if (entry.provider === 'higgsfield') {
+        if (entry.usdPerRequest !== undefined) expect(entry.usdPerRequest).toBeGreaterThan(0)
+        continue
+      }
       expect(IMAGE_USD_CONFIG[entry.id]).toBeDefined()
     }
+  })
+
+  test('SOUL V2 fallback matches the live account: $0.004 at 720p, $0.006 at 1080p', () => {
+    const standard = calculateImageUsageCost('hf-soul-v2', 'standard', '1024x1024')
+    const hd = calculateImageUsageCost('hf-soul-v2', 'hd', '1024x1024')
+    expect(standard.rawUsd).toBeCloseTo(0.004, 5)
+    expect(hd.rawUsd).toBeCloseTo(0.006, 5)
+    // The vendor's prose worked example says $0.094; the account says 23× less.
+    expect(standard.rawUsd).toBeLessThan(0.01)
   })
 
   test('fal list prices', () => {

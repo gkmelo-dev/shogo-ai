@@ -73,7 +73,7 @@ import { decideApproval, listPendingApprovals } from '../services/conversation-a
 import { liveActivityApprovalAnswered } from '../services/approval-live-activity'
 import { loadWorkLog } from '../services/agent-work-log'
 import { chainForAgentPost, rootChain, setThreadOwner } from '../services/conversation-agent-chain'
-import { loadAgentCard, loadTeamDirectory, resolveFriendlyMentions, setAgentBuddyLook } from '../services/conversation-directory'
+import { loadAgentCard, loadTeamDirectory, loadUserCard, resolveFriendlyMentions, setAgentBuddyLook } from '../services/conversation-directory'
 import { listTeamChannels, syncTeamChannelOwnership, TeamChannelError, upsertTeamChannel } from '../services/conversation-team-channels'
 import { huddleUserIds } from '../services/huddle.service'
 import { getPresence } from '../services/conversation-presence'
@@ -321,6 +321,17 @@ export function conversationRoutes(config: ConversationRoutesConfig): Hono {
     const projectId = c.req.query('projectId')?.trim() || null
     const card = await loadAgentCard(auth.workspaceId, projectId, auth.userId)
     if (!card) return c.json({ error: { code: 'not_found', message: 'Agent not found' } }, 404)
+    return c.json({ card })
+  })
+
+  /** Profile card for a person: identity, status and local time. */
+  router.get('/workspaces/:workspaceId/user-card', async (c) => {
+    const auth = await requireWorkspace(c)
+    if (auth instanceof Response) return auth
+    const userId = c.req.query('userId')?.trim()
+    if (!userId) return c.json({ error: { code: 'invalid_request', message: 'userId is required' } }, 400)
+    const card = await loadUserCard(auth.workspaceId, userId, auth.userId)
+    if (!card) return c.json({ error: { code: 'not_found', message: 'Person not found' } }, 404)
     return c.json({ card })
   })
 
@@ -1390,7 +1401,7 @@ export function agentChannelRoutes(routeConfig: AgentChannelRoutesConfig): Hono 
       }
       // Created before dispatch, so a fast reply cannot finish ahead of its task.
       const tasks = body.trackReplies === true && typeof body.sessionId === 'string' && !result.duplicate
-        ? await trackedReplies(auth.workspaceId, body.sessionId, result)
+        ? await trackedReplies(auth.workspaceId, body.sessionId, result, { conversationId: conversation.id, threadRootId: rootId })
         : []
       void afterMessagePosted(result, { actorUserId: null, origin: 'agent' })
       return c.json({
@@ -1409,12 +1420,21 @@ export function agentChannelRoutes(routeConfig: AgentChannelRoutesConfig): Hono 
   })
 
   /** Background tasks for the agents a post hands work to, so the poster can wait for their replies. */
-  async function trackedReplies(workspaceId: string, chatSessionId: string, result: any) {
+  async function trackedReplies(
+    workspaceId: string,
+    chatSessionId: string,
+    result: any,
+    where: { conversationId: string; threadRootId: string },
+  ) {
     try {
       const targets = await agentPostTargets(result)
       if (!targets.length) return []
       const agents = await Promise.all(targets.map(async (t) => ({ projectId: t.projectId, name: await agentDisplayName(workspaceId, t.projectId) })))
-      return await createReplyTasks(chatSessionId, result.row.id, agents)
+      return await createReplyTasks(chatSessionId, result.row.id, agents, {
+        conversationId: where.conversationId,
+        threadRootId: where.threadRootId,
+        workspaceId,
+      })
     } catch (err) {
       console.warn('[AgentChannels] reply tracking failed:', (err as Error).message)
       return []
@@ -1492,7 +1512,7 @@ export function agentChannelRoutes(routeConfig: AgentChannelRoutesConfig): Hono 
     if (!conversation) return c.json({ error: { code: 'not_found', message: 'Channel not found or not visible to this agent' } }, 404)
     try {
       const { addUserMembersAsAgent } = await import('../services/conversation.service')
-      const added = await addUserMembersAsAgent(conversation, users.slice(0, 50))
+      const added = await addUserMembersAsAgent(conversation, users.slice(0, 50), { projectId })
       return c.json({ added, channel: { id: conversation.id, name: conversation.name } })
     } catch (err) {
       return errorResponse(c, err)

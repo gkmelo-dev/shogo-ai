@@ -27,6 +27,7 @@ import { pinChatToHomeRegion, pinProjectRoutesToHomeRegion } from './lib/chat-re
 import { RuntimeNotInHomeRegionError, runtimeNotInHomeRegionResponse } from './lib/runtime-home-region-guard'
 import { workspaceChatRoutes } from './routes/workspace-chat'
 import { workspaceAgentRoutes, sessionAuthorize } from './routes/workspace-agent'
+import { workspaceExportRoutes } from './routes/workspace-export'
 import { workspaceMeetingRoutes, sharedMeetingRoutes } from './routes/workspace-meetings'
 import { conversationRoutes } from './routes/conversations'
 import { workBoardRoutes } from './routes/work-boards'
@@ -43,6 +44,7 @@ import { startAgentTaskWorker, stopAgentTaskWorker } from './jobs/run-agent-task
 import { startAgentScheduleWorker, stopAgentScheduleWorker } from './jobs/run-agent-schedule-dispatch'
 import { startEventDeliveryWorker, stopEventDeliveryWorker } from './jobs/run-event-delivery-dispatch'
 import { inviteLinkAcceptRoutes } from './routes/invite-link-accept'
+import { createInviteLinkAfterAccept } from './routes/invite-link-after-accept'
 import { inviteLinkRoutes } from './routes/invite-links'
 import { rbacRoutes } from './routes/rbac'
 import { appActionsRoutes } from './routes/app-actions'
@@ -208,8 +210,6 @@ const getInstanceDisplayPrice: any = cloud.getInstanceDisplayPrice ?? (() => und
 const sendPlanUpgradedEmail: any = cloud.sendPlanUpgradedEmail ?? (async () => {})
 const sendInvitationEmail: any = cloud.sendInvitationEmail ?? (async () => {})
 const sendProjectInviteEmail: any = cloud.sendProjectInviteEmail ?? (async () => {})
-const sendInviteAcceptedEmail: any = cloud.sendInviteAcceptedEmail ?? (async () => {})
-const sendMemberJoinedEmail: any = cloud.sendMemberJoinedEmail ?? (async () => {})
 const sendMemberRemovedEmail: any = cloud.sendMemberRemovedEmail ?? (async () => {})
 const sendAccountDeletedEmail: any = cloud.sendAccountDeletedEmail ?? (async () => {})
 const identifyUser: any = cloud.identifyUser ?? (async () => {})
@@ -1146,6 +1146,8 @@ if (process.env.SHOGO_LOCAL_MODE === 'true') {
     { id: 'google',     envKey: 'GOOGLE_API_KEY' },
     { id: 'openrouter', envKey: 'OPENROUTER_API_KEY' },
     { id: 'fal',        envKey: 'FAL_KEY' },
+    { id: 'tripo',      envKey: 'TRIPO_API_KEY' },
+    { id: 'higgsfield', envKey: 'HIGGSFIELD_API_KEY' },
   ] as const
 
   const PROVIDER_BY_ID: Map<string, string> = new Map(PROVIDER_KEYS.map((p) => [p.id, p.envKey]))
@@ -1600,6 +1602,10 @@ app.route('/api', workspaceAgentRoutes({
   authorize: sessionAuthorize(getAuthUserId),
   saveAgentAvatar: cloud.saveAgentAvatar,
 }))
+// Workspace-level export/import (one archive of every model + every project's
+// files). Mounted before the rest of the `/api/workspaces` routes so
+// `POST /api/workspaces/import` is never shadowed by a `:workspaceId` route.
+app.route('/api/workspaces', workspaceExportRoutes())
 app.route('/api', workspaceMeetingRoutes({ authorize: sessionAuthorize(getAuthUserId) }))
 app.route('/api', sharedMeetingRoutes())
 // Workspace channels (team chat with @mentionable agents).
@@ -8951,61 +8957,9 @@ app.route('/api', inviteLinkRoutes({
 // Accept invite link (public-ish - requires auth but not membership)
 app.route('/api', inviteLinkAcceptRoutes({
   resolveUserId: (c) => (c.get('auth') as any)?.userId ?? null,
-  afterAccept: async ({ link, userId, workspaceId: resolvedWorkspaceId, member }) => {
-    // Active-seat billing: workspace-level invite-link acceptance must bump
-    // the Stripe seat quantity (project-only memberships don't bill seats).
-    if (resolvedWorkspaceId && !member.projectId) {
-      billingService.syncSeatsFromMembership(resolvedWorkspaceId).catch((err: any) =>
-        console.error('[Billing] invite-link accept seat sync failed:', err.message ?? err),
-      )
-    }
-
-    // Send notification emails (non-blocking — errors are logged internally)
-    const baseUrl = getFrontendUrl()
-    const [acceptingUser, workspace, project] = await Promise.all([
-      prisma.user.findUnique({ where: { id: userId }, select: { name: true, email: true } }),
-      resolvedWorkspaceId ? prisma.workspace.findUnique({ where: { id: resolvedWorkspaceId }, select: { name: true } }) : null,
-      link.projectId ? prisma.project.findUnique({ where: { id: link.projectId }, select: { name: true } }) : null,
-    ])
-    const acceptingName = acceptingUser?.name || acceptingUser?.email || 'Someone'
-    const acceptingEmail = acceptingUser?.email || ''
-    const resourceName = project?.name || workspace?.name || 'your workspace'
-    const resourceType = link.projectId ? 'project' : 'workspace'
-    const workspaceName = workspace?.name || 'your workspace'
-
-    if (link.createdBy) {
-      const creator = await prisma.user.findUnique({ where: { id: link.createdBy }, select: { email: true } })
-      if (creator?.email) {
-        await sendInviteAcceptedEmail({
-          to: creator.email,
-          inviteeName: acceptingName,
-          inviteeEmail: acceptingEmail,
-          resourceName,
-          resourceType,
-          dashboardUrl: baseUrl,
-        })
-      }
-    }
-
-    if (resolvedWorkspaceId) {
-      const owners = await prisma.member.findMany({
-        where: { workspaceId: resolvedWorkspaceId, role: 'owner', projectId: null, userId: { not: userId } },
-        include: { user: { select: { email: true } } },
-      })
-      for (const owner of owners) {
-        if (owner.user?.email) {
-          await sendMemberJoinedEmail({
-            to: owner.user.email,
-            memberName: acceptingName,
-            memberEmail: acceptingEmail,
-            workspaceName,
-            role: link.role,
-            dashboardUrl: baseUrl,
-          })
-        }
-      }
-    }
-  },
+  afterAccept: createInviteLinkAfterAccept({
+    syncSeats: (workspaceId) => billingService.syncSeatsFromMembership(workspaceId),
+  }),
 }))
 
 // Get invite link info (for accept page - minimal auth)

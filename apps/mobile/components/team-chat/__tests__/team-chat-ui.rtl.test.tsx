@@ -199,6 +199,23 @@ mock.module('@/components/ui/popover', () => ({
   PopoverBackdrop: () => null,
   PopoverContent: ({ children }: any) => createElement(Fragment, null, children),
 }))
+// The add-to-channel confirmation hosts gluestack dialog chrome, which pulls in
+// react-native's real entrypoint. These cases are about the flow around it.
+mock.module('@/components/ui/alert-dialog', () => ({
+  AlertDialog: ({ children }: any) => createElement(Fragment, null, children),
+  AlertDialogBackdrop: () => null,
+  AlertDialogContent: ({ children }: any) => createElement(Fragment, null, children),
+  AlertDialogHeader: ({ children }: any) => createElement(Fragment, null, children),
+  AlertDialogBody: ({ children }: any) => createElement(Fragment, null, children),
+  AlertDialogFooter: ({ children }: any) => createElement(Fragment, null, children),
+}))
+mock.module('@/components/ui/heading', () => ({ Heading: ({ children }: any) => createElement('div', null, children) }))
+mock.module('@/components/ui/text', () => ({ Text: ({ children }: any) => createElement('div', null, children) }))
+mock.module('@/components/ui/button', () => ({
+  Button: ({ children, onPress, accessibilityLabel }: any) =>
+    createElement('div', { role: 'button', 'aria-label': accessibilityLabel, onClick: onPress }, children),
+  ButtonText: ({ children }: any) => createElement('div', null, children),
+}))
 mock.module('../../../lib/platform-config', () => ({ usePlatformConfig: () => ({ features: { billing: false, ezMode: false } }) }))
 mock.module('../../chat/useVoiceInput', () => ({
   useVoiceInput: () => ({ isBusy: false, isRecording: false, liveTranscript: '', canRecord: false, error: null, clearError() {}, toggleRecording: async () => {} }),
@@ -622,6 +639,25 @@ describe('MessageRow', () => {
     })
   })
 
+  test('a membership line reads as a compact record, with no author row', () => {
+    const { container } = render(
+      <MessageRow
+        message={message({
+          authorType: 'system', author: null, authorUserId: null,
+          text: 'Swastik Ranjan was added to 🔒 client-itau-col by Eby.',
+          blocks: { type: 'membership', addedUserIds: ['u-2'], addedById: 'u-1' },
+        })}
+        grouped={false} me="u-me" names={names} canManage={false} {...handlers()}
+      />,
+    )
+    const line = 'Swastik Ranjan was added to 🔒 client-itau-col by Eby.'
+    expect(screen.getByText(line)).toBeTruthy()
+    const row = container.querySelector('[accessibilitylabel]')
+    expect(row?.getAttribute('accessibilitylabel')).toBe(`Channel update: ${line}`)
+    // A record of what happened, not a message from Shogo.
+    expect(screen.queryByText('Shogo')).toBeNull()
+  })
+
   test('copy link copies a link to the message; mark unread is offered outside threads', async () => {
     const h = { ...handlers(), onMarkUnread: mock(() => {}) }
     const { container } = render(
@@ -843,6 +879,41 @@ describe('MessageList unread line', () => {
     render(list({ unreadAfterSeq: 0, unreadNotLoaded: true, onRevealUnread }))
     fireEvent.click(screen.getByLabelText('Jump to first unread message'))
     expect(onRevealUnread).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('MessageList day dividers', () => {
+  const timeline = (messages: any[]) => ({ messages, streaming: {}, hasMoreOlder: false }) as any
+  const at = (day: number, hour: number, minute: number) => new Date(2026, 9, day, hour, minute).toISOString()
+  /** The divider that shares a cell with the message carrying this text. */
+  const dividerAbove = (text: string) =>
+    shims('day-divider').find((d) => d.parentElement?.textContent?.includes(text))
+
+  const list = () => (
+    <MessageList
+      state={timeline([
+        message({ id: 'a', seq: 1, text: 'alpha', createdAt: at(5, 23, 56) }),
+        message({ id: 'b', seq: 2, text: 'bravo', createdAt: at(5, 23, 57) }),
+        message({ id: 'c', seq: 3, text: 'charlie', createdAt: at(6, 0, 0) }),
+      ])}
+      loading={false} me="u-me" names={names} canManage={false} {...handlers()} />
+  )
+
+  test('a divider opens each day, above the first message sent that day', () => {
+    render(list())
+    expect(shims('day-divider')).toHaveLength(2)
+    // Midnight starts a new day; a message a minute after an earlier same-day one does not.
+    expect(dividerAbove('charlie')).toBeTruthy()
+    expect(dividerAbove('bravo')).toBeUndefined()
+    expect(dividerAbove('alpha')).toBeTruthy()
+  })
+
+  test('a new day breaks the author grouping, so the header repeats', () => {
+    render(list())
+    // "bravo" is grouped under "alpha" (a minute apart, same author) and shows no
+    // name; "charlie" is only three minutes later but a day has turned over, so it
+    // must carry its own header rather than hanging under the previous day.
+    expect(screen.getAllByText('Ana Lopez')).toHaveLength(2)
   })
 })
 
@@ -1673,5 +1744,125 @@ describe('MessageRow image attachments', () => {
 
     expect(screen.queryByLabelText('Open shot-1.png')).toBeNull()
     expect(screen.queryByTestId('image-lightbox')).toBeNull()
+  })
+})
+
+describe('opening a person’s profile from a message', () => {
+  const profileOpener = () => mock((_userId: string) => {})
+  const channelConversation = {
+    id: 'c-eng', workspaceId: 'ws', kind: 'public', name: 'eng', slug: 'eng',
+    topic: null, lastSeq: 2, lastMessageAt: null, archivedAt: null, createdAt: '2026-09-29T10:00:00.000Z',
+    joined: true, starred: false, muted: false, notifyLevel: 'all', lastReadSeq: 2,
+    canPost: true, canReply: true, canManage: false, members: [],
+  }
+  const renderChannel = (onOpenProfile?: (userId: string) => void) =>
+    render(
+      <TimelinePane
+        workspaceId="ws"
+        conversation={{ ...channelConversation } as any}
+        me="u-me"
+        mentionables={{ ...mentionables, agents: [] }}
+        visible
+        onOpenProfile={onOpenProfile}
+      />,
+    )
+  const mentions = () => document.querySelectorAll('[data-testid="chat-mention"]')
+
+  beforeEach(() => {
+    activityTimeline.messages = []
+  })
+  afterEach(() => {
+    cleanup()
+    routed.length = 0
+    activityTimeline.messages = []
+  })
+
+  test('their name opens their profile', () => {
+    const onOpenProfile = profileOpener()
+    render(
+      <MessageRow message={message()} grouped={false} me="u-me" names={names} canManage={false} onOpenProfile={onOpenProfile} {...handlers()} />,
+    )
+    fireEvent.click(screen.getByLabelText('Ana Lopez profile'))
+    expect(onOpenProfile).toHaveBeenCalledWith('u-ana')
+  })
+
+  test('their photo opens it too', () => {
+    const onOpenProfile = profileOpener()
+    render(
+      <MessageRow message={message()} grouped={false} me="u-me" names={names} canManage={false} onOpenProfile={onOpenProfile} {...handlers()} />,
+    )
+    fireEvent.click(screen.getByLabelText('Ana Lopez avatar'))
+    expect(onOpenProfile).toHaveBeenCalledWith('u-ana')
+  })
+
+  test('is inert in a host that has nowhere to show one', () => {
+    render(
+      <MessageRow message={message()} grouped={false} me="u-me" names={names} canManage={false} {...handlers()} />,
+    )
+    // No handler, so the name is plain text rather than a dead button.
+    expect(screen.queryByLabelText('Ana Lopez profile')).toBeNull()
+    expect(screen.getByText('Ana Lopez')).toBeTruthy()
+  })
+
+  test('an agent author still gets its own card', async () => {
+    const onOpenProfile = profileOpener()
+    render(
+      <MessageRow
+        message={message({
+          authorType: 'agent', author: null, authorUserId: null,
+          authorAgent: { projectId: 'proj-1', name: 'Billing Bot' }, text: 'hello',
+        })}
+        grouped={false}
+        me="u-me"
+        names={names}
+        canManage={false}
+        onOpenProfile={onOpenProfile}
+        {...handlers()}
+      />,
+    )
+    fireEvent.click(screen.getAllByLabelText('Billing Bot profile')[0]!)
+    await screen.findByText('Sends invoices')
+    expect(onOpenProfile).not.toHaveBeenCalled()
+  })
+
+  test('a deleted message opens nothing', () => {
+    const onOpenProfile = profileOpener()
+    render(
+      <MessageRow
+        message={message({ deletedAt: '2026-09-29T11:00:00.000Z' })}
+        grouped={false}
+        me="u-me"
+        names={names}
+        canManage={false}
+        onOpenProfile={onOpenProfile}
+        {...handlers()}
+      />,
+    )
+    expect(screen.queryByLabelText('Ana Lopez profile')).toBeNull()
+    expect(onOpenProfile).not.toHaveBeenCalled()
+  })
+
+  test('tapping their mention in the text opens it too', () => {
+    const onOpenProfile = profileOpener()
+    activityTimeline.messages = [message({ text: 'ping <@u:u-ana> about the deck' })]
+    renderChannel(onOpenProfile)
+    fireEvent.click(mentions()[0]!)
+    expect(onOpenProfile).toHaveBeenCalledWith('u-ana')
+  })
+
+  test('an agent mention opens the agent profile page instead', () => {
+    routed.length = 0
+    activityTimeline.messages = [message({ text: 'thanks <@a:p:proj-1>' })]
+    renderChannel(mock(() => {}))
+    fireEvent.click(mentions()[0]!)
+    expect(routed).toEqual([{ pathname: '/(app)/agents/[key]', params: { key: 'p:proj-1' } }])
+  })
+
+  test('mentions stay plain highlights when the host offers no profile', () => {
+    const onOpenProfile = profileOpener()
+    activityTimeline.messages = [message({ text: 'ping <@u:u-ana>' })]
+    renderChannel()
+    expect(mentions()).toHaveLength(1)
+    expect(onOpenProfile).not.toHaveBeenCalled()
   })
 })

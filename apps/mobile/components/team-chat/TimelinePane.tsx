@@ -7,9 +7,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Alert, Platform, Pressable, ScrollView, Text, View } from 'react-native'
 import { useSafeAreaInsets } from 'react-native-safe-area-context'
+import { useRouter } from 'expo-router'
 import { ChevronLeft, Upload, X } from 'lucide-react-native'
 import { cn } from '@shogo/shared-ui/primitives'
 import { conversationTitle, teamChatApi, type ChatMessage, type ConversationDetail, type Mentionables } from '../../lib/team-chat-api'
+import type { MentionTarget } from '../chat/file-links'
 import { mentionNames, newestReadableSeq } from '../../lib/team-chat-state'
 import { runningAgentTypists, typingLabel } from '../../lib/team-chat-typing'
 import { useComposerColumnStyle } from '../chat/composer/useComposerColumnStyle'
@@ -24,6 +26,8 @@ import { ActivityFilterPicker } from './ActivityFilterPicker'
 import { MessageList } from './MessageList'
 import { Composer, type ComposerHandle } from './Composer'
 import { MentionNudgeCard } from './MentionNudgeCard'
+import { EphemeralNotice } from './EphemeralNotice'
+import { AddToChannelConfirmHost, confirmsAddToChannel } from './AddToChannelConfirm'
 import { CHROME_SIZE, GlassButton, GlassChip } from './FloatingChrome'
 import { usePhoneChromeOverlay } from '../layout/PhoneChromeOverlay'
 import { GlassBlurTarget } from '../ui/LiquidGlassBackdrop'
@@ -49,6 +53,8 @@ export interface TimelinePaneProps {
   onOpenThread?: (message: ChatMessage) => void
   onOpenSession?: (message: ChatMessage) => void
   onOpenProjectPane?: (projectId: string, name: string) => void
+  /** Open a person's profile — from their name, their photo, or a mention of them. */
+  onOpenProfile?: (userId: string) => void
   onClose?: () => void
   onJoin?: () => void
   /** Scroll to and emphasize this message (from a message link or search). */
@@ -119,8 +125,25 @@ function confirmDelete(): Promise<boolean> {
 
 export function TimelinePane(props: TimelinePaneProps) {
   const { workspaceId, conversation, threadRootId = null, me, mentionables, visible, floating = false, topInset = 0 } = props
+  const router = useRouter()
   const chrome = usePhoneChromeOverlay()
   const insets = useSafeAreaInsets()
+  /**
+   * What tapping an @-mention does. A person opens their profile through the
+   * host (`onOpenProfile`), an agent opens its own profile page, and the
+   * broadcast/channel/group targets stay plain highlights — so a host that
+   * offers no profile gets exactly today's behaviour.
+   */
+  const mentionPress = useMemo(() => {
+    if (!props.onOpenProfile) return undefined
+    const openProfile = props.onOpenProfile
+    return (target: MentionTarget) => {
+      if (target.kind === 'u') return openProfile(target.id)
+      if (target.kind === 'a') {
+        router.push({ pathname: '/(app)/agents/[key]', params: { key: target.id } } as any)
+      }
+    }
+  }, [props.onOpenProfile, router])
   const [threadHeaderHeight, setThreadHeaderHeight] = useState(0)
   const [footerHeight, setFooterHeight] = useState(0)
   const [cardFrom, setCardFrom] = useState<ChatMessage | null>(null)
@@ -278,25 +301,35 @@ export function TimelinePane(props: TimelinePaneProps) {
     () => (isChannel ? new Set(conversation.members.flatMap((m) => (m.type === 'user' ? [m.userId] : []))) : null),
     [isChannel, conversation.members],
   )
-  const [mentionNudge, setMentionNudge] = useState<{ ids: string[]; busy: boolean; error: string | null } | null>(null)
-  useEffect(() => setMentionNudge(null), [conversation.id, threadRootId])
+  const [mentionNudge, setMentionNudge] = useState<{ ids: string[]; busy: boolean; error: string | null; createdAt: string } | null>(null)
+  const [channelsAdded, setChannelsAdded] = useState<{ ids: string[]; createdAt: string } | null>(null)
+  useEffect(() => {
+    setMentionNudge(null)
+    setChannelsAdded(null)
+  }, [conversation.id, threadRootId])
   const handleSend = useCallback(async (input: SendInput) => {
     setMentionNudge(null)
+    setChannelsAdded(null)
     const sent = await timeline.send(input)
     if (!sent || !channelMemberIds || getMentionNudgeDismissed()) return
     const ids = nonMemberMentionIds(input.text, channelMemberIds, me)
-    if (ids.length) setMentionNudge({ ids, busy: false, error: null })
+    if (ids.length) setMentionNudge({ ids, busy: false, error: null, createdAt: new Date().toISOString() })
   }, [timeline.send, channelMemberIds, me])
   const addMentioned = useCallback(async () => {
     if (!mentionNudge) return
+    const { ids } = mentionNudge
+    // Adding to a private channel hands over the whole history, files
+    // included — the warning Slack puts in front of it.
+    if (!(await confirmsAddToChannel(conversation.kind))) return
     setMentionNudge((n) => (n ? { ...n, busy: true, error: null } : n))
     try {
-      await api.addMembers(conversation.id, mentionNudge.ids)
+      await api.addMembers(conversation.id, ids)
       setMentionNudge(null)
+      setChannelsAdded({ ids, createdAt: new Date().toISOString() })
     } catch (err) {
       setMentionNudge((n) => (n ? { ...n, busy: false, error: err instanceof Error ? err.message : 'Could not add them' } : n))
     }
-  }, [mentionNudge, conversation.id])
+  }, [mentionNudge, conversation.id, conversation.kind])
 
   const placeholder = threadRootId
     ? 'Reply in thread…'
@@ -341,6 +374,8 @@ export function TimelinePane(props: TimelinePaneProps) {
       onDiscard={timeline.discard}
       onOpenSession={props.onOpenSession}
       onOpenProjectPane={props.onOpenProjectPane}
+      onOpenProfile={props.onOpenProfile}
+      onMentionPress={mentionPress}
       onMarkUnread={threadRootId || !conversation.joined ? undefined : onMarkUnread}
       onMakeCard={canMakeCards ? setCardFrom : undefined}
       unreadAfterSeq={filtering ? null : unread?.afterSeq ?? null}
@@ -402,9 +437,14 @@ export function TimelinePane(props: TimelinePaneProps) {
     <>
       {mentionNudge && (
         <MentionNudgeCard
-          names={mentionNudge.ids.map((id) => names.users.get(id) ?? 'Someone')}
+          ids={mentionNudge.ids}
+          names={names}
+          isPrivate={conversation.kind === 'private'}
+          workspaceId={workspaceId}
+          createdAt={mentionNudge.createdAt}
           busy={mentionNudge.busy}
           error={mentionNudge.error}
+          onMentionPress={mentionPress}
           onAdd={() => void addMentioned()}
           onDismiss={() => setMentionNudge(null)}
           onDontShowAgain={() => {
@@ -413,6 +453,17 @@ export function TimelinePane(props: TimelinePaneProps) {
           }}
         />
       )}
+      {channelsAdded && (
+        <EphemeralNotice
+          testID="added-to-channel-notice"
+          text={`OK! ${channelsAdded.ids.map((id) => `<@u:${id}>`).join(', ')} ${channelsAdded.ids.length === 1 ? 'has' : 'have'} been added to this channel.`}
+          names={names}
+          createdAt={channelsAdded.createdAt}
+          workspaceId={workspaceId}
+          onMentionPress={mentionPress}
+        />
+      )}
+      <AddToChannelConfirmHost />
       <Composer
         ref={composerRef}
         workspaceId={workspaceId}

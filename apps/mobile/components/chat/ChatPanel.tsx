@@ -86,6 +86,7 @@ import {
 import {
   useChatTransportConfig,
   buildChatTurnUrl,
+  buildChatTasksUrl,
   truncateMessagesFrom,
   getPrecedingCheckpoint,
   rollbackProjectToCheckpoint,
@@ -117,8 +118,18 @@ import {
   LATE_TURN_MAX_WAIT_MS,
   LATE_TURN_POLL_INTERVAL_MS,
   pendingExternalPromptIndex,
+  persistedTailAwaitsReply,
+  persistedTailIsUnseen,
   pollForLateTurn,
+  taskWakeHasResponse,
+  type PersistedTail,
 } from "./late-turn-attach"
+import {
+  lastTurnStartedBackgroundWork,
+  NOTIFY_WAKE_MAX_WAIT_MS,
+  NOTIFY_WAKE_POLL_INTERVAL_MS,
+  watchForNotifyWake,
+} from "./notify-task-watch"
 import {
   decideRetryAction,
   lastAssistantHasResumableWork,
@@ -130,6 +141,7 @@ import {
   shouldAutoRecoverStalledTurn,
 } from "./stall-recovery"
 import { recordAutoResumeAttempt } from "./auto-resume-circuit-breaker"
+import { followNextTurn } from "./next-turn-follow"
 import {
   runResumeStreamSingleFlight,
   type ResumeStreamFlightRef,
@@ -145,6 +157,7 @@ import { markStoppedTail, mergeStoppedSnapshot } from "./stopped-turn"
 import { cn } from "@shogo/shared-ui/primitives"
 import { useBillingData } from "@shogo/shared-app/hooks"
 import { API_URL, api, createHttpClient } from "../../lib/api"
+import { agentProxyBase } from "../../lib/agent-proxy-base"
 import { usePlatformConfig } from "../../lib/platform-config"
 import { workspaceProjectFilter } from "../../lib/project-load"
 import {
@@ -225,6 +238,7 @@ import { PlanDockPanel } from "./dock/panels/PlanDockPanel"
 import { PendingPlanComposerBar } from "./PendingPlanComposerBar"
 import { ChecklistDockPanel } from "./dock/panels/ChecklistDockPanel"
 import { RunningDockPanel, type TaskWaitState } from "./dock/panels/RunningDockPanel"
+import { isFinishedProcess } from "./dock/finished-rows"
 import { BrowserDockPanel } from "./dock/panels/BrowserDockPanel"
 import { WorktreeDockPanel } from "./dock/panels/WorktreeDockPanel"
 import { ChangesDockPanel } from "./dock/panels/ChangesDockPanel"
@@ -241,7 +255,10 @@ import {
   type ChatContextValue,
   type ChatMessage,
   type OpenProjectPaneRequest,
+  type OpenTaskHint,
 } from "./ChatContext"
+import { asTaskLink, type TaskOutputInfo } from "../../lib/task-link"
+import { taskThreadPane } from "../../lib/task-thread-pane-store"
 import {
   DESKTOP_ISLAND_WORKSPACE_AGENT_ID,
   registerDesktopIslandSession,
@@ -917,6 +934,36 @@ async function ensureAiConsentForMessage(): Promise<boolean> {
 // Component
 // ============================================================
 
+/**
+ * A seed fetch replaces the dock list wholesale. If a row that was running is
+ * simply missing from the answer (the runtime forgot it, or its registry was
+ * recreated), keep it once as a finished row so it fades out instead of
+ * blinking away — and so the "a task finished" probe still sees it drop.
+ */
+function keepDroppedAsFinished(
+  prev: RunningProcess[],
+  next: RunningProcess[],
+): RunningProcess[] {
+  if (prev.length === 0) return next
+  const seen = new Set(next.map((p) => p.id ?? p.runId))
+  const dropped = prev.filter(
+    (p) =>
+      !seen.has(p.id ?? p.runId) &&
+      !p.stale &&
+      (!p.status || p.status === "running"),
+  )
+  if (dropped.length === 0) return next
+  const now = Date.now()
+  return [
+    ...next,
+    ...dropped.map((p) => ({
+      ...p,
+      status: p.status === "running" ? "completed" : p.status,
+      finishedAt: p.finishedAt ?? now,
+    })),
+  ]
+}
+
 const ChatPanelContent = observer(function ChatPanelContent({
   presentation = "studio",
   featureId,
@@ -986,6 +1033,22 @@ const ChatPanelContent = observer(function ChatPanelContent({
 
   const { studioChat } = useSDKDomains()
   const actions = useDomainActions()
+
+  // Workspace-scoped chat routes to `/api/workspaces/:workspaceId/chat`
+  // instead of the per-project endpoint. Only set when this panel is
+  // operating in workspace scope and we actually have a workspace id.
+  const chatWorkspaceId =
+    chatScope === "workspace" && workspaceId ? workspaceId : undefined
+
+  // One base for every runtime call (tasks, cancel, output, quick actions).
+  // The landing chat has a workspaceId but no projectId, and used to resolve
+  // this to `null` — so its dock never seeded and lost every row on remount.
+  const agentBaseUrl = agentProxyBase({
+    localAgentUrl,
+    projectId,
+    workspaceId: chatWorkspaceId,
+    apiUrl: API_URL,
+  })
 
   // Sibling projects (same workspace, excluding the current one) for the
   // composer's "@" mention menu. Tagging one mounts it into the chat runtime
@@ -1119,9 +1182,7 @@ const ChatPanelContent = observer(function ChatPanelContent({
   >([])
 
   const fetchQuickActions = useCallback(async () => {
-    const url =
-      localAgentUrl ||
-      (projectId ? `${API_URL}/api/projects/${projectId}/agent-proxy` : null)
+    const url = agentBaseUrl
     if (!url) return
     try {
       const fetchFn = expoFetch ?? globalThis.fetch
@@ -1141,7 +1202,7 @@ const ChatPanelContent = observer(function ChatPanelContent({
     } catch {
       // Silently ignore — quick actions are non-critical
     }
-  }, [localAgentUrl, projectId, nativeHeaders, expoFetch])
+  }, [agentBaseUrl, nativeHeaders, expoFetch])
 
   useEffect(() => {
     if (!isActive) return
@@ -1740,11 +1801,16 @@ const ChatPanelContent = observer(function ChatPanelContent({
     new Set(),
   )
 
-  const fetchRunningProcesses = useCallback(async () => {
-    const base =
-      localAgentUrl ||
-      (projectId ? `${API_URL}/api/projects/${projectId}/agent-proxy` : null)
-    if (!base || !currentSessionId) return
+  const fetchRunningProcesses = useCallback(async (): Promise<RunningProcess[] | null> => {
+    if (!currentSessionId) return null
+    const tasksUrl = buildChatTasksUrl(
+      API_URL!,
+      projectId,
+      localAgentUrl,
+      currentSessionId,
+      chatWorkspaceId,
+    )
+    if (!tasksUrl) return null
     try {
       const fetchFn = expoFetch ?? globalThis.fetch
       const headers: Record<string, string> = nativeHeaders
@@ -1754,26 +1820,35 @@ const ChatPanelContent = observer(function ChatPanelContent({
         headers,
         credentials: Platform.OS === "web" ? "include" : undefined,
       } as any
-      let res = await fetchFn(`${base}/agent/chat/${currentSessionId}/tasks`, init)
+      let res = await fetchFn(tasksUrl, init)
       // Runtimes that predate tasks only list shell processes.
       if (res.status === 404) {
-        res = await fetchFn(`${base}/agent/chat/${currentSessionId}/processes`, init)
+        res = await fetchFn(tasksUrl.replace(/\/tasks$/, "/processes"), init)
       }
-      if (res.ok) {
-        const data = await res.json()
-        const list = data?.tasks ?? data?.processes
-        if (Array.isArray(list)) setRunningProcesses(list as RunningProcess[])
-      }
+      if (!res.ok) return null
+      const data = await res.json()
+      const list = data?.tasks ?? data?.processes
+      if (!Array.isArray(list)) return null
+      setRunningProcesses((prev) =>
+        keepDroppedAsFinished(prev, list as RunningProcess[]),
+      )
+      return list as RunningProcess[]
     } catch {
       // Non-critical — the panel just won't seed until the next live frame.
+      return null
     }
-  }, [localAgentUrl, projectId, currentSessionId, nativeHeaders, expoFetch])
+  }, [
+    localAgentUrl,
+    projectId,
+    chatWorkspaceId,
+    currentSessionId,
+    nativeHeaders,
+    expoFetch,
+  ])
 
   const handleKillProcess = useCallback(
     async (runId: string) => {
-      const base =
-        localAgentUrl ||
-        (projectId ? `${API_URL}/api/projects/${projectId}/agent-proxy` : null)
+      const base = agentBaseUrl
       if (!base || !currentSessionId) return
       setKillingProcesses((prev) => new Set(prev).add(runId))
       try {
@@ -1799,10 +1874,10 @@ const ChatPanelContent = observer(function ChatPanelContent({
         if (res.ok) {
           const data = await res.json()
           const list = data?.tasks ?? data?.processes
+          // The runtime now answers with the dock list, in which a cancelled
+          // task is a terminal row (Output still opens, no Kill). Trust it.
           if (Array.isArray(list))
-            setRunningProcesses(
-              (list as RunningProcess[]).filter((p) => p.runId !== runId),
-            )
+            setRunningProcesses(list as RunningProcess[])
           else
             setRunningProcesses((prev) => prev.filter((p) => p.runId !== runId))
         }
@@ -1816,14 +1891,12 @@ const ChatPanelContent = observer(function ChatPanelContent({
         })
       }
     },
-    [localAgentUrl, projectId, currentSessionId, nativeHeaders, expoFetch],
+    [agentBaseUrl, currentSessionId, nativeHeaders, expoFetch],
   )
 
   const loadTaskOutput = useCallback(
-    async (taskId: string): Promise<string | null> => {
-      const base =
-        localAgentUrl ||
-        (projectId ? `${API_URL}/api/projects/${projectId}/agent-proxy` : null)
+    async (taskId: string): Promise<TaskOutputInfo | null> => {
+      const base = agentBaseUrl
       if (!base || !currentSessionId) return null
       try {
         const fetchFn = expoFetch ?? globalThis.fetch
@@ -1834,12 +1907,48 @@ const ChatPanelContent = observer(function ChatPanelContent({
         )
         if (!res.ok) return null
         const data = await res.json()
-        return typeof data?.output === "string" ? data.output : null
+        return {
+          taskId: typeof data?.taskId === "string" ? data.taskId : taskId,
+          source: typeof data?.source === "string" ? data.source : undefined,
+          title: typeof data?.title === "string" ? data.title : undefined,
+          status: typeof data?.status === "string" ? data.status : undefined,
+          outputFile: typeof data?.outputFile === "string" ? data.outputFile : undefined,
+          output: typeof data?.output === "string" ? data.output : "",
+          link: asTaskLink(data?.link),
+        }
       } catch {
         return null
       }
     },
-    [localAgentUrl, projectId, currentSessionId, nativeHeaders, expoFetch],
+    [agentBaseUrl, currentSessionId, nativeHeaders, expoFetch],
+  )
+
+  // Pressing a background task opens where its work is happening: the tagged
+  // agent's thread, the card's thread, the callee project's chat, or its log.
+  const openTaskThread = useCallback(
+    async (taskId: string, hint?: OpenTaskHint) => {
+      taskThreadPane.open({
+        taskId,
+        title: hint?.title,
+        source: hint?.source,
+        status: hint?.status,
+        outputFile: hint?.outputFile,
+        link: hint?.link ?? null,
+        loading: true,
+      })
+      const out = await loadTaskOutput(taskId)
+      taskThreadPane.patch(taskId, {
+        loading: false,
+        output: out?.output ?? undefined,
+        outputFile: out?.outputFile ?? hint?.outputFile,
+        title: out?.title ?? hint?.title,
+        source: out?.source ?? hint?.source,
+        status: out?.status ?? hint?.status,
+        link: out?.link ?? hint?.link ?? null,
+        ...(out ? {} : { error: "This task is no longer tracked." }),
+      })
+    },
+    [loadTaskOutput],
   )
 
   // The agent blocked in `wait` (live `data-task-wait` frames during a turn).
@@ -1946,12 +2055,6 @@ const ChatPanelContent = observer(function ChatPanelContent({
   // saved history replaces it once the turn is over (see `onFinish`).
   const joinedStreamRef = useRef(false)
   const refreshHistoryRef = useRef<() => void>(() => {})
-
-  // Workspace-scoped chat routes to `/api/workspaces/:workspaceId/chat`
-  // instead of the per-project endpoint. Only set when this panel is
-  // operating in workspace scope and we actually have a workspace id.
-  const chatWorkspaceId =
-    chatScope === "workspace" && workspaceId ? workspaceId : undefined
 
   // Stable identity across renders: this is a dep of `useChatTransportConfig`'s
   // internal `useMemo`, so an inline arrow here would rebuild `transportConfig`
@@ -3278,18 +3381,19 @@ const ChatPanelContent = observer(function ChatPanelContent({
       const onScreen = messagesRef.current.some(
         (m) => m.id === queuedUserMessage.id,
       );
-      // Still queued bubbles are painted from the queue rows, not from this
-      // list, so a message already here came from the server's history (or a
-      // previous dispatch). If nothing landed after it, this turn's reply
-      // belongs at the end and attaching directly is right — no reload, so the
-      // messages still queued behind it keep their bubbles. If something did
-      // land after it, the transcript has moved on and history is the truth.
+      // Queued messages are not in this list at all any more — only the dock
+      // shows them — so a message already here came from the server's history
+      // (a reload while its turn was running). If nothing landed after it,
+      // this turn's reply belongs at the end and attaching directly is right;
+      // if something did, the transcript has moved on and history is the truth.
       if (onScreen && !canAttachQueuedTurn(messagesRef.current, queuedUserMessage)) {
         reloadAndAttachLiveTurnRef.current()
         return
       }
-      // The server saved the queued message and started its turn; show the
-      // message before attaching to the reply (see queued-user-message.ts).
+      // The server saved the queued message and started its turn: append it at
+      // the end and attach the reply under it, without reloading history. This
+      // is the normal path — the bubble first appears here, when the turn it
+      // belongs to starts.
       if (!onScreen) {
         setMessages((prev) => appendQueuedUserMessage(prev, queuedUserMessage))
       }
@@ -3644,10 +3748,10 @@ const ChatPanelContent = observer(function ChatPanelContent({
   }, [messages.length, pendingInitialMessage])
 
   /**
-   * The transcript plus the bubbles for the rows still waiting on the server.
-   * Derived here (not copied into `messages`) so a deleted or edited queued
-   * message loses its bubble and a history reload cannot drop the ones still
-   * queued (see queued-user-message.ts).
+   * The transcript plus the bubble of a dispatched head the panel has not
+   * attached yet. Only used to tell whether the pre-send echo has been
+   * superseded by the real message — still-queued rows are not in here (they
+   * live in the dock), so queueing clears the echo explicitly.
    */
   const messagesWithQueued = useMemo(
     () => appendQueuedUserMessages(messages, serverQueue.pendingUserMessages),
@@ -3832,6 +3936,46 @@ const ChatPanelContent = observer(function ChatPanelContent({
     [projectId, localAgentUrl, chatWorkspaceId, expoFetch, nativeHeaders],
   )
 
+  /**
+   * The newest saved row for this chat, one row wide. A refocus has to tell
+   * "this chat is up to date" from "a turn was written while this window was
+   * in the background" without pulling the transcript (SHO-53), and the id of
+   * the newest row is enough: if it is not the row on screen, history moved.
+   */
+  const probePersistedTail = useCallback(
+    async (sessionId: string): Promise<PersistedTail | null> => {
+      if (!API_URL) return null
+      const params = new URLSearchParams({
+        sessionId,
+        agent: "technical",
+        limit: "1",
+        offset: "0",
+      })
+      try {
+        const fetchFn = expoFetch ?? globalThis.fetch
+        const response = await fetchFn(
+          `${API_URL}/api/chat-messages?${params.toString()}`,
+          {
+            headers: nativeHeaders ? nativeHeaders() : {},
+            credentials: Platform.OS === "web" ? "include" : undefined,
+          } as any,
+        )
+        if (!response.ok) return null
+        const body = await response.json().catch(() => null)
+        const newest = Array.isArray(body?.items) ? body.items[0] : null
+        if (!newest?.id) return null
+        return {
+          id: String(newest.id),
+          role: typeof newest.role === "string" ? newest.role : null,
+        }
+      } catch {
+        // A failed read is not evidence of a missed turn: leave the panel be.
+        return null
+      }
+    },
+    [expoFetch, nativeHeaders],
+  )
+
   // A turn this panel is not attached to (started in another window, by
   // another member, by a schedule, or dispatched from a queue another window
   // filled) streams to nobody here until something attaches to it. Nothing
@@ -3868,10 +4012,14 @@ const ChatPanelContent = observer(function ChatPanelContent({
     historyOnlyNonceRef.current = ++liveTurnReloadNonceRef.current
     setLiveTurnReloadNonce(liveTurnReloadNonceRef.current)
   }
-  const attachToLiveTurnIfAny = useCallback(async () => {
+  /**
+   * @returns true when a live turn was found and this window started attaching
+   * to it. Callers that got `false` know nothing is running *yet*.
+   */
+  const attachToLiveTurnIfAny = useCallback(async (): Promise<boolean> => {
     const sessionId = currentSessionIdRef.current
     if (!sessionId || isStreamingRef.current || isSendingMessageRef.current) {
-      return
+      return false
     }
     lastLiveTurnCheckAtRef.current = Date.now()
     const turn = await probeLiveTurn(sessionId)
@@ -3880,21 +4028,108 @@ const ChatPanelContent = observer(function ChatPanelContent({
       isStreamingRef.current ||
       isSendingMessageRef.current
     ) {
-      return
+      return false
     }
     // The turn Stop just cancelled can still read `active`: attaching to it
     // would rebuild the reply the user stopped and hide the one that follows.
-    if (isLiveTurnOtherThan(turn, stoppedTurnIdRef.current)) {
-      reloadAndAttachLiveTurn()
-    }
+    if (!isLiveTurnOtherThan(turn, stoppedTurnIdRef.current)) return false
+    reloadAndAttachLiveTurn()
+    return true
   }, [probeLiveTurn, reloadAndAttachLiveTurn])
+
+  const attachToLiveTurnIfAnyRef = useRef(attachToLiveTurnIfAny)
+  attachToLiveTurnIfAnyRef.current = attachToLiveTurnIfAny
+
+  // Repaint the transcript from saved history. A turn this window did not run
+  // — a delegated task, a channel dispatch, a project call, or the wake a
+  // finished background task produces — has its reply written by the server,
+  // so reloading is the only way it lands here (SHO-31).
+  const reloadPersistedResponse = useCallback(
+    async (options: { requireReply?: boolean } = {}) => {
+      if (!sessionMessages || isStreamingRef.current) return
+      const sessionId = currentSessionIdRef.current
+      if (!sessionId) return
+      await sessionMessages.loadPage(
+        { sessionId, agent: "technical" },
+        { limit: MESSAGE_PAGE_SIZE, offset: 0 },
+      )
+      if (isStreamingRef.current || currentSessionIdRef.current !== sessionId) return
+
+      const loaded = [...sessionMessages.all].sort(
+        (a: any, b: any) =>
+          messageTimestamp(a.createdAt) - messageTimestamp(b.createdAt),
+      )
+      if (options.requireReply !== false) {
+        const promptIndex = pendingExternalPromptIndex(loaded)
+        if (promptIndex < 0 || !externalPromptHasResponse(loaded, promptIndex)) return
+      }
+
+      const aiMessages = loaded.map((message: any) => {
+        const next: any = {
+          id: message.id,
+          role: message.role as "user" | "assistant",
+          content: message.content ?? extractTextContent(message),
+          createdAt: message.createdAt,
+        }
+        if (message.parts) {
+          try {
+            next.parts = JSON.parse(message.parts)
+          } catch {
+            // Keep the text content when an older message has malformed parts.
+          }
+        }
+        return next
+      })
+      const cached = cachedMessagesRef.current
+      const unchanged =
+        cached?.length === aiMessages.length &&
+        cached?.[aiMessages.length - 1]?.id === aiMessages[aiMessages.length - 1]?.id &&
+        cached?.[aiMessages.length - 1]?.content === aiMessages[aiMessages.length - 1]?.content
+      if (!unchanged) {
+        cachedMessagesRef.current = aiMessages
+        setMessages(aiMessages)
+      }
+      sessionMessageCache.set(sessionId, aiMessages)
+    },
+    [sessionMessages, setMessages],
+  )
+
+  /**
+   * Catch up after the window was not in front (SHO-53). The wake watch only
+   * runs for an active panel, so a wake that ran while this chat sat behind
+   * another chat tab, another browser tab or another app left nothing armed
+   * here. By the time the person comes back the turn reads `completed`, which
+   * the attach path sends to "history is enough" — but this window has never
+   * seen that history. One row-wide read of the newest saved message decides
+   * it, so a chat that is already up to date still costs a single `/turn`
+   * probe and no transcript reload.
+   */
+  const repaintIfBehindPersistedTail = useCallback(async () => {
+    const sessionId = currentSessionIdRef.current
+    if (!sessionId || isStreamingRef.current || isSendingMessageRef.current) return
+    const tail = await probePersistedTail(sessionId)
+    if (currentSessionIdRef.current !== sessionId) return
+    if (!persistedTailIsUnseen(tail, messagesRef.current)) return
+    // A repaint that requires the reply keeps SHO-31's rule: another window's
+    // ordinary turn is not this window's to overwrite. A tail that is still a
+    // user row is a prompt answered elsewhere (the queue's `[Task update]`
+    // wake), so paint it and let the late-turn probe fetch the reply.
+    await reloadPersistedResponse({ requireReply: !persistedTailAwaitsReply(tail) })
+  }, [probePersistedTail, reloadPersistedResponse])
 
   useEffect(() => {
     if (!isActive || !currentSessionId) return
+    let cancelled = false
     const recheck = () => {
       // Focus fires on every click back into the window.
       if (Date.now() - lastLiveTurnCheckAtRef.current < 3000) return
-      void attachToLiveTurnIfAny()
+      // Both halves are one-shot per focus event: a live turn is attached to,
+      // and a turn that finished elsewhere is repainted from saved history.
+      // Nothing here polls.
+      void attachToLiveTurnIfAny().then((attached) => {
+        if (attached || cancelled) return
+        void repaintIfBehindPersistedTail()
+      })
     }
     if (Platform.OS === "web") {
       if (typeof window === "undefined" || typeof document === "undefined") {
@@ -3906,6 +4141,7 @@ const ChatPanelContent = observer(function ChatPanelContent({
       window.addEventListener("focus", recheck)
       document.addEventListener("visibilitychange", onVisibility)
       return () => {
+        cancelled = true
         window.removeEventListener("focus", recheck)
         document.removeEventListener("visibilitychange", onVisibility)
       }
@@ -3913,22 +4149,37 @@ const ChatPanelContent = observer(function ChatPanelContent({
     const subscription = AppState.addEventListener("change", (state) => {
       if (state === "active") recheck()
     })
-    return () => subscription.remove()
-  }, [isActive, currentSessionId, attachToLiveTurnIfAny])
+    return () => {
+      cancelled = true
+      subscription.remove()
+    }
+  }, [isActive, currentSessionId, attachToLiveTurnIfAny, repaintIfBehindPersistedTail])
 
-  const attachToLiveTurnIfAnyRef = useRef(attachToLiveTurnIfAny)
-  attachToLiveTurnIfAnyRef.current = attachToLiveTurnIfAny
   const wasTransportStreamingRef = useRef(false)
+  // A window that followed a turn must keep following: the next message in the
+  // server queue starts once the API has seen this turn end, which can be a
+  // dispatcher tick away, and a short queued turn can start *and* finish
+  // between two probes. Two fixed probes therefore miss it (SHO-29: window A
+  // showed none of the second queued reply), so keep looking for as long as the
+  // dispatcher could take, then refresh the history on the way out — a turn
+  // that ran while nothing here was attached still has to land on screen.
   useEffect(() => {
     const wasStreaming = wasTransportStreamingRef.current
     wasTransportStreamingRef.current = isTransportStreaming
     if (!wasStreaming || isTransportStreaming || !isActive) return
-    // The queue dispatcher starts the next message once the API has seen
-    // this turn end, a moment after this window has.
-    const timers = [1500, 4000].map((delay) =>
-      setTimeout(() => void attachToLiveTurnIfAnyRef.current(), delay),
-    )
-    return () => timers.forEach(clearTimeout)
+    let cancelled = false
+    void followNextTurn({
+      attachIfLive: attachToLiveTurnIfAnyRef.current,
+      refreshHistory: () => refreshHistoryRef.current(),
+      // A stream or a send starting is this window taking over again: the
+      // stream's own end re-arms the follow, and reloading history mid-send
+      // would drop the bubble just echoed.
+      isCancelled: () =>
+        cancelled || isStreamingRef.current || isSendingMessageRef.current,
+    })
+    return () => {
+      cancelled = true
+    }
   }, [isTransportStreaming, isActive])
 
   // A `wait` ends with its turn at the latest.
@@ -3936,36 +4187,95 @@ const ChatPanelContent = observer(function ChatPanelContent({
     if (!isStreaming) setTaskWait(null)
   }, [isStreaming])
 
-  // While idle with tasks that will wake the agent, keep the list fresh; when
-  // one of them finishes, the API queues a wake turn, so look for it.
+  // Background work that will wake this chat when it finishes. The wake turn
+  // is produced by the API's queue (a `[Task update]` row plus a turn this
+  // window never posted), and the task list here is the only local signal that
+  // such work exists — it is seeded once per session, i.e. before the turn
+  // that starts the task, so nothing would notice it otherwise.
+  // Only rows that are still running count: a finished row stays in the
+  // runtime's list for ten minutes (and in the dock for a few seconds), so it
+  // must not keep the "waiting for a wake" state alive.
   const notifyTaskIds = runningProcesses
-    .filter((p) => p.notify && !p.stale)
+    .filter((p) => p.notify && !p.stale && !isFinishedProcess(p))
     .map((p) => p.id ?? p.runId)
     .join("\0")
-  const previousNotifyTaskIdsRef = useRef(notifyTaskIds)
-  useEffect(() => {
-    const previous = previousNotifyTaskIdsRef.current
-    previousNotifyTaskIdsRef.current = notifyTaskIds
-    if (isStreaming || !isActive) return
-    const finished = previous
-      .split("\0")
-      .filter((id) => id && !notifyTaskIds.split("\0").includes(id))
-    if (finished.length === 0) return
-    const timers = [3000, 7000].map((delay) =>
-      setTimeout(() => void attachToLiveTurnIfAnyRef.current(), delay),
-    )
-    return () => timers.forEach(clearTimeout)
-  }, [notifyTaskIds, isStreaming, isActive])
-  useEffect(() => {
-    if (isStreaming || !isActive || !notifyTaskIds) return
-    const timer = setInterval(() => void fetchRunningProcesses(), 5000)
-    return () => clearInterval(timer)
-  }, [notifyTaskIds, isStreaming, isActive, fetchRunningProcesses])
+  const backgroundWorkExpected = useMemo(
+    () => lastTurnStartedBackgroundWork(messages),
+    [messages],
+  )
+  const wakeWatchArmed = Boolean(notifyTaskIds) || backgroundWorkExpected
 
-  // A delegated task or a channel mention starts its turn outside this panel.
-  // The first history-load probe can therefore see `unknown` while a slot or
-  // a cold runtime is still in the way. Keep probing so the live reply shows
-  // up here instead of only after the session is opened again.
+  useEffect(() => {
+    if (!wakeWatchArmed || !isActive || !currentSessionId || isStreaming) return
+
+    let cancelled = false
+    // The wake row and its reply both arrive after this arm, so an older
+    // answered wake in history must not end the wait on the first tick.
+    const wakeCountAtArm = messagesRef.current.length
+    const settled = () =>
+      messagesRef.current.length > wakeCountAtArm &&
+      taskWakeHasResponse(messagesRef.current)
+
+    void watchForNotifyWake({
+      probeTasks: async () => {
+        const list = await fetchRunningProcesses()
+        // Unknown (runtime unreachable) is not the same as "nothing running":
+        // hold the wait instead of probing turns for a wake that cannot come.
+        if (!list) return null
+        return list
+          .filter((p) => p.notify && !p.stale && !isFinishedProcess(p))
+          .map((p) => p.id ?? p.runId)
+      },
+      probeTurn: () => {
+        const turnUrl = buildChatTurnUrl(
+          API_URL!,
+          projectId,
+          localAgentUrl,
+          currentSessionId,
+          chatWorkspaceId,
+        )
+        return probeChatTurnStatus({
+          url: turnUrl,
+          fetch: expoFetch,
+          headers: nativeHeaders ? nativeHeaders() : undefined,
+          credentials: Platform.OS === "web" ? "include" : undefined,
+        })
+      },
+      // Reload first: the live stream carries only the reply, and the wake's
+      // `[Task update]` row has to be in place for it to attach to.
+      attach: () => reloadAndAttachLiveTurn(),
+      reload: () => reloadPersistedResponse({ requireReply: false }),
+      isSettled: settled,
+      isCancelled: () => cancelled || isStreamingRef.current,
+      intervalMs: NOTIFY_WAKE_POLL_INTERVAL_MS,
+      maxWaitMs: NOTIFY_WAKE_MAX_WAIT_MS,
+      onError: (error) => {
+        if (!cancelled) console.warn("[ChatPanel] wake watch failed", error)
+      },
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [
+    wakeWatchArmed,
+    isActive,
+    currentSessionId,
+    isStreaming,
+    projectId,
+    localAgentUrl,
+    chatWorkspaceId,
+    expoFetch,
+    nativeHeaders,
+    fetchRunningProcesses,
+    reloadAndAttachLiveTurn,
+    reloadPersistedResponse,
+  ])
+
+  // A delegated task, a channel mention or a `[Task update]` wake starts its
+  // turn outside this panel. The first history-load probe can therefore see
+  // `unknown` while a slot or a cold runtime is still in the way. Keep probing
+  // so the live reply shows up here instead of only after the session is
+  // opened again.
   const externalPromptIndex = useMemo(
     () => pendingExternalPromptIndex(messages),
     [messages],
@@ -3989,39 +4299,8 @@ const ChatPanelContent = observer(function ChatPanelContent({
     let cancelled = false
 
     const refreshPersistedResponse = async () => {
-      if (cancelled || isStreamingRef.current) return
-      await sessionMessages.loadPage(
-        { sessionId: currentSessionId, agent: "technical" },
-        { limit: MESSAGE_PAGE_SIZE, offset: 0 },
-      )
-      if (cancelled || isStreamingRef.current) return
-
-      const loaded = [...sessionMessages.all].sort(
-        (a: any, b: any) =>
-          messageTimestamp(a.createdAt) - messageTimestamp(b.createdAt),
-      )
-      const promptIndex = pendingExternalPromptIndex(loaded)
-      if (promptIndex < 0 || !externalPromptHasResponse(loaded, promptIndex)) return
-
-      const aiMessages = loaded.map((message: any) => {
-        const next: any = {
-          id: message.id,
-          role: message.role as "user" | "assistant",
-          content: message.content ?? extractTextContent(message),
-          createdAt: message.createdAt,
-        }
-        if (message.parts) {
-          try {
-            next.parts = JSON.parse(message.parts)
-          } catch {
-            // Keep the text content when an older message has malformed parts.
-          }
-        }
-        return next
-      })
-      cachedMessagesRef.current = aiMessages
-      sessionMessageCache.set(currentSessionId, aiMessages)
-      setMessages(aiMessages)
+      if (cancelled) return
+      await reloadPersistedResponse()
     }
 
     void pollForLateTurn({
@@ -4065,7 +4344,7 @@ const ChatPanelContent = observer(function ChatPanelContent({
     expoFetch,
     nativeHeaders,
     guardedAutoResumeStream,
-    setMessages,
+    reloadPersistedResponse,
   ])
 
   // Detect when the AI SDK stream ends but we never observed a
@@ -6112,13 +6391,12 @@ const ChatPanelContent = observer(function ChatPanelContent({
         references,
         body,
       })
-      // The queued turn is the server's to run, but the bubble is the send's:
-      // waiting for the queue poll to notice the dispatch means the reply
-      // arrives before its own message, and with the previous user bubble
-      // still last, the new reply renders under the old message. The bubble is
-      // painted from the queue row itself (see `displayMessages`), so deleting
-      // or editing the queued message takes it away again; hand back any
-      // stopped snapshot so it lands *below* the stop.
+      // The queued turn is the server's to run: until it takes the row there
+      // is no user message in this session, so the message lives in the dock
+      // only and the caller drops the pre-send echo. When the server
+      // dispatches it, the hook hands over that turn's saved user message and
+      // it appears in the transcript with its reply. Hand back any stopped
+      // snapshot so that reply lands *below* the stop.
       releaseStopSnapshot()
     },
     [
@@ -6175,7 +6453,11 @@ const ChatPanelContent = observer(function ChatPanelContent({
       showOptimisticEcho(trimmedContent, files)
 
       const queueMessage = async () => {
-        const queueLocally = () =>
+        // Anything that lands in `displayedQueue` (the dock) must not also sit
+        // in the transcript: a queued message is not a turn yet, and its bubble
+        // appears when the server dispatches it.
+        const queueLocally = () => {
+          clearOptimisticEcho(trimmedContent)
           setMessageQueue((queue) => [
             ...queue,
             {
@@ -6188,6 +6470,7 @@ const ChatPanelContent = observer(function ChatPanelContent({
               references,
             },
           ])
+        }
         if (localAgentUrl) {
           queueLocally()
           return
@@ -6199,6 +6482,7 @@ const ChatPanelContent = observer(function ChatPanelContent({
             perMsgModel,
             references,
           )
+          clearOptimisticEcho(trimmedContent)
         } catch (error) {
           console.warn(
             "[ChatPanel] Server queue unavailable; retaining a local queued message:",
@@ -6248,6 +6532,7 @@ const ChatPanelContent = observer(function ChatPanelContent({
       )
     },
     [
+      clearOptimisticEcho,
       enqueueServerMessage,
       isStreaming,
       localAgentUrl,
@@ -7015,13 +7300,7 @@ const ChatPanelContent = observer(function ChatPanelContent({
   // silently failed to render (only the "Image generated" placeholder
   // showed, never the actual picture — see workspace-chat.ts's matching
   // `/workspaces/:workspaceId/agent-proxy/*` route).
-  const resolvedAgentUrl =
-    localAgentUrl ||
-    (projectId
-      ? `${API_URL}/api/projects/${projectId}/agent-proxy`
-      : chatWorkspaceId
-        ? `${API_URL}/api/workspaces/${chatWorkspaceId}/agent-proxy`
-        : null)
+  const resolvedAgentUrl = agentBaseUrl
 
   // Generate a stakeholder summary for a plan that doesn't have one yet.
   // Mutates the local pending/streaming plan as soon as the summary comes
@@ -7451,6 +7730,7 @@ const ChatPanelContent = observer(function ChatPanelContent({
       fileExists,
       workspaceId: workspaceId ?? null,
       openProjectPane: onOpenProjectPane,
+      openTaskThread,
       generateSummary: handleGenerateSummary,
       selectedModel,
       isPro: hasAdvancedModelAccess,
@@ -7473,6 +7753,7 @@ const ChatPanelContent = observer(function ChatPanelContent({
       fileExists,
       workspaceId,
       onOpenProjectPane,
+      openTaskThread,
       handleGenerateSummary,
       selectedModel,
       hasAdvancedModelAccess,
@@ -8003,6 +8284,15 @@ const ChatPanelContent = observer(function ChatPanelContent({
             waiting={taskWait}
             agentIdle={!isStreaming}
             loadOutput={loadTaskOutput}
+            onOpenTask={(proc) =>
+              void openTaskThread(proc.id ?? proc.runId, {
+                title: proc.title ?? proc.command,
+                source: proc.source,
+                status: proc.status,
+                outputFile: proc.outputFile,
+                link: proc.link,
+              })
+            }
           />
           <BrowserDockPanel />
           <WorktreeDockPanel
