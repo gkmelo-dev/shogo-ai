@@ -394,6 +394,27 @@ describe('cards that know their PR (SHO-64)', () => {
     expect(screen.getByTestId('board-card-SUP-4').textContent).not.toContain('#')
   })
 
+  test('a failing check that is not required still shows on the tile', async () => {
+    // #1533's shape: `unstable`, only `cla` + `Android (emulator)` red. The card
+    // says so, but the board does not treat it as blocked.
+    routes['GET /api/boards/b1'] = () => ({
+      board,
+      items: [item('5', 'c1', 5, {
+        pr: prBlock({
+          number: 1533,
+          red: false,
+          mergeableState: 'unstable',
+          checks: { total: 3, passing: 1, failing: 2, pending: 0 },
+          failing: [{ name: 'cla', url: null }, { name: 'Android (emulator)', url: null }],
+        }),
+      })],
+      health: { issues: [] },
+    })
+    render(createElement(BoardKanban, { boardId: 'b1', workspaceId: 'ws', mentionables: mentionables as any, onOpenCard: () => {} }))
+    const chip = await screen.findByTestId('board-card-pr-1533')
+    expect(chip.textContent).toContain('#1533 · 1/3 checks · failing')
+  })
+
   test('the column header shows and toggles the arming rule', async () => {
     routes['PATCH /api/boards/b1/columns/c1'] = (c) => ({ column: { ...columns[0], rules: c.body.rules }, board })
     render(createElement(BoardKanban, { boardId: 'b1', workspaceId: 'ws', mentionables: mentionables as any, onOpenCard: () => {} }))

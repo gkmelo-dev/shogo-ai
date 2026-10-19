@@ -45,15 +45,27 @@ interface StubPr {
 
 let stub: StubPr = { number: 1519 }
 const fetchCalls: string[] = []
+/** PR numbers GitHub was asked to disarm, in order. */
+const disarmCalls: number[] = []
 
 function stubFetch() {
-  globalThis.fetch = (async (input: any) => {
+  globalThis.fetch = (async (input: any, init?: any) => {
     const url = String(input?.url ?? input)
     fetchCalls.push(url)
+    if (url.endsWith('/graphql')) {
+      const id = JSON.parse(String(init?.body ?? '{}'))?.variables?.id
+      const number = Number(String(id ?? '').replace(/\D/g, ''))
+      disarmCalls.push(number)
+      return new Response(JSON.stringify({ data: { disablePullRequestAutoMerge: { pullRequest: { number } } } }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }
     const prMatch = url.match(/\/repos\/([^/]+)\/([^/]+)\/pulls\/(\d+)$/)
     if (prMatch) {
       return new Response(JSON.stringify({
         number: stub.number,
+        node_id: `PR_${stub.number}`,
         html_url: `https://github.com/${prMatch[1]}/${prMatch[2]}/pull/${stub.number}`,
         state: stub.state ?? 'open',
         draft: stub.draft ?? false,
@@ -279,6 +291,95 @@ describe('the link keeps GitHub’s own state', () => {
     expect(await pr.applyPrRules(again!.link, again!.metadata, again!.previous)).toBe('none')
   })
 
+  test('a red non-required check (cla, an emulator job) leaves the card where it is', async () => {
+    // Live shape of #1533: `unstable`, required "Lint, Typecheck, Test" green,
+    // only `cla` and `Android (emulator)` red. Russell's rule is that a red
+    // `cla` never holds a card (SHO-43), so `unstable` must not move it.
+    const card = await makeCard('PR Open')
+    const linked = await pr.linkPullRequestToCard({
+      workspaceId: seed.workspaceId,
+      repoFullName: 'shogo-labs/shogo-ai',
+      number: 1533,
+      workItem: card.key,
+    })
+    stubFetch()
+    stub = {
+      number: 1533,
+      mergeable_state: 'unstable',
+      head_sha: 'unstable1',
+      checks: [
+        { name: 'Lint, Typecheck, Test', conclusion: 'success' },
+        { name: 'cla', conclusion: 'failure' },
+        { name: 'Android (emulator)', conclusion: 'failure' },
+      ],
+    }
+    const refreshed = await pr.refreshPrLink(linked!.link)
+    expect(refreshed?.metadata.checks).toEqual({ total: 3, passing: 1, failing: 2, pending: 0 })
+    expect(await pr.applyPrRules(refreshed!.link, refreshed!.metadata, refreshed!.previous)).toBe('none')
+
+    const after = await cardRow(card.id)
+    expect(after.column.name).toBe('PR Open')
+    expect(await db.workItemEvent.count({ where: { workItemId: card.id, type: 'commented' } })).toBe(0)
+
+    // The card still shows the failing checks; it just is not red enough to move.
+    const block = pr.prBlock(await db.workItemLink.findUnique({ where: { id: linked!.link.id } }))
+    expect(block?.red).toBe(false)
+    expect(block?.checks.failing).toBe(2)
+  })
+
+  test('a PR armed from a column that does not allow it is disarmed and commented', async () => {
+    const card = await makeCard('In Development')
+    const linked = await pr.linkPullRequestToCard({
+      workspaceId: seed.workspaceId,
+      repoFullName: 'shogo-labs/shogo-ai',
+      number: 1537,
+      workItem: card.key,
+    })
+    stubFetch()
+    stub = {
+      number: 1537,
+      mergeable_state: 'clean',
+      head_sha: 'armed1',
+      auto_merge: { enabled_by: { login: 'shogoagent' } },
+      checks: [{ name: 'Lint, Typecheck, Test', conclusion: 'success' }],
+    }
+    disarmCalls.length = 0
+    const refreshed = await pr.refreshPrLink(linked!.link)
+    expect(await pr.applyPrRules(refreshed!.link, refreshed!.metadata, refreshed!.previous)).toBe('none')
+
+    expect(disarmCalls).toEqual([1537])
+    const link = await db.workItemLink.findUnique({ where: { id: linked!.link.id } })
+    expect(link.metadata.armed).toBe(false)
+    const comment = await db.workItemEvent.findFirst({ where: { workItemId: card.id, type: 'commented' } })
+    expect(comment.eventData.text).toContain('Disarmed')
+    expect(comment.eventData.text).toContain('"PR Open"')
+    // It stays where it is: a stray arm is not a reason to yank the card.
+    expect((await cardRow(card.id)).column.name).toBe('In Development')
+  })
+
+  test('a PR armed from PR Open stays armed', async () => {
+    const card = await makeCard('PR Open')
+    const linked = await pr.linkPullRequestToCard({
+      workspaceId: seed.workspaceId,
+      repoFullName: 'shogo-labs/shogo-ai',
+      number: 1538,
+      workItem: card.key,
+    })
+    stubFetch()
+    stub = {
+      number: 1538,
+      mergeable_state: 'clean',
+      head_sha: 'armed2',
+      auto_merge: { enabled_by: { login: 'shogoagent' } },
+      checks: [{ name: 'Lint, Typecheck, Test', conclusion: 'success' }],
+    }
+    disarmCalls.length = 0
+    const refreshed = await pr.refreshPrLink(linked!.link)
+    expect(await pr.applyPrRules(refreshed!.link, refreshed!.metadata, refreshed!.previous)).toBe('none')
+    expect(disarmCalls).toEqual([])
+    expect((await db.workItemLink.findUnique({ where: { id: linked!.link.id } })).metadata.armed).toBe(true)
+  })
+
   test('a merge moves the card to Done and comments the merge', async () => {
     const card = await makeCard('PR Open')
     const linked = await pr.linkPullRequestToCard({
@@ -493,6 +594,26 @@ describe('webhooks keep the board current without polling', () => {
     const link = await db.workItemLink.findUnique({ where: { id: linked!.link.id } })
     expect(link.syncedAt).toBeTruthy()
   })
+  test('the scheduled sweep is wired and refreshes a stale link', async () => {
+    const card = await makeCard('In Development')
+    const linked = await pr.linkPullRequestToCard({
+      workspaceId: seed.workspaceId,
+      repoFullName: 'shogo-labs/shogo-ai',
+      number: 1603,
+      workItem: card.key,
+    })
+    await db.workItemLink.update({ where: { id: linked!.link.id }, data: { syncedAt: null } })
+    stubFetch()
+    stub = { number: 1603, checks: [{ name: 'ci', conclusion: 'success' }] }
+
+    // The job, not just the service: `syncPrLinksForWorkspace` used to have no
+    // caller, so a token-connected repo never moved a card.
+    const { runSyncPrLinks } = await import('../jobs/sync-pr-links')
+    const summary = await runSyncPrLinks()
+    expect(summary.lockSkipped).toBeUndefined()
+    expect(summary.refreshed).toBeGreaterThan(0)
+    expect((await db.workItemLink.findUnique({ where: { id: linked!.link.id } })).syncedAt).toBeTruthy()
+  })
 })
 
 // ─── Pure helpers ────────────────────────────────────────────────────────────
@@ -510,8 +631,11 @@ describe('helpers', () => {
     expect(pr.parsePullRequestUrl('https://example.com/x')).toBeNull()
   })
 
-  test('red needs a failing check on a blocking merge state', () => {
-    expect(pr.isRed({ checks: { total: 2, passing: 1, failing: 1, pending: 0 }, mergeableState: 'unstable' })).toBe(true)
+  test('red needs a failing check that GitHub blocks on, not a red non-required one', () => {
+    // `blocked` = a required check is failing, so the card goes back.
+    expect(pr.isRed({ checks: { total: 2, passing: 1, failing: 1, pending: 0 }, mergeableState: 'blocked' })).toBe(true)
+    // `unstable` = only a non-required check (cla, an emulator job) is red.
+    expect(pr.isRed({ checks: { total: 2, passing: 1, failing: 1, pending: 0 }, mergeableState: 'unstable' })).toBe(false)
     expect(pr.isRed({ checks: { total: 2, passing: 1, failing: 1, pending: 0 }, mergeableState: 'clean' })).toBe(false)
     expect(pr.isRed({ checks: { total: 2, passing: 2, failing: 0, pending: 0 }, mergeableState: 'blocked' })).toBe(false)
   })

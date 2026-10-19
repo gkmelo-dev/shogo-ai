@@ -551,6 +551,46 @@ export async function mergePullRequest(options: {
   return { merged: true, sha: body?.sha, message: body?.message };
 }
 
+/**
+ * Turn off a PR's auto-merge ("armed") state. REST has no endpoint for this, so
+ * it takes GitHub's GraphQL mutation — with the PR's node id from REST, since a
+ * snapshot carries the number only. Throws when GitHub refuses, so a caller can
+ * leave the card's stored state untouched.
+ */
+export async function disablePullRequestAutoMerge(
+  auth: number | GitHubAuth,
+  repoOwner: string,
+  repoName: string,
+  number: number,
+): Promise<void> {
+  const token = await accessTokenFor(auth);
+  const headers = {
+    Authorization: `Bearer ${token}`,
+    Accept: 'application/vnd.github+json',
+    'X-GitHub-Api-Version': '2022-11-28',
+    'Content-Type': 'application/json',
+  };
+  const repoPath = `${GITHUB_API_URL}/repos/${encodeURIComponent(repoOwner)}/${encodeURIComponent(repoName)}`;
+  const prResponse = await fetch(`${repoPath}/pulls/${number}`, { headers });
+  const pr = (await prResponse.json().catch(() => null)) as any;
+  if (!prResponse.ok || !pr?.node_id) {
+    throw new Error(`Failed to read pull request #${number}: ${pr?.message || `HTTP ${prResponse.status}`}`);
+  }
+
+  const response = await fetch(`${GITHUB_API_URL}/graphql`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      query: 'mutation($id: ID!) { disablePullRequestAutoMerge(input: { pullRequestId: $id }) { pullRequest { number } } }',
+      variables: { id: pr.node_id },
+    }),
+  });
+  const body = (await response.json().catch(() => null)) as any;
+  if (!response.ok || Array.isArray(body?.errors) && body.errors.length) {
+    throw new Error(`Failed to disable auto-merge on #${number}: ${body?.errors?.[0]?.message || `HTTP ${response.status}`}`);
+  }
+}
+
 /** One check-run on a PR's head commit, reduced to what a card shows. */
 export interface PullRequestCheck {
   name: string

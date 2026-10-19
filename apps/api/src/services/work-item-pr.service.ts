@@ -38,7 +38,10 @@ export interface PrMetadata {
   mergedAt: string | null
   headSha: string | null
   headRef: string | null
-  /** GitHub's `mergeable_state`; `unstable`/`blocked` mean a required check is red. */
+  /**
+   * GitHub's `mergeable_state`. `blocked` is a failing **required** check;
+   * `unstable` is a red check that is not required (`cla`, an emulator job).
+   */
   mergeableState: string | null
   checks: { total: number; passing: number; failing: number; pending: number }
   failing: Array<{ name: string; url: string | null }>
@@ -107,10 +110,15 @@ function metadataOf(link: any): PrMetadata | null {
   return raw as PrMetadata
 }
 
-/** A blocking check failed: GitHub reports the PR as blocked, or checks failing. */
+/**
+ * A **required** check failed, so GitHub blocks the merge. `unstable` is a red
+ * check that is *not* required (`cla`, an emulator job) — a red `cla` never
+ * holds a card (Russell, 2026-10-19, SHO-43), so only `blocked` counts here.
+ * The chip still shows a failing `cla`; it just does not move the card.
+ */
 export function isRed(pr: Pick<PrMetadata, 'checks' | 'mergeableState'>): boolean {
   if (!pr.checks?.failing) return false
-  return pr.mergeableState === 'unstable' || pr.mergeableState === 'blocked'
+  return pr.mergeableState === 'blocked'
 }
 
 /** The `pr` block for one `pr` link, or null when its metadata was never read. */
@@ -332,6 +340,34 @@ function blockingColumns(board: any): string[] {
 const SYSTEM_ACTOR = { userId: null, agentRef: null, sessionId: null } as const
 
 /**
+ * Disarm a PR that was armed from a column that does not allow it. The merge
+ * tool is guarded at its route, but `gh pr merge --auto` and GitHub's own UI
+ * never pass through our routes, so the board enforces the rule on the way
+ * back in. Returns false when the repo cannot be written — the card keeps the
+ * state it has rather than claiming a disarm that did not happen.
+ */
+async function disarmPullRequest(link: any, metadata: PrMetadata): Promise<boolean> {
+  const repo = repoOf(link)
+  if (!repo) return false
+  const connection = await connectionForRepo(link.workspaceId, repo.repo)
+  const auth = connection ? await authOf(connection) : null
+  if (!auth) return false
+  const github = await cloudGitHub()
+  if (!github || typeof github.disablePullRequestAutoMerge !== 'function') return false
+  try {
+    await github.disablePullRequestAutoMerge(auth, repo.owner, repo.name, Number(link.refId))
+  } catch (err: any) {
+    console.warn(`[WorkItemPR] Could not disarm #${link.refId}:`, err?.message ?? err)
+    return false
+  }
+  await db.workItemLink.update({
+    where: { id: link.id },
+    data: { metadata: { ...metadata, armed: false, queued: false } },
+  })
+  return true
+}
+
+/**
  * Apply a card's PR state to the board: back to the first active column on a
  * newly red blocking check, to `done` on a merge, and a comment either way.
  * Runs only on the transition that matters, so repeat webhooks are no-ops.
@@ -363,6 +399,23 @@ export async function applyPrRules(link: any, metadata: PrMetadata, previous: Pr
   }
 
   const red = metadata.state === 'open' && isRed(metadata)
+
+  // A board enforces the arming rule once one of its columns opts in. Until
+  // then every column is still allowed, so a rollout does not silently disarm
+  // a pipeline that has not configured the rule yet.
+  const armingColumns = blockingColumns(board)
+  if (metadata.state === 'open' && metadata.armed && previous?.armed !== true && !columnAllowsAutoMerge(column) && armingColumns.length) {
+    if (await disarmPullRequest(link, metadata)) {
+      const allowed = armingColumns.map((c) => `"${c}"`).join(' or ')
+      await commentWorkItem(
+        item,
+        `${label} was armed from "${column.name}", which does not allow auto-merge. Disarmed — move ${item.key} to ${allowed} first.`,
+        SYSTEM_ACTOR,
+        { system: true },
+      )
+    }
+  }
+
   if (!red) return 'none'
   if (previous && isRed(previous) && previous.headSha === metadata.headSha) return 'none'
   if (metadata.regressedFor && metadata.regressedFor === metadata.headSha) return 'none'

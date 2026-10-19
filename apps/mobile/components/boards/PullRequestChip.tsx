@@ -12,6 +12,11 @@ import { CircleAlert, CircleCheck, GitMerge, GitPullRequest, Link2 } from 'lucid
 import { cn } from '@shogo/shared-ui/primitives'
 import type { CardPullRequest } from '../../lib/work-boards-api'
 
+/** `red` is a failing *required* check; any red check is still shown failing. */
+function hasFailingChecks(pr: CardPullRequest): boolean {
+  return pr.red || pr.checks.failing > 0
+}
+
 /** `#1519 · 3/4 checks · armed`, `#1519 · merged`, `#1519 · 2/4 checks · failing`. */
 export function prChipText(pr: CardPullRequest): string {
   const head = `#${pr.number}`
@@ -19,7 +24,7 @@ export function prChipText(pr: CardPullRequest): string {
   if (pr.state === 'closed') return `${head} · closed`
   const parts = [head]
   if (pr.checks.total) parts.push(`${pr.checks.passing}/${pr.checks.total} checks`)
-  if (pr.red) parts.push('failing')
+  if (hasFailingChecks(pr)) parts.push('failing')
   else if (pr.checks.pending) parts.push(`${pr.checks.pending} running`)
   if (pr.armed) parts.push('armed')
   if (pr.queued) parts.push('queued')
@@ -30,7 +35,7 @@ export function prChipText(pr: CardPullRequest): string {
 type Tone = 'red' | 'green' | 'muted'
 
 export function prTone(pr: CardPullRequest): Tone {
-  if (pr.red) return 'red'
+  if (hasFailingChecks(pr)) return 'red'
   if (pr.merged) return 'green'
   if (pr.state === 'open' && pr.checks.total > 0 && pr.checks.passing === pr.checks.total) return 'green'
   return 'muted'
@@ -43,7 +48,7 @@ const TONE_STYLE: Record<Tone, { box: string; text: string }> = {
 }
 
 function PrIcon({ pr, size = 10, className }: { pr: CardPullRequest; size?: number; className?: string }) {
-  if (pr.red) return <CircleAlert size={size} className={className} />
+  if (hasFailingChecks(pr)) return <CircleAlert size={size} className={className} />
   if (pr.merged) return <GitMerge size={size} className={className} />
   if (pr.state === 'open' && pr.checks.total > 0 && pr.checks.passing === pr.checks.total) return <CircleCheck size={size} className={className} />
   return <GitPullRequest size={size} className={className} />
@@ -83,6 +88,7 @@ function describe(pr: CardPullRequest): string {
   if (pr.merged) return 'Merged'
   if (pr.state === 'closed') return 'Closed without merging'
   if (pr.red) return 'A required check is failing'
+  if (pr.checks.failing > 0) return `${pr.checks.failing} check${pr.checks.failing === 1 ? '' : 's'} failing, none required — the card stays put`
   if (pr.queued) return 'In the merge queue'
   if (pr.armed) return 'Armed — merges when the required checks pass'
   if (pr.draft) return 'Draft'
