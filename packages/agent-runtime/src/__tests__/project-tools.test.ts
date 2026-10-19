@@ -12,6 +12,7 @@ import { tmpdir } from 'os'
 import { join } from 'path'
 import { runChatSessionId } from '@shogo/shared-runtime/project-call-chat'
 import * as realInternalApi from '../internal-api'
+import { setTechStackPreviewRestarter, type PreviewRestartRequest } from '../tech-stack-switch'
 
 // ─── internal-api fakes ─────────────────────────────────────────────────
 
@@ -115,6 +116,8 @@ type ToolContext = import('../gateway-tools').ToolContext
 // ─── Test harness ──────────────────────────────────────────────────────
 
 let workspaceDir = ''
+/** Preview restarts requested by a stack switch (a stub stands in for server.ts). */
+let restarts: PreviewRestartRequest[] = []
 
 function baseCtx(over: Partial<ToolContext> = {}): ToolContext {
   return {
@@ -142,6 +145,8 @@ beforeEach(() => {
   calls.length = 0
   internalApiCredentials = false
   workspaceDir = mkdtempSync(join(tmpdir(), 'project-tools-test-'))
+  restarts = []
+  setTechStackPreviewRestarter((req) => void restarts.push(req))
   api.graph = { ok: true, status: 200, data: [] }
   api.create = { ok: true, status: 201, data: { id: 'proj-new', name: 'New', description: null, workingMode: 'managed', settings: null } }
   api.attach = { ok: true, status: 201, data: { attachment: { id: 'att-1', attachedProjectId: 'target', attachedProjectName: 'Target', attachMode: 'readwrite' }, mounted: true } }
@@ -177,9 +182,18 @@ describe('project_list', () => {
     expect(out.currentProjectId).toBe('caller-1')
     const worker = out.projects.find((p: any) => p.id === 'proj-2')
     expect(worker.manifestKey).toBe('worker')
+    expect(worker.techStackId).toBeNull()
     const caller = out.projects.find((p: any) => p.id === 'caller-1')
     expect(caller.isCurrent).toBe(true)
     expect(caller.onDisk).toBe(true) // resolveProjectDir(ctx, ctx.projectId) === ctx.workspaceDir
+  })
+
+  test('includes each project\'s tech stack id', async () => {
+    api.graph.data = [
+      { id: 'caller-1', name: 'Caller', description: null, workingMode: 'managed', settings: { techStackId: 'video-editor' }, attachments: [], agent: null },
+    ]
+    const out = await run(createProjectListTool(baseCtx()))
+    expect(out.projects[0].techStackId).toBe('video-editor')
   })
 })
 
@@ -220,6 +234,26 @@ describe('project_create', () => {
     expect(out.ok).toBe(true)
     expect(out.attachment).toMatchObject({ code: 'cross_workspace' })
     expect(out.mounted).toBe(false)
+  })
+
+  test('describes every project type the runtime ships (id, name, description)', async () => {
+    const tool = createProjectCreateTool(baseCtx())
+    for (const id of ['react-app', 'expo-app', 'python-data', 'video-editor', 'custom', 'none']) {
+      expect(tool.description).toContain(`"${id}"`)
+    }
+    expect(tool.description).toContain('Video Editor')
+    // The param description carries the ids too, so the model can pick blind.
+    const param = (tool.parameters as any).properties.techStackId
+    expect(param.description).toContain('video-editor')
+  })
+
+  test('fails an unknown techStackId with the valid ids instead of copying the Vite template', async () => {
+    const ctx = baseCtx()
+    const out = await run(createProjectCreateTool(ctx), { name: 'Mystery', techStackId: 'video-editr' })
+    expect(out.code).toBe('unknown_tech_stack')
+    expect(out.validTechStackIds).toContain('video-editor')
+    expect(out.validTechStackIds).toContain('react-app')
+    expect(calls.find((c) => c.fn === 'createProject')).toBeUndefined()
   })
 })
 
@@ -357,6 +391,71 @@ describe('project_configure', () => {
     writeFileSync(join(workspaceDir, '.shogo/system.lock.json'), JSON.stringify({ version: 1, name: 'sys', bindings: { worker: 'proj-2' } }))
     const ctx = baseCtx()
     const out = await run(createProjectConfigureTool(ctx), { project: 'worker', name: 'Renamed Worker' })
+    expect(calls.find((c) => c.fn === 'configureProject')?.args[0]).toBe('proj-2')
+  })
+
+  // ── project type (`techStackId` / `resetFiles`) ──────────────────────────
+
+  test('rejects an unknown techStackId before patching anything', async () => {
+    const ctx = baseCtx({ projectId: 'proj-1' })
+    const out = await run(createProjectConfigureTool(ctx), { techStackId: 'nope' })
+    expect(out.code).toBe('unknown_tech_stack')
+    expect(out.validTechStackIds).toContain('video-editor')
+    expect(calls.find((c) => c.fn === 'configureProject')).toBeUndefined()
+  })
+
+  test('is a no-op when the project is already on that stack (and still applies other fields)', async () => {
+    api.getConfig.data.settings = { techStackId: 'video-editor' }
+    const ctx = baseCtx({ projectId: 'proj-1' })
+    const same = await run(createProjectConfigureTool(ctx), { techStackId: 'video-editor' })
+    expect(same.changed).toBe(false)
+    expect(same.techStackId).toBe('video-editor')
+    expect(same.stackNote).toContain('Already on "video-editor"')
+    expect(calls.find((c) => c.fn === 'configureProject')).toBeUndefined()
+
+    const renamed = await run(createProjectConfigureTool(ctx), { techStackId: 'video-editor', name: 'Renamed' })
+    expect(renamed.changed).toBe(true)
+    expect(calls.find((c) => c.fn === 'configureProject')?.args).toEqual(['proj-1', { name: 'Renamed' }])
+  })
+
+  test('switches the stack: patches settings + the stack capabilities, seeds the files, restarts once', async () => {
+    api.getConfig.data.settings = { techStackId: 'react-app' }
+    api.configure.data.settings = { techStackId: 'video-editor' }
+    const ctx = baseCtx({ projectId: 'proj-1' })
+
+    const out = await run(createProjectConfigureTool(ctx), { techStackId: 'video-editor' })
+
+    const patch = calls.find((c) => c.fn === 'configureProject')?.args[1] as any
+    expect(patch.settings.techStackId).toBe('video-editor')
+    // Stack capabilities ride along in the same PATCH.
+    expect(patch.settings.videoGenEnabled).toBe(true)
+    expect(patch.settings.browserEnabled).toBe(true)
+
+    expect(out.stack).toMatchObject({ from: 'react-app', to: 'video-editor', applied: 'local', seeded: true })
+    expect(out.stack.previewRestarted).toBe(true)
+    expect(restarts).toHaveLength(1)
+    expect(restarts[0]).toMatchObject({ projectId: 'proj-1', stackId: 'video-editor' })
+    // Seeded into the mounted project folder.
+    expect(existsSync(join(workspaceDir, '.tech-stack'))).toBe(true)
+    expect(readFileSync(join(workspaceDir, '.tech-stack'), 'utf-8').trim()).toBe('video-editor')
+    expect(existsSync(join(workspaceDir, 'remotion.config.ts'))).toBe(true)
+  })
+
+  test('reports appliesOnNextStart when the project is not mounted here', async () => {
+    api.graph.data = [
+      { id: 'caller-1', name: 'Caller', description: null, workingMode: 'managed', settings: null, attachments: [], agent: null },
+      { id: 'proj-2', name: 'Worker', description: null, workingMode: 'managed', settings: { techStackId: 'react-app' }, attachments: [], agent: null },
+    ]
+    api.getConfig.data.settings = { techStackId: 'react-app' }
+    const ctx = baseCtx()
+
+    const out = await run(createProjectConfigureTool(ctx), { project: 'proj-2', techStackId: 'video-editor' })
+
+    expect(out.stack.applied).toBe('next-start')
+    expect(out.stack.appliesOnNextStart).toBe(true)
+    expect(out.stack.seeded).toBeUndefined()
+    expect(restarts).toHaveLength(0)
+    // Settings were still persisted.
     expect(calls.find((c) => c.fn === 'configureProject')?.args[0]).toBe('proj-2')
   })
 })

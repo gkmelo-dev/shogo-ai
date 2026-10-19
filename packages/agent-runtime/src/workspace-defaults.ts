@@ -1341,6 +1341,10 @@ function inferStackFromWorkspaceFiles(dir: string): string | null {
   const threeish =
     has('three') || has('@react-three/fiber') || has('expo-gl') || has('expo-three')
   if (expoish) return threeish ? 'expo-three' : 'expo-app'
+  // A Remotion project is a video project, whatever else its package.json
+  // says. Checked before the `custom` line so a Remotion app that also has
+  // an Astro/Eleventy-style static config still previews as a video editor.
+  if (has('remotion') || has('@remotion/player')) return 'video-editor'
   if (has('astro') || has('@11ty/eleventy') || existsSync(join(dir, 'shogo.preview.json'))) return 'custom'
   return null
 }
