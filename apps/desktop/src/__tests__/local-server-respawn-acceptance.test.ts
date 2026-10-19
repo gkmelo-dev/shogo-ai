@@ -375,6 +375,41 @@ describe('desktop local API respawn (real processes)', () => {
       }
     }
   }, 60_000)
+
+  // AC3: after the policy has given up the owner of the machine can still get
+  // back to a working API — that is the banner's Retry, not a relaunch.
+  test('after giving up, restartNow() boots a fresh child on the real port', async () => {
+    const port = await freePort()
+    const blockedPort = await freePort()
+    const squatter = Bun.serve({
+      port: blockedPort,
+      hostname: '127.0.0.1',
+      fetch: () => new Response('squatter', { status: 503 }),
+    })
+    cleanups.push(() => void squatter.stop(true))
+
+    const rig = makeRig(port, {}, { restartHealthBudgetMs: 500, restartPort: blockedPort })
+    rigs.push(rig)
+
+    await rig.supervisor.start()
+    const firstPid = Number(readFileSync(rig.pidFile, 'utf8'))
+    process.kill(firstPid, 'SIGKILL')
+    await waitUntil(() => !isAlive(firstPid), 2_000, 'the old API to die')
+    await rig.supervisor.notifyExit(1, null)
+    expect(rig.supervisor.hasGivenUp).toBe(true)
+
+    // RestartNow is a cold boot (attempt 0), so it goes back to the real port,
+    // which the failed attempts never touched.
+    const { pid } = await rig.supervisor.restartNow()
+
+    expect(rig.supervisor.hasGivenUp).toBe(false)
+    expect(pid).not.toBe(firstPid)
+    expect(isAlive(pid!)).toBe(true)
+    expect(await healthOk(port)).toBe(true)
+    // The next launch reads this file, so it has to name the new child.
+    expect(Number(readFileSync(rig.pidFile, 'utf8'))).toBe(pid!)
+    expect(rig.restarts.at(-1)).toEqual({ attempt: 0, pid })
+  }, 60_000)
 })
 
 /**

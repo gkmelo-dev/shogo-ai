@@ -152,6 +152,14 @@ export function LocalApiStatusBanner() {
       <Text className="text-xs font-medium text-white">
         Local API is down — agents can’t run until it restarts.
       </Text>
+      {state.error ? (
+        <Text
+          testID="shogo-local-api-banner-error"
+          className="max-w-full text-xs text-white/80"
+        >
+          {state.error}
+        </Text>
+      ) : null}
       <Pressable
         accessibilityRole="button"
         accessibilityLabel="Retry local API"
