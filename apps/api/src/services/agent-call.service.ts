@@ -170,6 +170,88 @@ async function saveCallReply(sessionId: string, reply: string): Promise<void> {
   }
 }
 
+/**
+ * Whether the call chat already ends with an assistant row for its newest
+ * `project_call` prompt. This is the one idempotence gate for every writer of
+ * a call reply (the stream tracker, the settle fallback, and the list hook's
+ * reconcile), so one turn can never land twice.
+ */
+async function callReplyAlreadySaved(sessionId: string): Promise<boolean> {
+  try {
+    const db = await callChatDb()
+    const findFirst = db?.chatMessage?.findFirst
+    const count = db?.chatMessage?.count
+    // A test/fake client without these can't be asked; assume nothing was saved.
+    if (typeof findFirst !== 'function' || typeof count !== 'function') return false
+    const prompt = await findFirst({
+      where: { sessionId, role: 'user', agent: PROJECT_CALL_MESSAGE_AGENT },
+      orderBy: { createdAt: 'desc' },
+      select: { createdAt: true },
+    })
+    if (!prompt) return true
+    const replies = await count({
+      where: { sessionId, role: 'assistant', agent: 'technical', createdAt: { gte: prompt.createdAt } },
+    })
+    return replies > 0
+  } catch (err: any) {
+    console.warn('[AgentCall] could not check for an existing call reply:', err?.message ?? err)
+    // Erring towards "saved" keeps a broken check from duplicating a reply.
+    return true
+  }
+}
+
+/** The row a call chat gets when its turn ended without any text to show. */
+function noReplyRowText(status: string): string {
+  return `The called agent's turn ended before its reply could be saved (${status}). The reply may still be in the caller's task result.`
+}
+
+/**
+ * Terminal reply the callee runtime kept for a finished turn (Part C) — read
+ * after the 30 s stream-buffer window, so a follower that missed the turn can
+ * still persist what the agent said without re-running it.
+ */
+async function fetchTerminalTurnReply(projectId: string, chatSessionId: string): Promise<string | null> {
+  try {
+    const res = await fetchCalleeRuntime(projectId, `/agent/chat/${encodeURIComponent(chatSessionId)}/turn`)
+    if (!res.ok) {
+      await res.body?.cancel().catch(() => {})
+      return null
+    }
+    const turn = (await res.json().catch(() => null)) as { status?: string; reply?: unknown } | null
+    if (!turn || turn.status === 'active' || turn.status === 'unknown') return null
+    return typeof turn.reply === 'string' && turn.reply.trim() ? turn.reply : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Guarantee a finished call leaves an answer in its chat. The stream tracker
+ * usually writes the assistant row itself; when it could not (empty turn, lost
+ * buffer, a persist step that bailed), fall back to the text this side has,
+ * then to the runtime's terminal turn record, and finally to an explicit
+ * failure row — a call chat showing only the prompt is the bug.
+ */
+async function ensureCallReplyRow(
+  projectId: string,
+  chatSessionId: string,
+  text: string | null,
+  outcome: string,
+): Promise<void> {
+  try {
+    if (await callReplyAlreadySaved(chatSessionId)) return
+    const reply = text?.trim() ? text : await fetchTerminalTurnReply(projectId, chatSessionId)
+    console.warn(
+      `[AgentCall] no assistant row for ${chatSessionId} (status ${outcome}); writing ${
+        reply ? 'the reply' : 'a failure row'
+      }`,
+    )
+    await saveCallReply(chatSessionId, reply?.trim() ? reply : noReplyRowText(outcome))
+  } catch (err: any) {
+    console.warn('[AgentCall] could not write a fallback call reply:', err?.message ?? err)
+  }
+}
+
 async function callerName(callerProjectId: string | undefined): Promise<string> {
   if (!callerProjectId) return 'Project call'
   try {
@@ -545,7 +627,10 @@ async function trackCallTurn(
 /**
  * Record a followed call's outcome. A turn this side didn't see finish (gone
  * buffer, superseded turn, never started) fails the call so the caller isn't
- * left waiting on it.
+ * left waiting on it. Every terminal branch also makes sure the call chat got
+ * an answer: the tracker writes it when it saw the turn, and when it didn't
+ * (or its persist step bailed on an empty turn) the reply is recovered from
+ * the runtime's turn record, or an explicit failure row is written.
  */
 export async function settleAgentCallFromTurn(
   link: AgentCallSessionLink,
@@ -553,8 +638,11 @@ export async function settleAgentCallFromTurn(
   result: TrackedStreamResult | null,
 ): Promise<void> {
   const base = { runId: link.runId, sessionId: chatSessionId, chatSessionId, startedAt: link.startedAt, updatedAt: Date.now() }
+  // The tracker owns the assistant row when it persisted one.
+  const replyRowWritten = result?.assistantMessageId != null
   if (result?.outcome === 'complete' && result.status !== 'failed') {
     await putAgentCall(link.projectId, { ...base, status: 'completed', reply: result.text })
+    if (!replyRowWritten) await ensureCallReplyRow(link.projectId, chatSessionId, result.text, 'completed')
     return
   }
   if (result?.outcome === 'complete') {
@@ -564,6 +652,7 @@ export async function settleAgentCallFromTurn(
       reply: result.text || null,
       error: { code: 'agent_turn_failed', message: 'The target agent turn failed.' },
     })
+    if (!replyRowWritten) await ensureCallReplyRow(link.projectId, chatSessionId, result.text || null, 'agent_turn_failed')
     return
   }
   await putAgentCall(link.projectId, {
@@ -572,6 +661,7 @@ export async function settleAgentCallFromTurn(
     reply: result?.text || null,
     error: { code: CALLEE_TURN_LOST, message: 'The target agent turn ended before its reply could be read.' },
   })
+  if (!replyRowWritten) await ensureCallReplyRow(link.projectId, chatSessionId, result?.text || null, CALLEE_TURN_LOST)
 }
 
 export interface RemoteToolRequest {
@@ -595,15 +685,75 @@ export async function callProjectRemoteTool(
   req: RemoteToolRequest,
 ): Promise<AgentCallOutcome> {
   const timeoutMs = Math.min(Math.max(req.timeoutMs ?? 5 * 60_000, 10_000), 20 * 60_000)
-  let runtimeUrl: string
+  const resolved = await wakeRemoteTarget(projectId, 'RemoteTool')
+  if ('status' in resolved) return resolved
+
+  return forwardToProjectRuntime(
+    c,
+    projectId,
+    workspaceId,
+    '/agent/remote/tool',
+    JSON.stringify({ tool: req.tool, args: req.args, callerProjectId: req.callerProjectId }),
+    {
+      runtimeUrl: resolved.url,
+      timeoutMs,
+      ...(req.requesterTicket ? { headers: { 'X-Requester-Ticket': req.requesterTicket } } : {}),
+      timeoutMessage: `The target project did not finish ${req.tool} within ${Math.round(timeoutMs / 1000)}s.`,
+    },
+  )
+}
+
+export interface RemoteImportRequest {
+  /** Base64 tar.gz built by the caller runtime (packages/agent-runtime/src/project-transfer.ts). */
+  archive: string
+  dest?: string
+  overwrite?: boolean
+  callerProjectId?: string
+  requesterTicket?: string
+}
+
+/**
+ * Unpack an archive inside the target project's own runtime
+ * (`/agent/remote/import`, `copy_to_project`). Wakes it like
+ * callProjectRemoteTool. Never throws.
+ */
+export async function callProjectRemoteImport(
+  c: Context,
+  projectId: string,
+  workspaceId: string,
+  req: RemoteImportRequest,
+): Promise<AgentCallOutcome> {
+  const timeoutMs = 3 * 60_000
+  const resolved = await wakeRemoteTarget(projectId, 'RemoteImport')
+  if ('status' in resolved) return resolved
+
+  return forwardToProjectRuntime(
+    c,
+    projectId,
+    workspaceId,
+    '/agent/remote/import',
+    JSON.stringify({
+      archive: req.archive,
+      ...(req.dest !== undefined ? { dest: req.dest } : {}),
+      ...(req.overwrite ? { overwrite: true } : {}),
+      callerProjectId: req.callerProjectId,
+    }),
+    {
+      runtimeUrl: resolved.url,
+      timeoutMs,
+      ...(req.requesterTicket ? { headers: { 'X-Requester-Ticket': req.requesterTicket } } : {}),
+      timeoutMessage: `The target project did not finish importing files within ${Math.round(timeoutMs / 1000)}s.`,
+    },
+  )
+}
+
+/** Resolve (and so wake) the target project's own runtime, or the outcome to return instead. */
+async function wakeRemoteTarget(projectId: string, logTag: string): Promise<{ url: string } | AgentCallOutcome> {
   try {
     const overridden = runtimeUrlOverride ? await runtimeUrlOverride(projectId) : null
-    if (overridden) {
-      runtimeUrl = overridden
-    } else {
-      const { resolveProjectPodUrl } = await import('../lib/resolve-pod-url')
-      runtimeUrl = (await resolveProjectPodUrl(projectId, { logTag: 'RemoteTool' })).url
-    }
+    if (overridden) return { url: overridden }
+    const { resolveProjectPodUrl } = await import('../lib/resolve-pod-url')
+    return { url: (await resolveProjectPodUrl(projectId, { logTag })).url }
   } catch (err: any) {
     const { WorkspaceCapacityError, describeCapacityRefusal } = await import('../lib/workspace-compute-budget')
     if (err instanceof WorkspaceCapacityError) {
@@ -619,26 +769,12 @@ export async function callProjectRemoteTool(
         },
       }
     }
-    console.warn(`[RemoteTool] could not resolve runtime for ${projectId}: ${err?.message ?? err}`)
+    console.warn(`[${logTag}] could not resolve runtime for ${projectId}: ${err?.message ?? err}`)
     return {
       status: 502,
       body: { error: { code: 'target_unavailable', message: `Project ${projectId} runtime is unavailable: ${err?.message ?? err}` } },
     }
   }
-
-  return forwardToProjectRuntime(
-    c,
-    projectId,
-    workspaceId,
-    '/agent/remote/tool',
-    JSON.stringify({ tool: req.tool, args: req.args, callerProjectId: req.callerProjectId }),
-    {
-      runtimeUrl,
-      timeoutMs,
-      ...(req.requesterTicket ? { headers: { 'X-Requester-Ticket': req.requesterTicket } } : {}),
-      timeoutMessage: `The target project did not finish ${req.tool} within ${Math.round(timeoutMs / 1000)}s.`,
-    },
-  )
 }
 
 let runtimeUrlOverride: ((projectId: string) => Promise<string | null> | string | null) | null = null
