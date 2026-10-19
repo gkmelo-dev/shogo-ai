@@ -28,6 +28,16 @@ function git(...args: string[]): string {
   return execFileSync('git', args, { cwd: ws, encoding: 'utf-8', stdio: 'pipe' }).trim()
 }
 
+/** `git` that reports success instead of throwing — `check-ignore` exits 1 on no match. */
+function gitOk(...args: string[]): boolean {
+  try {
+    git(...args)
+    return true
+  } catch {
+    return false
+  }
+}
+
 function write(rel: string, body: string | Buffer = '') {
   const abs = join(ws, rel)
   mkdirSync(join(abs, '..'), { recursive: true })
@@ -176,11 +186,36 @@ describe('initRepo — .gitignore self-heal on existing repo', () => {
     write('.gitignore', 'node_modules/\n.bun/\ndist/\n.shogo/\n')
     await svc.initRepo(ws)
     const content = readFileSync(join(ws, '.gitignore'), 'utf-8')
-    expect(content).not.toContain('\n.shogo/\n') // the whole-dir pattern is gone
-    expect(content).toContain('.shogo/*')
-    expect(content).toContain('!.shogo/memory-history/')
+    const lines = content.split('\n').map((l) => l.trim()).filter(Boolean)
+    expect(lines).not.toContain('.shogo/') // the whole-dir pattern is gone
+    // Exactly one spelling of each — a rewrite that leaves the appended copy
+    // behind would still pass a plain `toContain`.
+    expect(lines.filter((l) => l === '.shogo/*')).toHaveLength(1)
+    expect(lines.filter((l) => l === '!.shogo/memory-history/')).toHaveLength(1)
     // The exception must come AFTER the ignore pattern to win.
     expect(content.indexOf('!.shogo/memory-history/')).toBeGreaterThan(content.indexOf('.shogo/*'))
+    expect(lines.indexOf('!.shogo/memory-history/')).toBe(lines.indexOf('.shogo/*') + 1)
+    // ...and it must actually work: runtime state ignored, memory history not.
+    write('.shogo/index.db', 'sqlite bytes')
+    write('.shogo/memory-history/MEMORY.md/2026-10-19.md', '# Memory\n')
+    expect(gitOk('check-ignore', '-q', '.shogo/index.db')).toBe(true)
+    expect(gitOk('check-ignore', '-q', '.shogo/memory-history/MEMORY.md/2026-10-19.md')).toBe(false)
+  })
+
+  it('puts the exception after the pattern even when the legacy line is last', async () => {
+    git('init', '-b', 'main')
+    configUser()
+    // A hand-edited file can hold the negation *before* the pattern it
+    // re-includes, which makes it dead — last matching pattern wins.
+    write('.gitignore', 'node_modules/\n!.shogo/memory-history/\ndist/\n.shogo/\n')
+    await svc.initRepo(ws)
+    const lines = readFileSync(join(ws, '.gitignore'), 'utf-8')
+      .split('\n').map((l) => l.trim()).filter(Boolean)
+    expect(lines.filter((l) => l === '.shogo/*')).toHaveLength(1)
+    expect(lines.filter((l) => l === '!.shogo/memory-history/')).toHaveLength(1)
+    expect(lines.indexOf('!.shogo/memory-history/')).toBe(
+      lines.indexOf('.shogo/*') + 1,
+    )
   })
 
   it('keeps `.shogo/memory-history` trackable while still ignoring runtime state', async () => {

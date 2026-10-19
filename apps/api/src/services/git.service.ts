@@ -267,6 +267,26 @@ function ensureCheckpointSafeGitConfig(workspacePath: string): void {
 const MEMORY_HISTORY_IGNORE_EXCEPTION = '!.shogo/memory-history/';
 
 /**
+ * Canonical key for one `.gitignore` entry, so equivalent spellings compare
+ * equal. A trailing `/` (directory-only) and a trailing `/*` (contents-only)
+ * both collapse onto the bare path, and a leading `!` is kept so a negation
+ * never matches the pattern it re-includes.
+ *
+ * Without this, `node_modules` vs `node_modules/` was the only equivalence we
+ * honoured, which silently broke the `.shogo/*` requirement: stripping a
+ * trailing slash off `.shogo/*` leaves `.shogo/*`, so a legacy `.shogo/` line
+ * never matched and we appended a second, competing spelling next to it.
+ */
+function normalizeIgnoreEntry(entry: string): string {
+  const trimmed = entry.trim();
+  const negated = trimmed.startsWith('!');
+  let key = negated ? trimmed.slice(1) : trimmed;
+  key = key.replace(/^\/+/, '').replace(/\/+$/, '');
+  if (key.endsWith('/*')) key = key.slice(0, -2);
+  return negated ? `!${key}` : key;
+}
+
+/**
  * Entries we always want ignored in a Shogo-managed workspace. Staging these
  * on Windows is what triggers the long-path crash in the first place, and
  * committing a 1 GB `node_modules/` tree is never what the user wants.
@@ -312,9 +332,11 @@ const REQUIRED_IGNORE_ENTRIES = [
   // history under `.shogo/memory-history/` is the one durable thing in
   // there, and a `.shogo/` pattern excludes the whole directory so git
   // never looks inside to honour the negation. See memory-history.ts
-  // (agent-runtime) and ensureMemoryHistoryTrackable() below.
+  // (agent-runtime) and ensureMemoryHistoryTrackable() below, which owns
+  // the matching negation — it is not listed here because a negation is
+  // only meaningful directly after the pattern it re-includes, and that
+  // pairing is that helper's job.
   '.shogo/*',
-  MEMORY_HISTORY_IGNORE_EXCEPTION,
   // Scratch dir. write_file remaps /tmp here; it is not project content
   // and must not be checkpointed, synced, or published.
   '.tmp/',
@@ -454,13 +476,12 @@ function ensureGitignoreIgnoresDeps(workspacePath: string): void {
       .split(/\r?\n/)
       .map((l) => l.trim())
       .filter((l) => l.length > 0 && !l.startsWith('#'))
+      .map(normalizeIgnoreEntry)
   );
 
-  const missing = REQUIRED_IGNORE_ENTRIES.filter((entry) => {
-    // Treat `node_modules` and `node_modules/` as equivalent.
-    const bare = entry.replace(/\/$/, '');
-    return !existing.has(entry) && !existing.has(bare);
-  });
+  const missing = REQUIRED_IGNORE_ENTRIES.filter(
+    (entry) => !existing.has(normalizeIgnoreEntry(entry))
+  );
 
   if (missing.length > 0) {
     const prefix = contents.length === 0 || contents.endsWith('\n') ? '' : '\n';
@@ -478,12 +499,18 @@ function ensureGitignoreIgnoresDeps(workspacePath: string): void {
 }
 
 /**
- * Rewrite a legacy `.shogo/` ignore line into `.shogo/*` + `!.shogo/memory-history/`
- * so memory write history becomes trackable. A `.shogo/` pattern excludes the
- * directory itself, so git never descends into it and the negation would be
- * dead — the line has to be replaced, not appended to.
+ * Guarantee the `.shogo` pair is on its canonical form: exactly one `.shogo/*`
+ * line, immediately followed by `!.shogo/memory-history/`.
  *
- * Idempotent, best-effort, and a no-op once the repo is on the new form.
+ * A legacy `.shogo/` line has to be *replaced*, not appended to — a `.shogo/`
+ * pattern excludes the directory itself, so git never descends into it and the
+ * negation would be dead. The negation must also land after the pattern it
+ * re-includes (last matching pattern wins), wherever the legacy line sat in
+ * the file, and no spelling may appear twice: appending a `.shogo/*` next to a
+ * legacy `.shogo/` and then rewriting the legacy line is what produced two
+ * identical `.shogo/*` entries.
+ *
+ * Idempotent, best-effort, and a no-op once the file is canonical.
  */
 function ensureMemoryHistoryTrackable(workspacePath: string): void {
   const gitignorePath = join(workspacePath, '.gitignore');
@@ -494,23 +521,37 @@ function ensureMemoryHistoryTrackable(workspacePath: string): void {
     return;
   }
 
-  const lines = contents.split(/\r?\n/);
-  const legacyPattern = /^\/?\.shogo\/?$/;
-  const blocksWholeDir = lines.some((l) => legacyPattern.test(l.trim()));
-  const hasException = lines.some((l) => l.trim() === MEMORY_HISTORY_IGNORE_EXCEPTION);
-  if (!blocksWholeDir && hasException) return;
+  const shogoContentsKey = normalizeIgnoreEntry('.shogo/*');
+  const exceptionKey = normalizeIgnoreEntry(MEMORY_HISTORY_IGNORE_EXCEPTION);
 
-  const rewritten = lines.map((line) =>
-    legacyPattern.test(line.trim()) ? '.shogo/*' : line,
-  );
-  let next = rewritten.join('\n');
-  if (!hasException) {
-    next = `${next.replace(/\n*$/, '')}\n${MEMORY_HISTORY_IGNORE_EXCEPTION}\n`;
+  const lines = contents.split(/\r?\n/);
+  const isPattern = (line: string) => normalizeIgnoreEntry(line) === shogoContentsKey;
+  const isException = (line: string) => normalizeIgnoreEntry(line) === exceptionKey;
+
+  const firstPattern = lines.findIndex(isPattern);
+  if (firstPattern === -1) {
+    // No `.shogo` pattern at all. Nothing to pair the negation with — the
+    // required-entries pass above is what adds the pattern, and it runs first.
+    return;
   }
-  if (next === contents) return;
+
+  const next: string[] = [];
+  lines.forEach((line, index) => {
+    if (isPattern(line) || isException(line)) {
+      // Re-emit the pair once, at the position of the first pattern.
+      if (index === firstPattern) {
+        next.push('.shogo/*', MEMORY_HISTORY_IGNORE_EXCEPTION);
+      }
+      return;
+    }
+    next.push(line);
+  });
+
+  const rewritten = next.join('\n');
+  if (rewritten === contents) return;
 
   try {
-    writeFileSync(gitignorePath, next);
+    writeFileSync(gitignorePath, rewritten);
   } catch {
     // Best-effort; a locked .gitignore must not fail a checkpoint.
   }
