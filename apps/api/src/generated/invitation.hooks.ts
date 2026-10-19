@@ -7,7 +7,7 @@
  * This file is safe to edit - it will not be overwritten.
  */
 
-import { sendInvitationEmail, sendProjectInviteEmail, sendInviteAcceptedEmail } from "../services/email.service"
+import { sendInvitationEmail, sendProjectInviteEmail } from "../services/email.service"
 import { getFrontendUrl } from "../lib/cloud-urls"
 import { canAssignProjectRole, canAssignWorkspaceRole, isWorkspaceRole, toProjectRole } from "@shogo/authz"
 import type { Principal } from "../lib/authz"
@@ -290,28 +290,18 @@ export const invitationHooks: InvitationHooks = {
 
   afterUpdate: async (record, ctx) => {
     if (record.status !== 'accepted' || !record.invitedBy) return
-    // Workspace joins are notified once, from the membership chokepoint
-    // (services/join-notifications.ts) — mailing here too is the duplicate SHO-51
-    // fixed. A project invitation has no member-joined mail, so it still sends.
+    // Join mail lives in services/join-notifications.ts: workspace joins are
+    // notified once from the membership chokepoint (the duplicate SHO-51 fixed),
+    // and a project invitation has no member-joined mail, so it sends its one
+    // "accepted" through the same seam.
     if (!record.projectId) return
 
     try {
-      const [inviter, invitee, project] = await Promise.all([
-        ctx.prisma.user.findUnique({ where: { id: record.invitedBy }, select: { email: true } }),
-        ctx.prisma.user.findFirst({ where: { email: record.email.toLowerCase() }, select: { name: true } }),
-        ctx.prisma.project.findUnique({ where: { id: record.projectId }, select: { name: true } }),
-      ])
-      if (!inviter?.email || !project?.name) return
-
-      const baseUrl = getFrontendUrl()
-      sendInviteAcceptedEmail({
-        to: inviter.email,
-        inviteeName: invitee?.name || record.email,
-        inviteeEmail: record.email,
-        resourceName: project.name,
-        resourceType: 'project',
-        dashboardUrl: `${baseUrl}/settings?tab=people`,
-      }).catch((err) => console.error('[Email] invite-accepted failed:', err))
+      const { notifyProjectInvitationAccepted } = await import('../services/join-notifications')
+      await notifyProjectInvitationAccepted(
+        { invitedBy: record.invitedBy, projectId: record.projectId, email: record.email },
+        ctx.prisma,
+      )
     } catch (err) {
       console.error('[Email] afterUpdate hook error:', err)
     }

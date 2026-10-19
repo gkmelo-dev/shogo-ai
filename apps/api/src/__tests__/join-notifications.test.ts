@@ -9,43 +9,51 @@
  * invitation and an invite link the way the client does and count the mail per
  * address — every address gets at most one, and a replayed accept gets none.
  *
- * Before the fix the invitation case records 2 sends to the inviter-owner; after
- * it, 1. Run one file per invocation:
+ * Mail is recorded through `setJoinMailSenders`, the service's own seam: no
+ * `mock.module` here, because that registry is process-global and leaks into
+ * whatever file `bun test` loads next.
+ *
+ * Run one file per invocation (how CI runs apps/api, via run-tests-isolated):
  *   bun --no-env-file --conditions=development test src/__tests__/join-notifications.test.ts
  */
 
-import { afterAll, beforeEach, describe, expect, test, mock } from 'bun:test'
+import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'bun:test'
 import { rmSync } from 'fs'
 import { Hono } from 'hono'
 import { setupChannelsTestDb, waitFor } from './helpers/channels-test-db'
 
 const { dir } = setupChannelsTestDb()
 
-const sent: Array<{ template: 'invite-accepted' | 'member-joined'; to: string }> = []
+const sent: Array<{ template: 'invite-accepted' | 'member-joined'; to: string; resourceType?: string; resourceName?: string }> = []
 
-// Record instead of sending: there is no SMTP in the pod, and a test must never
-// talk to a real mailer.
-const actualEmail = await import('../services/email.service')
-mock.module('../services/email.service', () => ({
-  ...actualEmail,
-  sendInviteAcceptedEmail: async (params: { to: string }) => {
-    sent.push({ template: 'invite-accepted', to: params.to })
-    return { success: true }
-  },
-  sendMemberJoinedEmail: async (params: { to: string }) => {
-    sent.push({ template: 'member-joined', to: params.to })
-    return { success: true }
-  },
-}))
-
-const { prisma } = await import('../lib/prisma')
+// Build our own handle instead of importing `../lib/prisma`: that module is what
+// other test files `mock.module(...)`, and the mock registry is process-global.
+const { createPrismaClient } = await import('../lib/create-prisma-client')
+const db: any = await createPrismaClient()
 const { memberHooks } = await import('../generated/member.hooks')
 const { invitationHooks } = await import('../generated/invitation.hooks')
 const { inviteLinkAcceptRoutes } = await import('../routes/invite-link-accept')
 const { createInviteLinkAfterAccept } = await import('../routes/invite-link-after-accept')
 const { onWorkspaceMemberJoined } = await import('../services/workspace-events')
+const { setJoinMailSenders } = await import('../services/join-notifications')
 
-const db = prisma as any
+beforeAll(() => {
+  setJoinMailSenders({
+    inviteAccepted: (async (params: any) => {
+      sent.push({
+        template: 'invite-accepted',
+        to: params.to,
+        resourceType: params.resourceType,
+        resourceName: params.resourceName,
+      })
+      return { success: true }
+    }) as any,
+    memberJoined: (async (params: any) => {
+      sent.push({ template: 'member-joined', to: params.to })
+      return { success: true }
+    }) as any,
+  })
+})
 
 interface JoinWorld {
   workspace: { id: string; name: string }
@@ -86,7 +94,8 @@ beforeEach(() => {
 })
 
 afterAll(async () => {
-  await (prisma as any).$disconnect?.()
+  setJoinMailSenders(null)
+  await db.$disconnect?.()
   rmSync(dir, { recursive: true, force: true })
 })
 
@@ -129,15 +138,6 @@ describe('accepting a workspace invitation', () => {
 
   test('a replayed accept sends nothing', async () => {
     const world = await seedJoinWorld()
-    const invitation = await db.invitation.create({
-      data: {
-        email: world.invitee.email,
-        workspaceId: world.workspace.id,
-        role: 'member',
-        invitedBy: world.owner.id,
-        expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
-      },
-    })
     const member = await db.member.create({
       data: { userId: world.invitee.id, workspaceId: world.workspace.id, role: 'member' },
     })
@@ -147,6 +147,7 @@ describe('accepting a workspace invitation', () => {
       memberId: member.id,
       role: 'member',
       source: 'invitation',
+      prisma: db,
     })
     expect(to(world.owner.email)).toHaveLength(1)
 
@@ -158,6 +159,7 @@ describe('accepting a workspace invitation', () => {
       memberId: member.id,
       role: 'member',
       source: 'invitation',
+      prisma: db,
     })
     await Bun.sleep(150)
     expect(sent).toHaveLength(0)
@@ -167,7 +169,7 @@ describe('accepting a workspace invitation', () => {
 describe('accepting an invite link', () => {
   function buildApp(inviteeId: string): Hono {
     const app = new Hono()
-    app.route('/api', inviteLinkAcceptRoutes({ resolveUserId: () => inviteeId }))
+    app.route('/api', inviteLinkAcceptRoutes({ resolveUserId: () => inviteeId, prisma: db }))
     return app
   }
 
@@ -213,7 +215,8 @@ describe('accepting a project invite link', () => {
       '/api',
       inviteLinkAcceptRoutes({
         resolveUserId: () => inviteeId,
-        afterAccept: createInviteLinkAfterAccept({ syncSeats: async () => ({}) }),
+        prisma: db,
+        afterAccept: createInviteLinkAfterAccept({ syncSeats: async () => ({}), prisma: db }),
       }),
     )
     return app
@@ -233,6 +236,8 @@ describe('accepting a project invite link', () => {
     const mail = to(world.owner.email)
     expect(mail).toHaveLength(1)
     expect(mail[0].template).toBe('invite-accepted')
+    expect(mail[0].resourceType).toBe('project')
+    expect(mail[0].resourceName).toBe(world.project.name)
     expect(sent.filter((m) => m.template === 'member-joined')).toHaveLength(0)
     expect(sent.map((m) => m.to)).not.toContain(world.otherOwner.email)
   })

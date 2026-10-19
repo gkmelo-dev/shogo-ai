@@ -18,16 +18,37 @@
 import { prisma } from '../lib/prisma'
 import { sendInviteAcceptedEmail, sendMemberJoinedEmail } from './email.service'
 
-const db = prisma as any
-
 type JoinMail = 'invite-accepted' | 'member-joined'
+
+export interface JoinMailSenders {
+  inviteAccepted: typeof sendInviteAcceptedEmail
+  memberJoined: typeof sendMemberJoinedEmail
+}
+
+type Db = any
+
+let injectedSenders: JoinMailSenders | null = null
+
+/**
+ * Test seam: route join mail through `senders` instead of the real mailer, so a
+ * test never has to `mock.module('../services/email.service')` (a process-global
+ * that leaks into whatever file `bun test` loads next). `null` restores the real
+ * senders.
+ */
+export function setJoinMailSenders(senders: JoinMailSenders | null): void {
+  injectedSenders = senders
+}
+
+function mailSenders(): JoinMailSenders {
+  return injectedSenders ?? { inviteAccepted: sendInviteAcceptedEmail, memberJoined: sendMemberJoinedEmail }
+}
 
 function frontendUrl(): string {
   return process.env.APP_URL || process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3001'
 }
 
 /** The accepted workspace invitation behind this membership, if there is one. */
-async function resolveInviterId(workspaceId: string, email: string | null | undefined): Promise<string | null> {
+async function resolveInviterId(db: Db, workspaceId: string, email: string | null | undefined): Promise<string | null> {
   if (!email) return null
   const invitation = await db.invitation.findFirst({
     where: {
@@ -48,7 +69,8 @@ export async function notifyWorkspaceJoined(input: {
   role?: string | null
   /** Who invited/created the link, when the caller knows. Otherwise resolved from the accepted invitation. */
   invitedBy?: string | null
-}): Promise<void> {
+}, dbArg?: Db): Promise<void> {
+  const db: Db = dbArg ?? prisma
   try {
     const [user, workspace, owners] = await Promise.all([
       db.user.findUnique({ where: { id: input.userId }, select: { name: true, email: true } }),
@@ -61,7 +83,7 @@ export async function notifyWorkspaceJoined(input: {
     if (!workspace) return
 
     const joinedEmail = (user?.email ?? '').toLowerCase() || null
-    const inviterId = input.invitedBy ?? (await resolveInviterId(input.workspaceId, user?.email))
+    const inviterId = input.invitedBy ?? (await resolveInviterId(db, input.workspaceId, user?.email))
 
     // One entry per address: the inviter's mail wins over the generic one.
     const recipients = new Map<string, JoinMail>()
@@ -83,11 +105,12 @@ export async function notifyWorkspaceJoined(input: {
     const memberName = user?.name || user?.email || 'A new member'
     const memberEmail = user?.email || ''
     const dashboardUrl = `${frontendUrl()}/settings?tab=people`
+    const senders = mailSenders()
 
     await Promise.allSettled(
       [...recipients].map(([email, mail]) =>
         mail === 'invite-accepted'
-          ? sendInviteAcceptedEmail({
+          ? senders.inviteAccepted({
               to: email,
               inviteeName: memberName,
               inviteeEmail: memberEmail,
@@ -95,7 +118,7 @@ export async function notifyWorkspaceJoined(input: {
               resourceType: 'workspace',
               dashboardUrl,
             })
-          : sendMemberJoinedEmail({
+          : senders.memberJoined({
               to: email,
               memberName,
               memberEmail,
@@ -111,34 +134,66 @@ export async function notifyWorkspaceJoined(input: {
 }
 
 /**
- * A project invite-link accept is a project-scoped (guest) membership: it has no
- * `member.joined` event and no owner mail, so `notifyWorkspaceJoined` never runs
- * for it — the creator still gets their one "accepted" mail from here.
+ * A project invite (link or email invitation) is a project-scoped (guest)
+ * membership: it has no `member.joined` event and no owner mail, so
+ * `notifyWorkspaceJoined` never runs for it — the inviter still gets their one
+ * "accepted" mail from here.
  */
+async function sendProjectAccepted(
+  db: Db,
+  opts: { invitedBy: string; projectId: string; invitee: { userId?: string; email?: string } },
+): Promise<void> {
+  const [creator, project] = await Promise.all([
+    db.user.findUnique({ where: { id: opts.invitedBy }, select: { email: true } }),
+    db.project.findUnique({ where: { id: opts.projectId }, select: { name: true } }),
+  ])
+  if (!creator?.email || !project?.name) return
+
+  const acceptingUser = opts.invitee.userId
+    ? await db.user.findUnique({ where: { id: opts.invitee.userId }, select: { name: true, email: true } })
+    : await db.user.findFirst({
+        where: { email: (opts.invitee.email ?? '').toLowerCase() },
+        select: { name: true, email: true },
+      })
+
+  await mailSenders().inviteAccepted({
+    to: creator.email,
+    inviteeName: acceptingUser?.name || acceptingUser?.email || opts.invitee.email || 'A new member',
+    inviteeEmail: acceptingUser?.email || opts.invitee.email || '',
+    resourceName: project.name,
+    resourceType: 'project',
+    dashboardUrl: `${frontendUrl()}/settings?tab=people`,
+  })
+}
+
 export async function notifyProjectLinkAccepted(input: {
   link: { createdBy?: string | null; projectId?: string | null }
   userId: string
-}): Promise<void> {
+}, dbArg?: Db): Promise<void> {
+  const db: Db = dbArg ?? prisma
   try {
     const { createdBy, projectId } = input.link
     if (!createdBy || !projectId) return
-
-    const [creator, acceptingUser, project] = await Promise.all([
-      db.user.findUnique({ where: { id: createdBy }, select: { email: true } }),
-      db.user.findUnique({ where: { id: input.userId }, select: { name: true, email: true } }),
-      db.project.findUnique({ where: { id: projectId }, select: { name: true } }),
-    ])
-    if (!creator?.email || !project?.name) return
-
-    await sendInviteAcceptedEmail({
-      to: creator.email,
-      inviteeName: acceptingUser?.name || acceptingUser?.email || 'A new member',
-      inviteeEmail: acceptingUser?.email || '',
-      resourceName: project.name,
-      resourceType: 'project',
-      dashboardUrl: `${frontendUrl()}/settings?tab=people`,
-    })
+    await sendProjectAccepted(db, { invitedBy: createdBy, projectId, invitee: { userId: input.userId } })
   } catch (error) {
     console.error('[JoinNotifications] project link send failed:', error instanceof Error ? error.message : error)
+  }
+}
+
+/** The `Invitation` counterpart, for `PATCH /api/invitations/:id` accepting a project invite. */
+export async function notifyProjectInvitationAccepted(input: {
+  invitedBy: string
+  projectId: string
+  email: string
+}, dbArg?: Db): Promise<void> {
+  const db: Db = dbArg ?? prisma
+  try {
+    await sendProjectAccepted(db, {
+      invitedBy: input.invitedBy,
+      projectId: input.projectId,
+      invitee: { email: input.email },
+    })
+  } catch (error) {
+    console.error('[JoinNotifications] project invitation send failed:', error instanceof Error ? error.message : error)
   }
 }

@@ -14,6 +14,8 @@ import type { InviteLinkAccepted } from './invite-link-accept'
 export interface InviteLinkAfterAcceptDeps {
   /** Stripe active-seat sync; the desktop composer passes a no-op. */
   syncSeats: (workspaceId: string) => Promise<unknown>
+  /** DB handle for tests; defaults to the app client. */
+  prisma?: any
 }
 
 export function createInviteLinkAfterAccept(deps: InviteLinkAfterAcceptDeps) {
@@ -30,7 +32,7 @@ export function createInviteLinkAfterAccept(deps: InviteLinkAfterAcceptDeps) {
     // mail comes from here. Workspace links mail from onWorkspaceMemberJoined.
     if (link.projectId) {
       const { notifyProjectLinkAccepted } = await import('../services/join-notifications')
-      await notifyProjectLinkAccepted({ link, userId })
+      await notifyProjectLinkAccepted({ link, userId }, deps.prisma)
     }
   }
 }

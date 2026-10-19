@@ -133,6 +133,7 @@ export const memberHooks: MemberHooks = {
         memberId: record.id,
         role: record.role,
         source: 'invitation',
+        prisma: ctx.prisma,
       }))
       .catch(() => {})
   },
