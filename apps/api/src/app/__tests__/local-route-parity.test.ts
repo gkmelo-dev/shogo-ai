@@ -63,6 +63,20 @@ const REQUIRED_LOCAL_ROUTES = [
   'GET /api/integrations/connections',
   'POST /api/integrations/connect',
   'DELETE /api/integrations/connections/:id',
+  // Social management (SHO-71): a desktop connects and publishes through the
+  // cloud relay, so every user-facing social route must be mounted locally too.
+  'GET /api/workspaces/:workspaceId/social/status',
+  'GET /api/workspaces/:workspaceId/social/accounts',
+  'POST /api/workspaces/:workspaceId/social/accounts/sync',
+  'POST /api/workspaces/:workspaceId/social/connect',
+  'POST /api/workspaces/:workspaceId/social/connect/complete',
+  'DELETE /api/workspaces/:workspaceId/social/accounts/:accountId',
+  'GET /api/workspaces/:workspaceId/social/posts',
+  'POST /api/workspaces/:workspaceId/social/posts',
+  'GET /api/workspaces/:workspaceId/social/posts/:postId',
+  'PATCH /api/workspaces/:workspaceId/social/posts/:postId',
+  'DELETE /api/workspaces/:workspaceId/social/posts/:postId',
+  'GET /api/workspaces/:workspaceId/social/calendar',
   // Called by the local agent-runtime; "Trust folder" is dead without it.
   'GET /api/internal/projects/:projectId/trust',
   'GET /api/local/remote-hosts',

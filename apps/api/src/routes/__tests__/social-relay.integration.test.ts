@@ -199,3 +199,144 @@ describe('relay tenant scoping', () => {
     expect(body.error.platform).toBe('instagram')
   })
 })
+
+/**
+ * The cases above trust the middleware to have put a workspace on the context.
+ * These two run the chain production actually mounts — `authMiddleware` →
+ * `apiAuthGate` → relay — with real `shogo_sk_*` keys, because a workspace id
+ * that never reaches the route is the one failure a stubbed context cannot see.
+ */
+describe('relay through the real auth chain (AC7)', () => {
+  let chainApp: Hono
+  const outbound: { url: string; headers: Record<string, string> }[] = []
+  const providerCalls: { url: string; headers: Record<string, string> }[] = []
+  const originalFetch = globalThis.fetch
+  const savedEnv = {
+    SHOGO_LOCAL_MODE: process.env.SHOGO_LOCAL_MODE,
+    SHOGO_API_KEY: process.env.SHOGO_API_KEY,
+    ZERNIO_API_KEY: process.env.ZERNIO_API_KEY,
+    SOCIAL_MODE: process.env.SOCIAL_MODE,
+  }
+  let ownKey = ''
+  let otherKey = ''
+
+  beforeAll(async () => {
+    const { authMiddleware } = await import('../../middleware/auth')
+    const { apiAuthGate } = await import('../../middleware/api-auth-gate')
+    const { socialRoutes } = await import('../social')
+    const { hashApiKey } = await import('../../lib/api-keys-mint')
+
+    chainApp = new Hono()
+    chainApp.use('/api/*', authMiddleware)
+    chainApp.use('/api/*', apiAuthGate)
+    chainApp.route('/api', socialRoutes({ resolveUserId: async (c: any) => c.get('auth')?.userId ?? null }))
+    chainApp.route('/api', socialRelayRoutes())
+
+    for (const [workspaceId, label] of [[own, 'own'], [other, 'other']] as const) {
+      const user = await db.user.create({
+        data: { name: `relay-${label}`, email: `relay-${label}-${suffix}@example.com` },
+      })
+      await db.member.create({ data: { workspaceId, userId: user.id, role: 'owner', projectId: null } })
+      const raw = `shogo_sk_${crypto.randomUUID().replace(/-/g, '')}`
+      await db.apiKey.create({
+        data: {
+          name: `relay-${label}`,
+          keyHash: await hashApiKey(raw),
+          keyPrefix: raw.slice(0, 16),
+          workspaceId,
+          userId: user.id,
+          kind: 'user',
+        },
+      })
+      if (label === 'own') ownKey = raw
+      else otherKey = raw
+    }
+  })
+
+  afterAll(() => {
+    globalThis.fetch = originalFetch
+    for (const [key, value] of Object.entries(savedEnv)) {
+      if (value === undefined) delete (process.env as any)[key]
+      else (process.env as any)[key] = value
+    }
+  })
+
+  test('a real workspace key resolves the workspace the relay scopes against', async () => {
+    setSocialClient({
+      mode: 'cloud',
+      async request(req: any) {
+        calls.push(req)
+        return { accounts: [{ id: 'acct_own', platform: 'instagram', username: 'own.ig' }] }
+      },
+    })
+    calls.length = 0
+    const res = await chainApp.request('/api/social-relay/accounts', {
+      headers: { authorization: `Bearer ${ownKey}` },
+    })
+    expect(res.status).toBe(200)
+    const ownProfile = await db.socialProfile.findUnique({ where: { workspaceId: own } })
+    expect(calls[0].query).toEqual({ profileId: ownProfile.zernioProfileId })
+
+    // And the other tenant's key is scoped to its own profile, not this one.
+    calls.length = 0
+    await chainApp.request('/api/social-relay/accounts', {
+      headers: { authorization: `Bearer ${otherKey}` },
+    })
+    const otherProfile = await db.socialProfile.findUnique({ where: { workspaceId: other } })
+    expect(calls[0].query.profileId).not.toBe(ownProfile.zernioProfileId)
+    expect(calls[0].query.profileId).toBe(otherProfile.zernioProfileId)
+  })
+
+  test('a desktop forwards every social call and the master key never leaves the cloud', async () => {
+    // A desktop: local mode + its own workspace key, no master Zernio key.
+    process.env.SHOGO_LOCAL_MODE = 'true'
+    process.env.SHOGO_API_KEY = ownKey
+    process.env.ZERNIO_API_KEY = 'zernio_master_must_not_reach_the_desktop'
+    delete process.env.SOCIAL_MODE
+    setSocialClient(null)
+
+    globalThis.fetch = (async (input: any, init: any = {}) => {
+      const url = new URL(String(input))
+      const headers = (init.headers ?? {}) as Record<string, string>
+      if (url.pathname.startsWith('/api/social-relay')) {
+        outbound.push({ url: String(input), headers })
+        // The hop lands on the cloud process, which is not in local mode.
+        process.env.SHOGO_LOCAL_MODE = 'false'
+        delete process.env.SHOGO_API_KEY
+        try {
+          return await chainApp.request(url.pathname + url.search, {
+            method: init.method,
+            headers,
+            body: init.body,
+          })
+        } finally {
+          process.env.SHOGO_LOCAL_MODE = 'true'
+          process.env.SHOGO_API_KEY = ownKey
+        }
+      }
+      providerCalls.push({ url: String(input), headers })
+      return new Response(
+        JSON.stringify({ accounts: [{ id: 'acct_own', platform: 'instagram', username: 'own.ig' }] }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      )
+    }) as any
+
+    const { getSocialClient } = await import('../../services/social/client')
+    const client = getSocialClient()
+    expect(client.mode).toBe('relay')
+
+    outbound.length = 0
+    providerCalls.length = 0
+    const result = await client.request<any>({ method: 'GET', path: '/accounts' })
+    expect(result).toHaveProperty('accounts')
+
+    expect(outbound).toHaveLength(1)
+    expect(outbound[0].url).toContain('/api/social-relay/accounts')
+    expect(outbound[0].headers.Authorization).toBe(`Bearer ${ownKey}`)
+    // The relay, not the desktop, put the master key on the provider call.
+    expect(providerCalls).toHaveLength(1)
+    expect(providerCalls[0].url).toStartWith('https://zernio.com/api/v1/accounts')
+    expect(providerCalls[0].headers.Authorization).toBe('Bearer zernio_master_must_not_reach_the_desktop')
+    expect(outbound[0].url).not.toContain('zernio_master_must_not_reach_the_desktop')
+  })
+})
