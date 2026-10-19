@@ -437,7 +437,15 @@ describe('project_configure', () => {
     expect(patch.settings.videoGenEnabled).toBe(true)
     expect(patch.settings.browserEnabled).toBe(true)
 
-    expect(out.stack).toMatchObject({ from: 'react-app', to: 'video-editor', applied: 'local', seeded: true })
+    expect(out.stack).toMatchObject({
+      from: 'react-app',
+      to: 'video-editor',
+      applied: 'local',
+      seeded: true,
+      collisions: [],
+      leftInPlace: [],
+      stackDocUpdated: true,
+    })
     expect(out.stack.previewRestarted).toBe(true)
     expect(restarts).toHaveLength(1)
     expect(restarts[0]).toMatchObject({ projectId: 'proj-1', stackId: 'video-editor' })
@@ -447,7 +455,35 @@ describe('project_configure', () => {
     expect(existsSync(join(workspaceDir, 'remotion.config.ts'))).toBe(true)
   })
 
-  test('a switch to a starter-less stack reports the files it left in place', async () => {
+  test('a colliding switch is refused, patches nothing and writes nothing', async () => {
+    api.getConfig.data.settings = { techStackId: 'react-app' }
+    api.configure.data.settings = { techStackId: 'video-editor' }
+    const ctx = baseCtx({ projectId: 'proj-1' })
+    await run(createProjectConfigureTool(ctx), { techStackId: 'video-editor' })
+    const patchesAfterSeed = calls.filter((c) => c.fn === 'configureProject').length
+
+    api.getConfig.data.settings = { techStackId: 'video-editor' }
+    api.configure.data.settings = { techStackId: 'react-app' }
+    // The other field in the same call must not apply either.
+    const out = await run(createProjectConfigureTool(ctx), { techStackId: 'react-app', name: 'Should not apply' })
+
+    expect(out.ok).toBe(false)
+    expect(out.code).toBe('stack_change_needs_reset')
+    expect(out.collisions).toContain('package.json')
+    expect(out.collisions).toContain('index.html')
+    expect(out.collisions).toContain('src')
+    expect(out.hint).toContain('resetFiles: true')
+    expect(out.error).toContain('Nothing was changed')
+    // No PATCH at all — not the stack, not the name.
+    expect(calls.filter((c) => c.fn === 'configureProject')).toHaveLength(patchesAfterSeed)
+    // And the folder is as the previous stack left it.
+    expect(readFileSync(join(workspaceDir, '.tech-stack'), 'utf-8').trim()).toBe('video-editor')
+    expect(readFileSync(join(workspaceDir, '.shogo', 'STACK.md'), 'utf-8')).toContain('Video Editor')
+    expect(readFileSync(join(workspaceDir, 'package.json'), 'utf-8')).not.toContain('@shogo-ai/sdk')
+    expect(existsSync(join(workspaceDir, 'prisma'))).toBe(false)
+  })
+
+  test('resetFiles is the way through a collision: it wipes, seeds and swaps the doc', async () => {
     api.getConfig.data.settings = { techStackId: 'react-app' }
     api.configure.data.settings = { techStackId: 'video-editor' }
     const ctx = baseCtx({ projectId: 'proj-1' })
@@ -455,16 +491,14 @@ describe('project_configure', () => {
 
     api.getConfig.data.settings = { techStackId: 'video-editor' }
     api.configure.data.settings = { techStackId: 'react-app' }
-    const out = await run(createProjectConfigureTool(ctx), { techStackId: 'react-app' })
+    const out = await run(createProjectConfigureTool(ctx), { techStackId: 'react-app', resetFiles: true })
 
-    // react-app ships no starter/ — these come from the bundled runtime-template
-    // and already exist in the video project, so the agent has to migrate them.
-    expect(out.stack.kept).toContain('package.json')
-    expect(out.stack.kept).toContain('index.html')
-    expect(out.stack.kept).toContain('src')
-    expect(out.stack.note).toContain('Migrate them')
-    // …and the stack doc follows the marker rather than describing the old stack.
-    expect(readFileSync(join(workspaceDir, '.shogo', 'STACK.md'), 'utf-8')).toContain('# Tech Stack — React App')
+    expect(out.ok).toBe(true)
+    expect(out.stack.wiped).toBeGreaterThan(0)
+    expect(out.stack.stackDocUpdated).toBe(true)
+    expect(existsSync(join(workspaceDir, 'src', 'videos', 'Main.tsx'))).toBe(false)
+    expect(readFileSync(join(workspaceDir, '.shogo', 'STACK.md'), 'utf-8')).toContain('Tech Stack — React App')
+    expect(readFileSync(join(workspaceDir, '.tech-stack'), 'utf-8').trim()).toBe('react-app')
   })
 
   test('a switch to a stack that ships no files says so instead of nothing', async () => {
@@ -474,7 +508,8 @@ describe('project_configure', () => {
 
     const out = await run(createProjectConfigureTool(ctx), { techStackId: 'none' })
 
-    expect(out.stack.kept).toEqual([])
+    expect(out.stack.collisions).toEqual([])
+    expect(out.stack.leftInPlace).toEqual([])
     expect(out.stack.note).toContain('ships no files of its own')
     expect(out.stack.note).toContain('resetFiles: true')
   })

@@ -4072,7 +4072,15 @@ app.post('/agent/workspace/reset-stack', async (c) => {
     resetFiles: true,
   })
   if (!applied.ok) {
-    return c.json({ error: applied.error ?? `Failed to seed tech stack ${stackId}` }, 500)
+    return c.json(
+      {
+        error: applied.error ?? `Failed to seed tech stack ${stackId}`,
+        ...(applied.code ? { code: applied.code } : {}),
+        ...(applied.hint ? { hint: applied.hint } : {}),
+        collisions: applied.collisions,
+      },
+      applied.code === 'stack_change_needs_reset' ? 409 : 500,
+    )
   }
 
   console.log(`[reset-stack] Reset complete (stack=${stackId}, wiped=${applied.wiped ?? 0} entries)`)
@@ -4080,7 +4088,8 @@ app.post('/agent/workspace/reset-stack', async (c) => {
     ok: true,
     stackId,
     wiped: applied.wiped ?? 0,
-    kept: applied.kept,
+    stackDocUpdated: applied.stackDocUpdated,
+    leftInPlace: applied.leftInPlace,
     previewRestarted: applied.previewRestarted,
   })
 })

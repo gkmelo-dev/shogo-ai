@@ -36,7 +36,13 @@ import { BACKGROUND_TASK_HINT, textResult } from './gateway-tools'
 import { trackRemoteTask } from './remote-tasks'
 import { capabilityState, effectiveCapabilityValue, lockedCapabilityKeys, resolveRuntimeCapabilities } from './capability-status-prompt'
 import { isMetalRuntime } from './remote-tools'
-import { applyTechStackChange, seedEntries, type ApplyTechStackChangeResult } from './tech-stack-switch'
+import {
+  applyTechStackChange,
+  planTechStackChange,
+  seedEntries,
+  stackChangeRefusalHint,
+  type ApplyTechStackChangeResult,
+} from './tech-stack-switch'
 import { listTechStacks, loadTechStackMeta, resolveWorkspaceConfigFilePath } from './workspace-defaults'
 import { isWorkspaceAgentRuntime } from './workspace-runtime-mode'
 import { TECH_STACK_REGISTRY } from '@shogo/shared-runtime'
@@ -459,7 +465,7 @@ export function createProjectConfigureTool(ctx: ToolContext): AgentTool {
     label: 'Configure Project',
     description:
       `Read or change a project's agent configuration: heartbeat (enabled/interval/quiet hours), default model, name, description, working mode and project type (\`techStackId\`). Defaults to the current project. Call with no changes to read the current config. \`workingMode: "external"\` makes an existing managed project folder-linked (one-way: it gains a primary folder row pointing at the workspace it already uses, and Shogo stops managing its git). An external project cannot become managed again. Heartbeats require a paid plan: on a free plan the other changes are still applied and the result includes a \`heartbeatError\`.\n\n` +
-      `\`techStackId\` switches the project type. It is non-destructive by default: the new stack's starter files are added where nothing exists yet, and any file that would have been overwritten is listed in \`kept\` for you to migrate. Pass \`resetFiles: true\` to delete the current project code first (agent identity, memory, git history and canvas state survive) — that is the only thing that deletes files. Project types this runtime ships:\n` +
+      `\`techStackId\` switches the project type. A switch that collides with files the project already has is **refused**: nothing is written, and the result carries \`code: "stack_change_needs_reset"\` with the \`collisions\` list and a \`hint\`. Pass \`resetFiles: true\` to delete the current project code first (agent identity, memory, git history and canvas state survive) — that is the only thing that deletes files. A switch into an empty project seeds the new stack and reports what it \`leftInPlace\`. Project types this runtime ships:\n` +
       techStackCatalogueText(),
     parameters: Type.Object({
       project: Type.Optional(Type.String({ description: 'Project id, name, or manifest key. Default: current project.' })),
@@ -537,6 +543,65 @@ export function createProjectConfigureTool(ctx: ToolContext): AgentTool {
         }
       }
 
+      // ── decide the stack change before writing anything ───────────────
+      // A colliding switch is refused with nothing written, so this runs before
+      // the settings PATCH: a refusal must not persist `techStackId` (or any
+      // other field in the same call) for a project whose files did not change.
+      const stackTarget = stackTo
+      const stackProjectDir = stackTarget ? resolveProjectDir(ctx, targetId) : null
+      let local: ApplyTechStackChangeResult | null = null
+      let appliesOnNextStart: { appliesOnNextStart: true; note: string } | null = null
+      if (stackTarget) {
+        if (stackProjectDir) {
+          const plan = planTechStackChange({
+            projectDir: stackProjectDir,
+            stackId: stackTarget,
+            resetFiles: p.resetFiles === true,
+          })
+          if (plan.needsReset) {
+            return textResult({
+              ok: false,
+              changed: false,
+              code: 'stack_change_needs_reset',
+              error:
+                `Switching to "${stackTarget}" would overwrite ${plan.collisions.length} existing ` +
+                `entr${plan.collisions.length === 1 ? 'y' : 'ies'}: ${plan.collisions.join(', ')}. ` +
+                `Nothing was changed — settings included.`,
+              from: plan.from,
+              to: plan.to,
+              collisions: plan.collisions,
+              leftInPlace: plan.leftInPlace,
+              hint: stackChangeRefusalHint(plan),
+            })
+          }
+          local = applyTechStackChange({
+            projectDir: stackProjectDir,
+            projectId: targetId,
+            stackId: stackTarget,
+            resetFiles: p.resetFiles === true,
+          })
+          if (!local.ok) {
+            return textResult({
+              ok: false,
+              changed: false,
+              code: local.code,
+              error: local.error ?? `Failed to apply project type "${stackTarget}"`,
+              collisions: local.collisions,
+              leftInPlace: local.leftInPlace,
+              ...(local.hint ? { hint: local.hint } : {}),
+            })
+          }
+        } else {
+          appliesOnNextStart = {
+            appliesOnNextStart: true,
+            note:
+              `The project's files are not mounted on this runtime, so only its settings changed. ` +
+              `They apply when it next starts. If it is a cloud/delegated project, run project_configure again ` +
+              `inside it (or ask its agent) to seed "${stackTarget}" into its folder.`,
+          }
+        }
+      }
+
       const agent: Record<string, unknown> = {}
       if (p.model !== undefined) agent.modelName = p.model
       if (p.provider !== undefined) agent.modelProvider = p.provider
@@ -575,29 +640,11 @@ export function createProjectConfigureTool(ctx: ToolContext): AgentTool {
       if (!res.ok || !res.data) return apiFailure(res)
       const heartbeatError = res.data.heartbeatError
 
-      // ── apply the stack to the files, if they are here ────────────────
-      const stackResult = wantsStack && stackTo ? { from: stackFrom, to: stackTo, resetFiles: p.resetFiles === true } : null
-      let local: ApplyTechStackChangeResult | null = null
-      let appliesOnNextStart: { appliesOnNextStart: true; note: string } | null = null
-      if (stackResult) {
-        const projectDir = resolveProjectDir(ctx, targetId)
-        if (projectDir) {
-          local = applyTechStackChange({
-            projectDir,
-            projectId: targetId,
-            stackId: stackResult.to,
-            resetFiles: stackResult.resetFiles,
-          })
-        } else {
-          appliesOnNextStart = {
-            appliesOnNextStart: true,
-            note:
-              `The project's files are not mounted on this runtime, so only its settings changed. ` +
-              `They apply when it next starts. If it is a cloud/delegated project, run project_configure again ` +
-              `inside it (or ask its agent) to seed "${stackResult.to}" into its folder.`,
-          }
-        }
-      }
+      // The files were already changed before the PATCH; this only decides what
+      // the caller is told about them.
+      const stackResult = stackTarget
+        ? { from: stackFrom, to: stackTarget, resetFiles: p.resetFiles === true }
+        : null
 
       return textResult({
         ok: true,
@@ -620,23 +667,24 @@ export function createProjectConfigureTool(ctx: ToolContext): AgentTool {
                   ? {
                       seeded: local.seeded,
                       wiped: local.wiped,
-                      kept: local.kept,
+                      collisions: local.collisions,
+                      leftInPlace: local.leftInPlace,
+                      stackDocUpdated: local.stackDocUpdated,
                       previewRestarted: local.previewRestarted,
-                      ...(local.kept.length > 0
+                      ...(seedEntries(stackResult.to).length === 0
                         ? {
                             note:
-                              `Kept ${local.kept.length} file(s) that exist in both the project and the new starter: ` +
-                              `${local.kept.join(', ')}. Migrate them to the new stack, or re-run with resetFiles: true to replace them.`,
+                              `"${stackResult.to}" ships no files of its own, so nothing was added or overwritten — ` +
+                              `the current project files are untouched and remain the project's code (see leftInPlace). ` +
+                              `Pass resetFiles: true to delete them and start from an empty project.`,
                           }
-                        : seedEntries(stackResult.to).length === 0
+                        : local.leftInPlace.length > 0
                           ? {
                               note:
-                                `"${stackResult.to}" ships no files of its own, so nothing was added or overwritten — ` +
-                                `the current project files are untouched and remain the project's code. ` +
-                                `Pass resetFiles: true to delete them and start from an empty project.`,
+                                `Left ${local.leftInPlace.length} entr${local.leftInPlace.length === 1 ? 'y' : 'ies'} in place that ` +
+                                `"${stackResult.to}" does not write: ${local.leftInPlace.join(', ')}. Pass resetFiles: true to delete them first.`,
                             }
                           : {}),
-                      ...(local.ok ? {} : { error: local.error }),
                     }
                   : {}),
                 ...(appliesOnNextStart ?? {}),
