@@ -139,6 +139,14 @@ const IN_PROCESS_E2E_SUITES: readonly InProcessE2ESuite[] = [
     files: ['e2e/workspace-tool-failures.integration.test.ts'],
     env: {},
   },
+  // One join, one email (SHO-51). Mocked at the `email.service` module, so it
+  // counts a send from *any* caller — a hook that mails directly is caught here
+  // even though `join-notifications.test.ts` only records through the seam.
+  {
+    name: 'invitations e2e: join notifications',
+    files: ['e2e/invitations/join-notifications.integration.test.ts'],
+    env: {},
+  },
   // SHO-39: spawns its own writer processes against its own throwaway SQLite
   // file, so it needs no prepared database and must not share a bun process
   // with the suites above.
