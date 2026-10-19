@@ -154,6 +154,7 @@ import { historyRoutes } from './routes/history'
 // Hosted voice media — imported directly (not via the cloud-only island) so
 // desktop/local mode serves /api/voice/tts and /api/voice/music too.
 import { voiceMediaRoutes } from './routes/voice-media'
+import { chatMentionRoutes } from './routes/chat-mentions'
 // Note: Manual routes (workspaces, projects, folders, starred) removed in favor of generated v2 routes
 import { createRuntimeManager, setRuntimeManager, type IRuntimeManager } from './lib/runtime'
 // Generated routes (v2 API)
@@ -1633,6 +1634,7 @@ startChannelWorkers()
 // Forward chat realtime events and presence to sibling regions (no-op in single-region mode).
 startConversationRelay()
 app.route('/api', historyRoutes({ resolveUserId: getAuthUserId }))
+app.route('/api', chatMentionRoutes({ resolveUserId: getAuthUserId }))
 // Workspace-level Slack base agent. Slack's Events API must terminate at one
 // stable API URL, then route each request to an enabled project runtime.
 app.route('/api', slackAgentRoutes({ resolveUserId: getAuthUserId, runtimeManager: getRuntimeManager() }))
