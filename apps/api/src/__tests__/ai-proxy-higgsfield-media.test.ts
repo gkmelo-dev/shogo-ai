@@ -909,6 +909,26 @@ describe('list_media_models', () => {
     expect(data.images.find((m: any) => m.id === 'hf-z-image-turbo').price.source).toBe('catalog')
   })
 
+  test('a catalog entry with no request shape still lists, and never rejects the listing', async () => {
+    // The pre-fix failure mode: `buildHiggsfieldImageRequest` threw for any id
+    // it did not know, and that throw rejected the whole `list_media_models`.
+    const catalog = IMAGE_MODEL_CATALOG as unknown as Record<string, any>
+    catalog['hf-qa-unshaped'] = {
+      id: 'hf-qa-unshaped', provider: 'higgsfield', apiModel: 'qa/unshaped',
+      displayName: 'QA Unshaped', capabilities: { textToImage: true, imageToImage: false, maxReferenceImages: 0 },
+      usdPerRequest: 0.02, bestFor: 'the no-shape fallback',
+    }
+    try {
+      const data = await listMediaModels() as any
+      const ids = data.images.map((m: any) => m.id)
+      expect(ids).toContain('hf-qa-unshaped')
+      expect(ids).toContain('hf-ideogram-4')
+      expect(data.images.find((m: any) => m.id === 'hf-qa-unshaped').price.usd).toBeCloseTo(0.02 * 1.2, 4)
+    } finally {
+      delete catalog['hf-qa-unshaped']
+    }
+  })
+
   test('publishes low/hd and per-size prices for a non-Higgsfield image model', async () => {
     process.env.OPENAI_API_KEY = 'sk-test'
     try {
