@@ -176,6 +176,13 @@ describe('list_media_models', () => {
     expect(r.videos).toHaveLength(1)
     expect(r.images).toBeUndefined()
   })
+
+  test('kind "presets" lists the restyle styles instead of models', async () => {
+    on(`${PROXY}/media/presets`, () => json({ presets: [{ id: 'preset-1', name: 'Anime' }] }))
+    const r = await run('list_media_models', { kind: 'presets' })
+    expect(r.presets).toEqual([{ id: 'preset-1', name: 'Anime' }])
+    expect(r.images).toBeUndefined()
+  })
 })
 
 // =========================================================================
@@ -261,6 +268,50 @@ describe('generate_video', () => {
       json({ error: { message: 'Veo 3.1 Fast supports durations 4, 6, 8 seconds; got 5.' } }, 400))
     const r = await run('generate_video', { prompt: 'x', model: 'veo-3.1-fast', duration: 5 })
     expect(r.error).toContain('durations 4, 6, 8')
+  })
+
+  test('defaults to the cheapest Higgsfield model', async () => {
+    const flow = mockVideoFlow(['completed'])
+    await run('generate_video', { prompt: 'a fox runs' })
+    expect(flow.submitBody().model).toBe('hf-hailuo-2.3')
+  })
+
+  test('a Genjutsu edit uploads the source clip and submits its public URL', async () => {
+    writeFileSync(join(TEST_DIR, 'refs/clip.mp4'), Buffer.from([0, 0, 0, 24]))
+    on(`${PROXY}/media/uploads`, () => json({ url: 'https://cdn.hf/in.mp4' }))
+    const flow = mockVideoFlow(['completed'])
+
+    const r = await run('generate_video', {
+      source_video: 'refs/clip.mp4',
+      genjutsu: 'restyle',
+      preset_id: 'preset-1',
+      prompt: 'make it anime',
+      path: 'videos/restyled.mp4',
+    })
+    expect(r.error).toBeUndefined()
+
+    const upload = calls.find((c) => c.url === `${PROXY}/media/uploads`)
+    expect(upload).toBeDefined()
+    expect((upload!.init?.headers as any)['Content-Type']).toBe('video/mp4')
+
+    expect(flow.submitBody()).toMatchObject({
+      model: 'hf-genjutsu-restyle',
+      source_video_url: 'https://cdn.hf/in.mp4',
+      preset_id: 'preset-1',
+      prompt: 'make it anime',
+    })
+  })
+
+  test('genjutsu without a source clip is refused before anything is uploaded', async () => {
+    const r = await run('generate_video', { genjutsu: 'motion_transfer', prompt: 'x' })
+    expect(r.error).toContain('source_video')
+    expect(calls.some((c) => c.url.includes('/media/uploads'))).toBe(false)
+  })
+
+  test('a non-MP4 source clip is refused with the reason', async () => {
+    writeFileSync(join(TEST_DIR, 'refs/clip.mov'), 'mov')
+    const r = await run('generate_video', { source_video: 'refs/clip.mov', genjutsu: 'object_swap', prompt: 'x' })
+    expect(r.error).toContain('must be an .mp4')
   })
 })
 

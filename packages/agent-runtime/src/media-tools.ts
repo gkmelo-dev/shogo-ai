@@ -87,6 +87,57 @@ function toDataUri(image: LoadedImage): string {
   return `data:${image.mimeType};base64,${image.buffer.toString('base64')}`
 }
 
+/** Higgsfield's input limit for a Genjutsu source clip. */
+export const MAX_SOURCE_VIDEO_BYTES = 200 * 1024 * 1024
+
+/**
+ * Read a workspace clip for a Genjutsu edit. Only MP4 is accepted (the provider
+ * documents `video/mp4`), and the size is checked before anything is uploaded
+ * so an oversize file fails without a round trip or a charge.
+ */
+function loadWorkspaceVideo(
+  ctx: ToolContext,
+  workspacePath: string,
+  maxBytes = MAX_SOURCE_VIDEO_BYTES,
+): { buffer: Buffer; workspacePath: string } | { error: string } {
+  const resolved = assertWithinWorkspace(ctx.workspaceDir, workspacePath)
+  if (!existsSync(resolved)) return { error: `Source video not found: ${workspacePath}` }
+  if (extname(resolved).toLowerCase() !== '.mp4') {
+    return { error: `Source video must be an .mp4 (got ${extname(resolved) || 'no extension'}): ${workspacePath}` }
+  }
+  const buffer = readFileSync(resolved)
+  if (buffer.byteLength > maxBytes) {
+    const limitMb = Math.round(maxBytes / (1024 * 1024))
+    const sizeMb = (buffer.byteLength / (1024 * 1024)).toFixed(1)
+    return { error: `Source video is ${sizeMb} MB; the limit is ${limitMb} MB. Trim or compress it first.` }
+  }
+  return { buffer, workspacePath }
+}
+
+/**
+ * Put a workspace clip on the provider's storage and return its public URL.
+ * The proxy owns the provider key, so the bytes go through it rather than to
+ * the storage host directly.
+ */
+async function uploadSourceVideo(
+  proxy: ProxyConfig,
+  buffer: Buffer,
+  signal?: AbortSignal,
+): Promise<{ url: string } | { error: string }> {
+  const response = await fetch(`${proxy.base}/v1/media/uploads`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'video/mp4', Authorization: `Bearer ${proxy.token}` },
+    body: buffer as unknown as BodyInit,
+    signal,
+  })
+  if (!response.ok) {
+    return { error: friendlyMediaError('Uploading the source video', response.status, await response.text()) }
+  }
+  const body = (await response.json()) as { url?: string }
+  if (!body.url) return { error: 'Uploading the source video failed: the proxy returned no URL.' }
+  return { url: body.url }
+}
+
 /**
  * Where generated media lands. `path` may point anywhere in the workspace
  * (validated by `assertWithinWorkspace`); `filename` is a shortcut that
@@ -185,17 +236,16 @@ export function friendlyMediaError(context: string, status: number, rawErrorText
 // ---------------------------------------------------------------------------
 
 const IMAGE_MODEL_GUIDE =
-  'Image model id (default "gpt-image-2.5-flare"). Call list_media_models for the full list with prices. ' +
-  'Rough guide: "nano-banana-pro" for keeping a character consistent across shots and multi-reference edits ' +
-  '("nano-banana-2" is cheaper), "seedream-5-pro" for stylized art, "flux-pro-ultra" for photorealism, ' +
-  '"ideogram-3" for text in images (posters, logos), "recraft-3" for vector and brand work, ' +
-  '"gpt-image-2.5-flare"/"gpt-image-2" for general prompt following, "imagen-4" for fast text-to-image.'
+  'Image model id (default "hf-soul-v2", a cheap Higgsfield model). Call list_media_models for the full list with prices. ' +
+  'Rough guide: "hf-soul-v2" for general editorial/product images, "hf-ideogram-4" for text in images (posters, logos), ' +
+  '"gpt-image-2.5-flare"/"gpt-image-2" for OpenAI prompt following, "imagen-4" for Google text-to-image. ' +
+  'fal ids ("nano-banana-pro", "seedream-5-pro", "flux-pro-ultra", ...) still work but are deprecated — prefer a Higgsfield model.'
 
 export function createGenerateImageTool(ctx: ToolContext): AgentTool {
   return {
     name: 'generate_image',
     description:
-      'Generate one to four image options from a text prompt. Pass reference_images (workspace paths) to edit an image or to keep a character, product or style consistent across shots. ' +
+      'Generate one to four image options from a text prompt (default model hf-soul-v2 on Higgsfield). Pass reference_images (workspace paths) to edit an image or to keep a character, product or style consistent across shots. ' +
       'Saves to images/ by default; pass path to save anywhere in the workspace (e.g. "public/assets/hero.png").',
     label: 'Generate Image',
     parameters: Type.Object({
@@ -258,7 +308,7 @@ export function createGenerateImageTool(ctx: ToolContext): AgentTool {
         reference_image?: string
         options?: number
       }
-      const { prompt, size = '1024x1024', model = 'gpt-image-2.5-flare', quality = 'standard', options = 1 } = p
+      const { prompt, size = '1024x1024', model = 'hf-soul-v2', quality = 'standard', options = 1 } = p
 
       if (!Number.isInteger(options) || options < 1 || options > 4) {
         return textResult({ error: 'The options parameter must be an integer between 1 and 4.' })
@@ -377,20 +427,39 @@ function createListMediaModelsTool(ctx: ToolContext): AgentTool {
   return {
     name: 'list_media_models',
     description:
-      'List the image, video and 3D models you can use, with what each is best for, whether it accepts reference images or a start frame, its main parameters, and its Shogo price (per image, per second of video, or per 3D task). ' +
-      'Check this before choosing a model or planning a batch so you can budget it.',
+      'List the image, video and 3D models you can use, with what each is best for, whether it accepts reference images or a start frame, its main parameters, and its Shogo price (per image, per second of video, or per clip). ' +
+      'Higgsfield models are the default and are listed first; fal entries marked deprecated still work but are being retired, and name their replacement. Check this before choosing a model or planning a batch so you can budget it.',
     label: 'List Media Models',
     parameters: Type.Object({
       kind: Type.Optional(
-        Type.Union([Type.Literal('image'), Type.Literal('video'), Type.Literal('3d'), Type.Literal('all')], {
-          description: 'Which models to list (default: "all")',
+        Type.Union([Type.Literal('image'), Type.Literal('video'), Type.Literal('3d'), Type.Literal('presets'), Type.Literal('all')], {
+          description: 'Which models to list (default: "all"); "presets" lists the Genjutsu Restyle style ids',
         }),
       ),
     }),
     execute: async (_toolCallId, params, signal) => {
-      const { kind = 'all' } = params as { kind?: 'image' | 'video' | '3d' | 'all' }
+      const { kind = 'all' } = params as { kind?: 'image' | 'video' | '3d' | 'presets' | 'all' }
       const proxy = proxyConfig(ctx)
       if (!proxy) return textResult({ error: 'Media models are not available: AI proxy not configured.' })
+
+      if (kind === 'presets') {
+        // Restyle style ids change over time, so they are fetched live rather
+        // than read from the catalog.
+        try {
+          const response = await fetch(`${proxy.base}/v1/media/presets`, {
+            headers: { Authorization: `Bearer ${proxy.token}` },
+            signal,
+          })
+          if (!response.ok) {
+            return textResult({ error: friendlyMediaError('Listing restyle presets', response.status, await response.text()) })
+          }
+          const data = (await response.json()) as { presets?: unknown[] }
+          return textResult({ presets: data.presets ?? [] })
+        } catch (err: any) {
+          return textResult({ error: `Listing restyle presets failed: ${err.message}` })
+        }
+      }
+
       try {
         const response = await fetch(`${proxy.base}/v1/media/models`, {
           headers: { Authorization: `Bearer ${proxy.token}` },
@@ -678,12 +747,23 @@ function jobResult(job: TrackedVideoJob, extra: Record<string, unknown> = {}) {
   })
 }
 
+/** Default video model for the tool: the cheapest Higgsfield clip. */
+export const DEFAULT_VIDEO_TOOL_MODEL = 'hf-hailuo-2.3'
+
+/** `genjutsu` mode → model id, so a caller can ask for the workflow by name. */
+export const GENJUTSU_MODEL_BY_MODE = {
+  motion_transfer: 'hf-genjutsu-motion-transfer',
+  object_swap: 'hf-genjutsu-object-swap',
+  restyle: 'hf-genjutsu-restyle',
+} as const
+
 function createGenerateVideoTool(ctx: ToolContext): AgentTool {
   return {
     name: 'generate_video',
     description:
       'Generate a video clip from a text prompt, or animate a still image by passing start_image (recommended: make the still with generate_image first). ' +
-      'Saves an MP4 to videos/ by default; pass path to save anywhere in the workspace. Billed per second of video, so use the shortest duration that works and call list_media_models for prices. ' +
+      'Also edits an existing clip: pass source_video with genjutsu "motion_transfer" | "object_swap" | "restyle" (restyle needs a preset_id from the presets list). ' +
+      'Saves an MP4 to videos/ by default; pass path to save anywhere in the workspace. Billed per clip on Higgsfield (the estimate comes back on submit) — call list_media_models for prices. ' +
       'Waits for the clip (usually 1-5 minutes). Pass wait: false to queue several shots at once, then call generate_video({ job_id }) to check each one.',
     label: 'Generate Video',
     parameters: Type.Object({
@@ -691,18 +771,33 @@ function createGenerateVideoTool(ctx: ToolContext): AgentTool {
       model: Type.Optional(
         Type.String({
           description:
-            'Video model id (default "kling-2.5-turbo-pro"). "kling-3-pro" for fluid motion and character references, "veo-3.1-fast" for cinematic shots with sound, "minimax-h3-max" for stylized looks. See list_media_models.',
+            'Video model id (default "hf-hailuo-2.3", the cheapest Higgsfield clip). "hf-kling-2.5-pro" for fluid motion, "hf-wan-2.6" for stylized looks up to 15 s, "hf-ltx-2.5-fast" for the only text-to-video that takes an aspect_ratio, "hf-genjutsu-*" to edit a clip. fal ids still work but are deprecated. See list_media_models.',
         }),
       ),
-      duration: Type.Optional(Type.Integer({ minimum: 1, maximum: 20, description: 'Clip length in seconds; each model allows specific values (see list_media_models)' })),
-      aspect_ratio: Type.Optional(Type.String({ description: 'e.g. "16:9", "9:16", "1:1" (text-to-video; image-to-video follows the start image)' })),
+      duration: Type.Optional(Type.Integer({ minimum: 1, maximum: 20, description: 'Clip length in seconds; each model allows specific values (see list_media_models). A Genjutsu edit follows its source clip.' })),
+      aspect_ratio: Type.Optional(Type.String({ description: 'e.g. "16:9", "9:16", "1:1". Only models that list one accept it — Hailuo, Kling and Wan follow the start image, so pass a portrait start_image for a 9:16 ad.' })),
+      resolution: Type.Optional(Type.String({ description: 'Resolution tier on models that have one: "480p" | "720p" | "1080p" ("720p" default). Cheaper tiers render faster.' })),
       audio: Type.Optional(Type.Boolean({ description: 'Generate sound/dialogue on models that support it (costs more). Default false.' })),
       start_image: Type.Optional(Type.String({ description: 'Workspace image to use as the first frame (image-to-video)' })),
       reference_images: Type.Optional(
         Type.Array(Type.String(), {
           maxItems: MAX_REFERENCE_IMAGES,
-          description: 'Character/object reference images for models that accept them (kling-3-pro)',
+          description: 'Character/object reference images. Genjutsu motion_transfer and object_swap need at least one (the subject to drive or swap in).',
         }),
+      ),
+      source_video: Type.Optional(
+        Type.String({
+          description: 'Workspace .mp4 to edit (Genjutsu). Uploaded automatically; 200 MB limit, and the clip must be at least 4 s (trimmed to 30 s).',
+        }),
+      ),
+      genjutsu: Type.Optional(
+        Type.Union(
+          [Type.Literal('motion_transfer'), Type.Literal('object_swap'), Type.Literal('restyle')],
+          { description: 'Editing workflow when source_video is set: drive a subject image with the clip\'s motion, swap an object, or restyle the clip. Selecting it picks the matching model.' },
+        ),
+      ),
+      preset_id: Type.Optional(
+        Type.String({ description: 'Restyle style id (required for genjutsu "restyle"); list them with list_media_models kind "presets".' }),
       ),
       path: Type.Optional(Type.String({ description: 'Output path anywhere in the workspace (e.g. "public/media/intro.mp4")' })),
       filename: Type.Optional(Type.String({ description: 'Destination filename under videos/ (ignored when path is set)' })),
@@ -715,9 +810,13 @@ function createGenerateVideoTool(ctx: ToolContext): AgentTool {
         model?: string
         duration?: number
         aspect_ratio?: string
+        resolution?: string
         audio?: boolean
         start_image?: string
         reference_images?: string[]
+        source_video?: string
+        genjutsu?: 'motion_transfer' | 'object_swap' | 'restyle'
+        preset_id?: string
         path?: string
         filename?: string
         wait?: boolean
@@ -727,10 +826,14 @@ function createGenerateVideoTool(ctx: ToolContext): AgentTool {
       if (!proxy) return textResult({ error: 'Video generation is not available: AI proxy not configured.' })
 
       if (p.job_id) return checkVideoJob(ctx, proxy, p.job_id, p, signal)
-      if (!p.prompt) return textResult({ error: 'prompt is required (or pass job_id to check an earlier job).' })
+      if (!p.prompt && !p.source_video) {
+        return textResult({ error: 'prompt is required (or pass source_video for a Genjutsu edit, or job_id to check an earlier job).' })
+      }
+      const model = p.model ?? (p.genjutsu ? GENJUTSU_MODEL_BY_MODE[p.genjutsu] : DEFAULT_VIDEO_TOOL_MODEL)
 
       let target: OutputTarget
       let startImage: string | undefined
+      let sourceVideoUrl: string | undefined
       const references: string[] = []
       try {
         if ((p.reference_images?.length ?? 0) > MAX_REFERENCE_IMAGES) {
@@ -746,6 +849,15 @@ function createGenerateVideoTool(ctx: ToolContext): AgentTool {
           if ('error' in image) return textResult({ error: image.error })
           references.push(toDataUri(image))
         }
+        if (p.source_video) {
+          const video = loadWorkspaceVideo(ctx, p.source_video)
+          if ('error' in video) return textResult({ error: video.error })
+          const uploaded = await uploadSourceVideo(proxy, video.buffer, signal)
+          if ('error' in uploaded) return textResult({ error: uploaded.error })
+          sourceVideoUrl = uploaded.url
+        } else if (p.genjutsu) {
+          return textResult({ error: `genjutsu "${p.genjutsu}" edits an existing clip: pass source_video (a workspace .mp4).` })
+        }
         target = resolveOutputTarget(ctx, {
           path: p.path,
           filename: p.filename,
@@ -757,19 +869,22 @@ function createGenerateVideoTool(ctx: ToolContext): AgentTool {
         return textResult({ error: err.message })
       }
 
-      let submitted: { id: string; model: string; duration: number; audio: boolean; estimated_usd?: number }
+      let submitted: { id: string; model: string; duration: number; audio: boolean; estimated_usd?: number; provider?: string }
       try {
         const response = await fetch(`${proxy.base}/v1/videos/generations`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${proxy.token}` },
           body: JSON.stringify({
             prompt: p.prompt,
-            model: p.model,
+            model,
             duration: p.duration,
             aspect_ratio: p.aspect_ratio,
+            resolution: p.resolution,
             audio: p.audio,
             start_image: startImage,
             reference_images: references.length > 0 ? references : undefined,
+            source_video_url: sourceVideoUrl,
+            preset_id: p.preset_id,
           }),
           signal,
         })
@@ -783,7 +898,7 @@ function createGenerateVideoTool(ctx: ToolContext): AgentTool {
 
       const job: TrackedVideoJob = {
         id: submitted.id,
-        prompt: p.prompt,
+        prompt: p.prompt ?? '',
         model: submitted.model,
         duration: submitted.duration,
         audio: submitted.audio,

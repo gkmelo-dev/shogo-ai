@@ -63,6 +63,7 @@ const KEY_PROVIDERS = [
   { id: 'openrouter', name: 'OpenRouter', placeholder: 'sk-or-…' },
   { id: 'fal', name: 'fal.ai (images and video)', placeholder: 'key-id:key-secret' },
   { id: 'tripo', name: 'Tripo (3D)', placeholder: 'tsk_…' },
+  { id: 'higgsfield', name: 'Higgsfield (video, images, Genjutsu)', placeholder: 'key-id:key-secret' },
 ] as const
 
 /** Providers we can prefill via live discovery. OpenRouter lists without a key. */
