@@ -34,7 +34,7 @@ import { TRIGGERS_GUIDE, triggerToolsAvailable } from './trigger-tools'
 import { runAgentLoop, classifyRetryability, RetryWaker, type LoopDetectorConfig } from './agent-loop'
 import { LONG_RETRY_MS, recordRetryEpisode, recordRetryLong, recordRetryNoProgress, recordRetryNow } from './retry-telemetry'
 import type { ToolContext } from './gateway-tools'
-import { createTools, textResult, filterDisabledCapabilityTools, filterSubagentOnlyTools, expectedCoreToolsForAgentMode, createModeUnavailableTool, workspaceAgentToolsRegistered, type RestrictedMode } from './gateway-tools'
+import { createTools, textResult, filterDisabledCapabilityTools, filterSubagentOnlyTools, subagentOrchestrationDisabled, expectedCoreToolsForAgentMode, createModeUnavailableTool, workspaceAgentToolsRegistered, type RestrictedMode } from './gateway-tools'
 import { DEFAULT_CLOUD_SECURITY_PREFERENCE, PermissionEngine, parseSecurityPolicy } from './permission-engine'
 import { buildExposedPortsPrompt } from './exposed-ports-prompt'
 import { buildConcurrentChatsPrompt, concurrentChatLabel, type ConcurrentChat } from './concurrent-chats-prompt'
@@ -48,7 +48,7 @@ import {
   resolveInLoopContextBudgetTokens,
   stableTransformContext,
 } from './stable-compaction'
-import { scrubOversizedImages } from './image-size-guard'
+import { scrubInvalidImages } from './image-size-guard'
 import {
   fingerprintMessages,
   fingerprintSystem,
@@ -121,8 +121,8 @@ import { BACKGROUND_TASKS_GUIDE } from './background-tasks-guide'
 import { buildGuideRegistry, buildCapabilitiesIndex } from './guide-registry'
 import { AgentManager } from './agent-manager'
 import { loadWorkspaceCustomAgents } from './subagent'
-import { TaskRegistry, formatTaskNotification } from './task-registry'
-import { cleanupTaskOutputs, taskOutputDir, taskOutputRoot } from './task-output'
+import { TaskRegistry, formatTaskNotification, type TaskLink, type TaskSource, type TaskStatus } from './task-registry'
+import { cleanupTaskOutputs, listTaskOutputRows, taskOutputBody, taskOutputDir, taskOutputRoot } from './task-output'
 import { createApiTaskClient } from './remote-tasks'
 import { releaseSessionBrowsers, reapOrphanChromium } from './browser-pool'
 import { TeamManager } from './team-manager'
@@ -458,6 +458,17 @@ export function describeTurnFailure(
 }
 
 export type VisualMode = 'canvas' | 'app' | 'none'
+
+/** What the dock's output route answers with: the text plus where the task lives. */
+export interface SessionTaskOutput {
+  taskId: string
+  source: TaskSource
+  title: string
+  status: TaskStatus
+  outputFile?: string
+  output: string
+  link?: TaskLink
+}
 
 export interface GatewayConfig {
   /**
@@ -2217,8 +2228,45 @@ export class AgentGateway {
       registry.onNotification(() => this.scheduleTaskWake(sessionId))
 
       this.commandRegistries.set(sessionId, registry)
+      // `sessionManager.get()` is memory-only: on a cold process the session is
+      // not loaded yet, so the seed above sees nothing. Load it once and retry,
+      // then fall back to the per-task logs when no snapshot survived.
+      this.hydrateCommandRegistry(sessionId, registry).catch(() => {})
     }
     return reg
+  }
+
+  private hydratingRegistries = new Map<string, Promise<void>>()
+
+  /**
+   * Seed a cold registry from the loaded session (or, failing that, the
+   * per-task logs). Returns the in-flight promise so callers that answer a
+   * request can wait for it: `sessionManager.get()` is memory-only, and a
+   * client that receives an empty dock never asks again.
+   */
+  private hydrateCommandRegistry(sessionId: string, registry: TaskRegistry): Promise<void> {
+    const inflight = this.hydratingRegistries.get(sessionId)
+    if (inflight) return inflight
+    const pending = (async () => {
+      try {
+        const session = await this.sessionManager.getOrCreateAsync(sessionId)
+        // Another caller already re-seeded this registry from the loaded session.
+        if (registry.listDock().length > 0) return
+        const persisted = session.metadata?.runningProcesses
+        if (Array.isArray(persisted) && persisted.length > 0) {
+          registry.restoreStale(persisted)
+          return
+        }
+        const rows = listTaskOutputRows(taskOutputDir(this.workspaceDir, sessionId))
+        if (rows.length > 0) registry.restoreFromOutputRows(rows)
+      } catch {
+        // Best effort: a dock that starts empty beats a failed first request.
+      } finally {
+        this.hydratingRegistries.delete(sessionId)
+      }
+    })()
+    this.hydratingRegistries.set(sessionId, pending)
+    return pending
   }
 
   // ---------------------------------------------------------------------------
@@ -2330,23 +2378,45 @@ export class AgentGateway {
     return this.getOrCreateCommandRegistry(sessionId).listVisible()
   }
 
-  /** Running tasks for the dock, with API-tracked ones refreshed first. */
+  /** Tasks for the dock (running + recently finished), remote ones refreshed first. */
   async listSessionTasks(sessionId: string): Promise<import('./task-registry').RunningProcess[]> {
     const reg = this.getOrCreateCommandRegistry(sessionId)
+    // A cold registry is seeded asynchronously; answer from the hydrated list.
+    // The client only polls the seed route while it already has rows, so an
+    // empty first response would never be retried.
+    await this.hydratingRegistries.get(sessionId)
     if (reg.hasRunningRemote()) await reg.refreshRemote()
-    return reg.listVisible()
+    return reg.listDock()
   }
 
-  /** Last part of a task's output, for the dock's output viewer. */
-  readSessionTaskOutput(sessionId: string, taskId: string): { taskId: string; outputFile?: string; output: string } | null {
-    const reg = this.commandRegistries.get(sessionId)
-    const entry = reg?.get(taskId)
-    if (!reg || !entry) return null
-    const output = reg.readOutput(entry)
+  /**
+   * Last part of a task's output, for the dock's output viewer. Remote tasks
+   * are refreshed first: the API is where their text lands, and a reader that
+   * skips the refresh sees an empty local log. The task's destination (`link`)
+   * comes back with it, so the client can open the agent's thread instead.
+   */
+  async readSessionTaskOutput(sessionId: string, taskId: string): Promise<SessionTaskOutput | null> {
+    const reg = this.getOrCreateCommandRegistry(sessionId)
+    let entry = reg.get(taskId)
+    if (!entry) {
+      // A cold registry is seeded asynchronously; the task may still arrive.
+      await this.hydratingRegistries.get(sessionId)
+      entry = reg.get(taskId)
+    }
+    if (!entry) return null
+    if (entry.remote && entry.status === 'running') {
+      await reg.refreshWhere((e) => e.id === entry!.id)
+    }
+    const local = taskOutputBody(reg.readOutput(entry)).trim()
+    const output = local || (entry.result?.summary ?? '').trim() || (entry.remoteNote ?? '').trim()
     return {
       taskId: entry.id,
+      source: entry.source,
+      title: entry.title,
+      status: entry.status,
       outputFile: reg.displayPath(entry.outputFile),
       output: output.length > 64_000 ? output.slice(-64_000) : output,
+      link: entry.link ?? (entry.outputFile ? { kind: 'log', path: reg.displayPath(entry.outputFile) } : undefined),
     }
   }
 
@@ -3146,18 +3216,20 @@ export class AgentGateway {
       const reg = this.getOrCreateCommandRegistry(sessionId)
       const visibleKey = (tasks: readonly { runId: string; status: string }[]) =>
         tasks.map((task) => `${task.runId}:${task.status}`).join('\0')
-      const writeTasks = (tasks: ReturnType<typeof reg.listVisible>) => {
+      const writeTasks = (tasks: ReturnType<typeof reg.listDock>) => {
         uiWriter.write({ type: 'data-task-update', data: { tasks }, transient: true } as any)
         uiWriter.write({ type: 'data-process-update', data: { processes: tasks }, transient: true } as any)
       }
       // Push the current list immediately so a reconnecting client re-syncs.
-      const initialTasks = reg.listVisible()
+      // `listDock` keeps a settled task as a terminal row, so a row that
+      // finishes during the turn updates in place instead of vanishing.
+      const initialTasks = reg.listDock()
       let lastVisibleKey = visibleKey(initialTasks)
       try {
         writeTasks(initialTasks)
       } catch { /* writer may already be closed */ }
       unsubscribeProcesses = reg.onChange(() => {
-        const tasks = reg.listVisible()
+        const tasks = reg.listDock()
         const nextKey = visibleKey(tasks)
         if (nextKey === lastVisibleKey) return
         lastVisibleKey = nextKey
@@ -3524,8 +3596,11 @@ export class AgentGateway {
       // their own queued wake, whose message carries the task. Injecting them
       // here would mark them consumed and the dispatcher would drop that wake
       // as already seen — so only notes that finish *during* the turn are
-      // injected.
+      // injected. A runtime with no internal API credentials can never queue
+      // that wake, so there the turn sweeps every pending note instead; see
+      // takeInjectedMessages below.
       const turnStartedAt = Date.now()
+      const canQueueTaskWake = hasInternalApiCredentials()
 
       // --- Prefix-cache debug: turn-start snapshot ---
       // Emits short hashes of the three inputs Anthropic keys its prompt
@@ -3576,6 +3651,9 @@ export class AgentGateway {
           recordRetryEpisode(retryCtx(), summary)
         },
         extraHeaders,
+        // Stage 1 of the image-400 repair ladder: drop only the blocks that
+        // provably cannot decode, instead of every image in history.
+        scrubInvalidImages,
         onContextOverflow: async () => {
           console.warn(`${this.logPrefix} Layer 5: Reactive compaction for session ${sessionId}`)
           const fileStateSummary = this.fileStateCache.size > 0
@@ -3615,21 +3693,27 @@ export class AgentGateway {
               `(budget ${inLoopBudgetTokens} tokens) for session ${sessionId}`,
             )
           }
-          // Final guard: self-heal any oversized image blocks that may have
-          // landed in history before this guard shipped (or that slipped past
-          // emission-time checks). Deterministic, so it does not disturb the
-          // stable-compaction byte-identical prefix invariant.
-          return scrubOversizedImages(result.messages)
+          // Final guard: self-heal any image block in history that no provider
+          // can accept — corrupt/truncated bytes, an unsupported format, or an
+          // oversized payload — before it reaches the wire. Deterministic, so it
+          // does not disturb the stable-compaction byte-identical prefix
+          // invariant.
+          return scrubInvalidImages(result.messages)
         },
         onToolCall: (name, input) => {
           console.log(`${this.logPrefix} Tool call: ${name}`, JSON.stringify(input).substring(0, 20))
         },
         takeInjectedMessages: () => {
-          const notes = commandRegistry?.consumeCompletionNotes(
-            (note) => (note.finishedAt ?? 0) >= turnStartedAt,
-          ) ?? []
           // One message per finished task: the agent acts on each result as its
           // own note, not on a batch joined into one message.
+          //
+          // Without credentials the API cannot queue a wake for a note that
+          // settled before this turn, so filtering by finishedAt would mean the
+          // finished task's result is never delivered to anyone: take every
+          // pending note there (its own message each, as before SHO-33).
+          const notes = commandRegistry?.consumeCompletionNotes(
+            canQueueTaskWake ? (note) => (note.finishedAt ?? 0) >= turnStartedAt : undefined,
+          ) ?? []
           return notes.map((text) => ({
             role: 'user',
             content: text,
@@ -4343,7 +4427,7 @@ export class AgentGateway {
       parts.push(BROWSER_TOOL_GUIDE)
     }
     parts.push(BACKGROUND_TASKS_GUIDE)
-    parts.push(SUBAGENT_GUIDE)
+    if (!subagentOrchestrationDisabled(this.config)) parts.push(SUBAGENT_GUIDE)
     if (this.config.gitWorktreesEnabled) parts.push(WORKTREE_GUIDE)
 
     if (sessionId) {
@@ -4406,7 +4490,7 @@ export class AgentGateway {
     }
 
     parts.push(BACKGROUND_TASKS_GUIDE)
-    parts.push(SUBAGENT_GUIDE)
+    if (!subagentOrchestrationDisabled(this.config)) parts.push(SUBAGENT_GUIDE)
     if (this.config.gitWorktreesEnabled) parts.push(WORKTREE_GUIDE)
 
     if (sessionId) {
@@ -4533,10 +4617,10 @@ export class AgentGateway {
       channels: channelsGuideOn,
       media: mediaGuideOn,
       video: this.config.videoGenEnabled === true,
-      // Personal workspaces have no subagent orchestration at all, so
-      // generate_image/transcribe_audio are kept directly callable (see the
-      // SUBAGENT_ONLY_TOOLS carve-out above) rather than delegated.
-      mediaDelegated: this.config.capabilityProfile !== 'personal',
+      // Personal workspaces and the workspace agent have no subagent
+      // orchestration at all, so generate_image/transcribe_audio are kept
+      // directly callable (see the SUBAGENT_ONLY_TOOLS carve-out above).
+      subagents: !subagentOrchestrationDisabled(this.config),
       devops: devopsGuideOn,
     }))
 
@@ -5042,12 +5126,16 @@ export class AgentGateway {
       'Saving that file triggers a fast restart (no regenerate, no db push)',
       'so changes are live in under a second.',
       '',
-      'If you ever see a route 404 or need to force a refresh, delegate to the `devops` subagent, which has the `server_sync` tool:',
-      '```',
-      'agent_spawn({ type: "devops", prompt: "Run server_sync and report the phase, active routes, and schema models" })',
-      '```',
-      'It reports the current phase, active routes, and schema models.',
-      '',
+      ...(subagentOrchestrationDisabled(this.config)
+        ? []
+        : [
+            'If you ever see a route 404 or need to force a refresh, delegate to the `devops` subagent, which has the `server_sync` tool:',
+            '```',
+            'agent_spawn({ type: "devops", prompt: "Run server_sync and report the phase, active routes, and schema models" })',
+            '```',
+            'It reports the current phase, active routes, and schema models.',
+            '',
+          ]),
       '**Do NOT** manually run `prisma generate`, `shogo generate`, or `npm run db:generate` — it is all automatic.',
     ].join('\n')
 

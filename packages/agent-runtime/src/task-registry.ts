@@ -19,10 +19,15 @@
 import { randomBytes } from 'crypto'
 import { join, relative } from 'path'
 import type { CommandHandle } from './sandbox-exec'
-import { TaskOutputWriter, readTaskOutput, tailLines } from './task-output'
+import {
+  TaskOutputWriter,
+  readTaskOutput,
+  tailLines,
+  type TaskOutputRow,
+} from './task-output'
 
 /** How long to keep finished entries around so a post-hoc `wait` works. */
-const COMPLETED_RETENTION_MS = 10 * 60 * 1000
+export const COMPLETED_RETENTION_MS = 10 * 60 * 1000
 /** How long a shell command must run before it is shown in the chat dock. */
 export const UI_VISIBLE_AFTER_MS = 30_000
 /** Rolling in-memory output window per non-shell task, used by `until` matching. */
@@ -36,6 +41,27 @@ const REMOTE_MIN_POLL_GAP_MS = 500
 
 export type TaskSource = 'shell' | 'subagent' | 'project_call' | 'agent_reply' | 'work_item'
 export type TaskStatus = 'running' | 'completed' | 'failed' | 'cancelled'
+
+/**
+ * Where a task's work is actually happening. The chat dock opens this instead
+ * of the runtime-local log, so pressing a background row lands on the agent's
+ * thread (a channel thread, a card, a project session) rather than an empty
+ * file. `log` is the local output file, used by shell commands.
+ */
+export type TaskLink =
+  | { kind: 'log'; path?: string }
+  | { kind: 'project_session'; projectId: string; chatSessionId?: string; name?: string }
+  | { kind: 'subagent'; projectId?: string; chatSessionId?: string; toolCallId: string }
+  | { kind: 'channel_thread'; workspaceId?: string; conversationId: string; threadRootId: string; title?: string }
+  | {
+      kind: 'card'
+      workspaceId?: string
+      conversationId: string
+      threadRootId: string
+      itemId: string
+      itemKey: string
+      board: string
+    }
 
 export interface TaskResult {
   exitCode?: number
@@ -64,6 +90,11 @@ export interface TaskEntry {
   backgrounded?: boolean
   /** Restored after a runtime restart; the local process is gone. */
   stale?: boolean
+  /**
+   * It was in the dock before the restart. A restored terminal row has no live
+   * duration to compare against the visibility delay, so it says so directly.
+   */
+  shown?: boolean
   /** Status comes from a client (the API, or another project's runtime); this entry mirrors it. */
   remote?: boolean
   /** Tracked by the API, which also wakes the agent itself when it finishes. */
@@ -74,6 +105,10 @@ export interface TaskEntry {
   dormant?: boolean
   /** Source-specific reference (subagent instance id, remote target, ...). */
   ref?: string
+  /** Where this task's work is happening, for the dock's "open the thread" action. */
+  link?: TaskLink
+  /** Wake text the API formatted for this task, when it finished. */
+  remoteNote?: string
   /** Absolute path of the output file, when output files are enabled. */
   outputFile?: string
   /** Shell tasks only. */
@@ -105,6 +140,8 @@ export interface RunningProcess {
   notify: boolean
   remote?: boolean
   stale?: boolean
+  /** Where the task's work is happening (thread, card, project session, log). */
+  link?: TaskLink
 }
 
 /** Serializable subset persisted into session metadata so the list survives restart. */
@@ -120,6 +157,13 @@ export interface RunningProcessSnapshot {
   remote?: boolean
   ref?: string
   outputFile?: string
+  /** Where the task's work is happening; survives a restart with the row. */
+  link?: TaskLink
+  /** Terminal rows keep their outcome and freeze so a restart still lists them. */
+  status?: TaskStatus
+  finishedAt?: number
+  /** The snapshot was taken from a row the dock was showing. */
+  shown?: boolean
 }
 
 export interface TaskNotification {
@@ -142,6 +186,10 @@ export interface RemoteTaskState {
   output?: string
   result?: TaskResult
   matched?: boolean
+  /** Where the API says the task's work is happening. */
+  link?: TaskLink
+  /** The API's formatted wake text, when the task has settled. */
+  note?: string
 }
 
 /** Transport for remote tasks; implemented over the internal API by the gateway. */
@@ -225,7 +273,7 @@ export class TaskRegistry {
   // ---------------------------------------------------------------------------
 
   /** Register a freshly spawned shell command. */
-  register(command: string, handle: CommandHandle, opts: { title?: string; notify?: boolean; cwd?: string } = {}): CommandEntry {
+  register(command: string, handle: CommandHandle, opts: { title?: string; notify?: boolean; cwd?: string; link?: TaskLink } = {}): CommandEntry {
     const id = newTaskId()
     let resolveDone!: () => void
     const done = new Promise<void>((r) => { resolveDone = r })
@@ -240,6 +288,7 @@ export class TaskRegistry {
       notify: opts.notify ?? true,
       consumed: false,
       handle,
+      link: opts.link,
       done,
     }
     this.entries.set(id, entry)
@@ -289,6 +338,7 @@ export class TaskRegistry {
     cancel?: () => void | Promise<void>
     id?: string
     dormant?: boolean
+    link?: TaskLink
   }): TaskHandle {
     const id = opts.id ?? newTaskId()
     let resolveDone!: () => void
@@ -305,6 +355,7 @@ export class TaskRegistry {
       consumed: false,
       backgrounded: opts.backgrounded,
       ref: opts.ref,
+      link: opts.link,
       dormant: opts.dormant || undefined,
       done,
     }
@@ -354,9 +405,14 @@ export class TaskRegistry {
     /** The API holds the task (wakes the session, records consumption). Default: no per-task client. */
     apiTracked?: boolean
     dormant?: boolean
+    /** Where the task's work is happening; shown as the dock row's destination. */
+    link?: TaskLink
   }): TaskEntry {
     const existing = this.entries.get(opts.id)
-    if (existing) return existing
+    if (existing) {
+      if (opts.link && !existing.link) existing.link = opts.link
+      return existing
+    }
     const handle = this.registerTask({
       id: opts.id,
       source: opts.source,
@@ -365,6 +421,7 @@ export class TaskRegistry {
       notify: opts.notify,
       backgrounded: true,
       dormant: opts.dormant,
+      link: opts.link,
     })
     handle.entry.remote = true
     handle.entry.apiTracked = opts.apiTracked ?? !opts.client
@@ -465,8 +522,18 @@ export class TaskRegistry {
   markBackgrounded(id: string): void {
     const entry = this.get(id)
     if (!entry) return
+    const wasVisible = this.dockVisible(entry, Date.now())
     entry.backgrounded = true
-    if (entry.status !== 'running') this.queueNote(entry)
+    if (entry.status !== 'running') {
+      this.queueNote(entry)
+      return
+    }
+    // A shell command that only just started is still below the visibility
+    // delay when it registers, so `register()`'s change was a no-op for the
+    // dock. Announcing it now is what puts the row on screen at all — without
+    // this the first frame a client ever sees for a background task is the one
+    // written when it settles (or after the 30 s timer).
+    if (!wasVisible) this.emitChange()
   }
 
   /**
@@ -744,6 +811,8 @@ export class TaskRegistry {
 
   /** Apply API state to a mirrored remote entry. */
   applyRemoteState(entry: TaskEntry, state: RemoteTaskState): void {
+    if (state.link && !entry.link) entry.link = state.link
+    if (state.note) entry.remoteNote = state.note
     if (state.output !== undefined) {
       const prev = this.recent.get(entry.id) ?? ''
       if (state.output.length > prev.length && state.output.startsWith(prev)) {
@@ -823,6 +892,7 @@ export class TaskRegistry {
       notify: entry.notify && !!entry.backgrounded,
       remote: entry.remote || undefined,
       stale: entry.stale || undefined,
+      link: entry.link,
     }
   }
 
@@ -854,16 +924,57 @@ export class TaskRegistry {
    * task, and any shell command the agent was told about, shows at once.
    */
   listVisible(): RunningProcess[] {
-    return this.listRunning().filter((p) => {
-      if (p.stale || p.source !== 'shell') return true
-      const entry = this.entries.get(p.id)
-      return !!entry?.backgrounded || p.elapsedMs >= this.uiVisibleAfterMs
-    })
+    const now = Date.now()
+    const out: RunningProcess[] = []
+    for (const entry of this.entries.values()) {
+      if (this.isRunning(entry) && this.dockVisible(entry, now)) out.push(this.toView(entry, now))
+    }
+    return out
   }
 
-  /** Serializable snapshot of the running list for persistence. */
+  /**
+   * Everything the chat dock shows: what is running (or stale) plus what
+   * finished inside the retention window, running first and then the newest
+   * finish. `task_list` keeps its running-only `listVisible()`; this list is
+   * for the dock only, so a row can settle in place instead of vanishing.
+   */
+  listDock(): RunningProcess[] {
+    const now = Date.now()
+    const running: RunningProcess[] = []
+    const finished: RunningProcess[] = []
+    for (const entry of this.entries.values()) {
+      if (!this.dockVisible(entry, now)) continue
+      if (this.isRunning(entry)) {
+        running.push(this.toView(entry, now))
+      } else if (entry.finishedAt && now - entry.finishedAt <= COMPLETED_RETENTION_MS) {
+        finished.push(this.toView(entry, now))
+      }
+    }
+    finished.sort((a, b) => (b.finishedAt ?? 0) - (a.finishedAt ?? 0))
+    return [...running, ...finished]
+  }
+
+  /** Would this entry be shown in the dock at all (running or finished)? */
+  private dockVisible(entry: TaskEntry, now: number): boolean {
+    if (entry.dormant) return false
+    if (entry.stale) return true
+    if (entry.shown) return true
+    if (entry.source !== 'shell') return true
+    if (entry.backgrounded) return true
+    return (entry.finishedAt ?? now) - entry.startedAt >= this.uiVisibleAfterMs
+  }
+
+  /**
+   * Serializable snapshot for persistence: every running task plus the
+   * recently finished rows the dock was showing. Running entries are taken
+   * from `listRunning()`, not `listDock()`, because a shell command still
+   * inside the dock visibility delay is invisible but must survive a restart.
+   */
   snapshot(): RunningProcessSnapshot[] {
-    return this.listRunning().map((p) => {
+    const persisted = new Map<string, RunningProcess>()
+    for (const p of this.listRunning()) persisted.set(p.id, p)
+    for (const p of this.listDock()) if (!persisted.has(p.id)) persisted.set(p.id, p)
+    return [...persisted.values()].map((p) => {
       const entry = this.entries.get(p.id)
       return {
         runId: p.id,
@@ -877,17 +988,25 @@ export class TaskRegistry {
         remote: entry?.apiTracked || undefined,
         ref: entry?.ref,
         outputFile: entry?.outputFile,
+        link: entry?.link,
+        // A settled task keeps its outcome across a restart, so it comes back
+        // as a finished row for the rest of its retention window.
+        status: p.status,
+        finishedAt: p.finishedAt,
+        shown: true,
       }
     })
   }
 
   /**
    * Re-seed from a persisted snapshot after a runtime restart. Local tasks
-   * belonged to the dead gateway and come back `stale` (dismissable only).
-   * Remote tasks are still tracked by the API and come back live.
+   * that were running belonged to the dead gateway and come back `stale`
+   * (dismissable only). Remote tasks are still tracked by the API and come
+   * back live; tasks that had already settled come back finished.
    */
   restoreStale(snapshots: RunningProcessSnapshot[]): void {
     if (!snapshots?.length) return
+    const now = Date.now()
     let changed = false
     for (const snap of snapshots) {
       if (!snap?.runId || this.entries.has(snap.runId)) continue
@@ -898,7 +1017,12 @@ export class TaskRegistry {
           title: snap.title ?? snap.command,
           ref: snap.ref,
           startedAt: snap.startedAt,
+          link: snap.link,
         })
+        changed = true
+        continue
+      }
+      if (this.restoreTerminal(snap, now)) {
         changed = true
         continue
       }
@@ -914,12 +1038,89 @@ export class TaskRegistry {
         consumed: false,
         stale: true,
         outputFile: snap.outputFile,
+        link: snap.link,
         handle: makeStaleHandle(snap),
         done: Promise.resolve(),
       })
       changed = true
     }
     if (changed) this.emitChange()
+  }
+
+  /**
+   * Restore what the per-task output logs say ran in this session. Used when
+   * no snapshot survived (first run after the snapshot existed, or metadata
+   * pruned): a log with a footer is a finished row, one without is a task the
+   * previous runtime died under — today's `stale` placeholder.
+   */
+  restoreFromOutputRows(rows: TaskOutputRow[]): void {
+    if (!rows?.length) return
+    const now = Date.now()
+    let changed = false
+    for (const row of rows) {
+      if (!row?.taskId || this.entries.has(row.taskId)) continue
+      const snap: RunningProcessSnapshot = {
+        runId: row.taskId,
+        command: row.title,
+        pid: undefined,
+        sandboxed: false,
+        startedAt: row.startedAt,
+        source: (row.source as TaskSource) ?? 'shell',
+        title: row.title,
+        outputFile: row.path,
+        status: row.status,
+        finishedAt: row.finishedAt,
+      }
+      if (this.restoreTerminal(snap, now)) {
+        changed = true
+        continue
+      }
+      if (now - row.startedAt > COMPLETED_RETENTION_MS) continue
+      this.entries.set(row.taskId, {
+        id: row.taskId,
+        runId: row.taskId,
+        source: snap.source ?? 'shell',
+        title: row.title,
+        command: row.title,
+        status: 'running',
+        startedAt: row.startedAt,
+        notify: false,
+        consumed: false,
+        stale: true,
+        outputFile: row.path,
+        link: snap.link,
+        handle: makeStaleHandle(snap),
+        done: Promise.resolve(),
+      })
+      changed = true
+    }
+    if (changed) this.emitChange()
+  }
+
+  /** Restore one settled row; false when it is unknown/too old to keep.  */
+  private restoreTerminal(snap: RunningProcessSnapshot, now: number): boolean {
+    if (!snap.status || snap.status === 'running' || !snap.finishedAt) return false
+    const remaining = snap.finishedAt + COMPLETED_RETENTION_MS - now
+    if (remaining <= 0) return true
+    this.entries.set(snap.runId, {
+      id: snap.runId,
+      runId: snap.runId,
+      source: snap.source ?? 'shell',
+      title: snap.title ?? snap.command,
+      command: snap.command,
+      status: snap.status,
+      startedAt: snap.startedAt,
+      finishedAt: snap.finishedAt,
+      notify: false,
+      consumed: true,
+      shown: snap.shown,
+      outputFile: snap.outputFile,
+      link: snap.link,
+      done: Promise.resolve(),
+    })
+    const cleanupTimer = setTimeout(() => this.forget(snap.runId), remaining)
+    ;(cleanupTimer as any)?.unref?.()
+    return true
   }
 
   // ---------------------------------------------------------------------------
@@ -987,7 +1188,13 @@ export class TaskRegistry {
 function stripFrontMatter(text: string): string {
   if (!text.startsWith('---\n')) return text
   const end = text.indexOf('\n---\n', 4)
-  return end === -1 ? text : text.slice(end + 5)
+  if (end !== -1) return text.slice(end + 5)
+  // A settled task's log can end exactly at the closing delimiter, with no
+  // body written at all. Returning the header would make the output viewer
+  // look blank, so report the empty body instead.
+  const close = text.lastIndexOf('\n---')
+  if (close !== -1 && text.slice(close + 4).trim() === '') return ''
+  return text
 }
 
 /** Build a synthetic, already-exited handle for a restored (stale) entry. */

@@ -168,6 +168,7 @@ import {
 } from './github-workspace-git'
 import { isHostMediatedDurability } from './host-durability'
 import { executeRemoteTool } from './remote-tools'
+import { executeRemoteImport } from './project-transfer'
 import { clearGitHubCliEnvCache } from './github-cli-credentials'
 import { HistoryIndex } from './history-index'
 import { WORKTREE_BRANCH_PREFIX } from '@shogo/shared-runtime'
@@ -189,6 +190,7 @@ import {
   parseWorkspaceMounts,
   shouldAutoStartAnchorPreview,
   userOwnedTrustGroups,
+  defaultShellCwd,
 } from './workspace-runtime-mode'
 import {
   workspaceFileRoutes,
@@ -204,7 +206,7 @@ import {
   listWorkspaceMembers,
   listAvailableWorkspaceProjects,
 } from './workspace-members'
-import { userMessage } from './pi-adapter'
+import { seedEmptyChatSession } from './file-attachment-utils'
 import { fileURLToPath } from 'url'
 import { WebChatAdapter } from './channels/webchat'
 import { WebhookAdapter } from './channels/webhook'
@@ -1431,9 +1433,9 @@ app.post('/agent/chat/:chatSessionId/tasks/:taskId/cancel', async (c) => {
   return c.json({ ok: true, tasks: await agentGateway.listSessionTasks(sessionId) })
 })
 
-app.get('/agent/chat/:chatSessionId/tasks/:taskId/output', (c) => {
+app.get('/agent/chat/:chatSessionId/tasks/:taskId/output', async (c) => {
   if (!agentGateway) return c.json({ error: 'Agent gateway not running' }, 503)
-  const output = agentGateway.readSessionTaskOutput(c.req.param('chatSessionId'), c.req.param('taskId'))
+  const output = await agentGateway.readSessionTaskOutput(c.req.param('chatSessionId'), c.req.param('taskId'))
   if (!output) return c.json({ error: 'unknown task_id' }, 404)
   return c.json(output)
 })
@@ -1764,7 +1766,7 @@ app.post('/agent/chat', async (c) => {
 
   const body = await c.req.json()
 
-  const allMessages = (body.messages || []) as Array<{ role: string; parts: Array<{ type: string; text?: string; mediaType?: string; url?: string; name?: string }> }>
+  const allMessages = (body.messages || []) as Array<{ role: string; parts: Array<{ type: string; text?: string; mediaType?: string; url?: string; name?: string; savedPath?: string }> }>
 
   let userText: string | undefined
   let userFileParts: Array<{ type: string; mediaType?: string; url?: string; name?: string; savedPath?: string }> = []
@@ -1900,49 +1902,18 @@ app.post('/agent/chat', async (c) => {
   // Seed the chat session with prior conversation history from the request.
   // AI SDK clients and eval runners send the full message array each turn;
   // the session is the authoritative store so we only seed when it's empty
-  // to avoid duplicating messages on subsequent turns.
+  // to avoid duplicating messages on subsequent turns. Attachments ride along
+  // as real image blocks (guarded like the live turn guards them) instead of
+  // `[N image(s) were attached]` notes — see seedEmptyChatSession.
   if (allMessages.length > 1) {
-    const sessionMgr = sessionManager
-    const session = sessionMgr.getOrCreate(chatSessionKey)
-    if (session.messages.length === 0) {
-      const priorMessages = allMessages.slice(0, -1)
-      for (const msg of priorMessages) {
-        const text = (msg.parts || [])
-          .filter((p: any) => p.type === 'text')
-          .map((p: any) => p.text)
-          .join('\n')
-
-        if (msg.role === 'user') {
-          const historyFileParts = (msg.parts || []).filter(
-            (p: any) => p.type === 'file' && p.url,
-          )
-          if (historyFileParts.length > 0) {
-            const imageCount = historyFileParts.filter((p: any) => p.mediaType?.startsWith('image/')).length
-            const fileCount = historyFileParts.length - imageCount
-            const notes: string[] = []
-            if (imageCount > 0) notes.push(`[${imageCount} image(s) were attached]`)
-            if (fileCount > 0) notes.push(`[${fileCount} file(s) were attached]`)
-            const effectiveText = [text, ...notes].filter(Boolean).join('\n')
-            if (!effectiveText) continue
-            sessionMgr.addMessages(chatSessionKey, userMessage(effectiveText))
-          } else {
-            if (!text) continue
-            sessionMgr.addMessages(chatSessionKey, userMessage(text))
-          }
-        } else if (msg.role === 'assistant') {
-          if (!text) continue
-          sessionMgr.addMessages(chatSessionKey, {
-            role: 'assistant',
-            content: [{ type: 'text', text }],
-            api: 'anthropic-messages',
-            provider: 'anthropic',
-            model: 'history',
-            usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
-            stopReason: 'stop',
-            timestamp: Date.now(),
-          } as any)
-        }
-      }
+    const seeded = seedEmptyChatSession(
+      sessionManager,
+      chatSessionKey,
+      allMessages.slice(0, -1),
+      { label: 'chat_history' },
+    )
+    if (seeded > 0) {
+      console.log(`[AgentRuntime][chat] seeded ${seeded} history message(s) for session ${chatSessionKey}`)
     }
   }
 
@@ -4357,8 +4328,12 @@ function collectBundleFiles(dir: string, baseDir: string): Record<string, string
   return files
 }
 
+// `?scope=project` bundles the runtime's own project. On a workspace runtime
+// that is `<WORKSPACE_DIR>/<anchorId>/`; the unscoped merged root holds only
+// workspace scaffolding plus one folder per member.
 app.get('/agent/workspace/bundle', (c) => {
-  const files = collectBundleFiles(WORKSPACE_DIR, WORKSPACE_DIR)
+  const root = c.req.query('scope') === 'project' ? projectScopeRoot() : WORKSPACE_DIR
+  const files = collectBundleFiles(root, root)
   return c.json({ files })
 })
 
@@ -4776,6 +4751,14 @@ app.post('/agent/remote/tool', async (c) => {
   }
   const body = await c.req.json().catch(() => null)
   const outcome = await executeRemoteTool(agentGateway.getRemoteTools(), body)
+  return c.json(outcome.body, outcome.status)
+})
+
+// Bulk counterpart (project-transfer.ts, `copy_to_project`): unpack another
+// project's tar.gz under the same root the remote tools use.
+app.post('/agent/remote/import', async (c) => {
+  const body = await c.req.json().catch(() => null)
+  const outcome = await executeRemoteImport(defaultShellCwd(WORKSPACE_DIR), body, notifyCanvasWorkspaceWrite)
   return c.json(outcome.body, outcome.status)
 })
 

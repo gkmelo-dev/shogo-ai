@@ -130,6 +130,7 @@ import {
   shouldAutoRecoverStalledTurn,
 } from "./stall-recovery"
 import { recordAutoResumeAttempt } from "./auto-resume-circuit-breaker"
+import { followNextTurn } from "./next-turn-follow"
 import {
   runResumeStreamSingleFlight,
   type ResumeStreamFlightRef,
@@ -145,6 +146,7 @@ import { markStoppedTail, mergeStoppedSnapshot } from "./stopped-turn"
 import { cn } from "@shogo/shared-ui/primitives"
 import { useBillingData } from "@shogo/shared-app/hooks"
 import { API_URL, api, createHttpClient } from "../../lib/api"
+import { agentProxyBase } from "../../lib/agent-proxy-base"
 import { usePlatformConfig } from "../../lib/platform-config"
 import { workspaceProjectFilter } from "../../lib/project-load"
 import {
@@ -225,6 +227,7 @@ import { PlanDockPanel } from "./dock/panels/PlanDockPanel"
 import { PendingPlanComposerBar } from "./PendingPlanComposerBar"
 import { ChecklistDockPanel } from "./dock/panels/ChecklistDockPanel"
 import { RunningDockPanel, type TaskWaitState } from "./dock/panels/RunningDockPanel"
+import { isFinishedProcess } from "./dock/finished-rows"
 import { BrowserDockPanel } from "./dock/panels/BrowserDockPanel"
 import { WorktreeDockPanel } from "./dock/panels/WorktreeDockPanel"
 import { ChangesDockPanel } from "./dock/panels/ChangesDockPanel"
@@ -241,7 +244,10 @@ import {
   type ChatContextValue,
   type ChatMessage,
   type OpenProjectPaneRequest,
+  type OpenTaskHint,
 } from "./ChatContext"
+import { asTaskLink, type TaskOutputInfo } from "../../lib/task-link"
+import { taskThreadPane } from "../../lib/task-thread-pane-store"
 import {
   DESKTOP_ISLAND_WORKSPACE_AGENT_ID,
   registerDesktopIslandSession,
@@ -917,6 +923,36 @@ async function ensureAiConsentForMessage(): Promise<boolean> {
 // Component
 // ============================================================
 
+/**
+ * A seed fetch replaces the dock list wholesale. If a row that was running is
+ * simply missing from the answer (the runtime forgot it, or its registry was
+ * recreated), keep it once as a finished row so it fades out instead of
+ * blinking away — and so the "a task finished" probe still sees it drop.
+ */
+function keepDroppedAsFinished(
+  prev: RunningProcess[],
+  next: RunningProcess[],
+): RunningProcess[] {
+  if (prev.length === 0) return next
+  const seen = new Set(next.map((p) => p.id ?? p.runId))
+  const dropped = prev.filter(
+    (p) =>
+      !seen.has(p.id ?? p.runId) &&
+      !p.stale &&
+      (!p.status || p.status === "running"),
+  )
+  if (dropped.length === 0) return next
+  const now = Date.now()
+  return [
+    ...next,
+    ...dropped.map((p) => ({
+      ...p,
+      status: p.status === "running" ? "completed" : p.status,
+      finishedAt: p.finishedAt ?? now,
+    })),
+  ]
+}
+
 const ChatPanelContent = observer(function ChatPanelContent({
   presentation = "studio",
   featureId,
@@ -986,6 +1022,22 @@ const ChatPanelContent = observer(function ChatPanelContent({
 
   const { studioChat } = useSDKDomains()
   const actions = useDomainActions()
+
+  // Workspace-scoped chat routes to `/api/workspaces/:workspaceId/chat`
+  // instead of the per-project endpoint. Only set when this panel is
+  // operating in workspace scope and we actually have a workspace id.
+  const chatWorkspaceId =
+    chatScope === "workspace" && workspaceId ? workspaceId : undefined
+
+  // One base for every runtime call (tasks, cancel, output, quick actions).
+  // The landing chat has a workspaceId but no projectId, and used to resolve
+  // this to `null` — so its dock never seeded and lost every row on remount.
+  const agentBaseUrl = agentProxyBase({
+    localAgentUrl,
+    projectId,
+    workspaceId: chatWorkspaceId,
+    apiUrl: API_URL,
+  })
 
   // Sibling projects (same workspace, excluding the current one) for the
   // composer's "@" mention menu. Tagging one mounts it into the chat runtime
@@ -1119,9 +1171,7 @@ const ChatPanelContent = observer(function ChatPanelContent({
   >([])
 
   const fetchQuickActions = useCallback(async () => {
-    const url =
-      localAgentUrl ||
-      (projectId ? `${API_URL}/api/projects/${projectId}/agent-proxy` : null)
+    const url = agentBaseUrl
     if (!url) return
     try {
       const fetchFn = expoFetch ?? globalThis.fetch
@@ -1141,7 +1191,7 @@ const ChatPanelContent = observer(function ChatPanelContent({
     } catch {
       // Silently ignore — quick actions are non-critical
     }
-  }, [localAgentUrl, projectId, nativeHeaders, expoFetch])
+  }, [agentBaseUrl, nativeHeaders, expoFetch])
 
   useEffect(() => {
     if (!isActive) return
@@ -1741,9 +1791,7 @@ const ChatPanelContent = observer(function ChatPanelContent({
   )
 
   const fetchRunningProcesses = useCallback(async () => {
-    const base =
-      localAgentUrl ||
-      (projectId ? `${API_URL}/api/projects/${projectId}/agent-proxy` : null)
+    const base = agentBaseUrl
     if (!base || !currentSessionId) return
     try {
       const fetchFn = expoFetch ?? globalThis.fetch
@@ -1762,18 +1810,19 @@ const ChatPanelContent = observer(function ChatPanelContent({
       if (res.ok) {
         const data = await res.json()
         const list = data?.tasks ?? data?.processes
-        if (Array.isArray(list)) setRunningProcesses(list as RunningProcess[])
+        if (Array.isArray(list))
+          setRunningProcesses((prev) =>
+            keepDroppedAsFinished(prev, list as RunningProcess[]),
+          )
       }
     } catch {
       // Non-critical — the panel just won't seed until the next live frame.
     }
-  }, [localAgentUrl, projectId, currentSessionId, nativeHeaders, expoFetch])
+  }, [agentBaseUrl, currentSessionId, nativeHeaders, expoFetch])
 
   const handleKillProcess = useCallback(
     async (runId: string) => {
-      const base =
-        localAgentUrl ||
-        (projectId ? `${API_URL}/api/projects/${projectId}/agent-proxy` : null)
+      const base = agentBaseUrl
       if (!base || !currentSessionId) return
       setKillingProcesses((prev) => new Set(prev).add(runId))
       try {
@@ -1799,10 +1848,10 @@ const ChatPanelContent = observer(function ChatPanelContent({
         if (res.ok) {
           const data = await res.json()
           const list = data?.tasks ?? data?.processes
+          // The runtime now answers with the dock list, in which a cancelled
+          // task is a terminal row (Output still opens, no Kill). Trust it.
           if (Array.isArray(list))
-            setRunningProcesses(
-              (list as RunningProcess[]).filter((p) => p.runId !== runId),
-            )
+            setRunningProcesses(list as RunningProcess[])
           else
             setRunningProcesses((prev) => prev.filter((p) => p.runId !== runId))
         }
@@ -1816,14 +1865,12 @@ const ChatPanelContent = observer(function ChatPanelContent({
         })
       }
     },
-    [localAgentUrl, projectId, currentSessionId, nativeHeaders, expoFetch],
+    [agentBaseUrl, currentSessionId, nativeHeaders, expoFetch],
   )
 
   const loadTaskOutput = useCallback(
-    async (taskId: string): Promise<string | null> => {
-      const base =
-        localAgentUrl ||
-        (projectId ? `${API_URL}/api/projects/${projectId}/agent-proxy` : null)
+    async (taskId: string): Promise<TaskOutputInfo | null> => {
+      const base = agentBaseUrl
       if (!base || !currentSessionId) return null
       try {
         const fetchFn = expoFetch ?? globalThis.fetch
@@ -1834,12 +1881,48 @@ const ChatPanelContent = observer(function ChatPanelContent({
         )
         if (!res.ok) return null
         const data = await res.json()
-        return typeof data?.output === "string" ? data.output : null
+        return {
+          taskId: typeof data?.taskId === "string" ? data.taskId : taskId,
+          source: typeof data?.source === "string" ? data.source : undefined,
+          title: typeof data?.title === "string" ? data.title : undefined,
+          status: typeof data?.status === "string" ? data.status : undefined,
+          outputFile: typeof data?.outputFile === "string" ? data.outputFile : undefined,
+          output: typeof data?.output === "string" ? data.output : "",
+          link: asTaskLink(data?.link),
+        }
       } catch {
         return null
       }
     },
-    [localAgentUrl, projectId, currentSessionId, nativeHeaders, expoFetch],
+    [agentBaseUrl, currentSessionId, nativeHeaders, expoFetch],
+  )
+
+  // Pressing a background task opens where its work is happening: the tagged
+  // agent's thread, the card's thread, the callee project's chat, or its log.
+  const openTaskThread = useCallback(
+    async (taskId: string, hint?: OpenTaskHint) => {
+      taskThreadPane.open({
+        taskId,
+        title: hint?.title,
+        source: hint?.source,
+        status: hint?.status,
+        outputFile: hint?.outputFile,
+        link: hint?.link ?? null,
+        loading: true,
+      })
+      const out = await loadTaskOutput(taskId)
+      taskThreadPane.patch(taskId, {
+        loading: false,
+        output: out?.output ?? undefined,
+        outputFile: out?.outputFile ?? hint?.outputFile,
+        title: out?.title ?? hint?.title,
+        source: out?.source ?? hint?.source,
+        status: out?.status ?? hint?.status,
+        link: out?.link ?? hint?.link ?? null,
+        ...(out ? {} : { error: "This task is no longer tracked." }),
+      })
+    },
+    [loadTaskOutput],
   )
 
   // The agent blocked in `wait` (live `data-task-wait` frames during a turn).
@@ -1946,12 +2029,6 @@ const ChatPanelContent = observer(function ChatPanelContent({
   // saved history replaces it once the turn is over (see `onFinish`).
   const joinedStreamRef = useRef(false)
   const refreshHistoryRef = useRef<() => void>(() => {})
-
-  // Workspace-scoped chat routes to `/api/workspaces/:workspaceId/chat`
-  // instead of the per-project endpoint. Only set when this panel is
-  // operating in workspace scope and we actually have a workspace id.
-  const chatWorkspaceId =
-    chatScope === "workspace" && workspaceId ? workspaceId : undefined
 
   // Stable identity across renders: this is a dep of `useChatTransportConfig`'s
   // internal `useMemo`, so an inline arrow here would rebuild `transportConfig`
@@ -3278,18 +3355,19 @@ const ChatPanelContent = observer(function ChatPanelContent({
       const onScreen = messagesRef.current.some(
         (m) => m.id === queuedUserMessage.id,
       );
-      // Still queued bubbles are painted from the queue rows, not from this
-      // list, so a message already here came from the server's history (or a
-      // previous dispatch). If nothing landed after it, this turn's reply
-      // belongs at the end and attaching directly is right — no reload, so the
-      // messages still queued behind it keep their bubbles. If something did
-      // land after it, the transcript has moved on and history is the truth.
+      // Queued messages are not in this list at all any more — only the dock
+      // shows them — so a message already here came from the server's history
+      // (a reload while its turn was running). If nothing landed after it,
+      // this turn's reply belongs at the end and attaching directly is right;
+      // if something did, the transcript has moved on and history is the truth.
       if (onScreen && !canAttachQueuedTurn(messagesRef.current, queuedUserMessage)) {
         reloadAndAttachLiveTurnRef.current()
         return
       }
-      // The server saved the queued message and started its turn; show the
-      // message before attaching to the reply (see queued-user-message.ts).
+      // The server saved the queued message and started its turn: append it at
+      // the end and attach the reply under it, without reloading history. This
+      // is the normal path — the bubble first appears here, when the turn it
+      // belongs to starts.
       if (!onScreen) {
         setMessages((prev) => appendQueuedUserMessage(prev, queuedUserMessage))
       }
@@ -3644,10 +3722,10 @@ const ChatPanelContent = observer(function ChatPanelContent({
   }, [messages.length, pendingInitialMessage])
 
   /**
-   * The transcript plus the bubbles for the rows still waiting on the server.
-   * Derived here (not copied into `messages`) so a deleted or edited queued
-   * message loses its bubble and a history reload cannot drop the ones still
-   * queued (see queued-user-message.ts).
+   * The transcript plus the bubble of a dispatched head the panel has not
+   * attached yet. Only used to tell whether the pre-send echo has been
+   * superseded by the real message — still-queued rows are not in here (they
+   * live in the dock), so queueing clears the echo explicitly.
    */
   const messagesWithQueued = useMemo(
     () => appendQueuedUserMessages(messages, serverQueue.pendingUserMessages),
@@ -3868,10 +3946,14 @@ const ChatPanelContent = observer(function ChatPanelContent({
     historyOnlyNonceRef.current = ++liveTurnReloadNonceRef.current
     setLiveTurnReloadNonce(liveTurnReloadNonceRef.current)
   }
-  const attachToLiveTurnIfAny = useCallback(async () => {
+  /**
+   * @returns true when a live turn was found and this window started attaching
+   * to it. Callers that got `false` know nothing is running *yet*.
+   */
+  const attachToLiveTurnIfAny = useCallback(async (): Promise<boolean> => {
     const sessionId = currentSessionIdRef.current
     if (!sessionId || isStreamingRef.current || isSendingMessageRef.current) {
-      return
+      return false
     }
     lastLiveTurnCheckAtRef.current = Date.now()
     const turn = await probeLiveTurn(sessionId)
@@ -3880,13 +3962,13 @@ const ChatPanelContent = observer(function ChatPanelContent({
       isStreamingRef.current ||
       isSendingMessageRef.current
     ) {
-      return
+      return false
     }
     // The turn Stop just cancelled can still read `active`: attaching to it
     // would rebuild the reply the user stopped and hide the one that follows.
-    if (isLiveTurnOtherThan(turn, stoppedTurnIdRef.current)) {
-      reloadAndAttachLiveTurn()
-    }
+    if (!isLiveTurnOtherThan(turn, stoppedTurnIdRef.current)) return false
+    reloadAndAttachLiveTurn()
+    return true
   }, [probeLiveTurn, reloadAndAttachLiveTurn])
 
   useEffect(() => {
@@ -3919,16 +4001,30 @@ const ChatPanelContent = observer(function ChatPanelContent({
   const attachToLiveTurnIfAnyRef = useRef(attachToLiveTurnIfAny)
   attachToLiveTurnIfAnyRef.current = attachToLiveTurnIfAny
   const wasTransportStreamingRef = useRef(false)
+  // A window that followed a turn must keep following: the next message in the
+  // server queue starts once the API has seen this turn end, which can be a
+  // dispatcher tick away, and a short queued turn can start *and* finish
+  // between two probes. Two fixed probes therefore miss it (SHO-29: window A
+  // showed none of the second queued reply), so keep looking for as long as the
+  // dispatcher could take, then refresh the history on the way out — a turn
+  // that ran while nothing here was attached still has to land on screen.
   useEffect(() => {
     const wasStreaming = wasTransportStreamingRef.current
     wasTransportStreamingRef.current = isTransportStreaming
     if (!wasStreaming || isTransportStreaming || !isActive) return
-    // The queue dispatcher starts the next message once the API has seen
-    // this turn end, a moment after this window has.
-    const timers = [1500, 4000].map((delay) =>
-      setTimeout(() => void attachToLiveTurnIfAnyRef.current(), delay),
-    )
-    return () => timers.forEach(clearTimeout)
+    let cancelled = false
+    void followNextTurn({
+      attachIfLive: attachToLiveTurnIfAnyRef.current,
+      refreshHistory: () => refreshHistoryRef.current(),
+      // A stream or a send starting is this window taking over again: the
+      // stream's own end re-arms the follow, and reloading history mid-send
+      // would drop the bubble just echoed.
+      isCancelled: () =>
+        cancelled || isStreamingRef.current || isSendingMessageRef.current,
+    })
+    return () => {
+      cancelled = true
+    }
   }, [isTransportStreaming, isActive])
 
   // A `wait` ends with its turn at the latest.
@@ -3938,8 +4034,12 @@ const ChatPanelContent = observer(function ChatPanelContent({
 
   // While idle with tasks that will wake the agent, keep the list fresh; when
   // one of them finishes, the API queues a wake turn, so look for it.
+  // Only running rows count: a finished row stays in the dock for ten
+  // minutes, so it must not keep the "waiting for a wake" state alive.
   const notifyTaskIds = runningProcesses
-    .filter((p) => p.notify && !p.stale)
+    .filter(
+      (p) => p.notify && !p.stale && (!p.status || p.status === "running"),
+    )
     .map((p) => p.id ?? p.runId)
     .join("\0")
   const previousNotifyTaskIdsRef = useRef(notifyTaskIds)
@@ -3956,11 +4056,15 @@ const ChatPanelContent = observer(function ChatPanelContent({
     )
     return () => timers.forEach(clearTimeout)
   }, [notifyTaskIds, isStreaming, isActive])
+  // Poll while a task is still running — a finished row leaves the dock on its
+  // own (the runtime keeps listing it for ten minutes, so polling for it would
+  // keep this alive long after nothing is on screen).
+  const dockRowCount = runningProcesses.filter((p) => !isFinishedProcess(p)).length
   useEffect(() => {
-    if (isStreaming || !isActive || !notifyTaskIds) return
+    if (isStreaming || !isActive || dockRowCount === 0) return
     const timer = setInterval(() => void fetchRunningProcesses(), 5000)
     return () => clearInterval(timer)
-  }, [notifyTaskIds, isStreaming, isActive, fetchRunningProcesses])
+  }, [dockRowCount, isStreaming, isActive, fetchRunningProcesses])
 
   // A delegated task or a channel mention starts its turn outside this panel.
   // The first history-load probe can therefore see `unknown` while a slot or
@@ -6112,13 +6216,12 @@ const ChatPanelContent = observer(function ChatPanelContent({
         references,
         body,
       })
-      // The queued turn is the server's to run, but the bubble is the send's:
-      // waiting for the queue poll to notice the dispatch means the reply
-      // arrives before its own message, and with the previous user bubble
-      // still last, the new reply renders under the old message. The bubble is
-      // painted from the queue row itself (see `displayMessages`), so deleting
-      // or editing the queued message takes it away again; hand back any
-      // stopped snapshot so it lands *below* the stop.
+      // The queued turn is the server's to run: until it takes the row there
+      // is no user message in this session, so the message lives in the dock
+      // only and the caller drops the pre-send echo. When the server
+      // dispatches it, the hook hands over that turn's saved user message and
+      // it appears in the transcript with its reply. Hand back any stopped
+      // snapshot so that reply lands *below* the stop.
       releaseStopSnapshot()
     },
     [
@@ -6175,7 +6278,11 @@ const ChatPanelContent = observer(function ChatPanelContent({
       showOptimisticEcho(trimmedContent, files)
 
       const queueMessage = async () => {
-        const queueLocally = () =>
+        // Anything that lands in `displayedQueue` (the dock) must not also sit
+        // in the transcript: a queued message is not a turn yet, and its bubble
+        // appears when the server dispatches it.
+        const queueLocally = () => {
+          clearOptimisticEcho(trimmedContent)
           setMessageQueue((queue) => [
             ...queue,
             {
@@ -6188,6 +6295,7 @@ const ChatPanelContent = observer(function ChatPanelContent({
               references,
             },
           ])
+        }
         if (localAgentUrl) {
           queueLocally()
           return
@@ -6199,6 +6307,7 @@ const ChatPanelContent = observer(function ChatPanelContent({
             perMsgModel,
             references,
           )
+          clearOptimisticEcho(trimmedContent)
         } catch (error) {
           console.warn(
             "[ChatPanel] Server queue unavailable; retaining a local queued message:",
@@ -6248,6 +6357,7 @@ const ChatPanelContent = observer(function ChatPanelContent({
       )
     },
     [
+      clearOptimisticEcho,
       enqueueServerMessage,
       isStreaming,
       localAgentUrl,
@@ -7015,13 +7125,7 @@ const ChatPanelContent = observer(function ChatPanelContent({
   // silently failed to render (only the "Image generated" placeholder
   // showed, never the actual picture — see workspace-chat.ts's matching
   // `/workspaces/:workspaceId/agent-proxy/*` route).
-  const resolvedAgentUrl =
-    localAgentUrl ||
-    (projectId
-      ? `${API_URL}/api/projects/${projectId}/agent-proxy`
-      : chatWorkspaceId
-        ? `${API_URL}/api/workspaces/${chatWorkspaceId}/agent-proxy`
-        : null)
+  const resolvedAgentUrl = agentBaseUrl
 
   // Generate a stakeholder summary for a plan that doesn't have one yet.
   // Mutates the local pending/streaming plan as soon as the summary comes
@@ -7451,6 +7555,7 @@ const ChatPanelContent = observer(function ChatPanelContent({
       fileExists,
       workspaceId: workspaceId ?? null,
       openProjectPane: onOpenProjectPane,
+      openTaskThread,
       generateSummary: handleGenerateSummary,
       selectedModel,
       isPro: hasAdvancedModelAccess,
@@ -7473,6 +7578,7 @@ const ChatPanelContent = observer(function ChatPanelContent({
       fileExists,
       workspaceId,
       onOpenProjectPane,
+      openTaskThread,
       handleGenerateSummary,
       selectedModel,
       hasAdvancedModelAccess,
@@ -8003,6 +8109,15 @@ const ChatPanelContent = observer(function ChatPanelContent({
             waiting={taskWait}
             agentIdle={!isStreaming}
             loadOutput={loadTaskOutput}
+            onOpenTask={(proc) =>
+              void openTaskThread(proc.id ?? proc.runId, {
+                title: proc.title ?? proc.command,
+                source: proc.source,
+                status: proc.status,
+                outputFile: proc.outputFile,
+                link: proc.link,
+              })
+            }
           />
           <BrowserDockPanel />
           <WorktreeDockPanel
