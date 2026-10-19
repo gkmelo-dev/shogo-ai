@@ -5,6 +5,7 @@ export {
   useSDKDomain,
   useSDKDomains,
   useSDKHttp,
+  useSDKHttpOptional,
   useSDKReady,
   useWorkspaceCollection,
   useProjectCollection,

@@ -29,6 +29,7 @@ if (isLocalMode()) installWorkspaceFetchRouter(API_URL!)
 export {
   useSDKDomain as useDomain,
   useSDKHttp as useDomainHttp,
+  useSDKHttpOptional as useDomainHttpOptional,
   useSDKReady as useDomainReady,
   useProjectCollection,
   useWorkspaceCollection,

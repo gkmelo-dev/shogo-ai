@@ -56,6 +56,11 @@ export function createDomainActions(store: IDomainStore) {
     ) => {
       const workspace = await store.workspaceCollection.create({
         name,
+        // `WorkspaceModel.slug` is a required identifier-ish string, so the
+        // optimistic insert throws without one. The server owns the real value
+        // (local allocates its own; cloud's `beforeCreate` dedupes a provided
+        // one) — this placeholder only has to be a legal slug-shaped string.
+        slug: name.toLowerCase().replace(/\s+/g, "-").replace(/[^a-z0-9-]/g, ""),
         ...(description ? { description } : {}),
       })
 

@@ -327,6 +327,17 @@ export function useSDKHttp(): HttpClient {
   return ctx.http
 }
 
+/**
+ * Same client as `useSDKHttp`, but `null` when there is no provider above —
+ * for components that render both inside and outside the domain tree (a
+ * workspace switcher in a popover, a shared row). Callers already have to
+ * cope with "no data yet", so they should degrade to their empty state
+ * instead of crashing the shell with a provider error.
+ */
+export function useSDKHttpOptional(): HttpClient | null {
+  return useContext(SDKDomainContext)?.http ?? null
+}
+
 export function useSDKReady() {
   const ctx = useContext(SDKDomainContext)
   if (!ctx) throw new Error('useSDKReady must be used within SDKDomainProvider')

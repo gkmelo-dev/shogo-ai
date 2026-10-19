@@ -250,17 +250,34 @@ test.describe("More than one workspace (local mode)", () => {
     // all; either way the preview is a list, never undefined.
     expect(Array.isArray(previewBody.preview.removedDirs)).toBe(true)
 
-    await page.goto("/settings?tab=workspace")
+    // The narrow test above left a different workspace active, and delete acts
+    // on the active one — switch to ours first, the way a user would.
+    let trigger = await goHome(page)
+    await openAccountPopover(page, trigger)
+    await page.getByLabel(workspace.name, { exact: true }).click()
+    await expect
+      .poll(() => page.evaluate(() => localStorage.getItem("shogo:active-workspace-id")), {
+        timeout: 30_000,
+      })
+      .toBe(workspace.id)
+
+    // `/settings` is also an admin-console route, so a cold URL load lands there.
+    // Walk in the way the switcher points people: Manage workspaces → the
+    // workspace settings tab (the phone surface uses /account instead).
+    trigger = await goHome(page)
+    await openAccountPopover(page, trigger)
+    await page.getByLabel("Manage workspaces").click()
+    await expect(page).toHaveURL(/\/settings\?tab=workspace/, { timeout: 20_000 })
     await expect(page.getByText("Delete workspace", { exact: true }).first()).toBeVisible({
       timeout: 20_000,
     })
-    await page.getByRole("button", { name: "Delete", exact: true }).first().click()
+    await page.getByLabel("Delete workspace").click()
 
     // Type-to-confirm, then delete.
     const confirmInput = page.getByPlaceholder(`Type "${workspace.name}" to confirm`)
     await expect(confirmInput).toBeVisible({ timeout: 10_000 })
     await confirmInput.fill(workspace.name)
-    await page.getByRole("button", { name: "Delete workspace" }).click()
+    await page.getByLabel("Confirm delete workspace").click()
 
     await expect
       .poll(async () => (await listWorkspaces(page)).some((w) => w.id === workspace.id), {

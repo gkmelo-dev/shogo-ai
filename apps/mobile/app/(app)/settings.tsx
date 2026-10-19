@@ -860,6 +860,7 @@ const WorkspaceSettingsTab = observer(function WorkspaceSettingsTab() {
               <Button
                 variant="destructive"
                 size="sm"
+                accessibilityLabel="Delete workspace"
                 disabled={!canDelete}
                 onPress={() => void openDeleteDialog()}
               >
@@ -1079,6 +1080,7 @@ const WorkspaceSettingsTab = observer(function WorkspaceSettingsTab() {
               <Button
                 variant="destructive"
                 size="sm"
+                accessibilityLabel="Confirm delete workspace"
                 onPress={handleDeleteWorkspace}
                 disabled={!isDeleteConfirmed || isDeleting}
               >

@@ -6,7 +6,7 @@
  */
 
 import { useCallback, useEffect, useState, type ReactNode } from "react";
-import { Linking, Platform, Pressable, Text, View } from "react-native";
+import { Linking, Platform, Pressable, Text, useWindowDimensions, View } from "react-native";
 import { Check, Cloud, CloudOff, ExternalLink, LogIn, LogOut, Plus, Settings, Sparkles, Users, Zap } from "lucide-react-native";
 import { cn } from "@shogo/shared-ui/primitives";
 import { usePostHogSafe } from "../../../contexts/posthog";
@@ -18,7 +18,8 @@ import { AccountSettingsGroup } from "./AccountSettingsGroup";
 import { isCloudWorkspace, useCloudWorkspaces } from "../../../lib/workspace-route";
 import { workspaceColor, workspaceInitial } from "../../../lib/workspace-color";
 import { useCloudSession } from "../../../hooks/useCloudSession";
-import { useDomainHttp } from "../../../contexts/domain";
+import { useDomainHttpOptional } from "../../../contexts/domain";
+import { isPhoneLayout } from "../../../lib/native-phone-layout";
 
 export interface WorkspaceMenuSectionProps {
   workspaces: any[];
@@ -102,12 +103,24 @@ export function WorkspaceMenuSection({
   const posthog = usePostHogSafe();
   const density = densityFor(isNative);
   const cloud = useCloudWorkspaces();
+  const { width, height } = useWindowDimensions();
+  // "Manage workspaces" is a signpost to wherever rename/delete live on this
+  // surface. `/account` is the phone/native account page — on wide web it
+  // redirects straight back to the shell (`usePhoneOnlyRoute`), so desktop goes
+  // to the workspace settings page instead.
+  const manageWorkspacesHref =
+    isNative || Platform.OS !== "web" || isPhoneLayout(width, height)
+      ? "/(app)/account"
+      : "/(app)/settings?tab=workspace";
   const currentIsCloud = !!localMode && isCloudWorkspace(currentWorkspace?.id);
 
   // Switching workspaces deliberately leaves runtimes warm, so an agent can be
   // mid-turn in a workspace the user just left. Say so here instead of letting
   // that work look like it vanished (Decision 3).
-  const http = useDomainHttp();
+  // Rendered outside SDKDomainProvider on desktop (the popover hangs off the
+  // rail), so this must be the non-throwing accessor: no provider just means
+  // no badge.
+  const http = useDomainHttpOptional();
   const [busyElsewhere, setBusyElsewhere] = useState(0);
   useEffect(() => {
     setBusyElsewhere(0);
@@ -220,6 +233,7 @@ export function WorkspaceMenuSection({
     <View className="flex-row gap-2 px-3 pb-2">
       <Pressable
         onPress={openWorkspaceSettings}
+        accessibilityLabel="Workspace settings"
         className="h-8 flex-1 flex-row items-center justify-center gap-1.5 rounded-md border border-border active:bg-muted"
       >
         <Settings size={14} className="text-muted-foreground" />
@@ -511,7 +525,7 @@ export function WorkspaceMenuSection({
       <Pressable
         onPress={() => {
           onClose();
-          onNavigate("/(app)/account");
+          onNavigate(manageWorkspacesHref);
         }}
         accessibilityLabel="Manage workspaces"
         className="flex-row items-center gap-3 rounded-lg px-2 py-1.5 active:bg-muted"
