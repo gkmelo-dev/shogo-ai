@@ -846,6 +846,53 @@ export async function wakeAgent(itemId: string, agentRef: string, actor: BoardAc
 
 // ─── Cards ───────────────────────────────────────────────────────────────────
 
+/**
+ * A person tagged this agent in a card's thread. The card records it with the
+ * same `agent_woken` event a column, an assignment or a move writes, so the
+ * board's history answers "why did this agent run" for a tag too. A board wake
+ * posts its own tag as a system message and records its own event, so this only
+ * answers for a person's message.
+ */
+export async function noteThreadTagWake(run: {
+  threadRootId: string | null
+  agentRef: string
+  messageId: string
+}): Promise<void> {
+  if (!run.threadRootId) return
+  const item = await db.workItem.findFirst({
+    where: { threadRootMessageId: run.threadRootId, archivedAt: null },
+    select: { id: true, workspaceId: true },
+  })
+  if (!item) return
+  await recordEvent(item, 'agent_woken', { agentRef: run.agentRef }, {
+    agentRef: run.agentRef,
+    reason: 'thread_tag',
+    messageId: run.messageId,
+  })
+}
+
+/**
+ * A wake for this card's agent arrived while that agent was still working the
+ * card thread: it is queued behind the live run, and the card records it so the
+ * board shows work waiting rather than work lost.
+ */
+export async function noteAgentWakeQueued(run: {
+  threadRootId: string | null
+  agentRef: string
+  runningMessageId: string | null
+}): Promise<void> {
+  if (!run.threadRootId) return
+  const item = await db.workItem.findFirst({
+    where: { threadRootMessageId: run.threadRootId, archivedAt: null },
+    select: { id: true, workspaceId: true },
+  })
+  if (!item) return
+  await recordEvent(item, 'agent_wake_queued', { agentRef: run.agentRef }, {
+    agentRef: run.agentRef,
+    ...(run.runningMessageId ? { runningMessageId: run.runningMessageId } : {}),
+  })
+}
+
 export interface ItemInput {
   title: string
   description?: string | null
@@ -1116,7 +1163,13 @@ export async function moveWorkItem(item: any, input: MoveInput, actor: BoardActo
   const who = await actorLabel(item.workspaceId, actor)
   const where = toBoard.id === fromBoard.id ? toColumn.name : `${toBoard.name} › ${toColumn.name}`
   await postActivity(updated, fromBoard, `${who} moved ${item.key} to ${where}`, { done: isClosed(toColumn.category) })
-  if (toColumn.agentRef) await wakeAgent(item.id, toColumn.agentRef, actor, `moved to ${toColumn.name}`)
+  // One wake decision per move: a column that binds an agent hands the card to
+  // that agent; a work column that binds none hands it back to the card's own
+  // developer (a card parked in *Changes Requested* used to wake nobody, and the
+  // developer sat idle until someone tagged it by hand).
+  const wakeRef = toColumn.agentRef
+    ?? (toColumn.category === 'active' || toColumn.category === 'backlog' ? updated.assigneeAgentRef : null)
+  if (wakeRef) await wakeAgent(item.id, wakeRef, actor, `moved to ${toColumn.name}`)
   await publishBoard(fromBoard, { action: 'item.moved', itemId: item.id })
   if (toBoard.id !== fromBoard.id) await publishBoard(toBoard, { action: 'item.moved', itemId: item.id })
   return { item: serializeItem(updated), warnings }

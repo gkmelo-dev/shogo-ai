@@ -7,10 +7,10 @@
  * permissions, and the agent-facing routes the board tools call.
  */
 
-import { afterAll, beforeAll, describe, expect, test } from 'bun:test'
+import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'bun:test'
 import { rmSync } from 'fs'
 import { Hono } from 'hono'
-import { seedWorkspace, setupChannelsTestDb, waitFor, type SeededWorkspace } from './helpers/channels-test-db'
+import { seedWorkspace, setupChannelsTestDb, sseResponse, waitFor, type SeededWorkspace } from './helpers/channels-test-db'
 
 const { dir } = setupChannelsTestDb()
 
@@ -19,6 +19,7 @@ const { conversationRoutes } = await import('../routes/conversations')
 const { workBoardRoutes, agentBoardRoutes } = await import('../routes/work-boards')
 const bus = await import('../lib/conversation-bus')
 const service = await import('../services/work-boards.service')
+const dispatcher = await import('../services/conversation-agent-dispatcher')
 
 const db = prisma as any
 let seed: SeededWorkspace
@@ -543,5 +544,81 @@ describe('#activity', () => {
     const created = await call(seed.member, 'POST', `/boards/${board.id}/items`, { title: 'Pick me' })
     const detail = await call(seed.member, 'GET', `/work-items/${created.json.item.id}`)
     expect(detail.json.board.columns.map((c: any) => c.name)).toEqual(board.columns.map((c: any) => c.name))
+  })
+})
+
+describe('waking the agent that owns a card', () => {
+  const tag = (projectId: string) => `<@a:p:${projectId}>`
+  let calls: Array<{ projectId: string | null; prompt: string; release: (text: string) => void }> = []
+
+  beforeEach(() => {
+    calls = []
+    dispatcher._resetDispatcherForTests()
+    dispatcher.configureConversationAgentDispatcher({
+      retryDelaysMs: [0],
+      retryBudgetMs: 60_000,
+      invoke: (args) => new Promise<Response>((resolve) => {
+        calls.push({
+          projectId: args.projectId,
+          prompt: args.prompt,
+          release: (text) => resolve(sseResponse([
+            { type: 'text-start', id: 't1' },
+            { type: 'text-delta', id: 't1', delta: text },
+            { type: 'finish' },
+          ])),
+        })
+      }),
+    })
+  })
+
+  afterAll(() => { dispatcher._resetDispatcherForTests() })
+
+  test('a move into an agent column while that agent is live in the card thread queues the wake', async () => {
+    const board = await createBoard({ conversationId: channelId, name: 'Wake queue' })
+    const column = await call(seed.member, 'POST', `/boards/${board.id}/columns`, { name: 'Agent queue', category: 'active', agentRef: seed.projectId })
+    expect(column.status).toBe(201)
+    const card = (await call(seed.member, 'POST', `/boards/${board.id}/items`, { title: 'Queued hand-off', column: 'Backlog' })).json.item
+    const root = card.threadRootMessageId
+
+    // The agent is already working this card's thread.
+    await call(seed.member, 'POST', `/conversations/${channelId}/messages`, { text: `${tag(seed.projectId)} start on this`, threadRootId: root })
+    await waitFor(() => calls.length === 1)
+    // A person's tag is itself a wake the board knows about (SHO-59's other half).
+    await waitFor(async () => {
+      const events = await db.workItemEvent.findMany({ where: { workItemId: card.id, type: 'agent_woken' } })
+      return events.some((e: any) => (typeof e.eventData === 'string' ? JSON.parse(e.eventData) : e.eventData)?.reason === 'thread_tag') ? true : null
+    })
+
+    expect((await call(seed.member, 'POST', `/work-items/${card.id}/move`, { column: 'Agent queue' })).status).toBe(200)
+
+    // The move does not start a second run: it is acknowledged in the thread.
+    await new Promise((r) => setTimeout(r, 150))
+    expect(calls).toHaveLength(1)
+    const rows = await db.conversationMessage.findMany({ where: { threadRootId: root } })
+    const ack = rows
+      .map((r: any) => ({ ...r, blocks: typeof r.blocks === 'string' ? JSON.parse(r.blocks) : r.blocks }))
+      .find((r: any) => r.blocks?.wakeQueued)
+    expect(ack?.text).toContain('still working on the previous message')
+    expect(ack.blocks.wakeQueued.agentRef).toBe(`project:${seed.projectId}`)
+    expect(await db.workItemEvent.count({ where: { workItemId: card.id, type: 'agent_wake_queued' } })).toBe(1)
+
+    // It still runs, once the live one ends, with the card in its prompt.
+    calls[0]!.release('Started.')
+    await waitFor(() => calls.length === 2, 5000)
+    expect(calls[1]!.prompt).toContain(card.key)
+    calls[1]!.release('On it.')
+    await waitFor(() => db.agentWake.findFirst({ where: { conversationId: channelId, status: 'done' } }), 5000)
+  })
+
+  test('a move into a column that binds no agent wakes the card’s developer exactly once', async () => {
+    const board = await createBoard({ conversationId: channelId, name: 'Handback' })
+    const card = (await call(seed.member, 'POST', `/boards/${board.id}/items`, { title: 'Back to you', assigneeAgentRef: seed.projectId })).json.item
+    const before = await db.workItemEvent.count({ where: { workItemId: card.id, type: 'agent_woken' } })
+
+    // 'In progress' binds no agent, so the card's own developer is the one who acts on it.
+    expect((await call(seed.member, 'POST', `/work-items/${card.id}/move`, { column: 'In progress' })).status).toBe(200)
+    await waitFor(async () => (await db.workItemEvent.count({ where: { workItemId: card.id, type: 'agent_woken' } })) === before + 1)
+    await new Promise((r) => setTimeout(r, 100))
+    expect(await db.workItemEvent.count({ where: { workItemId: card.id, type: 'agent_woken' } })).toBe(before + 1)
   })
 })
