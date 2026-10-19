@@ -77,6 +77,7 @@ const REQUIRED_LOCAL_ROUTES = [
   'PATCH /api/workspaces/:workspaceId/social/posts/:postId',
   'DELETE /api/workspaces/:workspaceId/social/posts/:postId',
   'GET /api/workspaces/:workspaceId/social/calendar',
+  'GET /api/workspaces/:workspaceId/social/analytics',
   'GET /api/workspaces/:workspaceId/social/inbox',
   'GET /api/workspaces/:workspaceId/social/inbox/conversations/:conversationId',
   'POST /api/workspaces/:workspaceId/social/inbox/conversations/:conversationId/messages',

@@ -19,6 +19,12 @@ import { SocialError, getSocialClient, type SocialClient } from './client'
 import { externalIdFor, getProfile, recordProfileMapping, type SocialProfileRow } from './profiles.service'
 import { planRelayRequest } from './relay-plan'
 import { normalizeZernioAccount, upsertAccount } from './accounts.service'
+import {
+  assertSocialBudget,
+  meterXPost,
+  projectedConnectRawUsd,
+  projectedPublishRawUsd,
+} from './usage.service'
 
 const db = prisma as any
 
@@ -72,23 +78,66 @@ async function recordPost(
   if (!zernioPostId) return
   const scheduledFor = typeof body?.scheduledFor === 'string' ? new Date(body.scheduledFor) : null
   const mediaUrls = Array.isArray(body?.mediaUrls) ? body.mediaUrls : []
-  await db.socialPost
-    .create({
+  const publishNow = body?.publishNow === true
+
+  // The relay is where a broadcast is billed, so the cloud keeps the same
+  // per-account legs the desktop wrote locally: without them the `social_x_api`
+  // meter has nothing to claim and an X post composed on a desktop would never
+  // be charged.
+  const platforms: any[] = Array.isArray(body?.platforms) ? body.platforms : []
+  const providerAccountIds = platforms
+    .map((platform: any) => platform?.accountId)
+    .filter((id: unknown): id is string => typeof id === 'string')
+  const accounts = providerAccountIds.length
+    ? await db.socialAccount.findMany({
+        where: { workspaceId, zernioAccountId: { in: providerAccountIds } },
+        select: { id: true, zernioAccountId: true },
+      })
+    : []
+  const byProviderId = new Map(accounts.map((account: any) => [account.zernioAccountId, account.id]))
+  const targets = platforms
+    .map((platform: any) => {
+      const accountId = byProviderId.get(platform?.accountId)
+      if (!accountId || typeof platform?.platform !== 'string') return null
+      return {
+        accountId,
+        platform: platform.platform,
+        customContent: typeof platform.customContent === 'string' ? platform.customContent : null,
+        // The relay only relays the create; per-target delivery status arrives
+        // on the desktop that owns the post, so a scheduled leg stays `pending`.
+        status: publishNow ? 'published' : 'pending',
+      }
+    })
+    .filter((target): target is NonNullable<typeof target> => target !== null)
+
+  let created: any = null
+  try {
+    created = await db.socialPost.create({
       data: {
         workspaceId,
-        status: body?.publishNow ? 'published' : 'scheduled',
+        status: publishNow ? 'published' : 'scheduled',
         content: typeof body?.content === 'string' ? body.content : '',
         mediaJson: mediaUrls.length ? mediaUrls : null,
         scheduledFor: Number.isNaN(scheduledFor?.getTime() ?? NaN) ? null : scheduledFor,
+        publishedAt: publishNow ? new Date() : null,
         zernioPostId,
         // Already unique per tenant; the prefix keeps a desktop's hash from
         // colliding with a cloud-composed post.
         idempotencyKey: `relay:${workspaceId}:${localWorkspaceId}:${key ?? zernioPostId}`,
+        ...(targets.length ? { targets: { create: targets } } : {}),
       },
+      include: { targets: { select: { id: true, platform: true } } },
     })
-    .catch((err: any) => {
-      if (err?.code !== 'P2002') throw err
-    })
+  } catch (err: any) {
+    // The same relayed create arriving twice is one post and one charge.
+    if (err?.code !== 'P2002') throw err
+    return
+  }
+
+  for (const target of created?.targets ?? []) {
+    if (target.platform !== 'x') continue
+    await meterXPost(workspaceId, target.id)
+  }
 }
 
 export interface RelayOutcome {
@@ -147,6 +196,34 @@ export async function relayOperation(args: {
       status: 403,
       body: new SocialError(403, 'post_out_of_scope', 'That post belongs to another workspace.').toJSON(),
     }
+  }
+
+  // The wallet is asked before the provider is: a connect adds a monthly account
+  // charge and a broadcast can carry X's per-post charge. `402` here costs the
+  // user nothing; a call we then have to collect on costs us the provider bill.
+  try {
+    if (plan.path.startsWith('/connect/')) {
+      const active = await db.socialAccount.count({
+        where: { workspaceId: args.workspaceId, isActive: true },
+      })
+      await assertSocialBudget(args.workspaceId, projectedConnectRawUsd(active))
+    } else if (plan.record === 'post-created') {
+      const body: any = plan.body ?? {}
+      const content = typeof body.content === 'string' ? body.content : ''
+      const platforms: any[] = Array.isArray(body.platforms) ? body.platforms : []
+      await assertSocialBudget(
+        args.workspaceId,
+        projectedPublishRawUsd(
+          platforms.map((platform: any) => ({
+            platform: typeof platform?.platform === 'string' ? platform.platform : '',
+            content: typeof platform?.customContent === 'string' ? platform.customContent : content,
+          })),
+        ),
+      )
+    }
+  } catch (err) {
+    if (err instanceof SocialError) return { status: err.status, body: err.toJSON() }
+    throw err
   }
 
   const result = await client.request<any>({

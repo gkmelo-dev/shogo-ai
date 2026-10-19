@@ -5039,6 +5039,10 @@ model SocialAccount {
   tokenHealthy    Boolean   @default(true)
   needsReconnect  Boolean   @default(false)
   lastHealthAt    DateTime?
+  /// Watermark for the `social_account_monthly` meter: the month this row has
+  /// already been charged for. Zernio bills per connected account, prorated by
+  /// active days, so the sweep charges once per account per month.
+  monthlyRateDebitedFor DateTime?
   connectedAt     DateTime  @default(now())
   createdAt       DateTime  @default(now())
   updatedAt       DateTime  @updatedAt
@@ -5097,6 +5101,10 @@ model SocialPostTarget {
   platformPostId  String?
   platformPostUrl String?
   error           String?
+  /// Set once the `social_x_api` meter has charged this leg, so a retried
+  /// dispatch cannot bill the same published post twice. Null on every
+  /// non-X platform, which Zernio does not bill per post.
+  meteredAt       DateTime?
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
 

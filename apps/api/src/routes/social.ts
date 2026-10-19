@@ -38,6 +38,7 @@ import {
   replyToConversation,
 } from '../services/social/inbox.service'
 import { LOCAL_SCOPE_HEADER } from '../services/social/client'
+import { socialAnalytics } from '../services/social/analytics.service'
 import { isScopeId, localScopeFor } from '../services/social/local-scope'
 import {
   ZERNIO_EVENT_ID_HEADER,
@@ -129,6 +130,25 @@ function conversationWindow(c: any): { messageLimit?: number; before?: string | 
  */
 function defaultRedirectUrl(): string {
   return process.env.SOCIAL_CONNECT_REDIRECT_URL || `${getFrontendUrl()}/settings/social`
+}
+
+/**
+ * The analytics window. Defaults to the last 30 days, and refuses a range that
+ * does not make sense *before* the query runs: `to <= from` is a client bug, and
+ * a range wider than a year is a mistyped date that would walk a busy
+ * workspace's whole history.
+ */
+function analyticsRange(c: any): { from: Date; to: Date } {
+  const now = new Date()
+  const from = parseDateParam(c.req.query('from'), new Date(now.getTime() - 30 * 86_400_000))
+  const to = parseDateParam(c.req.query('to'), now)
+  if (to.getTime() <= from.getTime()) {
+    throw new SocialError(400, 'invalid_range', '`to` must be after `from`')
+  }
+  if (to.getTime() - from.getTime() > 366 * 86_400_000) {
+    throw new SocialError(400, 'invalid_range', 'A range of a year or less')
+  }
+  return { from, to }
 }
 
 export function socialRoutes(config: SocialRoutesConfig): Hono {
@@ -323,6 +343,17 @@ export function socialRoutes(config: SocialRoutesConfig): Hono {
       const from = parseDateParam(c.req.query('from'), new Date(now.getTime() - 7 * 86_400_000))
       const to = parseDateParam(c.req.query('to'), new Date(now.getTime() + 30 * 86_400_000))
       return c.json({ from: from.toISOString(), to: to.toISOString(), posts: await calendar(workspaceId, from, to) })
+    } catch (err) {
+      return errorResponse(c, err)
+    }
+  })
+
+  router.get('/workspaces/:workspaceId/social/analytics', async (c) => {
+    const workspaceId = c.req.param('workspaceId')
+    const userId = await requireMember(c, workspaceId)
+    if (userId instanceof Response) return userId
+    try {
+      return c.json(await socialAnalytics(workspaceId, analyticsRange(c)))
     } catch (err) {
       return errorResponse(c, err)
     }
@@ -549,6 +580,16 @@ export function agentSocialRoutes(config: AgentSocialRoutesConfig): Hono {
       const from = parseDateParam(c.req.query('from'), new Date(now.getTime() - 7 * 86_400_000))
       const to = parseDateParam(c.req.query('to'), new Date(now.getTime() + 30 * 86_400_000))
       return c.json({ from: from.toISOString(), to: to.toISOString(), posts: await calendar(auth.workspaceId, from, to) })
+    } catch (err) {
+      return errorResponse(c, err)
+    }
+  })
+
+  router.get('/workspaces/:workspaceId/social/analytics', async (c) => {
+    const auth = await authorize(c)
+    if (auth instanceof Response) return auth
+    try {
+      return c.json(await socialAnalytics(auth.workspaceId, analyticsRange(c)))
     } catch (err) {
       return errorResponse(c, err)
     }

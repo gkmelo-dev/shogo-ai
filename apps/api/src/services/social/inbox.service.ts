@@ -26,6 +26,7 @@
 import { prisma } from '../../lib/prisma'
 import { SocialError, getSocialClient } from './client'
 import { ensureProfile } from './profiles.service'
+import { meterOutboundMessage } from './usage.service'
 
 const db = prisma as any
 
@@ -465,6 +466,12 @@ export async function ingestSocialEvent(input: IngestInput): Promise<IngestResul
       data: { unreadCount: 0 },
     })
   }
+  // `message.sent` is the provider telling us an outbound DM went out, whoever
+  // sent it (our reply, the agent, the platform's own inbox). The meter claims
+  // the row before it bills, so this and the reply path collapse onto one unit.
+  if (direction === 'outgoing') {
+    await meterOutboundMessage(input.workspaceId, written.id)
+  }
 
   return { handled: true, conversationId: conversation.id, messageId: written.id, created: written.created }
 }
@@ -715,12 +722,16 @@ export async function replyToConversation(workspaceId: string, conversationId: s
     },
   })
 
+  // The send is billable now, not when the provider echoes `message.sent` — that
+  // echo may never come for a thread the platform's own inbox is driving. Both
+  // paths go through the same claim, so whichever lands second is a no-op.
+  const meter = written ? await meterOutboundMessage(workspaceId, written.id) : null
+
   return {
     messageId: written?.id ?? null,
     providerMessageId,
     conversationId: conversation.id,
-    // P6's `social_dm` meter counts this row; the reply path only records it.
-    metered: false,
+    metered: meter?.billed === true,
   }
 }
 

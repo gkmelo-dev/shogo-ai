@@ -9872,6 +9872,26 @@ setTimeout(async () => {
   })()
 }
 
+// Social account monthly meter — `social_account_monthly`. Daily on purpose:
+// the per-account watermark makes an extra tick a no-op, and a monthly-only job
+// misses the 1st after any deploy window. Wrapped in
+// `withGlobalJobLock('social-account-monthly')` so one region charges.
+{
+  ;(async () => {
+    try {
+      const { startSocialAccountMonthlyCron } = await import(
+        './jobs/social-account-monthly'
+      )
+      startSocialAccountMonthlyCron()
+    } catch (err: any) {
+      console.error(
+        '[SocialAccountMonthly] failed to schedule the account meter (non-fatal):',
+        err?.message ?? err,
+      )
+    }
+  })()
+}
+
 // Super-admin grant monthly refill — refills `monthlyIncludedUsd` on
 // free-tier workspaces with active `WorkspaceGrant` rows. Paid plans
 // are refilled by the Stripe `invoice.payment_succeeded` webhook.

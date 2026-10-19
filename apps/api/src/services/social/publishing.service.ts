@@ -14,6 +14,7 @@ import { createHash } from 'node:crypto'
 import { prisma } from '../../lib/prisma'
 import { SocialError, getSocialClient } from './client'
 import { ensureProfile } from './profiles.service'
+import { assertSocialBudget, meterXPost, projectedPublishRawUsd } from './usage.service'
 
 const db = prisma as any
 
@@ -237,6 +238,22 @@ export async function dispatchPost(
   else if (post.scheduledFor) body.scheduledFor = post.scheduledFor.toISOString()
   else body.draft = true
 
+  // X bills per post and 13× more when the post carries a link, so the wallet is
+  // asked before the call: a `402` here costs nothing, whereas a publish the
+  // wallet cannot cover costs a provider charge we then have to collect. A draft
+  // publishes nothing and is not pre-flighted.
+  if (publishNow || post.scheduledFor) {
+    await assertSocialBudget(
+      workspaceId,
+      projectedPublishRawUsd(
+        post.targets.map((target: any) => ({
+          platform: target.platform,
+          content: target.customContent ?? post.content,
+        })),
+      ),
+    )
+  }
+
   if (publishNow) {
     await db.socialPost.update({ where: { id: post.id }, data: { status: 'publishing' } })
     await db.socialPostTarget.updateMany({
@@ -310,6 +327,16 @@ export async function dispatchPost(
       publishedAt: status === 'published' || status === 'partial' ? new Date() : null,
     },
   })
+
+  // X charges the moment it accepts the post — published now or scheduled for
+  // later — so a leg the provider did not reject is billable. Every other
+  // platform is free per post and `meterXPost` is a no-op for it.
+  if (publishNow || post.scheduledFor) {
+    for (const target of post.targets) {
+      if (target.platform !== 'x') continue
+      await meterXPost(workspaceId, target.id)
+    }
+  }
 
   return getPost(workspaceId, post.id)
 }

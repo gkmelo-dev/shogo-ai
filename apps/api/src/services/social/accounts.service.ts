@@ -12,6 +12,7 @@
 import { prisma } from '../../lib/prisma'
 import { SocialError, getSocialClient } from './client'
 import { ensureProfile } from './profiles.service'
+import { assertSocialBudget, projectedConnectRawUsd } from './usage.service'
 
 const db = prisma as any
 
@@ -108,11 +109,22 @@ export async function upsertAccount(workspaceId: string, profileId: string, acco
   })
 }
 
-/** Pull the profile's accounts from Zernio and reconcile our rows. */
-export async function syncAccounts(workspaceId: string, workspaceName: string): Promise<any[]> {
-  const profile = await ensureProfile(workspaceId, workspaceName)
+/**
+ * Reconcile **one profile's** accounts against the provider.
+ *
+ * Scoped by `profileId` rather than by workspace, because a cloud workspace owns
+ * several profiles (one per local workspace of the desktop) and the monthly
+ * sweep has to reconcile each of them: an account that exists only at Zernio —
+ * a desktop that connected and then never synced — is still billed, and a stale
+ * local row must not be able to hide it from the sweep.
+ */
+export async function syncProfileAccounts(profile: {
+  id: string
+  workspaceId: string
+  zernioProfileId: string
+}): Promise<ZernioAccount[]> {
   const payload = await getSocialClient().request<any>({
-    workspaceId,
+    workspaceId: profile.workspaceId,
     method: 'GET',
     path: '/accounts',
     query: { profileId: profile.zernioProfileId },
@@ -122,12 +134,12 @@ export async function syncAccounts(workspaceId: string, workspaceName: string): 
     .filter((account): account is ZernioAccount => !!account)
 
   for (const account of remote) {
-    await upsertAccount(workspaceId, profile.id, account)
+    await upsertAccount(profile.workspaceId, profile.id, account)
   }
 
   const seen = new Set(remote.map((account) => account.id))
   const ours = await db.socialAccount.findMany({
-    where: { workspaceId, isActive: true },
+    where: { profileId: profile.id, isActive: true },
     select: { id: true, zernioAccountId: true },
   })
   for (const row of ours) {
@@ -137,7 +149,13 @@ export async function syncAccounts(workspaceId: string, workspaceName: string): 
       data: { isActive: false, tokenHealthy: false, needsReconnect: true, lastHealthAt: new Date() },
     })
   }
+  return remote
+}
 
+/** Pull the current scope's accounts from Zernio and reconcile our rows. */
+export async function syncAccounts(workspaceId: string, workspaceName: string): Promise<any[]> {
+  const profile = await ensureProfile(workspaceId, workspaceName)
+  await syncProfileAccounts(profile)
   return listAccounts(workspaceId)
 }
 
@@ -153,6 +171,15 @@ export async function connectUrl(args: {
 }): Promise<{ url: string; platform: string; profileId: string }> {
   const platform = parsePlatform(args.platform)
   const profile = await ensureProfile(args.workspaceId, args.workspaceName)
+
+  // Every connected account is a monthly charge, and the band is decided by how
+  // many the workspace has — so the wallet is asked before the user is sent
+  // through a platform's OAuth only to have the account refused afterwards.
+  // A no-op on a desktop and on BYOK, where Zernio bills the user directly.
+  const activeAccounts = await db.socialAccount.count({
+    where: { workspaceId: args.workspaceId, isActive: true },
+  })
+  await assertSocialBudget(args.workspaceId, projectedConnectRawUsd(activeAccounts))
 
   const payload = await getSocialClient().request<any>({
     workspaceId: args.workspaceId,
