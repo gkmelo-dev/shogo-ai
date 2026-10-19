@@ -14,6 +14,9 @@
  * list re-reads itself once per heartbeat window — otherwise the row keeps
  * whatever status it had when the switcher first mounted, and a machine that
  * was asleep at mount never gets its live workspaces.
+ *
+ * The live per-machine read is only made while that machine is online; the
+ * relay wakes a sleeping machine, which must not happen on every poll.
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
@@ -104,8 +107,13 @@ export function useMachineWorkspaces(): UseMachineWorkspacesResult {
         }))
         setMachines(seeded)
 
+        // Only a machine with a live tunnel gets the extra read: the relay wakes
+        // a sleeping one with a high-priority push, and then waits for it. Doing
+        // that every poll would spam a laptop that is shut. Its rows stay on the
+        // heartbeat snapshot until it is online again.
         const resolved = await Promise.all(
           seeded.map(async (machine) => {
+            if (machine.status !== "online") return machine
             try {
               const wsRes = await fetch(`${API_URL}/api/machines/${machine.id}/workspaces`, {
                 credentials: "include",
