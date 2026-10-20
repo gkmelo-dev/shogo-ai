@@ -139,6 +139,24 @@ const IN_PROCESS_E2E_SUITES: readonly InProcessE2ESuite[] = [
     files: ['e2e/workspace-tool-failures.integration.test.ts'],
     env: {},
   },
+  // SHO-63: `system_apply` against a real HTTP API that answers 401 to an
+  // attach from the workspace anchor — the failure that produced six
+  // meaningless errors on every workspace apply. Sets its own runtime env,
+  // so it gets a process of its own.
+  {
+    name: 'system_apply loud failures',
+    files: ['e2e/system-apply-loud.integration.test.ts'],
+    env: {},
+  },
+  // SHO-65: a Video Editor project is a Remotion project, and the stack switch
+  // that used to half-apply is refused. The fast half is real files on disk;
+  // the build/MP4 half is opt-in (`RUN_HEAVY=1`) because it installs the
+  // starter and renders 150 frames.
+  {
+    name: 'video-editor stack e2e',
+    files: ['e2e/video-editor-stack.integration.test.ts'],
+    env: {},
+  },
   // One join, one email (SHO-51). Mocked at the `email.service` module, so it
   // counts a send from *any* caller — a hook that mails directly is caught here
   // even though `join-notifications.test.ts` only records through the seam.

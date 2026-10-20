@@ -773,6 +773,9 @@ export interface AgentSchedule {
   cronExpression: string
   timezone: string
   enabled: boolean
+  /** Team chat channel the result is posted in, when the schedule posts. */
+  notifyConversationId: string | null
+  notifyThreadRootId?: string | null
   nextRunAt: string
   lastRunAt: string | null
   lastRunStatus: string | null
@@ -1164,6 +1167,27 @@ export async function agentBoardsRequest<T = any>(
   return personalFetch<T>(`/api/internal/workspaces/${encodeURIComponent(workspaceId)}${path}${qs ? `?${qs}` : ''}`, {
     method,
     ...(options.body ? { body: JSON.stringify(options.body) } : {}),
+  })
+}
+
+export interface AgentChatHandoffInput {
+  chat: string
+  message: string
+  sourceChatId?: string
+}
+
+/**
+ * Deliver a message into another chat as the requester (the `chat_handoff`
+ * tool). The API resolves the target chat against that person's access; the
+ * receiving chat's own runtime starts the turn.
+ */
+export async function deliverAgentChatHandoff(
+  workspaceId: string,
+  input: AgentChatHandoffInput,
+): Promise<CheckpointCallResult<{ delivered?: { id: string; title: string; started: boolean } }>> {
+  return personalFetch(`/api/internal/workspaces/${encodeURIComponent(workspaceId)}/chat-handoff`, {
+    method: 'POST',
+    body: JSON.stringify(input),
   })
 }
 
@@ -1857,6 +1881,24 @@ export async function createProject(
     body: JSON.stringify(req),
     parse: (j) => j?.project as ProjectSummary,
     timeoutMs: 30_000,
+  })
+}
+
+/**
+ * Every project in the workspace the caller can reach, without the
+ * attachment graph. `system_apply` uses it to resolve a locked project id
+ * that the live graph does not return (the project exists, it simply is not
+ * visible/mounted to this runtime) — so it becomes a configure, never a
+ * duplicate create.
+ */
+export async function listWorkspaceProjects(
+  workspaceId: string,
+  opts: { userId?: string } = {},
+): Promise<CheckpointCallResult<ProjectSummary[]>> {
+  const qs = opts.userId ? `?userId=${encodeURIComponent(opts.userId)}` : ''
+  return lifecycleFetch(`/api/internal/workspaces/${encodeURIComponent(workspaceId)}/projects${qs}`, {
+    method: 'GET',
+    parse: (j) => (j?.projects ?? []) as ProjectSummary[],
   })
 }
 

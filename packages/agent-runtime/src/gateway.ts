@@ -25,7 +25,7 @@ import type { Message, ImageContent } from '@mariozechner/pi-ai'
 import type { StreamFn, AgentTool, AgentToolResult } from '@mariozechner/pi-agent-core'
 import { Type } from '@sinclair/typebox'
 import type { ChannelAdapter, IncomingMessage, AgentStatus, ChannelStatus, StreamChunkConfig, SandboxConfig } from './types'
-import { loadAllSkills, migrateFromLegacySkills, matchSkill, buildSkillsPromptSection, type Skill } from './skills'
+import { loadAllSkills, migrateFromLegacySkills, matchSkill, buildSkillsPromptSection, buildSkillMatchPrompt, type Skill } from './skills'
 import { loadQuickActions, buildQuickActionsPromptSection, type QuickAction } from './quick-actions'
 import { SkillServerManager } from './skill-server-manager'
 import { setLoadedSkills } from './gateway-tools'
@@ -60,6 +60,7 @@ import { BlockChunker } from './block-chunker'
 import { canvasModeStableGuides } from './canvas-v2-prompt'
 import { buildCapabilityStatusSection, resolveRuntimeCapabilities } from './capability-status-prompt'
 import { BOARDS_GUIDE, COMPANY_OPS_GUIDE } from './board-tools'
+import { TASK_WAKE_RETRY_MS } from './remote-tasks'
 import { buildViewerContextPrompt, parseCanvasViewer } from './viewer-context'
 import { buildAccountContextPrompt, type AccountContext } from './account-context'
 import { CanvasFileWatcher } from './canvas-file-watcher'
@@ -280,11 +281,11 @@ const AUTO_TIER_CEILING_TTL_MS = 5 * 60 * 1000
 /** Finished tasks arriving this close together wake an idle session once. */
 const TASK_WAKE_COALESCE_MS = 2_000
 /**
- * A wake the API did not accept is retried on these delays. The note stays
- * unreported until a flush succeeds, so a refused notify cannot silently end
- * the session's wake.
+ * A wake the API did not accept is retried on these delays (shared with the
+ * task-create retry, so one table governs both). The note stays unreported
+ * until a flush succeeds, so a refused notify cannot silently end the
+ * session's wake.
  */
-const TASK_WAKE_RETRY_MS = [2_000, 5_000, 15_000, 60_000, 300_000]
 /** How often an idle session polls tasks mirrored from another project's runtime. */
 const REMOTE_TASK_POLL_MS = 10_000
 /** How often a running turn refreshes remote tasks so their results can be injected mid-turn. */
@@ -1053,6 +1054,24 @@ export class AgentGateway {
     const ts = new Date().toISOString()
     const formatted = `[${ts}] ${line}`
     this._onLog?.(formatted)
+  }
+
+  private loggedSkillsTruncation = new Set<string>()
+
+  /**
+   * Report a truncated `## Available Skills` section. The prompt builders run
+   * every turn, so log each distinct (included, omitted) pair only once — the
+   * point is that the omission is visible at all, not that it repeats.
+   */
+  private reportSkillsTruncation(info: { included: number; omitted: number; omittedNames: string[] }): void {
+    const key = `${info.included}:${info.omitted}`
+    if (this.loggedSkillsTruncation.has(key)) return
+    this.loggedSkillsTruncation.add(key)
+
+    const sample = info.omittedNames.slice(0, 10).join(', ') + (info.omittedNames.length > 10 ? ', …' : '')
+    const line = `[Skills] prompt budget: ${info.included} skills listed, ${info.omitted} omitted (${sample})`
+    console.warn(line)
+    this.emitLog(line)
   }
 
   private loadConfig(): GatewayConfig {
@@ -1886,16 +1905,7 @@ export class AgentGateway {
         let activeSkill: { name: string } | undefined
 
         if (matchedSkill) {
-          prompt = [
-            `[Skill: ${matchedSkill.name}]`,
-            `A saved skill matched this request. Follow its instructions for this integration.`,
-            `You can still use search_integrations if you need additional tools or integrations beyond what the skill provides.`,
-            ``,
-            matchedSkill.content,
-            ``,
-            `[User Message]`,
-            message.text,
-          ].join('\n')
+          prompt = buildSkillMatchPrompt(matchedSkill, message.text)
           activeSkill = { name: matchedSkill.name }
         }
 
@@ -1948,16 +1958,7 @@ export class AgentGateway {
     const matchedSkill = matchSkill(this.skills, text)
     if (matchedSkill) {
       this.emitLog(`Matched skill: ${matchedSkill.name}`)
-      const prompt = [
-        `[Skill: ${matchedSkill.name}]`,
-        `A saved skill matched this request. Follow its instructions for this integration.`,
-        `You can still use search_integrations if you need additional tools or integrations beyond what the skill provides.`,
-        ``,
-        matchedSkill.content,
-        ``,
-        `[User Message]`,
-        text,
-      ].join('\n')
+      const prompt = buildSkillMatchPrompt(matchedSkill, text)
       return { prompt, activeSkill: { name: matchedSkill.name } }
     }
     return { prompt: `[Chat — User Message]\nThis is a direct message from a user, NOT a heartbeat trigger. Respond conversationally and helpfully. Do NOT respond with HEARTBEAT_OK.\n\n${text}` }
@@ -4475,7 +4476,7 @@ export class AgentGateway {
     parts.push(SELF_EVOLUTION_GUIDE)
 
     if (this.skills.length > 0) {
-      const skillsSection = buildSkillsPromptSection(this.skills)
+      const skillsSection = buildSkillsPromptSection(this.skills, undefined, (info) => this.reportSkillsTruncation(info))
       if (skillsSection) {
         parts.push(skillsSection)
       }
@@ -4874,7 +4875,7 @@ export class AgentGateway {
 
     // 11. Skills and skill server (can change when skills are installed)
     if (this.skills.length > 0) {
-      const skillsSection = buildSkillsPromptSection(this.skills)
+      const skillsSection = buildSkillsPromptSection(this.skills, undefined, (info) => this.reportSkillsTruncation(info))
       if (skillsSection) {
         pushDynamic('skills', skillsSection)
       }
