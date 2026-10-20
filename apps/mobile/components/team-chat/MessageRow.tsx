@@ -44,6 +44,8 @@ import { toggleSaved, useIsSaved } from '../../hooks/useChatItems'
 import { customEmojiFor, jumboEmojiCodes, useCustomEmoji } from '../../hooks/useCustomEmoji'
 import { useEditRequest } from '../../hooks/useChatShortcuts'
 import { useMobileWorkspaceChrome } from '../layout/MobileWorkspaceChromeContext'
+import { parseInAppFileHref } from '../../lib/share-file-links'
+import { useShareFileOpener } from '../chat/share-file-context'
 
 export const QUICK_REACTIONS = ['👍', '✅', '👀', '🎉', '❤️', '😂']
 
@@ -398,6 +400,14 @@ function MessageRowImpl(props: MessageRowProps) {
   })
 
   const [copied, setCopied] = useState(false)
+  // An attachment the app serves itself opens in the app's own viewer, never a
+  // browser tab on the API URL (SHO-80).
+  const openShareFile = useShareFileOpener()
+  const openAttachment = useCallback((url: string) => {
+    const served = parseInAppFileHref(url)
+    if (served && openShareFile) openShareFile(served)
+    else void Linking.openURL(url)
+  }, [openShareFile])
   useEffect(() => {
     if (!copied) return
     const t = setTimeout(() => setCopied(false), 1500)
@@ -830,7 +840,7 @@ function MessageRowImpl(props: MessageRowProps) {
                   size={a.size}
                   url={absoluteApiUrl(a.url)}
                   preview={a.preview}
-                  onOpen={() => void Linking.openURL(absoluteApiUrl(a.url))}
+                  onOpen={() => openAttachment(absoluteApiUrl(a.url))}
                 />
               ),
             )}
