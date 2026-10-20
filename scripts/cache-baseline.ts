@@ -29,8 +29,10 @@
  * `--check` fails (exit 1) when any test's cache-hit ratio drops more than 5
  * points, or its turn-1 prompt grows more than 10%, versus that model's
  * baseline at `packages/agent-runtime/src/evals/cache-baseline.json` (tracked,
- * unlike `bench-results/`, so CI can gate on it). Missing baseline for the
- * model being checked = not a failure; `--write` records it.
+ * unlike `bench-results/`, so CI can gate on it). A file with NO baselines yet
+ * is a recording run, not a failure; a file that records other models but not
+ * the one being checked fails, because that is an id mismatch and a "pass"
+ * there would be a comparison of zero tests.
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
@@ -39,6 +41,7 @@ import type { EvalResult, EvalSuiteResult } from '../packages/agent-runtime/src/
 import {
   CACHE_GATE_RATIO_DROP_POINTS,
   CACHE_GATE_TURN_TOKEN_GROWTH,
+  baselineFor,
   compareCacheBaseline,
   computeCacheBaseline,
   describeRegression,
@@ -154,9 +157,18 @@ if (write) {
 }
 
 if (check) {
-  const baseline = selectBaseline(readFileState(), model)
-  if (!baseline) console.log(`No baseline recorded for ${model} yet — recording only, not a failure.`)
-  const gate = compareCacheBaseline(current, baseline)
+  const lookup = baselineFor(readFileState(), model)
+  if (lookup.status === 'model-missing') {
+    // A model the file has no entry for, while it holds entries for others, is a
+    // mismatch (renamed model, or CLI id vs the id the run reported) — not a
+    // first run. Passing here would compare zero tests and print a green gate.
+    console.error(`No baseline for "${model}" in ${OUT}.`)
+    console.error(`Recorded: ${lookup.recorded.join(', ')}.`)
+    console.error('Refusing to report a pass for a comparison that examined nothing: record this model with --write, or check the id the run reported.')
+    process.exit(1)
+  }
+  if (lookup.status === 'empty') console.log(`No baseline recorded yet in ${OUT} — recording only, not a failure.`)
+  const gate = compareCacheBaseline(current, lookup.status === 'ready' ? lookup.baseline : null)
   console.log(
     `Cache gate: ${gate.checked} test(s) compared against ${OUT} ` +
     `(fail on -${CACHE_GATE_RATIO_DROP_POINTS} pts ratio or +${CACHE_GATE_TURN_TOKEN_GROWTH * 100}% turn-1 prompt)`,

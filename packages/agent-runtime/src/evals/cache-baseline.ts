@@ -77,6 +77,33 @@ export function selectBaseline(file: CacheBaselineFile | null | undefined, model
   return entry && entry.perTest ? entry : null
 }
 
+/** Model ids the file holds a baseline for, sorted — for messages and mismatch reports. */
+export function recordedModelIds(file: CacheBaselineFile | null | undefined): string[] {
+  const models = file?.models ?? {}
+  return Object.keys(models)
+    .filter((id) => models[id]?.perTest)
+    .sort()
+}
+
+/**
+ * What the gate can compare `model` against. Three outcomes because "no
+ * baseline" means two different things: before anything is recorded it is the
+ * expected first-run state, but once the file holds other models it is an
+ * id mismatch (a renamed model, or the CLI id versus the id the run reported) —
+ * and there, passing would mean comparing zero tests and reporting green.
+ */
+export type CacheBaselineLookup =
+  | { status: 'ready'; baseline: CacheBaseline }
+  | { status: 'empty' }
+  | { status: 'model-missing'; recorded: string[] }
+
+export function baselineFor(file: CacheBaselineFile | null | undefined, model: string): CacheBaselineLookup {
+  const baseline = selectBaseline(file, model)
+  if (baseline) return { status: 'ready', baseline }
+  const recorded = recordedModelIds(file)
+  return recorded.length === 0 ? { status: 'empty' } : { status: 'model-missing', recorded }
+}
+
 /** Insert or replace one model's baseline in the file. */
 export function upsertBaseline(
   file: CacheBaselineFile | null | undefined,

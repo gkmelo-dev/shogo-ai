@@ -24,6 +24,7 @@ import {
 import {
   CACHE_GATE_RATIO_DROP_POINTS,
   CACHE_GATE_TURN_TOKEN_GROWTH,
+  baselineFor,
   compareCacheBaseline,
   computeCacheBaseline,
   describeRegression,
@@ -277,5 +278,22 @@ describe('one baseline per model', () => {
     const gate = compareCacheBaseline(entry(0.72), selectBaseline(file, 'gpt-6-luna'))
     expect(gate.ok).toBe(false)
     expect(gate.regressions[0].metric).toBe('baselineFloor')
+  })
+
+  test('a run whose model has no entry among recorded models is a mismatch, not a first run', () => {
+    // Nothing recorded yet: bootstrapping, so --check must not fail.
+    expect(baselineFor(null, 'hoshi-2-0')).toEqual({ status: 'empty' })
+    expect(baselineFor({ models: {} }, 'hoshi-2-0')).toEqual({ status: 'empty' })
+
+    const file = upsertBaseline(null, 'luna', entry(0.72), '2026-10-20T00:00:00.000Z')
+    const withHaiku = upsertBaseline(file, 'claude-haiku-5-5', entry(0.65), '2026-10-20T00:00:00.000Z')
+
+    // `gpt-6-luna` is what a caller types; `luna` is what the run reported.
+    // Comparing zero tests and calling it a pass is how a gate goes quiet.
+    expect(baselineFor(withHaiku, 'gpt-6-luna')).toEqual({
+      status: 'model-missing',
+      recorded: ['claude-haiku-5-5', 'luna'],
+    })
+    expect(baselineFor(withHaiku, 'luna')).toMatchObject({ status: 'ready' })
   })
 })
