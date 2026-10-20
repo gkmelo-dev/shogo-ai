@@ -35,7 +35,6 @@ export const NATIVE_PROVIDER_ENV_KEY: Record<string, string> = {
   openai: 'OPENAI_API_KEY',
   google: 'GOOGLE_API_KEY',
   openrouter: 'OPENROUTER_API_KEY',
-  fal: 'FAL_KEY',
   tripo: 'TRIPO_API_KEY',
   higgsfield: 'HIGGSFIELD_API_KEY',
 }

@@ -19,7 +19,7 @@ import { getSharedRedis } from './tunnel-redis'
 export interface VideoJobRecord {
   id: string
   /** Which vendor owns the job; the status route dispatches on it. */
-  provider: 'fal' | 'higgsfield'
+  provider: 'higgsfield'
   workspaceId: string
   projectId: string
   userId?: string
@@ -44,7 +44,7 @@ export interface VideoJobRecord {
   createdAt: number
 }
 
-/** fal keeps results for a while; a day comfortably covers slow queues and late polls. */
+/** The vendor keeps results for a while; a day comfortably covers slow queues and late polls. */
 export const VIDEO_JOB_TTL_SECONDS = 24 * 60 * 60
 
 const isLocalMode = process.env.SHOGO_LOCAL_MODE === 'true'
