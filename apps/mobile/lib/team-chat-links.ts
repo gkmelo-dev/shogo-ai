@@ -67,3 +67,22 @@ export function parseMessageLink(href: string, hosts: Set<string> = ownHosts()):
     threadRootId: url.searchParams.get('thread'),
   }
 }
+
+/**
+ * The attachment a shared file link points at. Both shapes count: the
+ * capability URL an attachment carries (`/api/conversation-files/<id>?t=…`)
+ * and the in-app viewer's own path (`/f/<id>`), because either can end up in
+ * a message, a doc or a person's clipboard.
+ */
+export function parseFileLink(href: string, hosts: Set<string> = ownHosts()): { attachmentId: string } | null {
+  let url: URL
+  try {
+    url = new URL(href)
+  } catch {
+    return null
+  }
+  if (!hosts.has(url.host)) return null
+  const match = url.pathname.match(/^\/(?:api\/conversation-files|f)\/([^/]+)\/?$/)
+  if (!match) return null
+  return { attachmentId: decodeURIComponent(match[1]!) }
+}
