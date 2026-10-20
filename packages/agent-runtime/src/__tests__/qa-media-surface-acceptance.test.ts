@@ -106,4 +106,18 @@ describe('SHO-81 — every advertised media tool exists', () => {
     })
     expect(offenders).toEqual([])
   })
+
+  test('the capability docs do not advertise the retired tools', () => {
+    // The docs table is what a user reads before turning `imageGenEnabled` on,
+    // so a stale row promises two tools that answer "tool not found".
+    const docs = readFileSync(
+      join(import.meta.dir, '../../../../apps/docs/docs/features/capabilities.md'),
+      'utf8'
+    )
+    const imageRow = docs.split('\n').filter((line) => line.includes('`imageGenEnabled` |'))
+    expect(imageRow).toHaveLength(1)
+    expect(imageRow[0]).toContain('`generate_image`')
+    expect(docs).not.toContain('upscale_image')
+    expect(docs).not.toContain('remove_background')
+  })
 })
