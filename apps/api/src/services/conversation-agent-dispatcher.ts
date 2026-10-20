@@ -70,7 +70,8 @@ const DEFAULT_START_RETRY_BUDGET_MS = 3 * 60_000
 /** Safety cap so a zero delay cannot spin for the whole budget. */
 const MAX_START_RETRIES = 20
 const CONTEXT_MESSAGES = 20
-const DELTA_THROTTLE_MS = 350
+/** Each streamed-reply update is a database write plus a broadcast; once a second reads as live. */
+const DELTA_THROTTLE_MS = 1_000
 /** A workspace file read for a reply's media; a slow runtime must not hold the reply. */
 const REPLY_MEDIA_FETCH_TIMEOUT_MS = 10_000
 export { AGENT_REPLY_TIMEOUT_MS }
@@ -1000,7 +1001,15 @@ async function channelDocContext(conversation: any): Promise<string[]> {
     '',
     `Channel doc${doc.title ? ` "${doc.title}"` : ''} (version ${doc.version}): the channel's shared document. Treat it as the ` +
       'source of truth for plans, decisions and checklists. Update it with team_chat_doc_update when you settle ' +
-      'something the team should keep (prefer mode "patch_section" or "append" over rewriting it).',
+      'something the team should keep (prefer mode "patch_section" or "append" over rewriting it). Keep per-card ' +
+      'narratives in the card thread with work_item_comment, not here.',
+    `${doc.budget.chars.toLocaleString('en-US')} / ${doc.budget.limit.toLocaleString('en-US')} characters (${doc.budget.pct}%, ` +
+      `${doc.budget.level}). ` +
+      (doc.budget.level === 'critical'
+        ? 'It is nearly full: archive a finished section with mode "archive_section" before you add anything.'
+        : doc.budget.level === 'warn'
+          ? 'It is filling up: prefer editing an existing section over appending a new one.'
+          : ''),
     '<channel_doc>',
     body,
     '</channel_doc>',
@@ -1611,7 +1620,7 @@ async function runReservedReply(
       // The run ended on a tool call: nothing more to say than what it did.
       await settle('', 'done')
     } else {
-      const text = await resolveFriendlyMentions(conversation.workspaceId, finalText)
+      const text = (await resolveFriendlyMentions(conversation.workspaceId, finalText)).text
       const mentions = /<[@!]/.test(text) ? await replaceMentions(messageId, conversation.workspaceId, text) : []
       await settle(text, 'done')
       if (mentions.length) await afterReplySettled(reply.conversation, messageId, mentions)

@@ -87,6 +87,7 @@ import { createChatMessageFeedbackRoutes, createChatSessionFeedbackRoutes } from
 import { createChatSessionForkRoutes } from './routes/chat-session-fork'
 import { chatQueuedMessageActionsRoutes } from './routes/chat-queued-message-actions'
 import { toolsProxyRoutes } from './routes/tools-proxy'
+import { socialRelayRoutes, socialRoutes, socialWebhookRoutes } from './routes/social'
 import {
   generateTitleCompletion,
   setTitleGenerationModelId,
@@ -151,6 +152,9 @@ import {
 } from './lib/workspace-compute-budget'
 import { requireSuperAdminUnlessScoped } from './middleware/admin-access'
 import { historyRoutes } from './routes/history'
+// Hosted voice media — imported directly (not via the cloud-only island) so
+// desktop/local mode serves /api/voice/tts and /api/voice/music too.
+import { voiceMediaRoutes } from './routes/voice-media'
 import { chatMentionRoutes } from './routes/chat-mentions'
 // Note: Manual routes (workspaces, projects, folders, starred) removed in favor of generated v2 routes
 import { createRuntimeManager, setRuntimeManager, type IRuntimeManager } from './lib/runtime'
@@ -241,6 +245,7 @@ const evalAdminRoutes: any = cloud.evalAdminRoutes ?? emptyRouter
 const evalInternalRoutes: any = cloud.evalInternalRoutes ?? emptyRouter
 const cliAuthRoutes: any = cloud.cliAuthRoutes ?? emptyRouter
 const instanceRoutes: any = cloud.instanceRoutes ?? emptyRouter
+const machineRoutes: any = cloud.machineRoutes ?? emptyRouter
 const authenticateInstanceWs: any = cloud.authenticateInstanceWs ?? (async () => false)
 const handleInstanceWsOpen: any = cloud.handleInstanceWsOpen ?? (() => {})
 const handleInstanceWsMessage: any = cloud.handleInstanceWsMessage ?? (() => {})
@@ -1590,6 +1595,8 @@ app.route('/api', cliAuthRoutes())
 
 // Remote Control — Instance registry, tunnel proxy, audit trail, push subscriptions
 app.route('/api', instanceRoutes())
+// A paired desktop's own workspaces, owner-only (`/api/machines…`).
+app.route('/api', machineRoutes())
 app.route('/api', remoteAuditRoutes())
 app.route('/api', mobilePushRoutes())
 app.route('/api', appInstallRoutes())
@@ -8586,11 +8593,26 @@ app.route('/api/v1', publicApi)
 // Uses the same JWT auth as the AI proxy — no raw API keys in agent pods.
 const toolsProxy = toolsProxyRoutes()
 app.route('/api', toolsProxy)
+// Social management (Zernio). People talk to the workspace-scoped routes; a
+// desktop forwards its provider calls to the relay, which is the only place
+// the master Zernio key is used.
+app.route('/api', socialRoutes({ resolveUserId: getAuthUserId }))
+app.route('/api', socialRelayRoutes())
+// Zernio's webhooks (comments, DMs, account health). Cloud only: the desktop
+// half of the relay applies local-scope events in its own DB.
+app.route('/api', socialWebhookRoutes())
 
 // EZ Mode / voice translator routes (session-auth'd via authMiddleware
 // above). Keeps ELEVENLABS_API_KEY on the server and serves the shared
 // translator persona for both voice (signed URL) and text (streaming chat).
 app.route('/api', voiceRoutes())
+
+// Hosted voice media (`/api/voice/tts`, `/api/voice/music`). Mounted
+// unconditionally — unlike `voiceRoutes()` this module has no cloud-only
+// imports, so desktop (`SHOGO_LOCAL_MODE`) serves the same endpoints and the
+// SDK's runtime-token proxy works there too. Without ELEVENLABS_API_KEY the
+// handlers answer 503 with a specific message.
+app.route('/api', voiceMediaRoutes())
 
 // Public streaming chat route — text-only sibling of the voice signed-
 // URL endpoint. Lets external SDK consumers (`useShogoChat`) drive the
@@ -9863,6 +9885,26 @@ setTimeout(async () => {
   })()
 }
 
+// Social account monthly meter — `social_account_monthly`. Daily on purpose:
+// the per-account watermark makes an extra tick a no-op, and a monthly-only job
+// misses the 1st after any deploy window. Wrapped in
+// `withGlobalJobLock('social-account-monthly')` so one region charges.
+{
+  ;(async () => {
+    try {
+      const { startSocialAccountMonthlyCron } = await import(
+        './jobs/social-account-monthly'
+      )
+      startSocialAccountMonthlyCron()
+    } catch (err: any) {
+      console.error(
+        '[SocialAccountMonthly] failed to schedule the account meter (non-fatal):',
+        err?.message ?? err,
+      )
+    }
+  })()
+}
+
 // Super-admin grant monthly refill — refills `monthlyIncludedUsd` on
 // free-tier workspaces with active `WorkspaceGrant` rows. Paid plans
 // are refilled by the Stripe `invoice.payment_succeeded` webhook.
@@ -9912,6 +9954,23 @@ setTimeout(async () => {
     } catch (err: any) {
       console.error(
         '[Affiliate] failed to schedule cron jobs (non-fatal):',
+        err?.message ?? err,
+      )
+    }
+  })()
+}
+
+// Cards that know their PR — sweeps stale PR links (a dropped webhook, a repo
+// connected with a personal token rather than the App) so a card never sits on
+// yesterday's checks. Wrapped in withGlobalJobLock: one region per tick.
+{
+  ;(async () => {
+    try {
+      const { startSyncPrLinksCron } = await import('./jobs/sync-pr-links')
+      startSyncPrLinksCron()
+    } catch (err: any) {
+      console.error(
+        '[SyncPrLinks] failed to schedule sweep (non-fatal):',
         err?.message ?? err,
       )
     }
