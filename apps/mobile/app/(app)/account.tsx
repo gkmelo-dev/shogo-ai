@@ -122,14 +122,15 @@ export default observer(function AccountPage() {
     }
   }, [currentWorkspace?.id, pendingWorkspaceId])
 
-  // A settings deep link (`/settings?tab=…` redirected here) opens its sheet,
-  // then the consumed `tab` param is cleared so closing the sheet or pressing
-  // Back does not re-open it. `slackLinked` is left for `IntegrationsTab`.
+  // A settings deep link (`/settings?tab=…` redirected here) opens its sheet.
+  // The `tab` param is consumed by `closeSettingsSheet`, never on mount: a
+  // `setParams` here remounts the route on web and would drop the sheet state
+  // (and `?workspace=`) before it renders. `slackLinked` is left for
+  // `IntegrationsTab`, which owns and clears it.
   useEffect(() => {
     if (!requestedTab) return
     setSettingsTab(phoneSettingsSheetTab({ tab: requestedTab }, settingsOptions))
-    router.setParams({ tab: undefined } as any)
-  }, [requestedTab, router, settingsOptions])
+  }, [requestedTab, settingsOptions])
 
   // `?workspace=<id>` switches the active workspace before the tab body renders
   // — it is what makes the Automations/People deep links show the right one.
@@ -223,7 +224,13 @@ export default observer(function AccountPage() {
     } catch {}
   }, [posthog, signOut])
 
-  const closeSettingsSheet = useCallback(() => setSettingsTab(null), [])
+  // Clearing the consumed `tab` here (not on mount) keeps the deep-linked
+  // sheet open while it renders, and still leaves the Account screen clean:
+  // closing it or pressing Back afterwards does not re-open the sheet.
+  const closeSettingsSheet = useCallback(() => {
+    setSettingsTab(null)
+    if (requestedTab) router.setParams({ tab: undefined } as any)
+  }, [requestedTab, router])
 
   if (!isSupported) return null
 
