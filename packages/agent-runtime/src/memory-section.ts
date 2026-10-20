@@ -317,7 +317,15 @@ function fitSections(preamble: string, sections: ParsedSection[], availableChars
     if (preamble.length + SECTION_SEPARATOR.length <= remaining) {
       remaining -= preamble.length + SECTION_SEPARATOR.length
     } else {
-      const cut = cutAtLineBoundary(preamble, Math.max(0, remaining))
+      // The separator that follows the preamble is only free when a section is
+      // joined after it (`remaining` is seeded with one spare separator). Spend
+      // it here, or the preamble overruns the budget by 2 chars — which is a
+      // token once it crosses a multiple of 4 (QA, SHO-78: a headingless file
+      // at MEMORY_BUDGET_TOKENS=400 reported 401 tokens).
+      const cut = cutAtLineBoundary(
+        preamble,
+        Math.max(0, remaining - SECTION_SEPARATOR.length),
+      )
       keptPreamble = cut.text
       preambleTruncated = cut.cut
       remaining = SECTION_SEPARATOR.length
