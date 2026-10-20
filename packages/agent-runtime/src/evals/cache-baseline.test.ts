@@ -27,8 +27,11 @@ import {
   compareCacheBaseline,
   computeCacheBaseline,
   describeRegression,
+  selectBaseline,
+  upsertBaseline,
   type CacheBaseline,
   type CacheBaselineEntry,
+  type CacheBaselineFile,
 } from './cache-baseline'
 
 function turn(
@@ -178,7 +181,7 @@ describe('cache accounting helpers', () => {
 
 describe('cache baseline + gate', () => {
   const perTestOf = (ratio: number, turnTokens = 12_000): Record<string, CacheBaselineEntry> => ({
-    'cache-warm-repeat': { ratio, turnTokens, prefixTokens: 10_000, turns: 2 },
+    'cache-warm-repeat': { ratio, firstTurnRatio: 0, turnTokens, prefixTokens: 10_000, turns: 3 },
   })
 
   const baselineOf = (ratio: number, turnTokens = 12_000): CacheBaseline => ({
@@ -243,5 +246,36 @@ describe('cache baseline + gate', () => {
     expect(Object.keys(baseline.perTest)).toEqual(['cache-warm-repeat'])
     expect(baseline.perTest['cache-warm-repeat'].ratio).toBeCloseTo(0.9, 5)
     expect(baseline.perTest['cache-warm-repeat'].turnTokens).toBe(1_000)
+  })
+})
+
+describe('one baseline per model', () => {
+  const entry = (ratio: number): Record<string, CacheBaselineEntry> => ({
+    'cache-warm-repeat': { ratio, firstTurnRatio: 0, turnTokens: 12_000, prefixTokens: 10_000, turns: 3 },
+  })
+
+  test('each model keeps its own numbers and the gate picks the matching one', () => {
+    let file: CacheBaselineFile | null = upsertBaseline(null, 'hoshi-2-0', entry(0.68), '2026-10-20T00:00:00.000Z')
+    file = upsertBaseline(file, 'haiku-5-5', entry(0.65), '2026-10-20T00:00:00.000Z')
+    file = upsertBaseline(file, 'gpt-6-luna', entry(0.72), '2026-10-20T00:00:00.000Z')
+
+    expect(selectBaseline(file, 'hoshi-2-0')?.perTest['cache-warm-repeat'].ratio).toBe(0.68)
+    expect(selectBaseline(file, 'haiku-5-5')?.perTest['cache-warm-repeat'].ratio).toBe(0.65)
+    expect(selectBaseline(file, 'gpt-6-luna')?.perTest['cache-warm-repeat'].ratio).toBe(0.72)
+    // A model with no baseline is recorded, not failed.
+    expect(selectBaseline(file, 'opus')).toBeNull()
+
+    // Writing one model again must not disturb the others.
+    const rewritten = upsertBaseline(file, 'haiku-5-5', entry(0.7), '2026-10-21T00:00:00.000Z')
+    expect(rewritten.models['haiku-5-5'].perTest['cache-warm-repeat'].ratio).toBe(0.7)
+    expect(rewritten.models['hoshi-2-0'].perTest['cache-warm-repeat'].ratio).toBe(0.68)
+    expect(Object.keys(rewritten.models)).toHaveLength(3)
+  })
+
+  test('a model whose baseline is below the floor is refused on its own', () => {
+    const file = upsertBaseline(null, 'gpt-6-luna', entry(0.3), '2026-10-20T00:00:00.000Z')
+    const gate = compareCacheBaseline(entry(0.72), selectBaseline(file, 'gpt-6-luna'))
+    expect(gate.ok).toBe(false)
+    expect(gate.regressions[0].metric).toBe('baselineFloor')
   })
 })

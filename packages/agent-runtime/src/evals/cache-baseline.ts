@@ -34,8 +34,15 @@ export const CACHE_RATIO_FLOORS: Record<string, number> = {
 }
 
 export interface CacheBaselineEntry {
-  /** Cache-hit ratio of the run, 0..1. */
+  /**
+   * Cache-hit ratio of the LAST turn, 0..1. Deliberately not the run aggregate:
+   * the first turn of an eval is always cold (it reads only whatever prefix a
+   * previous session happened to persist), so an aggregate is mostly a measure
+   * of how long the eval was. Steady state is what the gate should hold.
+   */
   ratio: number
+  /** Cache-hit ratio of turn 1 — recorded, never gated on (warm-up order). */
+  firstTurnRatio: number
   /** Prompt tokens (uncached + cache-read + cache-write) of turn 1. */
   turnTokens: number
   /** Estimated prompt tokens of the run (stable + dynamic + tool schema). */
@@ -50,6 +57,40 @@ export interface CacheBaseline {
   date: string
   perTest: Record<string, CacheBaselineEntry>
   notes?: string
+}
+
+/**
+ * One baseline per model, because the providers cache differently:
+ * DeepSeek (hoshi) caches implicitly and best-effort with no breakpoint to set,
+ * Anthropic (haiku/sonnet/opus) caches explicitly at our `cache_control`
+ * breakpoints, and OpenAI (luna/sol) caches implicitly with its own TTL. A
+ * ratio recorded on one says nothing about the others, so the file holds a
+ * baseline per model and the gate picks the one matching the run.
+ */
+export interface CacheBaselineFile {
+  models: Record<string, CacheBaseline>
+}
+
+/** The baseline recorded for `model`, or null when that model has none yet. */
+export function selectBaseline(file: CacheBaselineFile | null | undefined, model: string): CacheBaseline | null {
+  const entry = file?.models?.[model]
+  return entry && entry.perTest ? entry : null
+}
+
+/** Insert or replace one model's baseline in the file. */
+export function upsertBaseline(
+  file: CacheBaselineFile | null | undefined,
+  model: string,
+  perTest: Record<string, CacheBaselineEntry>,
+  date: string,
+  notes?: string,
+): CacheBaselineFile {
+  return {
+    models: {
+      ...(file?.models ?? {}),
+      [model]: { model, date, perTest, ...(notes ? { notes } : {}) },
+    },
+  }
 }
 
 export interface CacheGateRegression {
@@ -74,8 +115,10 @@ export interface CacheGateResult {
 export function cacheMetricsOf(result: EvalResult): CacheBaselineEntry {
   const turns = result.perTurnUsage ?? []
   const first = turns[0]
+  const last = turns[turns.length - 1]
   return {
-    ratio: cacheHitRatio(result.metrics.tokens),
+    ratio: last ? cacheHitRatio(last) : 0,
+    firstTurnRatio: first ? cacheHitRatio(first) : 0,
     turnTokens: first ? totalInputTokens(first) : 0,
     prefixTokens: prefixTokens(result).total,
     turns: turns.length,

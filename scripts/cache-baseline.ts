@@ -13,11 +13,24 @@
  * DeepSeek's best-effort, async prefix cache needs — a single run can
  * under-report hits.
  *
+ * One baseline is kept PER MODEL — hoshi (DeepSeek, implicit + best effort),
+ * haiku (Anthropic, explicit breakpoints), luna (OpenAI, implicit) cache in
+ * different ways, so a ratio from one is not a target for another. Record each
+ * with its own run:
+ *
+ *   bun run run-eval.ts --track cache-efficiency --model hoshi-2-0 --repeat 3
+ *   bun run run-eval.ts --track cache-efficiency --model haiku     --repeat 3
+ *   bun run run-eval.ts --track cache-efficiency --model luna      --repeat 3
+ *
+ * (`--model hoshi` — the bare alias — does not resolve in the eval worker: the
+ * runtime's model config rejects it and every turn answers "[ERROR] … please
+ * try again". Use the full `hoshi-2-0` id.)
+ *
  * `--check` fails (exit 1) when any test's cache-hit ratio drops more than 5
- * points, or its turn-1 prompt grows more than 10%, versus the checked-in
+ * points, or its turn-1 prompt grows more than 10%, versus that model's
  * baseline at `packages/agent-runtime/src/evals/cache-baseline.json` (tracked,
- * unlike `bench-results/`, so CI can gate on it). Missing baseline = not a
- * failure; the first `--write` records it.
+ * unlike `bench-results/`, so CI can gate on it). Missing baseline for the
+ * model being checked = not a failure; `--write` records it.
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
@@ -29,8 +42,10 @@ import {
   compareCacheBaseline,
   computeCacheBaseline,
   describeRegression,
-  type CacheBaseline,
+  selectBaseline,
+  upsertBaseline,
   type CacheBaselineEntry,
+  type CacheBaselineFile,
 } from '../packages/agent-runtime/src/evals/cache-baseline'
 import { median } from '../packages/agent-runtime/src/evals/eval-helpers'
 
@@ -79,6 +94,7 @@ function mediansOfRun(runs: EvalSuiteResult[]): Record<string, CacheBaselineEntr
     if (entries.length === 0) continue
     out[id] = {
       ratio: median(entries.map((e) => e.ratio)),
+      firstTurnRatio: median(entries.map((e) => e.firstTurnRatio)),
       turnTokens: Math.round(median(entries.map((e) => e.turnTokens))),
       prefixTokens: Math.round(median(entries.map((e) => e.prefixTokens))),
       turns: Math.max(...entries.map((e) => e.turns)),
@@ -104,23 +120,42 @@ function printTable(entries: Record<string, CacheBaselineEntry>): void {
   console.log('')
 }
 
-if (write) {
-  const previous = existsSync(OUT) ? (JSON.parse(readFileSync(OUT, 'utf-8')) as CacheBaseline) : null
-  const baseline: CacheBaseline = {
-    model,
-    date: new Date().toISOString(),
-    perTest: current,
-    notes: `median of ${suites.length} run(s) on ${model}` +
-      (previous?.date ? `; previous baseline ${previous.date}` : ''),
+const readFileState = (): CacheBaselineFile | null => {
+  if (!existsSync(OUT)) return null
+  try {
+    return JSON.parse(readFileSync(OUT, 'utf-8')) as CacheBaselineFile
+  } catch (err: any) {
+    console.error(`Could not parse ${OUT}: ${err.message}`)
+    process.exit(2)
   }
+}
+
+if (write) {
+  // A single-model file written by an earlier version of this script is
+  // migrated in place rather than clobbered.
+  const raw = readFileState() as any
+  const state: CacheBaselineFile | null = raw?.models
+    ? raw
+    : raw?.perTest
+      ? { models: { [raw.model as string]: raw } }
+      : null
+  const previous = selectBaseline(state, model)
+  const next = upsertBaseline(
+    state,
+    model,
+    current,
+    new Date().toISOString(),
+    `median of ${suites.length} run(s)` + (previous?.date ? `; previous baseline ${previous.date}` : ''),
+  )
   mkdirSync(dirname(OUT), { recursive: true })
-  writeFileSync(OUT, `${JSON.stringify(baseline, null, 2)}\n`, 'utf-8')
-  console.log(`Wrote ${OUT} (${Object.keys(current).length} tests, ${suites.length} run(s) on ${model})`)
+  writeFileSync(OUT, `${JSON.stringify(next, null, 2)}\n`, 'utf-8')
+  console.log(`Wrote ${OUT} (${model}: ${Object.keys(current).length} tests, ${suites.length} run(s))`)
   printTable(current)
 }
 
 if (check) {
-  const baseline = existsSync(OUT) ? (JSON.parse(readFileSync(OUT, 'utf-8')) as CacheBaseline) : null
+  const baseline = selectBaseline(readFileState(), model)
+  if (!baseline) console.log(`No baseline recorded for ${model} yet — recording only, not a failure.`)
   const gate = compareCacheBaseline(current, baseline)
   console.log(
     `Cache gate: ${gate.checked} test(s) compared against ${OUT} ` +
