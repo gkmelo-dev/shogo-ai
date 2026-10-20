@@ -23,6 +23,7 @@ mock.module('react-native', () =>
       }, children),
   } as any),
 )
+mock.module('expo-router', () => ({ useRouter: () => ({ push: () => {}, setParams: () => {} }) }))
 mock.module('expo-clipboard', () => ({ setStringAsync: async () => {} }))
 mock.module('@shogo/shared-ui/primitives', () => ({ cn: (...args: unknown[]) => args.filter(Boolean).join(' ') }))
 mock.module(resolve(here, '../../../hooks/useConversationDoc'), () => ({ useConversationDoc: () => hook }))
