@@ -120,9 +120,14 @@ describe('the monthly account meter', () => {
     await resetMonth()
     // Two accounts on the cloud profile, one on the desktop's — three total, so
     // the workspace is in the 3–10 band even though each profile is in 1–2.
-    await addAccount({ profileId, platform: 'instagram' })
-    await addAccount({ profileId, platform: 'facebook' })
-    await addAccount({ profileId: localProfileId, platform: 'tiktok' })
+    // `connectedAt` is pinned to an instant before the injected `now`: letting
+    // it default to the real clock made `activeFraction` return 0 once wall
+    // time passed 2026-10-20T12:00Z (`start > end`), so this test went red on
+    // every branch at noon UTC regardless of what the branch changed.
+    const connectedAt = new Date('2026-10-10T00:00:00.000Z')
+    await addAccount({ profileId, platform: 'instagram', connectedAt })
+    await addAccount({ profileId, platform: 'facebook', connectedAt })
+    await addAccount({ profileId: localProfileId, platform: 'tiktok', connectedAt })
     setSocialClient({ mode: 'cloud', async request() { return { accounts: providerAccounts } } })
     setSocialUsageWallet(fakeWallet)
 
@@ -131,8 +136,8 @@ describe('the monthly account meter', () => {
     expect(summary.debited).toBe(3)
     expect(charges).toHaveLength(1)
     expect(charges[0]!.actionType).toBe('social_account_monthly')
-    // 3 × $6, prorated to the part of October these accounts were live: they
-    // were connected "now", so this is the remaining days of the month only.
+    // 3 × $6, prorated to the part of October these accounts were live: the
+    // 10th to the 20th, so under the full month.
     expect(charges[0]!.actionMetadata.inventory).toBe(3)
     expect(charges[0]!.actionMetadata.band).toBe(10)
     expect(charges[0]!.rawUsd).toBeLessThan(18)
