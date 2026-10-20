@@ -383,6 +383,8 @@ export interface GitHubPullRequestOptions {
   body?: string
   draft?: boolean
   runId?: string
+  /** Card key to link the PR to; absent → derived from the branch or title. */
+  workItem?: string
 }
 
 export interface GitHubPullRequestResult {
@@ -390,6 +392,8 @@ export interface GitHubPullRequestResult {
   url: string
   htmlUrl?: string
   author?: string
+  /** The card this PR was linked to, when its title/branch (or `workItem`) named one. */
+  workItem?: string
   /** `github-app` (App bot), `user-token` (the connection's stored user token), or `requester` (the person who asked). */
   mode?: 'github-app' | 'user-token' | 'requester'
   /** Which account the write used, for the tool call's "as …" label. */
@@ -1109,6 +1113,8 @@ export async function postAgentChannelMessage(
 ): Promise<CheckpointCallResult<{
   id: string; conversationId: string; threadId: string; runId: string | null; url: string | null
   tasks?: Array<{ task_id: string; title: string; status: 'running' }>
+  /** Plain `@Name`s the server left unresolved because more than one person or agent answers to them. */
+  mention_warnings?: string[]
 }>> {
   return personalFetch(channelsPath(workspaceId, `/${encodeURIComponent(channel)}/messages`), {
     method: 'POST',
@@ -1132,6 +1138,8 @@ export async function postAgentChannelMessage(
       runId: j?.message?.runId ?? null,
       url: j?.message?.url ?? null,
       ...(Array.isArray(j?.message?.tasks) ? { tasks: j.message.tasks } : {}),
+      // Plain `@Name`s the server could not resolve (more than one person or agent answers to them).
+      ...(Array.isArray(j?.mention_warnings) && j.mention_warnings.length ? { mention_warnings: j.mention_warnings } : {}),
     }),
   })
 }
