@@ -544,10 +544,10 @@ export interface ConfigureWorkspaceInput {
  * toggles belong to the workspace, not to the anchor project.
  */
 export async function readWorkspaceConfig(workspaceId: string): Promise<WorkspaceConfigSnapshot> {
-  const workspace = (await prisma.workspace.findUnique({
+  const workspace = await prisma.workspace.findUnique({
     where: { id: workspaceId },
-    select: { id: true, name: true, kind: true, settings: true } as any,
-  })) as { id: string; name: string; kind?: string; settings?: unknown } | null;
+    select: { id: true, name: true, kind: true, settings: true },
+  });
   if (!workspace) throw new WorkspaceConfigError('not_found', `Workspace ${workspaceId} not found`);
   return {
     id: workspace.id,
@@ -566,18 +566,20 @@ export async function configureWorkspace(
   workspaceId: string,
   patch: ConfigureWorkspaceInput,
 ): Promise<WorkspaceConfigSnapshot> {
-  const existing = (await prisma.workspace.findUnique({
+  const existing = await prisma.workspace.findUnique({
     where: { id: workspaceId },
-    select: { id: true, settings: true } as any,
-  })) as { id: string; settings?: unknown } | null;
+    select: { id: true, settings: true },
+  });
   if (!existing) throw new WorkspaceConfigError('not_found', `Workspace ${workspaceId} not found`);
 
   if (patch.settings) {
     const current = parseWorkspaceSettings(existing.settings) ?? {};
-    await prisma.workspace.update({
-      where: { id: workspaceId },
-      data: { settings: encodeWorkspaceSettingsForWrite({ ...current, ...patch.settings }) } as any,
-    });
+    // Same encoding rule as `Project.settings`: a bare object on Postgres, the
+    // pre-stringified form on SQLite (see `lib/project-settings.ts`).
+    const data: Record<string, unknown> = {
+      settings: encodeWorkspaceSettingsForWrite({ ...current, ...patch.settings }),
+    };
+    await prisma.workspace.update({ where: { id: workspaceId }, data: data as any });
   }
   return readWorkspaceConfig(workspaceId);
 }
