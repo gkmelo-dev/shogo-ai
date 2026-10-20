@@ -194,6 +194,7 @@ import { enforceImageSizeLimit, MAX_IMAGE_BASE64_BYTES } from './image-size-guar
 import { injectCommitTrailer } from './git-attribution'
 import type { TeamManager } from './team-manager'
 import type { TeammateLoopHandle } from './teammate-loop'
+import { createChatHandoffTool } from './chat-handoff-tool'
 
 export interface ToolContext {
   workspaceDir: string
@@ -777,10 +778,30 @@ async function resolveRemoteTarget(ctx: ToolContext, ref: string): Promise<Remot
   return target
 }
 
+/**
+ * One actionable message for every tool aimed at a project this runtime cannot
+ * reach, instead of the raw `project_not_attached` code the API answers with.
+ * Shared by all remoted file/shell tools so `read_file`, `write_file`,
+ * `edit_file`, `delete_file`, `exec` and `search` say the same thing.
+ */
+export function projectNotAttachedMessage(projectId: string): string {
+  return (
+    `Project ${projectId} isn't attached to this runtime. ` +
+    'Attach it with project_attach (readwrite to edit), or call its agent with project_call.'
+  )
+}
+
 function remoteFailure(err: unknown, project: { id: string; name: string }): AgentToolResult<any> {
   const message = err instanceof Error ? err.message : String(err)
   const code = err instanceof RemoteToolError ? err.code : undefined
   const status = err instanceof RemoteToolError ? err.status : undefined
+  if (code === 'project_not_attached' || /project_not_attached/.test(message)) {
+    return textResult({
+      error: projectNotAttachedMessage(project.id),
+      code: 'project_not_attached',
+      project,
+    })
+  }
   return textResult({
     error: message,
     ...(code ? { code } : {}),
@@ -8861,6 +8882,9 @@ export function createTools(ctx: ToolContext, extraTools?: AgentTool[]): AgentTo
   // BETA: per-chat git worktrees — cross-chat awareness tool
   tools.push(createWorktreeListTool(ctx))
 
+  // Hand work to another chat (any workspace the person can open).
+  tools.push(createChatHandoffTool(ctx))
+
   // Project lifecycle: compose multi-project systems (project-tools.ts).
   // Creating/attaching/calling projects is a `project`-category mutation —
   // NOT `system` (that category is PermissionEngine's unconditional,
@@ -9045,7 +9069,7 @@ function createSkillTool(ctx: ToolContext, allToolsGetter: () => AgentTool[]): A
   return {
     name: 'skill',
     description:
-      'Manage and invoke skills. Actions: invoke (default), search, install, run_script. See read_guide("skill-matching") for details.',
+      'Installed skills in this workspace, and how to use them. The "## Available Skills" section of your instructions lists skills installed here — call skill({ action: "invoke", skill: "<name>" }) to load one and follow its instructions. Actions: invoke (default), search (installed skills first, then the external registry), install, run_script. A skill is instructions you invoke, not an integration tool. See read_guide("skill-matching") for details.',
     label: 'Skill',
     parameters: Type.Object({
       action: Type.Optional(
@@ -9099,38 +9123,121 @@ function createSkillTool(ctx: ToolContext, allToolsGetter: () => AgentTool[]): A
         dir_name?: string
       }
 
-      // --- Search: find skills in the registry ---
+      // --- Search: installed skills first, then bundled and registry skills ---
       if (action === 'search') {
-        const { loadSkillRegistryManifest } = require('./skills') as typeof import('./skills')
+        const { loadSkillRegistryManifest, loadBundledSkills, searchSkills } =
+          require('./skills') as typeof import('./skills')
+        const LIMIT = 20
+        const installed = getLoadedSkills()
         const manifest = loadSkillRegistryManifest()
-        if (manifest.length === 0) {
-          return textResult({
-            results: [],
-            message: 'No external skills available in the registry.',
-          })
-        }
+
+        const installedRow = (skill: Skill) => ({
+          name: skill.name,
+          description: skill.description,
+          installed: true,
+          source: 'installed',
+          // Present but not callable by the model: list it, do not advertise invoke.
+          action: skill.disableModelInvocation ? undefined : 'invoke',
+          ...(skill.trigger ? { trigger: skill.trigger } : {}),
+          ...(skill.disableModelInvocation
+            ? { note: 'disable-model-invocation: not invocable by the model — read it directly with read_file or run_script' }
+            : {}),
+        })
+
+        const registryRow = (entry: { name: string; description: string; source: string; sourceDescription: string; dirName: string }) => ({
+          name: entry.name,
+          description: entry.description,
+          installed: false,
+          source: entry.source,
+          sourceType: 'registry',
+          sourceDescription: entry.sourceDescription,
+          dir_name: entry.dirName,
+          dirName: entry.dirName,
+          action: 'install',
+        })
+
+        const bundledRow = (skill: Skill) => ({
+          name: skill.name,
+          description: skill.description,
+          installed: false,
+          source: 'bundled',
+          sourceType: 'bundled',
+          action: 'install',
+          installWith: `connect({ name: "skill:${skill.name}" })`,
+        })
 
         if (!query) {
+          if (installed.length > 0) {
+            return textResult({
+              total: installed.length,
+              results: installed.slice(0, LIMIT).map(installedRow),
+              message:
+                installed.length > LIMIT
+                  ? `${installed.length} installed skills in this workspace; showing ${LIMIT}. Call skill({ action: "invoke", skill: "<name>" }) to use one, or provide a query to filter.`
+                  : `${installed.length} installed skills in this workspace. Call skill({ action: "invoke", skill: "<name>" }) to use one, or provide a query to filter.`,
+            })
+          }
+          if (manifest.length === 0) {
+            return textResult({
+              results: [],
+              message: 'No external skills available in the registry.',
+            })
+          }
           return textResult({
             total: manifest.length,
-            results: manifest.slice(0, 20),
+            results: manifest.slice(0, LIMIT).map(registryRow),
             message: `${manifest.length} skills available. Provide a query to filter.`,
           })
         }
 
         const q = query.toLowerCase()
-        const matches = manifest.filter(
+        const registryMatches = manifest.filter(
           (s) =>
             s.name.toLowerCase().includes(q) ||
             s.description.toLowerCase().includes(q) ||
             s.source.toLowerCase().includes(q) ||
             s.sourceDescription.toLowerCase().includes(q),
         )
+
+        // Nothing installed to search: the registry is all there is, so keep
+        // answering exactly as before rather than claiming a search we did not do.
+        if (installed.length === 0) {
+          if (manifest.length === 0) {
+            return textResult({
+              results: [],
+              message: 'No external skills available in the registry.',
+            })
+          }
+          return textResult({
+            query,
+            total: registryMatches.length,
+            results: registryMatches.slice(0, LIMIT).map(registryRow),
+            message: registryMatches.length > LIMIT ? `Showing ${LIMIT} of ${registryMatches.length} matches. Refine your query.` : undefined,
+          })
+        }
+
+        const bundled = loadBundledSkills(new Set(installed.map((s) => s.name)))
+        const installedHits = searchSkills(query, installed, [], LIMIT)
+        const bundledHits = searchSkills(query, [], bundled, LIMIT)
+        const seen = new Set([...installedHits, ...bundledHits].map((s) => s.name))
+        const registryRows = registryMatches.filter((s) => !seen.has(s.name)).map(registryRow)
+
+        const rows = [...installedHits.map(installedRow), ...bundledHits.map(bundledRow), ...registryRows]
+        const total = rows.length
+
+        const message =
+          total === 0
+            ? `${installed.length} installed skills searched; nothing matched "${query}". Call skill({ action: "search" }) with no query to list them, or refine the query.`
+            : total > LIMIT
+              ? `${installed.length} installed skills; ${total} matches. Showing ${LIMIT} of ${total}. Refine your query.`
+              : `${installed.length} installed skills; ${total} match${total === 1 ? '' : 'es'}.`
+
         return textResult({
           query,
-          total: matches.length,
-          results: matches.slice(0, 20),
-          message: matches.length > 20 ? `Showing 20 of ${matches.length} matches. Refine your query.` : undefined,
+          total,
+          installedSearched: installed.length,
+          results: rows.slice(0, LIMIT),
+          message,
         })
       }
 
@@ -9253,7 +9360,7 @@ function createSkillTool(ctx: ToolContext, allToolsGetter: () => AgentTool[]): A
           error: overlapHint ? `${baseError}\n\n${overlapHint}` : baseError,
           hint: overlapHint
             ? 'Call the integration tool directly by name (do not use `skill` or `agent_spawn({type:"integration"})`).'
-            : 'Use skill({ action: "search", query: "..." }) to find and install new skills.',
+            : 'Use skill({ action: "search", query: "..." }) to find an installed skill (it searches the skills installed in this workspace first), or to find a new one to install.',
         })
       }
 
