@@ -20,6 +20,7 @@ import { readIslandFiles } from './island-files'
 import { ISLAND_WINDOW_ARG } from './preload-island'
 import { hasMeetingActivity } from './island-meeting'
 import { planPendingNotifications } from './island-notifications'
+import { islandCueForTransition } from './island-cues'
 import { PendingNotifier } from './island-pending-notification'
 import {
   EMPTY_ISLAND_MEETING_STATE,
@@ -409,11 +410,31 @@ export class IslandWindow {
   private publish(): void {
     const focused = this.windowManager.getFocusedWindowRecord()
     const focusedSnapshot = focused ? this.snapshots.get(focused.browserWindow.id) : undefined
+    const previous = this.snapshot
     this.snapshot = mergeIslandSnapshots(this.snapshots.values(), focusedSnapshot)
     this.maybeMaterialize()
     this.sendSnapshot()
     this.reconcileMode()
+    this.playCue(previous)
     this.notifyPending()
+  }
+
+  /** The island plays its own cues. With no island on screen, the main window does. */
+  private playCue(previous: IslandSnapshot): void {
+    if (this.canPresentMeetingPrompt() || !this.config.sounds) return
+    const cue = islandCueForTransition(previous, this.snapshot)
+    const app = this.appWindow()
+    if (cue && app) app.webContents.send('notification-cue', { cue, volume: this.config.soundVolume })
+  }
+
+  /** OS notifications stay quiet when a window plays the sound for them. */
+  osNotificationsSilent(): boolean {
+    return !this.config.sounds || this.config.soundVolume <= 0 || this.appWindow() !== null
+  }
+
+  private appWindow(): BrowserWindow | null {
+    const win = this.windowManager.getPrimaryWindow()
+    return win && !win.isDestroyed() ? win : null
   }
 
   /** A waiting agent the island is not showing gets an OS notification. */
@@ -423,7 +444,7 @@ export class IslandWindow {
     })
     this.announcedRequestIds = plan.announced
     for (const id of plan.resolved) this.pendingNotifier.close(id)
-    for (const notice of plan.notify) this.pendingNotifier.show(notice)
+    for (const notice of plan.notify) this.pendingNotifier.show(notice, this.osNotificationsSilent())
   }
 
   private onAction = async (event: IpcMainInvokeEvent, raw: unknown): Promise<IslandActionResult> => {

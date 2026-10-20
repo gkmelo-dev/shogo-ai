@@ -89,6 +89,7 @@ import { isIslandWindow } from "../components/island/types";
 import { EnvironmentBadge } from "../components/layout/EnvironmentBadge";
 import { getActiveEnvKey, telemetryEnvFor } from "../lib/env-override";
 import { getRuntimeAppEnv } from "../lib/runtime-env";
+import { playIslandSound, type IslandSound } from "../components/island/island-sounds";
 
 import { isNoiseEvent } from "../lib/sentry-noise-filter";
 
@@ -238,7 +239,18 @@ function AuthenticatedAppShell({
   );
 }
 
+function useDesktopNotificationCues() {
+  useEffect(() => {
+    if (Platform.OS !== "web" || typeof window === "undefined") return;
+    const d = (window as any).shogoDesktop;
+    if (!d?.onNotificationCue) return;
+    d.onNotificationCue(({ cue, volume }: { cue: IslandSound; volume: number }) => playIslandSound(cue, volume));
+    return () => d.removeNotificationCueListener?.();
+  }, []);
+}
+
 function RootLayoutInner() {
+  useDesktopNotificationCues();
   csMark("root:layout:render");
   useEffect(() => {
     csMark("root:layout:mounted");

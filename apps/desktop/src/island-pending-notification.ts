@@ -15,11 +15,11 @@ export class PendingNotifier {
 
   constructor(private readonly perform: (action: IslandAction) => Promise<IslandActionResult>) {}
 
-  show(notice: PendingNotice): void {
+  show(notice: PendingNotice, silent: boolean): void {
     if (!Notification.isSupported()) return
     try {
       const actions = process.platform === 'darwin' ? noticeActions(notice) : []
-      const notification = new Notification({ title: notice.title, body: notice.body, silent: false, actions })
+      const notification = new Notification({ title: notice.title, body: notice.body, silent, actions })
       const open = () => {
         void this.perform({ type: 'open', projectId: notice.projectId, sessionId: notice.sessionId })
       }

@@ -1484,7 +1484,7 @@ function registerIpcHandlers(): void {
     ) => {
       if (!Notification.isSupported()) return
       const { title, body, sessionId, projectId } = args
-      const n = new Notification({ title, body, silent: false })
+      const n = new Notification({ title, body, silent: islandWindow?.osNotificationsSilent() ?? false })
       n.on('click', () => {
         windowManager.focusAndSendToPrimaryWindow('notification-clicked', { sessionId, projectId })
       })

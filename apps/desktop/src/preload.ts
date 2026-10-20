@@ -232,6 +232,12 @@ contextBridge.exposeInMainWorld('shogoDesktop', {
   removeNavigateListener: () => {
     ipcRenderer.removeAllListeners('navigate')
   },
+  onNotificationCue: (callback: (data: { cue: string; volume: number }) => void) => {
+    ipcRenderer.on('notification-cue', (_event, data) => callback(data))
+  },
+  removeNotificationCueListener: () => {
+    ipcRenderer.removeAllListeners('notification-cue')
+  },
 
   // App updates — downloads are user-gated. The main process probes the
   // feed and broadcasts `status: 'available'` with a version; the renderer
