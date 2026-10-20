@@ -18,7 +18,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { ActivityIndicator, Image, Linking, Platform, Pressable, ScrollView, Text, View } from 'react-native'
 import { AlertCircle, ClipboardCopy, Download, ExternalLink } from 'lucide-react-native'
-import * as Clipboard from 'expo-clipboard'
 import { attachmentDownloadUrl, downloadAttachment } from '../../lib/attachment-download'
 import { formatFileSize } from '../../lib/composer-attachments'
 import { fileTypeMeta } from '../../lib/file-type'
@@ -240,6 +239,9 @@ function TextView({ file }: { file: ConversationFileMeta }) {
         </Text>
         <Pressable
           onPress={() => {
+            // Required lazily: the clipboard's native module is loaded when a
+            // person copies, not when a file is opened.
+            const Clipboard = require('expo-clipboard') as typeof import('expo-clipboard')
             void Clipboard.setStringAsync(text.text ?? '')
             setCopied(true)
             setTimeout(() => setCopied(false), 1500)
