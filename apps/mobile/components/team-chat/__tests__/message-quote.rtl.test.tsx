@@ -11,6 +11,7 @@ import { resolve } from 'node:path'
 import { cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { createElement, type ReactNode } from 'react'
 import { createReactNativeMock } from '../../../test/react-native-mock'
+import * as lucideStub from '../../../test/stubs/lucide-react-native'
 
 const pushes: Array<{ pathname: string; params: Record<string, unknown> }> = []
 
@@ -24,10 +25,7 @@ mock.module('@shogo/shared-ui/primitives', () => ({
   cn: (...args: unknown[]) => args.filter(Boolean).join(' '),
 }))
 
-mock.module('lucide-react-native', () => ({
-  CornerDownRight: () => createElement('span', { 'data-icon': 'CornerDownRight' }),
-  MessageSquare: () => createElement('span', { 'data-icon': 'MessageSquare' }),
-}))
+mock.module('lucide-react-native', () => lucideStub)
 
 const quoted = {
   id: 'm-1',
@@ -52,20 +50,36 @@ const quoted = {
   editedAt: null,
   deletedAt: null,
   createdAt: '2026-10-19T17:04:00.000Z',
+  conversation: { id: 'conv-1', name: 'shogo-dev', kind: 'public' as const },
 }
 
 function failWith(status: number) {
   return Object.assign(new Error(`HTTP ${status}`), { status })
 }
 
+/** Every message id the card asked the server for, in order. */
+const asked: string[] = []
+
 mock.module(resolve(import.meta.dir, '../../../lib/team-chat-api'), () => ({
   teamChatApi: () => ({
     message: async (id: string) => {
+      asked.push(id)
       if (id === 'm-gone') throw failWith(404)
       if (id === 'm-deleted') return { ...quoted, id, deletedAt: '2026-10-19T18:00:00.000Z', text: '' }
+      if (id === 'm-dm')
+        return { ...quoted, id, conversation: { id: 'dm-1', name: null, kind: 'dm' as const } }
       return { ...quoted, id }
     },
+    // This replacement is process-wide, so keep the rest of the surface a sibling
+    // suite in the same run expects; nothing here calls it.
+    fileMeta: async () => {
+      throw failWith(404)
+    },
+    fileText: async () => {
+      throw failWith(404)
+    },
   }),
+  absoluteApiUrl: (url: string) => url,
 }))
 
 // The shared mock forwards props to the DOM, but `onPress` is not a DOM
@@ -105,25 +119,48 @@ mock.module('react-native', () =>
   }),
 )
 
-const { MessageQuoteCard } = await import('../MessageQuoteCard')
+const { MessageQuoteCard, resetMessageQuoteCache } = await import('../MessageQuoteCard')
 
 afterEach(cleanup)
 
 beforeEach(() => {
   pushes.length = 0
+  asked.length = 0
+  resetMessageQuoteCache()
 })
 
 const target = (messageId: string) => ({ conversationId: 'conv-1', messageId, threadRootId: null })
 const href = 'https://studio.shogo.ai/c/conv-1?msg=m-1'
 
 describe('a quoted message', () => {
-  test('shows who wrote it, when, and the opening of the message', async () => {
+  test('shows where it came from, who wrote it, when, and the opening of the message', async () => {
     const { container } = render(<MessageQuoteCard quote={{ href, target: target('m-1') }} />)
 
     await screen.findByText('Ana Lopez')
+    // A quote is only a reference if you can see which channel it came from.
+    expect(container.textContent).toContain('#shogo-dev')
     expect(container.textContent).toContain('Ana Lopez')
     expect(container.textContent).toContain('The migration is ready for review')
     expect(container.textContent).toContain('Jump to message')
+  })
+
+  test('a quote from a DM says DM, not a channel name', async () => {
+    const { container } = render(<MessageQuoteCard quote={{ href, target: target('m-dm') }} />)
+
+    await screen.findByText('Ana Lopez')
+    expect(container.textContent).toContain('DM')
+    expect(container.textContent).not.toContain('#')
+  })
+
+  test('two quotes of the same message ask the server once', async () => {
+    render(<MessageQuoteCard quote={{ href, target: target('m-1') }} />)
+    await screen.findByText('Ana Lopez')
+
+    cleanup()
+    render(<MessageQuoteCard quote={{ href, target: target('m-1') }} />)
+    await screen.findByText('Ana Lopez')
+
+    expect(asked).toEqual(['m-1'])
   })
 
   test('opens the message in place when tapped', async () => {

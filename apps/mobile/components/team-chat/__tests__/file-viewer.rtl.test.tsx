@@ -11,22 +11,15 @@ import { resolve } from 'node:path'
 import { cleanup, render, screen } from '@testing-library/react'
 import { createElement, type ReactNode } from 'react'
 import { createReactNativeMock } from '../../../test/react-native-mock'
+import * as lucideStub from '../../../test/stubs/lucide-react-native'
 
 mock.module('@shogo/shared-ui/primitives', () => ({
   cn: (...args: unknown[]) => args.filter(Boolean).join(' '),
 }))
 
-mock.module('lucide-react-native', () => ({
-  AlertCircle: () => createElement('span', { 'data-icon': 'AlertCircle' }),
-  ChevronLeft: () => createElement('span', { 'data-icon': 'ChevronLeft' }),
-  ClipboardCopy: () => createElement('span', { 'data-icon': 'ClipboardCopy' }),
-  Download: () => createElement('span', { 'data-icon': 'Download' }),
-  ExternalLink: () => createElement('span', { 'data-icon': 'ExternalLink' }),
-  // Reached through `file-type` / the attachment preview helpers.
-  File: () => createElement('span', { 'data-icon': 'File' }),
-  FileText: () => createElement('span', { 'data-icon': 'FileText' }),
-  Image: () => createElement('span', { 'data-icon': 'Image' }),
-}))
+// The shared stub, not a hand-picked subset: a partial mock here leaks into
+// every other file in the same test process and takes its icons with it.
+mock.module('lucide-react-native', () => lucideStub)
 
 // Downloading reaches expo-file-system and the share sheet; the viewer only has
 // to offer the button, so the press is recorded rather than performed.
@@ -76,6 +69,11 @@ const baseFile = {
 mock.module(resolve(import.meta.dir, '../../../lib/team-chat-api'), () => ({
   teamChatApi: () => api,
   absoluteApiUrl: (url: string) => url,
+  // This replacement is process-wide, so keep the rest of the surface a sibling
+  // suite in the same run expects; nothing here calls it.
+  message: async () => {
+    throw Object.assign(new Error('HTTP 404'), { status: 404 })
+  },
 }))
 
 mock.module('react-native', () =>

@@ -203,6 +203,11 @@ export interface ChatMessage {
   editedAt: string | null
   deletedAt: string | null
   createdAt: string
+  /**
+   * Where the message lives. Only the single-message fetch returns this (a
+   * quote labels itself from it); list responses leave it off.
+   */
+  conversation?: { id: string; name: string | null; kind: ConversationKind } | null
   /** Client-only: optimistic send not yet acknowledged, or failed. */
   pending?: 'sending' | 'failed'
 }

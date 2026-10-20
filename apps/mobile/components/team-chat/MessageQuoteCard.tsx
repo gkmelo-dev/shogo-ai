@@ -28,23 +28,64 @@ type QuoteState =
   | { status: 'ready'; message: ChatMessage }
   | { status: 'unavailable' }
 
+/**
+ * One fetch per message, session-wide: a channel where three people quote the
+ * same message asks for it once, and a message this viewer cannot read is not
+ * re-asked on every re-render. In memory only — nothing here is persisted.
+ */
+const resolved = new Map<string, QuoteState>()
+const inflight = new Map<string, Promise<QuoteState>>()
+
+function loadQuote(messageId: string): Promise<QuoteState> {
+  const settled = resolved.get(messageId)
+  if (settled) return Promise.resolve(settled)
+  const pending = inflight.get(messageId)
+  if (pending) return pending
+
+  const request = api
+    .message(messageId)
+    .then((message): QuoteState => {
+      const state: QuoteState = { status: 'ready', message }
+      resolved.set(messageId, state)
+      return state
+    })
+    .catch((err: { status?: number }): QuoteState => {
+      const state: QuoteState = { status: 'unavailable' }
+      // 404 is the server's only answer for a message this viewer may not
+      // read, deleted or elsewhere, so that one is worth remembering; anything
+      // else is worth retrying on the next mount.
+      if (err?.status === 404) resolved.set(messageId, state)
+      else console.warn('[message-quote] could not load quoted message:', err)
+      return state
+    })
+    .finally(() => {
+      inflight.delete(messageId)
+    })
+
+  inflight.set(messageId, request)
+  return request
+}
+
+/** Drop the session cache. Tests only. */
+export function resetMessageQuoteCache(): void {
+  resolved.clear()
+  inflight.clear()
+}
+
 function useQuotedMessage(messageId: string): QuoteState {
-  const [state, setState] = useState<QuoteState>({ status: 'loading' })
+  const [state, setState] = useState<QuoteState>(() => resolved.get(messageId) ?? { status: 'loading' })
 
   useEffect(() => {
+    const settled = resolved.get(messageId)
+    if (settled) {
+      setState(settled)
+      return
+    }
     let live = true
     setState({ status: 'loading' })
-    api
-      .message(messageId)
-      .then((message) => {
-        if (live) setState({ status: 'ready', message })
-      })
-      .catch((err: { status?: number }) => {
-        // 404 is the server's only answer for a message this viewer may not
-        // read, deleted or elsewhere; anything else is worth retrying later.
-        if (live) setState({ status: 'unavailable' })
-        if (err?.status !== 404) console.warn('[message-quote] could not load quoted message:', err)
-      })
+    void loadQuote(messageId).then((next) => {
+      if (live) setState(next)
+    })
     return () => {
       live = false
     }
@@ -55,6 +96,14 @@ function useQuotedMessage(messageId: string): QuoteState {
 
 function authorName(message: ChatMessage): string {
   return message.author?.name ?? message.authorAgent?.name ?? 'Someone'
+}
+
+/** Where the quoted message lives, as its own links label it. */
+function channelLabel(conversation: NonNullable<ChatMessage['conversation']>): string {
+  if (conversation.kind === 'dm') return 'DM'
+  if (conversation.kind === 'group_dm') return 'Group DM'
+  if (conversation.kind === 'activity') return 'Activity'
+  return conversation.name ? `#${conversation.name}` : 'Channel'
 }
 
 function excerpt(message: ChatMessage): string {
@@ -118,13 +167,14 @@ export function MessageQuoteCard({ quote, className }: MessageQuoteCardProps) {
 
   const { message } = state
   const deleted = !!message.deletedAt
+  const { conversation } = message
 
   return (
     <Pressable
       onPress={deleted ? undefined : open}
       disabled={deleted}
       accessibilityRole={deleted ? undefined : 'link'}
-      accessibilityLabel={`Quoted message from ${authorName(message)}`}
+      accessibilityLabel={`Quoted message from ${authorName(message)}${conversation ? ` in ${channelLabel(conversation)}` : ''}`}
       className={cn(
         'mt-1.5 max-w-[520px] flex-row items-start gap-2 rounded-md border-l-4 border-primary/50 bg-muted/40 py-2 pl-3 pr-2',
         !deleted && 'active:bg-muted',
@@ -135,6 +185,15 @@ export function MessageQuoteCard({ quote, className }: MessageQuoteCardProps) {
       <CornerDownRight size={13} className="mt-0.5 shrink-0 text-muted-foreground" />
       <View className="min-w-0 flex-1">
         <View className="flex-row items-baseline gap-1.5">
+          {conversation ? (
+            <Text
+              className="shrink-0 text-[11px] font-medium text-muted-foreground"
+              numberOfLines={1}
+              testID="message-quote-channel"
+            >
+              {channelLabel(conversation)}
+            </Text>
+          ) : null}
           <Text className="min-w-0 shrink text-sm font-semibold text-foreground" numberOfLines={1}>
             {authorName(message)}
           </Text>

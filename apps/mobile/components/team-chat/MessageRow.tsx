@@ -15,7 +15,7 @@ import { ChatMarkdown } from '../chat/ChatMarkdown'
 import type { MentionTarget } from '../chat/file-links'
 import { SidebarContextMenu, type SidebarMenuEntry } from '../layout/SidebarContextMenu'
 import { absoluteApiUrl, teamChatApi, type ChatMessage, type LinkUnfurl } from '../../lib/team-chat-api'
-import { messageLink, parseFileLink, parseMessageLink } from '../../lib/team-chat-links'
+import { messageLink, parseConversationLink, parseFileLink } from '../../lib/team-chat-links'
 import { extractMessageQuotes } from '../../lib/message-quotes'
 import { MessageQuoteCards } from './MessageQuoteCard'
 import { activityTarget } from '../../lib/activity-target'
@@ -103,14 +103,20 @@ export interface MessageRowProps {
   highlighted?: boolean
 }
 
-/** Links this app can open in place: a message, or a shared file. */
+/**
+ * Links this app can open in place: a channel (with whatever pane it asked for
+ * — a message, a thread, its doc, a card), or a shared file.
+ */
 export function openMessageLinkInApp(href: string): boolean {
-  const target = parseMessageLink(href)
+  // Every `/c/<id>` link is ours to open, not just the ones carrying `msg`:
+  // `?doc=1` and `?card=<id>` are shapes our own links produce, and falling
+  // through to the browser there is a full page reload on web.
+  const target = parseConversationLink(href)
   if (target) {
     void import('expo-router').then(({ router }) =>
       router.push({
         pathname: '/(app)/c/[conversationId]',
-        params: { conversationId: target.conversationId, msg: target.messageId, ...(target.threadRootId ? { thread: target.threadRootId } : {}) },
+        params: { conversationId: target.conversationId, ...target.params },
       } as any),
     )
     return true
