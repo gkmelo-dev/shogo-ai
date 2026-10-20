@@ -30,8 +30,20 @@
  *
  * Floors are deliberately loose (phase A): DeepSeek's cache is async and
  * best-effort, so a single run can under-report hits and turn 1 mostly reflects
- * warm-up order. Run the track with `--repeat 3` and compare medians — that is
- * what `cache-baseline.json` and the regression gate use.
+ * warm-up order. `--repeat N` runs one test N times (`test#t1`, `#t2`, …) and
+ * `cache-baseline.json` stores the MEDIAN of those trials under the bare test
+ * id, which is what the gate compares — but the committed file is currently one
+ * run per model ("median of 1 run(s)"), so its 5-point tolerance rests on a
+ * single sample. Re-record with `--repeat 3` when it is refreshed.
+ *
+ * A baseline is only comparable inside the pod that recorded it: a local eval
+ * worker inherits the host env (attached projects, existing workspaces), so a
+ * turn can loop or fan out differently there and the reading does not survive
+ * the move.
+ *
+ * Test 6 is record-only in phase A: it reports what a MEMORY.md rewrite costs
+ * instead of gating on it, and on a cold first turn it cannot show a drop at
+ * all, so a pass there means "no cost observed", not "isolation proved".
  *
  * Tests:
  *   1. cache-stable-zone-identical  — no LLM: the cached zone is byte-stable across a tick
@@ -39,7 +51,7 @@
  *   3. cache-warm-repeat            — a repeat turn reads the cache (≥ 0.50)
  *   4. cache-multiturn-history      — history is reused turn over turn (≥ 0.60 by turn 4)
  *   5. cache-tool-loop              — the prefix isn't rebuilt per iteration
- *   6. cache-volatile-isolation     — editing MEMORY.md does not touch the cached zone
+ *   6. cache-volatile-isolation     — what a MEMORY.md rewrite costs (record-only in phase A)
  *   7. cache-compaction-recovery    — a rewritten prefix recovers instead of resetting
  *   8. cache-subagent-fork          — a fork subagent rides the parent prefix (≥ 0.40)
  *   9. cache-accounting-identity    — per-call accounting adds up to the turn totals

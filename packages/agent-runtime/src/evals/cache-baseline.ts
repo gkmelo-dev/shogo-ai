@@ -4,14 +4,14 @@
  * Cache-efficiency baseline and non-regression gate.
  *
  * `run-eval --track cache-efficiency` writes ratios and prompt sizes; this
- * module turns them into `bench-results/cache-baseline.json` and compares a
+ * module turns them into `packages/agent-runtime/src/evals/cache-baseline.json` and compares a
  * later run against it. Kept free of I/O so both the CLI
  * (`scripts/cache-baseline.ts`) and the `cache-regression-gate` eval can use
  * the same thresholds, and so the gate itself is unit-tested (including the
  * negative case: a baseline hand-edited downward must fail).
  */
 import type { EvalResult } from './types'
-import { cacheHitRatio, prefixTokens, totalInputTokens } from './eval-helpers'
+import { cacheHitRatio, median, prefixTokens, totalInputTokens } from './eval-helpers'
 
 /** Fail when the weighted cache-hit ratio drops more than this many points. */
 export const CACHE_GATE_RATIO_DROP_POINTS = 5
@@ -152,15 +152,54 @@ export function cacheMetricsOf(result: EvalResult): CacheBaselineEntry {
   }
 }
 
-/** Build a baseline from one suite run's results. */
+/**
+ * `run-eval --repeat N` reports each trial under its own id (`cache-warm-repeat#t1`,
+ * `#t2`, …). Trials are samples of one test, so they share one baseline slot: the
+ * bare id is what floors are keyed on and what a baseline must be written under,
+ * otherwise a re-record through the documented `--repeat` path would store
+ * `#t`-suffixed ids, every floor lookup would miss, and the
+ * hand-edited-baseline protection would quietly stop applying.
+ */
+export function baseTestId(id: string): string {
+  return id.replace(/#t\d+$/, '')
+}
+
+function medianEntry(entries: CacheBaselineEntry[]): CacheBaselineEntry {
+  return {
+    ratio: median(entries.map((e) => e.ratio)),
+    firstTurnRatio: median(entries.map((e) => e.firstTurnRatio)),
+    turnTokens: Math.round(median(entries.map((e) => e.turnTokens))),
+    prefixTokens: Math.round(median(entries.map((e) => e.prefixTokens))),
+    turns: Math.max(...entries.map((e) => e.turns)),
+  }
+}
+
+/** Collapse `--repeat` trials onto their bare ids, taking the median of the trials. */
+export function collapseTrials(perTest: Record<string, CacheBaselineEntry>): Record<string, CacheBaselineEntry> {
+  const groups = new Map<string, CacheBaselineEntry[]>()
+  for (const [id, entry] of Object.entries(perTest)) {
+    const base = baseTestId(id)
+    const group = groups.get(base)
+    if (group) group.push(entry)
+    else groups.set(base, [entry])
+  }
+  const out: Record<string, CacheBaselineEntry> = {}
+  for (const [base, entries] of groups) out[base] = medianEntry(entries)
+  return out
+}
+
+/** Build a baseline from one suite run's results, medianing `--repeat` trials. */
 export function computeCacheBaseline(model: string, results: EvalResult[], date = new Date().toISOString()): CacheBaseline {
-  const perTest: Record<string, CacheBaselineEntry> = {}
+  const samples: Record<string, CacheBaselineEntry[]> = {}
   for (const result of results) {
     // Structural (no-LLM) tests have no tokens; they are gates on their own
     // criteria, not on a ratio.
     if ((result.perTurnUsage ?? []).length === 0) continue
-    perTest[result.eval.id] = cacheMetricsOf(result)
+    const id = baseTestId(result.eval.id)
+    ;(samples[id] ??= []).push(cacheMetricsOf(result))
   }
+  const perTest: Record<string, CacheBaselineEntry> = {}
+  for (const [id, entries] of Object.entries(samples)) perTest[id] = medianEntry(entries)
   return { model, date, perTest }
 }
 
@@ -173,7 +212,11 @@ export function compareCacheBaseline(
   baseline: CacheBaseline | null,
 ): CacheGateResult {
   if (!baseline) return { ok: true, regressions: [], checked: 0, reason: 'no baseline recorded yet' }
-  const shared = Object.keys(current).filter((id) => baseline.perTest[id])
+  // Both sides are collapsed onto bare ids first: a run recorded with
+  // `--repeat` carries `test#t1`, `#t2`, … and every floor lookup would miss.
+  const now = collapseTrials(current)
+  const was = collapseTrials(baseline.perTest)
+  const shared = Object.keys(now).filter((id) => was[id])
   if (shared.length === 0) {
     return { ok: true, regressions: [], checked: 0, reason: 'baseline has no test in common with this run' }
   }
@@ -183,27 +226,27 @@ export function compareCacheBaseline(
   for (const id of shared) {
     const floor = CACHE_RATIO_FLOORS[id]
     if (floor === undefined) continue
-    if (baseline.perTest[id].ratio + 1e-9 < floor) {
+    if (was[id].ratio + 1e-9 < floor) {
       regressions.push({
         test: id,
         metric: 'baselineFloor',
         baseline: floor,
-        current: baseline.perTest[id].ratio,
-        delta: baseline.perTest[id].ratio - floor,
+        current: was[id].ratio,
+        delta: was[id].ratio - floor,
       })
     }
   }
   for (const id of shared) {
-    const was = baseline.perTest[id]
-    const now = current[id]
-    const ratioDropPoints = (was.ratio - now.ratio) * 100
+    const before = was[id]
+    const after = now[id]
+    const ratioDropPoints = (before.ratio - after.ratio) * 100
     if (ratioDropPoints > CACHE_GATE_RATIO_DROP_POINTS) {
-      regressions.push({ test: id, metric: 'ratio', baseline: was.ratio, current: now.ratio, delta: now.ratio - was.ratio })
+      regressions.push({ test: id, metric: 'ratio', baseline: before.ratio, current: after.ratio, delta: after.ratio - before.ratio })
     }
-    if (was.turnTokens > 0) {
-      const growth = (now.turnTokens - was.turnTokens) / was.turnTokens
+    if (before.turnTokens > 0) {
+      const growth = (after.turnTokens - before.turnTokens) / before.turnTokens
       if (growth > CACHE_GATE_TURN_TOKEN_GROWTH) {
-        regressions.push({ test: id, metric: 'turnTokens', baseline: was.turnTokens, current: now.turnTokens, delta: now.turnTokens - was.turnTokens })
+        regressions.push({ test: id, metric: 'turnTokens', baseline: before.turnTokens, current: after.turnTokens, delta: after.turnTokens - before.turnTokens })
       }
     }
   }

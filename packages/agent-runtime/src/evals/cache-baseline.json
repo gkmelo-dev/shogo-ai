@@ -112,8 +112,8 @@
       },
       "notes": "median of 1 run(s)"
     },
-    "luna": {
-      "model": "luna",
+    "gpt-6-luna": {
+      "model": "gpt-6-luna",
       "date": "2026-10-20T08:47:37.512Z",
       "perTest": {
         "cache-warm-repeat": {

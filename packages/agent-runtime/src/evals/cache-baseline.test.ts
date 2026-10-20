@@ -296,4 +296,31 @@ describe('one baseline per model', () => {
     })
     expect(baselineFor(withHaiku, 'luna')).toMatchObject({ status: 'ready' })
   })
+
+  test('--repeat trials collapse onto the bare test id, and the gate medians and floors them', () => {
+    // Last-turn ratio = cacheRead / (input + cacheRead + cacheWrite).
+    const trial = (id: string, cacheRead: number) =>
+      ({
+        eval: { id },
+        perTurnUsage: [
+          { turn: 1, input: 1_000, output: 5, cacheRead: 0, cacheWrite: 0, iterations: 1, perCallUsage: [] },
+          { turn: 2, input: 1_000, output: 5, cacheRead, cacheWrite: 0, iterations: 1, perCallUsage: [] },
+        ],
+      }) as any
+
+    const recorded = computeCacheBaseline('hoshi-2-0', [
+      trial('cache-warm-repeat#t1', 1_000), // 0.50
+      trial('cache-warm-repeat#t2', 3_000), // 0.75
+      trial('cache-warm-repeat#t3', 9_000), // 0.90
+    ])
+    expect(Object.keys(recorded.perTest)).toEqual(['cache-warm-repeat'])
+    expect(recorded.perTest['cache-warm-repeat'].ratio).toBeCloseTo(0.75, 6)
+
+    // A trial-suffixed baseline below the floor is still refused, which is the
+    // property a `--repeat`-recorded baseline used to lose.
+    const trials = Object.fromEntries(Object.entries(entry(0.02)).map(([id, e]) => [`${id}#t1`, e]))
+    const suffixed: CacheBaseline = { ...recorded, perTest: trials }
+    const gate = compareCacheBaseline(trials, suffixed)
+    expect(gate.regressions.map((r) => r.metric)).toContain('baselineFloor')
+  })
 })
