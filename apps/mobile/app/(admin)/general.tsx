@@ -109,6 +109,22 @@ export default function AdminGeneralPage() {
    * Connected by itself instead of sitting on Disconnected until the screen is
    * reloaded (the #1568 report).
    */
+  // `workspaces` is optional for older local APIs; fall back to the single
+  // workspace name so the row is never blank on a machine that is registered.
+  const registeredWorkspaces =
+    instanceInfo?.workspaces ??
+    (instanceInfo?.workspaceName
+      ? [
+          {
+            id: instanceInfo.workspaceName,
+            name: instanceInfo.workspaceName,
+            state: (instanceInfo.tunnelConnected ? "connected" : "connecting") as
+              | "connected"
+              | "connecting",
+          },
+        ]
+      : [])
+
   const settlePollRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const settleInstanceInfo = useCallback(() => {
     if (settlePollRef.current) clearInterval(settlePollRef.current)
@@ -662,10 +678,39 @@ export default function AdminGeneralPage() {
                     )}
                   </View>
                 </View>
-                <InfoRow
-                  label="Cloud Workspace"
-                  value={instanceInfo.workspaceName ?? "not registered yet"}
-                />
+                {/* Every workspace this machine is registered in, with its own
+                    tunnel state — a desktop signed into several workspaces
+                    registers in each of them. */}
+                <View className="gap-1">
+                  <Text className="text-xs font-medium text-muted-foreground uppercase tracking-wider">
+                    Cloud Workspaces
+                  </Text>
+                  {registeredWorkspaces.length === 0 ? (
+                    <Text className="text-sm text-muted-foreground">
+                      {instanceInfo.tunnelConnected ? "not registered yet" : "Connecting…"}
+                    </Text>
+                  ) : (
+                    registeredWorkspaces.map((workspace) => (
+                      <View
+                        key={workspace.id}
+                        className="flex-row items-center justify-between gap-2"
+                      >
+                        <Text className="text-sm text-foreground flex-1" numberOfLines={1}>
+                          {workspace.name || workspace.id}
+                        </Text>
+                        <Text
+                          className={
+                            workspace.state === "connected"
+                              ? "text-xs text-green-500 font-medium"
+                              : "text-xs text-muted-foreground font-medium"
+                          }
+                        >
+                          {workspace.state === "connected" ? "Connected" : "Connecting…"}
+                        </Text>
+                      </View>
+                    ))
+                  )}
+                </View>
               </View>
             </View>
           </SectionCard>

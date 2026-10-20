@@ -125,9 +125,10 @@ beforeEach(() => {
 })
 
 describe('GET /api/instances?scope=owner', () => {
-  test('lists every machine the caller registered, in every cloud workspace, with its workspace name', async () => {
+  test('lists every machine the caller registered once, with every workspace it is in', async () => {
     workspaceNames.set('ws-personal', 'Personal')
     workspaceNames.set('ws-team', 'Samsara')
+    // One desktop, two tunnels: the same machine filed under both workspaces.
     seedInstance({ id: 'i-personal', workspaceId: 'ws-personal' })
     seedInstance({
       id: 'i-team',
@@ -140,11 +141,24 @@ describe('GET /api/instances?scope=owner', () => {
     expect(res.status).toBe(200)
     const body = (await res.json()) as any
 
-    expect(body.instances.map((i: any) => i.id).sort()).toEqual(['i-personal', 'i-team'])
-    const team = body.instances.find((i: any) => i.id === 'i-team')
-    expect(team.workspaceName).toBe('Samsara')
-    const personal = body.instances.find((i: any) => i.id === 'i-personal')
-    expect(personal.workspaceName).toBe('Personal')
+    // One machine, not one per workspace it registered in.
+    expect(body.instances).toHaveLength(1)
+    const [machine] = body.instances
+    expect(machine.id).toBe('i-team')
+    expect(machine.workspaceName).toBe('Samsara')
+    expect(machine.workspaces).toEqual([
+      { id: 'ws-team', name: 'Samsara' },
+      { id: 'ws-personal', name: 'Personal' },
+    ])
+  })
+
+  test('two different machines stay two rows', async () => {
+    seedInstance({ id: 'i-odin', workspaceId: 'ws-personal', hostname: 'odin', name: 'samasra' })
+    seedInstance({ id: 'i-mac', workspaceId: 'ws-personal', hostname: 'mac', name: 'MacBook' })
+    const body = (await (await buildApp().fetch(
+      new Request('http://x/api/instances?scope=owner'),
+    )).json()) as any
+    expect(body.instances.map((i: any) => i.hostname).sort()).toEqual(['mac', 'odin'])
   })
 
   test('needs no workspaceId and no membership of anyone else’s workspace', async () => {

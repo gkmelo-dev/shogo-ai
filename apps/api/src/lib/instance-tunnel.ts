@@ -37,6 +37,8 @@ import { wipeCloudKey } from './cloud-key-wipe'
 import { deriveProjectRuntimeToken } from './project-runtime-token'
 import { getShogoCloudUrl } from './cloud-urls'
 import { resolveLocalApiPort } from './local-api-port'
+import { prisma } from './prisma'
+import { listCloudWorkspaces } from '../services/cloud-workspaces'
 
 // Re-export the worker's symbols so existing callers keep working.
 export const TUNNEL_PROTOCOL_VERSION = _TUNNEL_PROTOCOL_VERSION
@@ -66,6 +68,9 @@ function splitPathAndQuery(pathWithQuery: string): { pathname: string; search: s
  * desktop minted: the local runtime serving a project is a workspace runtime,
  * so its RUNTIME_AUTH_SECRET is the locally signed workspace token.
  */
+const SNAPSHOT_TTL_MS = 20_000
+let snapshotCache: { at: number; value: Record<string, unknown> } | null = null
+
 const desktopResolver: RuntimeResolver = {
   async resolveLocalUrl(pathWithQuery, projectId) {
     const { pathname, search } = splitPathAndQuery(pathWithQuery)
@@ -124,8 +129,14 @@ const desktopResolver: RuntimeResolver = {
    * mirroring any of the machine's data.
    */
   async machineSnapshot() {
+    // One read per cycle, not one per tunnel: the snapshot walks SQLite for
+    // workspaces and activity, and a fan-out has several tunnels heartbeating.
+    const now = Date.now()
+    if (snapshotCache && now - snapshotCache.at < SNAPSHOT_TTL_MS) return snapshotCache.value
     try {
-      return (await collectMachineSnapshot()) as unknown as Record<string, unknown>
+      const value = (await collectMachineSnapshot()) as unknown as Record<string, unknown>
+      snapshotCache = { at: now, value }
+      return value
     } catch (err: any) {
       console.warn(`[InstanceTunnel] machine snapshot unavailable: ${err?.message ?? err}`)
       return null
@@ -143,26 +154,91 @@ const desktopResolver: RuntimeResolver = {
   },
 }
 
-// ─── Module-level singleton (desktop expects this shape) ────────────────────
+// ─── Module-level singletons (desktop expects this shape) ───────────────────
 
+/** Key for the tunnel built from `SHOGO_API_KEY` — the one the app signs in with. */
+const PRIMARY_TUNNEL = 'primary'
+
+/**
+ * One tunnel per cloud workspace the desktop holds a device key for.
+ *
+ * A machine belongs to a *person*, but the cloud files its `instances` row under
+ * the workspace its key was issued in — so a desktop signed into three
+ * workspaces would only ever appear in one of them. Each stored device key gets
+ * its own tunnel, and the machine registers in every workspace it is signed into.
+ * Keyed by workspace id (`PRIMARY_TUNNEL` for the primary key until that id is
+ * known).
+ */
+const activeTunnels = new Map<string, WorkerTunnel>()
+const tunnelNames = new Map<string, string>()
 let activeTunnel: WorkerTunnel | null = null
 
-function getOrCreateTunnel(): WorkerTunnel {
-  if (activeTunnel) return activeTunnel
-  const apiKey = process.env.SHOGO_API_KEY ?? ''
-  const cloudUrl = getShogoCloudUrl()
-  const name = process.env.SHOGO_INSTANCE_NAME || osHostname()
-  activeTunnel = new WorkerTunnel({
+function createTunnel(apiKey: string): WorkerTunnel {
+  return new WorkerTunnel({
     apiKey,
-    cloudUrl,
-    name,
+    cloudUrl: getShogoCloudUrl(),
+    name: process.env.SHOGO_INSTANCE_NAME || osHostname(),
     kind: 'desktop',
     resolver: desktopResolver,
     onAuthRevoked: (reason) => {
       void wipeCloudKey(`instance tunnel ${reason}`)
     },
   })
+}
+
+function getOrCreateTunnel(): WorkerTunnel {
+  if (activeTunnel) return activeTunnel
+  activeTunnel = createTunnel(process.env.SHOGO_API_KEY ?? '')
+  activeTunnels.set(PRIMARY_TUNNEL, activeTunnel)
+  tunnelNames.set(PRIMARY_TUNNEL, process.env.SHOGO_INSTANCE_NAME || osHostname())
   return activeTunnel
+}
+
+/** The workspace the primary key was issued in, from `SHOGO_KEY_INFO`. */
+async function primaryWorkspaceId(): Promise<string | null> {
+  try {
+    const row = await (prisma as any).localConfig?.findUnique?.({ where: { key: 'SHOGO_KEY_INFO' } })
+    const id = row?.value ? JSON.parse(row.value)?.workspace?.id : null
+    return typeof id === 'string' && id ? id : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Start a tunnel for every other workspace the desktop is signed into.
+ *
+ * `SHOGO_CLOUD_WORKSPACES` holds one device key per workspace (written at
+ * sign-in and refreshed by `syncCloudWorkspaces`). A stored key identical to the
+ * primary is skipped — that workspace's tunnel is already running, and two
+ * tunnels with the same key would race for the same `(workspaceId, hostname)`
+ * row. With `enabled: false` (a pasted key, a headless worker) exactly one tunnel
+ * runs, which is the pre-fan-out behaviour.
+ */
+async function startWorkspaceTunnels(): Promise<void> {
+  try {
+    const { workspaces, enabled } = await listCloudWorkspaces()
+    if (!enabled || !workspaces.length) return
+    const primaryKey = process.env.SHOGO_API_KEY ?? ''
+    const primaryId = await primaryWorkspaceId()
+    for (const workspace of workspaces) {
+      const key = workspace.key
+      if (!key || key === primaryKey) continue
+      if (primaryId && workspace.id === primaryId) continue
+      if (activeTunnels.has(workspace.id)) continue
+      try {
+        const tunnel = createTunnel(key)
+        tunnel.start()
+        activeTunnels.set(workspace.id, tunnel)
+        tunnelNames.set(workspace.id, workspace.name || process.env.SHOGO_INSTANCE_NAME || osHostname())
+        console.log(`[InstanceTunnel] Also registered in "${workspace.name}"`)
+      } catch (err: any) {
+        console.warn(`[InstanceTunnel] tunnel for ${workspace.id} failed to start: ${err?.message ?? err}`)
+      }
+    }
+  } catch (err: any) {
+    console.warn(`[InstanceTunnel] per-workspace tunnels unavailable: ${err?.message ?? err}`)
+  }
 }
 
 // ─── Public API (preserved verbatim from the pre-refactor module) ───────────
@@ -175,23 +251,59 @@ export function startInstanceTunnel(): void {
   // Force a fresh instance so a previous stop()'d tunnel + a new
   // SHOGO_API_KEY env value are reflected on restart. Matches the
   // legacy module-singleton lifecycle.
-  if (activeTunnel) {
-    try { activeTunnel.stop() } catch { /* already stopped */ }
-    activeTunnel = null
-  }
+  stopQuietly()
   console.log('[InstanceTunnel] Starting heartbeat polling to Shogo Cloud...')
   getOrCreateTunnel().start()
+  // Fan out to the user's other workspaces; the read is async, the primary
+  // tunnel is already up by then.
+  void startWorkspaceTunnels()
 }
 
 export function stopInstanceTunnel(): void {
-  if (!activeTunnel) return
-  try { activeTunnel.stop() } catch { /* nothing to do */ }
+  if (!activeTunnels.size && !activeTunnel) return
+  for (const tunnel of activeTunnels.values()) {
+    try { tunnel.stop() } catch { /* nothing to do */ }
+  }
+  activeTunnels.clear()
+  tunnelNames.clear()
   activeTunnel = null
   console.log('[InstanceTunnel] Tunnel stopped')
 }
 
+/** Restart without logging a stop for tunnels that were never started. */
+function stopQuietly(): void {
+  for (const tunnel of activeTunnels.values()) {
+    try { tunnel.stop() } catch { /* nothing to do */ }
+  }
+  activeTunnels.clear()
+  tunnelNames.clear()
+  activeTunnel = null
+}
+
 export function isTunnelConnected(): boolean {
-  return activeTunnel?.isConnected() ?? false
+  if (activeTunnel?.isConnected()) return true
+  for (const tunnel of activeTunnels.values()) {
+    if (tunnel.isConnected()) return true
+  }
+  return false
+}
+
+/**
+ * Which cloud workspaces this machine is currently registered in, for
+ * Settings → Cloud Registration. `connecting` means the tunnel is up or
+ * starting but has not completed its first heartbeat yet — never report
+ * `connected` before the cloud has acknowledged one.
+ */
+export function getInstanceTunnelStatus(): Array<{
+  id: string
+  name: string
+  state: 'connected' | 'connecting'
+}> {
+  return [...activeTunnels.entries()].map(([id, tunnel]) => ({
+    id,
+    name: tunnelNames.get(id) ?? id,
+    state: tunnel.isConnected() ? 'connected' : 'connecting',
+  }))
 }
 
 // ─── Test surface ───────────────────────────────────────────────────────────

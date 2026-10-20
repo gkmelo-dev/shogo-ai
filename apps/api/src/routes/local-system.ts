@@ -383,10 +383,11 @@ export function localSystemRoutes(): Hono {
     } catch (err) {
       console.warn('[LocalSystem] instance-info: tunnel status unavailable:', (err as Error)?.message ?? err)
     }
-    // Which cloud workspace this machine's key was issued in. Information only
-    // (one tunnel serves every machine the user owns), but Settings has to be
-    // able to say where the machine is registered.
+    // Which cloud workspaces this machine is registered in, and how each
+    // tunnel is doing. A desktop signed into several workspaces registers in
+    // every one of them (one device key each), and Settings has to say so.
     let workspaceName: string | null = null
+    let keyWorkspaceId: string | null = null
     try {
       const infoRow = await localDb.localConfig
         .findUnique({ where: { key: 'SHOGO_KEY_INFO' } })
@@ -394,7 +395,35 @@ export function localSystemRoutes(): Hono {
       const info = infoRow?.value ? JSON.parse(infoRow.value) : null
       const name = info?.workspace?.name
       workspaceName = typeof name === 'string' && name ? name : null
+      const id = info?.workspace?.id
+      keyWorkspaceId = typeof id === 'string' && id ? id : null
     } catch { /* no key yet, or malformed info: leave it unnamed */ }
+
+    let tunnels: Array<{ id: string; name: string; state: 'connected' | 'connecting' }> = []
+    try {
+      const { getInstanceTunnelStatus } = await import('../lib/instance-tunnel')
+      tunnels = getInstanceTunnelStatus()
+    } catch (err) {
+      console.warn('[LocalSystem] instance-info: tunnel status unavailable:', (err as Error)?.message ?? err)
+    }
+    // `workspaceName` stays the key's workspace (what the SDK type already had);
+    // `workspaces` lists every workspace this machine is registered in.
+    const workspaces = tunnels.length
+      ? tunnels.map((tunnel) => ({
+          // The primary tunnel is keyed before its workspace id is read; report
+          // the real id so Settings can match a row to a workspace.
+          id: tunnel.id === 'primary' ? (keyWorkspaceId ?? 'primary') : tunnel.id,
+          name: tunnel.name,
+          state: tunnel.state,
+        }))
+      : workspaceName
+        ? [{
+            id: keyWorkspaceId ?? 'primary',
+            name: workspaceName,
+            state: tunnelConnected ? ('connected' as const) : ('connecting' as const),
+          }]
+        : []
+
     return Response.json({
       name,
       hostname: os.hostname(),
@@ -403,6 +432,7 @@ export function localSystemRoutes(): Hono {
       tunnelConnected,
       cloudUrl: getShogoCloudUrl(),
       workspaceName,
+      workspaces,
     })
   })
 

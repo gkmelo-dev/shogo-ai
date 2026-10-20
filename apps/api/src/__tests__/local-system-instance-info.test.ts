@@ -32,10 +32,12 @@ mock.module('../lib/federated-upstream', () => ({
   _resetAgentModelDefaultsCache: () => {},
   _resetUpstreamCredentialCache: () => {},
 }))
+let registered: Array<{ id: string; name: string; state: 'connected' | 'connecting' }> = []
 mock.module('../lib/instance-tunnel', () => ({
   startInstanceTunnel: () => {},
   stopInstanceTunnel: () => {},
   isTunnelConnected: () => tunnelConnected,
+  getInstanceTunnelStatus: () => registered,
 }))
 mock.module('../services/cloud-workspaces', () => ({
   setCloudWorkspaces: async () => {},
@@ -55,6 +57,7 @@ function getInfo(): Promise<Response> {
 beforeEach(() => {
   keyInfoValue = null
   tunnelConnected = false
+  registered = []
   process.env.SHOGO_INSTANCE_NAME = 'samasra'
 })
 
@@ -84,6 +87,39 @@ describe('GET /api/local/instance-info', () => {
     const body = (await (await getInfo()).json()) as any
     expect(body.workspaceName).toBeNull()
     expect(body.tunnelConnected).toBe(false)
+  })
+
+  test('lists every workspace it registered in, with each tunnel state', async () => {
+    keyInfoValue = JSON.stringify({
+      workspace: { id: 'ws-personal', name: 'Personal' },
+      user: { id: 'u-1' },
+    })
+    tunnelConnected = true
+    registered = [
+      { id: 'primary', name: 'Personal', state: 'connected' },
+      { id: 'ws-odin', name: 'Odin AI', state: 'connecting' },
+    ]
+
+    const body = (await (await getInfo()).json()) as any
+    // The primary tunnel is keyed before its workspace id is known; the route
+    // reports the key's own workspace id instead of the placeholder.
+    expect(body.workspaces).toEqual([
+      { id: 'ws-personal', name: 'Personal', state: 'connected' },
+      { id: 'ws-odin', name: 'Odin AI', state: 'connecting' },
+    ])
+    expect(body.workspaceName).toBe('Personal')
+  })
+
+  test('falls back to the key’s workspace when the tunnel list is empty', async () => {
+    keyInfoValue = JSON.stringify({
+      workspace: { id: 'ws-personal', name: 'Personal' },
+      user: { id: 'u-1' },
+    })
+    tunnelConnected = true
+    const body = (await (await getInfo()).json()) as any
+    expect(body.workspaces).toEqual([
+      { id: 'ws-personal', name: 'Personal', state: 'connected' },
+    ])
   })
 
   test('survives an older key whose info has no workspace name', async () => {

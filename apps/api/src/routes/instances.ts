@@ -22,6 +22,7 @@
 
 import { Hono } from 'hono'
 import { prisma, InstanceKind } from '../lib/prisma'
+import { groupMachinesByHostname } from '../lib/machine-list'
 import { can } from '../lib/authz'
 import { resolveApiKey } from './api-keys'
 import { logRemoteAction, classifyAction } from './remote-audit'
@@ -871,7 +872,18 @@ export function instanceRoutes() {
 
     const workspaceNames = await workspaceNameMap(instances.map((inst) => inst.workspaceId))
 
-    const withLiveStatus = await Promise.all(instances.map(async (inst) => ({
+    // Owner scope is a machine list, so a machine registered in several
+    // workspaces appears once, carrying every workspace it is in — the same
+    // grouping `GET /api/machines` (the workspace switcher) applies. The
+    // workspace-scoped list asks for one workspace's row and stays 1:1.
+    const grouped = ownerScoped
+      ? groupMachinesByHostname(instances, {
+          preferWorkspaceId: workspaceId,
+          nameFor: (id) => workspaceNames.get(id),
+        })
+      : instances.map((inst) => ({ row: inst, workspaces: [], rows: [inst] }))
+
+    const withLiveStatus = await Promise.all(grouped.map(async ({ row: inst, workspaces }) => ({
       ...inst,
       kind: formatInstanceKind(inst.kind),
       status: tunnels.has(inst.id) || await isTunnelConnectedAnywhere(inst.id)
@@ -879,6 +891,7 @@ export function instanceRoutes() {
         : (isRecentlySeenViaHeartbeat(inst.lastSeenAt) ? 'heartbeat' : 'offline'),
       origin: 'local' as const,
       workspaceName: workspaceNames.get(inst.workspaceId) ?? null,
+      workspaces,
     })))
 
     // Local mode: merge in any instances registered against the cloud

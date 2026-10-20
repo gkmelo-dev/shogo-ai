@@ -28,6 +28,7 @@ import {
   sendTunnelStreamRequest,
 } from './instances'
 import { classifyAction, logRemoteAction } from './remote-audit'
+import { groupMachinesByHostname } from '../lib/machine-list'
 
 /** How long a cold machine gets to open its tunnel before we call it offline. */
 const DEFAULT_WAKE_DEADLINE_MS = 10_000
@@ -94,6 +95,21 @@ function cachedSnapshot(instance: MachineRow): Record<string, any> | null {
   return machine && typeof machine === 'object' ? (machine as Record<string, any>) : null
 }
 
+/** Workspace id → name, best-effort (a deleted workspace simply has no name). */
+async function workspaceNames(workspaceIds: string[]): Promise<Map<string, string>> {
+  const ids = [...new Set(workspaceIds.filter(Boolean))]
+  if (!ids.length) return new Map()
+  try {
+    const rows = await prisma.workspace.findMany({
+      where: { id: { in: ids } },
+      select: { id: true, name: true },
+    })
+    return new Map(rows.map((row) => [row.id, row.name]))
+  } catch {
+    return new Map()
+  }
+}
+
 export function machineRoutes() {
   const router = new Hono()
 
@@ -111,8 +127,14 @@ export function machineRoutes() {
       orderBy: { lastSeenAt: 'desc' },
     })) as MachineRow[]
 
+    // One machine per hostname, not one per workspace it registered in: the
+    // desktop opens a tunnel per stored device key, so a machine signed into
+    // three workspaces has three rows here.
+    const names = await workspaceNames(rows.map((row) => row.workspaceId))
+    const grouped = groupMachinesByHostname(rows, { nameFor: (id) => names.get(id) })
+
     const machines = await Promise.all(
-      rows.map(async (row) => ({
+      grouped.map(async ({ row, workspaces }) => ({
         id: row.id,
         name: row.name,
         hostname: row.hostname,
@@ -120,6 +142,7 @@ export function machineRoutes() {
         arch: row.arch,
         kind: row.kind,
         workspaceId: row.workspaceId,
+        workspaces,
         status: await getInstanceTunnelStatus(row.id, row.lastSeenAt),
         lastSeenAt: row.lastSeenAt ? row.lastSeenAt.toISOString() : null,
         snapshot: cachedSnapshot(row),
