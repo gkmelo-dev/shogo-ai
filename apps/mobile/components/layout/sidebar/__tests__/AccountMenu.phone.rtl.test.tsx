@@ -87,6 +87,14 @@ mock.module(resolve(import.meta.dir, "../../../../contexts/theme"), () => ({
 mock.module(resolve(import.meta.dir, "../../../../contexts/domain"), () => ({
   useDomainHttpOptional: () => null,
   getDomainHttpClient: () => null,
+  useDomainActions: () => ({
+    acceptInvitation: async () => ({}),
+    declineInvitation: async () => ({}),
+  }),
+  useWorkspaceCollection: () => ({ all: [], loadAll: async () => {} }),
+}))
+mock.module(resolve(import.meta.dir, "../../../../contexts/auth"), () => ({
+  useAuth: () => ({ user: { id: "user-1", email: "user@example.com" } }),
 }))
 mock.module(resolve(import.meta.dir, "../../../../lib/platform-config"), () => ({
   isLocalMode: () => false,
@@ -107,6 +115,10 @@ mock.module(resolve(import.meta.dir, "../../../../lib/billing-config"), () => ({
 mock.module(resolve(import.meta.dir, "../../../../lib/analytics"), () => ({
   EVENTS: { UPGRADE_CLICKED: "u" },
   trackEvent: () => {},
+}))
+mock.module(resolve(import.meta.dir, "../../../../lib/api"), () => ({
+  isInvitationExpired: () => false,
+  api: { getReceivedInvitations: async () => [] },
 }))
 mock.module(resolve(import.meta.dir, "../../../billing/UsageWindows"), () => ({
   CompactUsageWindows: () => null,
