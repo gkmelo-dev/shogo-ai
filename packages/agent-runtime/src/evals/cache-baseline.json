@@ -1,0 +1,49 @@
+{
+  "model": "hoshi-2-0",
+  "date": "2026-10-20T08:34:45.614Z",
+  "perTest": {
+    "cache-warm-repeat": {
+      "ratio": 0.6760092030955867,
+      "turnTokens": 47338,
+      "prefixTokens": 45856,
+      "turns": 3
+    },
+    "cache-multiturn-history": {
+      "ratio": 0.9797096438937775,
+      "turnTokens": 47338,
+      "prefixTokens": 45856,
+      "turns": 5
+    },
+    "cache-tool-loop": {
+      "ratio": 0.9957597231787969,
+      "turnTokens": 241022,
+      "prefixTokens": 46031,
+      "turns": 1
+    },
+    "cache-volatile-isolation": {
+      "ratio": 0.9934585533096355,
+      "turnTokens": 47431,
+      "prefixTokens": 45959,
+      "turns": 3
+    },
+    "cache-compaction-recovery": {
+      "ratio": 0.9940538591209105,
+      "turnTokens": 47431,
+      "prefixTokens": 45959,
+      "turns": 3
+    },
+    "cache-subagent-fork": {
+      "ratio": 0.995676208198785,
+      "turnTokens": 438504,
+      "prefixTokens": 45959,
+      "turns": 1
+    },
+    "cache-accounting-identity": {
+      "ratio": 0.9956784788245462,
+      "turnTokens": 47437,
+      "prefixTokens": 45959,
+      "turns": 1
+    }
+  },
+  "notes": "median of 1 run(s) on hoshi-2-0; previous baseline 2026-10-20T00:00:00.000Z"
+}
