@@ -163,7 +163,7 @@ export interface ImageModelEntry {
   provider: ImageProvider
   apiModel: string
   displayName: string
-  /** Endpoint for requests with reference images, when it differs from `apiModel` (fal). */
+  /** Endpoint for requests with reference images, when it differs from `apiModel`. */
   editApiModel?: string
   capabilities: ImageModelCapabilities
   /** One line telling an agent when to pick this model. */

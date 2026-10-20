@@ -5,7 +5,7 @@
  *
  * A runtime submits a job (`POST /ai/v1/videos/generations`) on one API
  * replica and polls `GET /ai/v1/videos/:id` on whichever replica the load
- * balancer picks, so the record (fal queue URLs, owner, billing inputs) lives
+ * balancer picks, so the record (status URL, owner, billing inputs) lives
  * in Redis. Local mode, and cloud mode while Redis is unreachable, use a
  * per-process Map instead.
  *
@@ -28,8 +28,6 @@ export interface VideoJobRecord {
   endpoint: string
   /** Where to poll. Provider-specific; checked against the provider's base on read. */
   statusUrl: string
-  /** fal's result URL. Absent for Higgsfield, whose status body carries the output. */
-  responseUrl?: string
   /** Higgsfield request id, for cancel and support. */
   requestId?: string
   /** Price captured from `/estimate` at submit — what the completion is billed. */

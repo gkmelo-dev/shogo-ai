@@ -3078,10 +3078,9 @@ import {
 } from '../lib/higgsfield-media'
 
 /**
- * One billable media output. Images (including upscale / background removal)
- * fold into the open billing session's image totals; video folds into its
- * video totals; 3D folds into its own. With no session open, it is charged as
- * its own usage event.
+ * One billable media output. Images fold into the open billing session's image
+ * totals; video folds into its video totals; 3D folds into its own. With no
+ * session open, it is charged as its own usage event.
  */
 interface MediaCharge {
   kind: 'image' | 'video' | '3d'
@@ -3090,7 +3089,7 @@ interface MediaCharge {
   billedUsd: number
   /** Output seconds (video only). */
   seconds?: number
-  actionType: 'ai_image_generation' | 'ai_image_processing' | 'ai_video_generation' | 'ai_3d_generation'
+  actionType: 'ai_image_generation' | 'ai_video_generation' | 'ai_3d_generation'
   metadata: Record<string, unknown>
 }
 

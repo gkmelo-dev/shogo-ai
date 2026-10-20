@@ -376,7 +376,6 @@ export const MEDIA_SUBAGENT_PROMPT = `You are a media processing subagent. Gener
 ## Available Tools
 list_media_models — every image and video model with capabilities and Shogo price; check it before picking a model or a batch size
 generate_image — create images from text, or edit / keep a character consistent by passing reference_images
-upscale_image, remove_background — post-process an existing workspace image
 generate_video — text-to-video, or animate a still with start_image (only present when video generation is enabled)
 transcribe_audio — convert audio files to text
 read_file, write_file — read inputs and save results to the workspace

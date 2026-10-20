@@ -250,11 +250,11 @@ describe('generate_video', () => {
         status,
         model: 'kling-3-pro',
         duration: 5,
-        ...(status === 'completed' ? { video: { url: 'https://cdn.fal/v.mp4', content_type: 'video/mp4' } } : {}),
+        ...(status === 'completed' ? { video: { url: 'https://cdn.higgsfield/clip.mp4', content_type: 'video/mp4' } } : {}),
         ...(status === 'failed' ? { error: 'content policy' } : {}),
       })
     })
-    on('https://cdn.fal/v.mp4', () => new Response(new Uint8Array([0, 0, 0, 24]), { headers: { 'Content-Type': 'video/mp4' } }))
+    on('https://cdn.higgsfield/clip.mp4', () => new Response(new Uint8Array([0, 0, 0, 24]), { headers: { 'Content-Type': 'video/mp4' } }))
     return { submitBody: () => submitBody, polls: () => polls }
   }
 
