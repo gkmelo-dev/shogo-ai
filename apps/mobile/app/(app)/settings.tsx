@@ -279,6 +279,7 @@ function TabBar({
   return (
     <ScrollView
       horizontal
+      testID="settings-legacy-tab-bar"
       showsHorizontalScrollIndicator={false}
       className="border-b border-border/70 bg-card"
       contentContainerClassName="gap-1 px-4 py-1"
@@ -4504,7 +4505,11 @@ export default observer(function SettingsPage({
   }
 
   return (
-    <View className="flex-1 bg-background" style={{ paddingTop: insets.top }}>
+    <View
+      testID="settings-legacy-page"
+      className="flex-1 bg-background"
+      style={{ paddingTop: insets.top }}
+    >
       <View className="flex-row items-center gap-3 border-b border-border/70 bg-card px-4 py-3">
         <Pressable
           accessibilityRole="button"
