@@ -9,10 +9,11 @@
  * Russell asked for ("a number, and no silent regression") only hold if the
  * CLI reads the file `run-eval.ts` writes and refuses a tampered baseline.
  *
- * One case is red on purpose: a baseline recorded through `run-eval --repeat N`
- * carries trial ids (`test#t1`), which makes every floor lookup miss, so the
- * hand-edited-baseline protection silently stops applying on the documented
- * re-record path.
+ * `run-eval --repeat N` reports its trials as `test#t1`, `test#t2`, … — the
+ * documented re-record path — so both directions are pinned here: `--write`
+ * must store the trials' MEDIAN under the bare id, and `--check` must compare a
+ * trial-suffixed run against that bare id instead of reporting a pass for a
+ * comparison that examined nothing.
  *
  * No model is called: each case writes a `results.json` in the shape
  * `run-eval.ts` emits and runs the script against it.
@@ -339,4 +340,52 @@ describe('a repeat-recorded baseline is still floor-checked', () => {
     const gate = compareCacheBaseline({ ...baseline.perTest }, baseline)
     expect(gate.regressions.some((r) => r.metric === 'baselineFloor')).toBe(true)
   })
+})
+
+describe('the --repeat re-record path through the CLI', () => {
+  /** `run-eval --repeat 3` writes one result per trial: `test#t1`, `#t2`, `#t3`. */
+  const trials = { 'cache-warm-repeat#t1': 0.5, 'cache-warm-repeat#t2': 0.75, 'cache-warm-repeat#t3': 0.9 }
+
+  test('--write stores the trials\' median under the bare test id', () => {
+    const dir = scratch()
+    try {
+      writeFileSync(join(dir, 'results.json'), JSON.stringify(resultsFile('hoshi-2-0', trials)))
+      const out = join(dir, 'baseline.json')
+
+      const run = runCli(['--write', '--out', out, join(dir, 'results.json')])
+      expect(run.stderr).toBe('')
+      expect(run.status).toBe(0)
+
+      const written = JSON.parse(readFileSync(out, 'utf-8')) as CacheBaselineFile
+      const perTest = written.models['hoshi-2-0'].perTest
+      expect(Object.keys(perTest)).toEqual(['cache-warm-repeat'])
+      expect(perTest['cache-warm-repeat'].ratio).toBeCloseTo(0.75, 6)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  }, 60_000)
+
+  test('--check compares a trial-suffixed run against the bare-id baseline', () => {
+    const dir = scratch()
+    try {
+      const out = join(dir, 'baseline.json')
+      writeFileSync(out, JSON.stringify(baselineFile({ 'cache-warm-repeat': 0.75 })))
+
+      // Same trials as recorded: medians match, one test is actually compared.
+      writeFileSync(join(dir, 'same.json'), JSON.stringify(resultsFile('hoshi-2-0', trials)))
+      const same = runCli(['--check', '--out', out, join(dir, 'same.json')])
+      expect(same.stdout).toContain('1 test(s) compared')
+      expect(same.status).toBe(0)
+
+      // A 15-point drop on the same shape must fail, not "no test in common".
+      const dropped = { 'cache-warm-repeat#t1': 0.6, 'cache-warm-repeat#t2': 0.6, 'cache-warm-repeat#t3': 0.6 }
+      writeFileSync(join(dir, 'dropped.json'), JSON.stringify(resultsFile('hoshi-2-0', dropped)))
+      const worse = runCli(['--check', '--out', out, join(dir, 'dropped.json')])
+      expect(worse.stdout).toContain('1 test(s) compared')
+      expect(worse.stderr).toContain('cache-warm-repeat')
+      expect(worse.status).toBe(1)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  }, 90_000)
 })
