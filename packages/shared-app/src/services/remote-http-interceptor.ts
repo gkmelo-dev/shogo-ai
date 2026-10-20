@@ -78,6 +78,36 @@ const ROUTE_TABLE: RouteEntry[] = [
 ]
 
 /**
+ * Paths that only belong to the desktop while one of its *own* workspaces is
+ * open (`source: 'machine'`).
+ *
+ * They are deliberately not in ROUTE_TABLE: the same URLs are cloud routes for a
+ * cloud workspace, so they are an allow-list consulted only when a machine
+ * workspace is open. Every entry is a narrow sub-path, which is what makes it
+ * safe to match them before ROUTE_TABLE — their cloud counterparts (the
+ * workspace list itself, members, analytics, exports) come through the generic
+ * `/api/workspaces` pin and must keep winning for those.
+ */
+const MACHINE_WORKSPACE_ROUTE_TABLE: RouteEntry[] = [
+  // The machine's workspace runtime and its agent.
+  { pattern: /^\/api\/workspaces\/[^/]+\/agent-proxy(\/|$)/,   target: 'remote' },
+  { pattern: /^\/api\/workspaces\/[^/]+\/agent-profile/,       target: 'remote' },
+  { pattern: /^\/api\/workspaces\/[^/]+\/agent-avatar/,        target: 'remote' },
+  { pattern: /^\/api\/workspaces\/[^/]+\/agent-card/,          target: 'remote' },
+  // The workspace agent chat itself: session resolution, turns, stop.
+  { pattern: /^\/api\/workspaces\/[^/]+\/(chat|sessions|active-chats)(\/|\?|$)/, target: 'remote' },
+  { pattern: /^\/api\/workspaces\/[^/]+\/history(\/|\?|$)/,    target: 'remote' },
+  // Team chat of the machine's workspace.
+  { pattern: /^\/api\/workspaces\/[^/]+\/(conversations|dms)(\/|\?|$)/, target: 'remote' },
+  { pattern: /^\/api\/conversations(\/|\?|$)/,                 target: 'remote' },
+  { pattern: /^\/api\/conversation-messages(\/|\?|$)/,         target: 'remote' },
+  { pattern: /^\/api\/scheduled-messages(\/|\?|$)/,            target: 'remote' },
+  { pattern: /^\/api\/reminders(\/|\?|$)/,                     target: 'remote' },
+  { pattern: /^\/api\/custom-emoji(\/|\?|$)/,                  target: 'remote' },
+  { pattern: /^\/api\/user-groups(\/|\?|$)/,                   target: 'remote' },
+]
+
+/**
  * Legacy prefix list for backward-compat exports.
  * @deprecated Use ROUTE_TABLE instead.
  */
@@ -157,6 +187,22 @@ export function rewriteMachineWorkspaceParam(path: string, localWorkspaceId: str
 }
 
 /**
+ * Point a machine-workspace request at the machine's own workspace id when the
+ * id sits in the path (`/api/workspaces/:id/agent-proxy/…`).
+ *
+ * A workspace-scoped URL the cloud app builds carries the cloud workspace id,
+ * which the desktop has never heard of: it would resolve to no workspace and
+ * answer 404 (or, worse, to whichever row happened to match). The query and
+ * body rewrites below cannot reach that segment.
+ */
+export function rewriteMachineWorkspacePath(path: string, localWorkspaceId: string): string {
+  return path.replace(
+    /^\/api\/workspaces\/[^/?#]+/,
+    `/api/workspaces/${encodeURIComponent(localWorkspaceId)}`,
+  )
+}
+
+/**
  * Point a machine-workspace request body at the machine's own workspace id.
  *
  * Creates carry `workspaceId` in the body while the UI still holds the cloud
@@ -181,9 +227,23 @@ export function rewriteMachineWorkspaceBody<T>(body: T, localWorkspaceId: string
  * `/api/projects/:id/publish` hit cloud even though `/api/projects` is
  * remote.  First match wins.
  */
-export function shouldRouteToRemote(path: string): boolean {
+export function shouldRouteToRemote(
+  path: string,
+  opts?: { machineWorkspaceId?: string | null },
+): boolean {
   // Strip query string for matching — qs is preserved during rewrite.
   const pathOnly = path.split('?')[0] || path
+
+  // A paired desktop's own workspace owns the agent and team chat of that
+  // workspace. These entries are consulted first because their cloud
+  // counterparts are reached through the generic `/api/workspaces` pin, which
+  // must keep sending the workspace *list* and its cloud-only families to
+  // cloud. They are a narrow allow-list, so nothing else can be shadowed.
+  if (opts?.machineWorkspaceId) {
+    for (const entry of MACHINE_WORKSPACE_ROUTE_TABLE) {
+      if (entry.pattern.test(pathOnly)) return true
+    }
+  }
 
   for (const entry of ROUTE_TABLE) {
     if (entry.pattern.test(pathOnly)) {
@@ -257,20 +317,30 @@ export function createRemoteAwareHttpClient(
 
         // Extract path from arguments
         const originalPath: string = args[0]
-        const path =
-          config.machineWorkspaceId
-            ? rewriteMachineWorkspaceParam(originalPath, config.machineWorkspaceId)
-            : originalPath
 
-        // Check if this path should be routed to remote
-        const shouldRoute = shouldRouteToRemote(path)
+        // Check if this path should be routed to remote. A machine workspace
+        // widens the remote set (its own agent and team chat live on the
+        // desktop), but only paths that match either table.
+        const shouldRoute = shouldRouteToRemote(originalPath, {
+          machineWorkspaceId: config.machineWorkspaceId,
+        })
 
         if (!shouldRoute) {
           return (original as Function).apply(target, args)
         }
 
+        // Point the request at the machine's own workspace id — in the path
+        // (`/api/workspaces/:id/agent-proxy/…`), the query string and, for a
+        // create, the body.
+        const machinePath = config.machineWorkspaceId
+          ? rewriteMachineWorkspacePath(
+              rewriteMachineWorkspaceParam(originalPath, config.machineWorkspaceId),
+              config.machineWorkspaceId,
+            )
+          : originalPath
+
         // Rewrite the path to go through the tunnel proxy
-        const rewrittenPath = rewritePathForRemote(path, config.remoteProxyBaseUrl)
+        const rewrittenPath = rewritePathForRemote(machinePath, config.remoteProxyBaseUrl)
         const newArgs = [...args]
         newArgs[0] = rewrittenPath
 
@@ -319,7 +389,7 @@ export function createRemoteAwareHttpClient(
         if (result && typeof result.then === 'function') {
           return result.catch((error: Error) => {
             // Notify caller about remote errors for fallback handling
-            config.onRemoteError?.(error, path)
+            config.onRemoteError?.(error, machinePath)
             throw error
           })
         }
@@ -334,4 +404,11 @@ export function createRemoteAwareHttpClient(
 
 // ─── Exports ────────────────────────────────────────────────────────────────
 
-export { REMOTE_ROUTED_PREFIXES, REMOTE_EXCLUDED_PATTERNS, ROUTE_TABLE, type RouteTarget, type RouteEntry }
+export {
+  REMOTE_ROUTED_PREFIXES,
+  REMOTE_EXCLUDED_PATTERNS,
+  ROUTE_TABLE,
+  MACHINE_WORKSPACE_ROUTE_TABLE,
+  type RouteTarget,
+  type RouteEntry,
+}

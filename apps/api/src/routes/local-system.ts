@@ -27,12 +27,17 @@ const LOCAL_ACCESS_KEY = 'LOCAL_ACCESS_PREFS'
 import { clearCloudWorkspaces, setCloudWorkspaces } from '../services/cloud-workspaces'
 
 function restartInstanceTunnel(): void {
+  // A silent failure here strands the machine "disconnected" with no clue why;
+  // the import is lazy only to keep the runtime/tunnel graph out of this
+  // router's mount, not because it is allowed to fail.
   void import('../lib/instance-tunnel')
     .then(({ stopInstanceTunnel, startInstanceTunnel }) => {
       stopInstanceTunnel()
       startInstanceTunnel()
     })
-    .catch(() => {})
+    .catch((err) => {
+      console.warn('[LocalSystem] restartInstanceTunnel failed:', (err as Error)?.message ?? err)
+    })
 }
 
 const PROVIDER_KEYS = [
@@ -269,7 +274,9 @@ export function localSystemRoutes(): Hono {
       // router otherwise doesn't need (and which tests of its other routes mock around).
       void import('../lib/runtime')
         .then(({ getRuntimeManager }) => getRuntimeManager().pushLocalAccessPolicy(toLocalAccessPolicy(merged)))
-        .catch(() => {})
+        .catch((err) => {
+          console.warn('[LocalSystem] pushLocalAccessPolicy failed:', (err as Error)?.message ?? err)
+        })
       return c.json({ ok: true, configured: true, prefs: merged })
     } catch (err: any) {
       return c.json({ error: err?.message ?? String(err) }, 500)
@@ -345,7 +352,11 @@ export function localSystemRoutes(): Hono {
     delete process.env.SHOGO_API_KEY
     _resetUpstreamCredentialCache()
     _resetAgentModelDefaultsCache()
-    void import('../lib/instance-tunnel').then(({ stopInstanceTunnel }) => stopInstanceTunnel()).catch(() => {})
+    void import('../lib/instance-tunnel')
+      .then(({ stopInstanceTunnel }) => stopInstanceTunnel())
+      .catch((err) => {
+        console.warn('[LocalSystem] stopInstanceTunnel failed:', (err as Error)?.message ?? err)
+      })
     return c.json({ ok: true })
   })
 
@@ -369,7 +380,21 @@ export function localSystemRoutes(): Hono {
     try {
       const { isTunnelConnected } = await import('../lib/instance-tunnel')
       tunnelConnected = isTunnelConnected()
-    } catch {}
+    } catch (err) {
+      console.warn('[LocalSystem] instance-info: tunnel status unavailable:', (err as Error)?.message ?? err)
+    }
+    // Which cloud workspace this machine's key was issued in. Information only
+    // (one tunnel serves every machine the user owns), but Settings has to be
+    // able to say where the machine is registered.
+    let workspaceName: string | null = null
+    try {
+      const infoRow = await localDb.localConfig
+        .findUnique({ where: { key: 'SHOGO_KEY_INFO' } })
+        .catch(() => null)
+      const info = infoRow?.value ? JSON.parse(infoRow.value) : null
+      const name = info?.workspace?.name
+      workspaceName = typeof name === 'string' && name ? name : null
+    } catch { /* no key yet, or malformed info: leave it unnamed */ }
     return Response.json({
       name,
       hostname: os.hostname(),
@@ -377,6 +402,7 @@ export function localSystemRoutes(): Hono {
       arch: os.arch(),
       tunnelConnected,
       cloudUrl: getShogoCloudUrl(),
+      workspaceName,
     })
   })
 

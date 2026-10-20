@@ -36,6 +36,7 @@ import { collectMachineSnapshot } from './machine-snapshot'
 import { wipeCloudKey } from './cloud-key-wipe'
 import { deriveProjectRuntimeToken } from './project-runtime-token'
 import { getShogoCloudUrl } from './cloud-urls'
+import { resolveLocalApiPort } from './local-api-port'
 
 // Re-export the worker's symbols so existing callers keep working.
 export const TUNNEL_PROTOCOL_VERSION = _TUNNEL_PROTOCOL_VERSION
@@ -43,10 +44,6 @@ export const TunnelWebSocketHeaderSupportError = _TunnelWebSocketHeaderSupportEr
 export type TunnelWebSocketHeaderSupportError = _TunnelWebSocketHeaderSupportError
 
 // ─── Desktop-specific resolver ──────────────────────────────────────────────
-
-function getApiPort(): number {
-  return parseInt(process.env.PORT || process.env.API_PORT || '8002', 10)
-}
 
 function splitPathAndQuery(pathWithQuery: string): { pathname: string; search: string } {
   const q = pathWithQuery.indexOf('?')
@@ -62,7 +59,7 @@ function splitPathAndQuery(pathWithQuery: string): { pathname: string; search: s
  *     `http://localhost:${runtime.agentPort}`. Cold-start latency
  *     surfaces as request latency (matches the same RuntimeManager
  *     behaviour exposed at `/api/projects/:id/agent-proxy/*`).
- *   - Anything else → forwards to the local apps/api on `getApiPort()`,
+ *   - Anything else → forwards to the local apps/api on `resolveLocalApiPort()`,
  *     which is what the desktop already serves.
  *
  * `deriveRuntimeToken` replaces the cloud's `x-runtime-token` with one this
@@ -101,7 +98,7 @@ const desktopResolver: RuntimeResolver = {
     // available) default to the local apps/api server. The historical
     // contract was "anything I receive on the tunnel I forward locally" —
     // this preserves that.
-    return `http://localhost:${getApiPort()}${path}${search}`
+    return `http://localhost:${resolveLocalApiPort()}${path}${search}`
   },
 
   async deriveRuntimeToken(projectId) {

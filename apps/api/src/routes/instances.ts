@@ -225,19 +225,48 @@ function isWsRequested(wsRequestedAt: Date | null): boolean {
 }
 
 /**
- * Strip the /api/projects/:pid/agent-proxy wrapper from a tunneled path,
- * returning the clean agent path (e.g. "/agent/quick-actions").
+ * Names of the cloud workspaces a set of instance rows were filed under, so a
+ * machine list can say where each one is registered. Best-effort: a missing row
+ * (deleted workspace, local id the cloud does not know) simply has no name.
+ */
+async function workspaceNameMap(workspaceIds: string[]): Promise<Map<string, string>> {
+  const ids = [...new Set(workspaceIds.filter(Boolean))]
+  if (!ids.length) return new Map()
+  try {
+    const rows = await prisma.workspace.findMany({
+      where: { id: { in: ids } },
+      select: { id: true, name: true },
+    })
+    return new Map(rows.map((row) => [row.id, row.name]))
+  } catch {
+    // A machine list is still useful without the workspace label.
+    return new Map()
+  }
+}
+
+/**
+ * Strip the agent-proxy wrapper from a tunneled path, returning the clean agent
+ * path (e.g. "/agent/quick-actions").
+ *
+ * Two wrappers exist: `/api/projects/:pid/agent-proxy` for a project chat and
+ * `/api/workspaces/:wsId/agent-proxy` for a workspace chat (the personal
+ * companion, and a paired desktop's own workspace). A workspace agent turn is
+ * the same SSE stream as a project one, so both are unwrapped here — otherwise
+ * `isStreamingRequest` says "not streaming" and the relay buffers the whole
+ * turn instead of forwarding it.
  *
  * IMPORTANT: only strips query-free path segments. Callers must handle
  * query strings separately (append after normalization).
  */
 export function normalizeTransparentProxyPath(path: string): string {
   const pathWithoutQuery = path.split('?')[0] || path
-  const wrappedProjectPath = pathWithoutQuery.match(/^\/api\/projects\/[^/]+\/agent-proxy(\/.*)?$/)
-  if (wrappedProjectPath) {
+  const wrapped = pathWithoutQuery.match(
+    /^\/api\/(?:projects|workspaces)\/[^/]+\/agent-proxy(\/.*)?$/,
+  )
+  if (wrapped) {
     // group 1 is undefined when the path ends exactly at /agent-proxy —
     // forward to /agent (the runtime's root) rather than "/" which 404s.
-    return wrappedProjectPath[1] || '/agent'
+    return wrapped[1] || '/agent'
   }
   return pathWithoutQuery
 }
@@ -805,29 +834,42 @@ export function instanceRoutes() {
     return c.json({ ok: true, status: 'requested' })
   })
 
-  // GET /instances — List all instances for the authenticated user's workspace
+  // GET /instances — List all instances for the authenticated user.
+  //
+  // `?workspaceId=` scopes to one cloud workspace (a project's runtime picker).
+  // `?scope=owner` is the Settings → Remote control list: every machine this
+  // user registered, whichever cloud workspace the app happens to be showing —
+  // the same owner-scoped list the workspace switcher reads from
+  // `GET /api/machines`. Each row carries the name of the workspace its key was
+  // issued in, which is information only (one tunnel serves all of them).
   router.get('/instances', async (c) => {
     const auth = c.get('auth') as any
     if (!auth?.userId) {
       return c.json({ error: { code: 'unauthorized', message: 'Authentication required' } }, 401)
     }
 
+    const ownerScoped = c.req.query('scope') === 'owner'
     const workspaceId = c.req.query('workspaceId')
-    if (!workspaceId) {
-      return c.json({ error: { code: 'invalid_request', message: 'workspaceId query param required' } }, 400)
-    }
 
-    if (!(await can(c, 'workspace:read', { workspaceId }))) {
-      return c.json({ error: { code: 'forbidden', message: 'Not a member of this workspace' } }, 403)
+    if (!ownerScoped) {
+      if (!workspaceId) {
+        return c.json({ error: { code: 'invalid_request', message: 'workspaceId query param required' } }, 400)
+      }
+
+      if (!(await can(c, 'workspace:read', { workspaceId }))) {
+        return c.json({ error: { code: 'forbidden', message: 'Not a member of this workspace' } }, 403)
+      }
     }
 
     // Scope to the machines this user paired. Ownership is stamped from the
     // API key used to register/heartbeat the machine (see resolveApiKey), so
     // each member only sees their own machines, not everyone's in the workspace.
     const instances = await prisma.instance.findMany({
-      where: { workspaceId, userId: auth.userId },
+      where: ownerScoped ? { userId: auth.userId } : { workspaceId, userId: auth.userId },
       orderBy: { lastSeenAt: 'desc' },
     })
+
+    const workspaceNames = await workspaceNameMap(instances.map((inst) => inst.workspaceId))
 
     const withLiveStatus = await Promise.all(instances.map(async (inst) => ({
       ...inst,
@@ -836,6 +878,7 @@ export function instanceRoutes() {
         ? 'online'
         : (isRecentlySeenViaHeartbeat(inst.lastSeenAt) ? 'heartbeat' : 'offline'),
       origin: 'local' as const,
+      workspaceName: workspaceNames.get(inst.workspaceId) ?? null,
     })))
 
     // Local mode: merge in any instances registered against the cloud
@@ -844,7 +887,9 @@ export function instanceRoutes() {
     // the UI can render a badge.
     let merged: Array<Record<string, unknown>> = withLiveStatus
     if (await isFederatedEnabled()) {
-      const cloud = await listCloudInstancesForWorkspace(workspaceId)
+      const cloud = ownerScoped
+        ? await listCloudInstancesForWorkspace(workspaceId ?? '', { ownerScope: true })
+        : await listCloudInstancesForWorkspace(workspaceId ?? '')
       if (cloud.length) {
         const origin = getUpstreamOrigin()
         const localIds = new Set(withLiveStatus.map((i) => i.id))
